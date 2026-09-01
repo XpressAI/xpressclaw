@@ -110,17 +110,18 @@ impl WorkflowEngine {
         )
     }
 
-    /// Cancel a workflow run and atomically retire any continuation that is
-    /// reusing its source task. Both continuation creation and this method
-    /// reserve the SQLite writer before checking ownership, so cancellation
-    /// cannot miss a prompt queued concurrently with the request.
+    /// Cancel a workflow run and atomically retire only the exact attempt
+    /// owned by a continuation that is reusing its source task. Both
+    /// continuation creation and this method reserve the SQLite writer before
+    /// checking ownership, so cancellation cannot miss a prompt queued
+    /// concurrently with the request or consume an unrelated user turn.
     pub fn cancel_instance(
         &self,
         instance_id: &str,
         summary: &str,
     ) -> Result<WorkflowCancellation> {
         let sessions = SessionManager::new(self.db.clone());
-        let (continuation_task_id, attempts) = self.db.with_conn(|conn| {
+        let (continuation_task_id, cancelled_attempt) = self.db.with_conn(|conn| {
             let transaction = rusqlite::Transaction::new_unchecked(
                 conn,
                 rusqlite::TransactionBehavior::Immediate,
@@ -129,22 +130,28 @@ impl WorkflowEngine {
                 &transaction,
                 instance_id,
             )?;
-            let continuation_task_id = continuation.and_then(|execution| execution.task_id);
-            let attempts = continuation_task_id
+            let (continuation_task_id, continuation_attempt_id) = continuation
+                .map(|execution| (execution.task_id, execution.continuation_attempt_id))
+                .unwrap_or_default();
+            let cancelled_attempt = continuation_attempt_id
                 .as_deref()
-                .map(|task_id| {
-                    sessions.cancel_task_attempts_in_transaction(&transaction, task_id, summary)
+                .map(|attempt_id| {
+                    sessions.cancel_workflow_attempt_in_transaction(
+                        &transaction,
+                        attempt_id,
+                        summary,
+                    )
                 })
                 .transpose()?
                 .flatten();
             InstanceManager::cancel_instance_in_transaction(&transaction, instance_id)?;
             transaction.commit()?;
-            Ok::<_, Error>((continuation_task_id, attempts))
+            Ok::<_, Error>((continuation_task_id, cancelled_attempt))
         })?;
 
-        let cancelled_attempts = match (continuation_task_id.as_deref(), attempts) {
-            (Some(task_id), Some(attempts)) => {
-                sessions.record_task_attempt_cancellations(task_id, summary, attempts)?
+        let cancelled_attempts = match (continuation_task_id.as_deref(), cancelled_attempt) {
+            (Some(task_id), Some(attempt)) => {
+                sessions.record_task_attempt_cancellations(task_id, summary, vec![attempt])?
             }
             _ => Vec::new(),
         };

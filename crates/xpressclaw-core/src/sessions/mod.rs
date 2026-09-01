@@ -597,10 +597,8 @@ impl SessionManager {
             .transpose()
     }
 
-    /// Apply the durable half of task cancellation inside a caller-owned
-    /// transaction. Workflow cancellation uses this to retire a same-task
-    /// continuation before its owning run becomes terminal in the same
-    /// commit.
+    /// Apply the durable half of whole-task cancellation inside a caller-owned
+    /// transaction.
     pub(crate) fn cancel_task_attempts_in_transaction(
         &self,
         transaction: &rusqlite::Transaction<'_>,
@@ -674,6 +672,101 @@ impl SessionManager {
             )?;
         }
         Ok(Some(attempts))
+    }
+
+    /// Cancel one workflow-owned attempt without changing unrelated attempts
+    /// or making the shared source task terminal. Same-task continuations use
+    /// this narrower lifecycle when their workflow run is cancelled.
+    pub(crate) fn cancel_workflow_attempt_in_transaction(
+        &self,
+        transaction: &rusqlite::Transaction<'_>,
+        attempt_id: &str,
+        summary: &str,
+    ) -> Result<Option<WorkAttempt>> {
+        let attempt = transaction
+            .query_row(
+                "SELECT id, session_id, task_id, queue_id, kind, runner, status, prompt,
+                        native_session_id, container_id, result, error_message,
+                        created_at, started_at, completed_at, context_used, context_size,
+                        trigger_message_id, response_queued_at, response_started_at
+                 FROM work_attempts WHERE id = ?1",
+                [attempt_id],
+                row_to_attempt,
+            )
+            .optional()?
+            .ok_or_else(|| Error::Task(format!("attempt {attempt_id} not found")))?;
+        if matches!(
+            attempt.status.as_str(),
+            "completed" | "failed" | "cancelled" | "interrupted"
+        ) {
+            return Ok(None);
+        }
+        let task_id = attempt.task_id.as_deref().ok_or_else(|| {
+            Error::Task(format!(
+                "workflow continuation attempt {attempt_id} has no task"
+            ))
+        })?;
+
+        transaction.execute(
+            "UPDATE work_attempts
+             SET status = 'cancelled', completed_at = CURRENT_TIMESTAMP,
+                 error_message = NULL
+             WHERE id = ?1",
+            [attempt_id],
+        )?;
+        if let Some(queue_id) = attempt.queue_id {
+            // A running dispatch retains the container lease until the server
+            // has stopped it. A queued dispatch can be retired immediately.
+            transaction.execute(
+                "UPDATE task_queue
+                 SET status = 'failed', completed_at = CURRENT_TIMESTAMP,
+                     harness_response = 'workflow cancelled by user'
+                 WHERE id = ?1 AND status = 'queued'",
+                [queue_id],
+            )?;
+        }
+
+        let replacement_attempt_id = transaction
+            .query_row(
+                "SELECT id FROM work_attempts
+                 WHERE task_id = ?1
+                   AND status IN ('queued', 'preparing', 'running',
+                                  'waiting_for_input', 'review')
+                 ORDER BY rowid DESC LIMIT 1",
+                [task_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let current_task_status: String =
+            transaction.query_row("SELECT status FROM tasks WHERE id = ?1", [task_id], |row| {
+                row.get(0)
+            })?;
+        let next_task_status = if matches!(current_task_status.as_str(), "completed" | "cancelled")
+            || replacement_attempt_id.is_some()
+        {
+            current_task_status
+        } else {
+            "completed".to_string()
+        };
+        transaction.execute(
+            "UPDATE tasks
+             SET status = ?1, active_attempt_id = ?2,
+                 completed_at = CASE
+                     WHEN ?1 = 'completed' THEN COALESCE(completed_at, CURRENT_TIMESTAMP)
+                     ELSE NULL END,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?3",
+            rusqlite::params![next_task_status, replacement_attempt_id, task_id],
+        )?;
+
+        let session_status = self.derive_status_with_conn(transaction, &attempt.session_id)?;
+        transaction.execute(
+            "UPDATE logical_sessions
+             SET status = ?1, latest_summary = ?2, updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?3",
+            rusqlite::params![session_status, summary, &attempt.session_id],
+        )?;
+        Ok(Some(attempt))
     }
 
     pub(crate) fn record_task_attempt_cancellations(

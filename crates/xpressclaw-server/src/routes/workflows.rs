@@ -6,6 +6,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use xpressclaw_core::sessions::{SessionManager, WorkAttempt};
+use xpressclaw_core::tasks::conversation::TaskConversation;
 use xpressclaw_core::workflows::definition::WorkflowDefinition;
 use xpressclaw_core::workflows::engine::{WorkflowContext, WorkflowEngine};
 use xpressclaw_core::workflows::instance::InstanceManager;
@@ -298,7 +299,6 @@ async fn cleanup_cancelled_continuation(
     cancelled: &[WorkAttempt],
 ) -> Result<(), (StatusCode, Json<Value>)> {
     let sessions = SessionManager::new(state.db.clone());
-    state.elicitations.cancel_task(task_id);
     let mut sessions_to_stop = std::collections::BTreeMap::<String, bool>::new();
     for attempt in cancelled {
         state.elicitations.cancel_attempt(&attempt.id);
@@ -349,15 +349,35 @@ async fn cleanup_cancelled_continuation(
         })
         .map_err(internal_error)?;
 
-    if let Err(error) = WorkflowEngine::new(state.db.clone()).on_task_completed(
-        task_id,
-        "cancelled",
-        "Workflow cancelled by user",
-    ) {
+    let output = TaskConversation::new(state.db.clone())
+        .get_messages(task_id)
+        .unwrap_or_default()
+        .into_iter()
+        .rev()
+        .find(|message| message.role == "assistant")
+        .map(|message| message.content)
+        .unwrap_or_default();
+    let source_status = state
+        .db
+        .with_conn(|conn| {
+            conn.query_row("SELECT status FROM tasks WHERE id = ?1", [task_id], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(xpressclaw_core::error::Error::from)
+        })
+        .map_err(internal_error)?;
+    let completion_status = if source_status == "cancelled" {
+        "cancelled"
+    } else {
+        "completed"
+    };
+    if let Err(error) =
+        WorkflowEngine::new(state.db.clone()).on_task_completed(task_id, completion_status, &output)
+    {
         tracing::warn!(
             task_id,
             error = %error,
-            "failed to release workflows attached to cancelled continuation"
+            "failed to release workflows waiting behind cancelled continuation"
         );
     }
     Ok(())
@@ -621,7 +641,7 @@ flows:
     }
 
     #[tokio::test]
-    async fn cancelling_run_retires_queued_source_task_continuation() {
+    async fn cancelling_run_preserves_a_newer_user_response() {
         let (app, db) = test_app_with_db();
         let workflow = WorkflowManager::new(db.clone())
             .create(&CreateWorkflow {
@@ -642,6 +662,25 @@ flows:
         WorkflowManager::new(db.clone())
             .set_default_for_tasks(&workflow.id, true)
             .unwrap();
+        let other_workflow = WorkflowManager::new(db.clone())
+            .create(&CreateWorkflow {
+                name: "second-ui-check".into(),
+                description: None,
+                yaml_content: r#"
+name: second-ui-check
+flows:
+  main:
+    steps:
+      - id: second_review
+        type: continue
+        prompt: Run the second UI check.
+"#
+                .into(),
+            })
+            .unwrap();
+        WorkflowManager::new(db.clone())
+            .set_default_for_tasks(&other_workflow.id, true)
+            .unwrap();
 
         let task = TaskBoard::new(db.clone())
             .create(&CreateTask {
@@ -659,7 +698,8 @@ flows:
             .enqueue(&task.id, "atlas")
             .unwrap();
         let engine = WorkflowEngine::new(db.clone());
-        let instance_id = engine.attach_default_workflows_to_task(&task.id).unwrap()[0].clone();
+        let instance_ids = engine.attach_default_workflows_to_task(&task.id).unwrap();
+        let instances = InstanceManager::new(db.clone());
 
         db.with_conn(|conn| {
             conn.execute(
@@ -682,15 +722,60 @@ flows:
             .on_task_completed(&task.id, "completed", "Initial response")
             .unwrap();
 
+        let instance_id = instance_ids
+            .iter()
+            .find(|instance_id| {
+                instances
+                    .list_step_executions(instance_id)
+                    .is_ok_and(|executions| {
+                        executions
+                            .iter()
+                            .any(|execution| execution.continuation_attempt_id.is_some())
+                    })
+            })
+            .unwrap()
+            .clone();
+        let other_instance_id = instance_ids
+            .iter()
+            .find(|candidate_id| candidate_id.as_str() != instance_id.as_str())
+            .unwrap()
+            .clone();
+
+        let continuation = instances
+            .list_step_executions(&instance_id)
+            .unwrap()
+            .into_iter()
+            .find(|execution| execution.continuation_attempt_id.is_some())
+            .unwrap();
+        let workflow_attempt_id = continuation.continuation_attempt_id.unwrap();
+        let conversation = TaskConversation::new(db.clone());
+        let user_message = conversation
+            .add_message(
+                &task.id,
+                "user",
+                "Please handle this after the workflow prompt.",
+            )
+            .unwrap();
+        let user_queue = TaskQueue::new(db.clone())
+            .enqueue_continuation_for_message(
+                &task.id,
+                "atlas",
+                user_message.id,
+                &user_message.timestamp,
+            )
+            .unwrap()
+            .expect("a user response must not coalesce into workflow-owned work");
+        let user_attempt_id = user_queue.attempt_id.clone().unwrap();
+        assert_ne!(workflow_attempt_id, user_attempt_id);
+
         let active_before: (String, String) = db
             .with_conn(|conn| {
                 conn.query_row(
                     "SELECT queue.status, attempt.status
                      FROM task_queue queue
                      JOIN work_attempts attempt ON attempt.queue_id = queue.id
-                     WHERE queue.task_id = ?1
-                     ORDER BY queue.id DESC LIMIT 1",
-                    [&task.id],
+                     WHERE attempt.id = ?1",
+                    [&workflow_attempt_id],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .map_err(xpressclaw_core::error::Error::from)
@@ -711,25 +796,55 @@ flows:
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(body_json(response.into_body()).await["status"], "cancelled");
 
-        let terminal: (String, String, String) = db
+        let terminal: (String, Option<String>, String, String, String, String) = db
             .with_conn(|conn| {
                 conn.query_row(
-                    "SELECT task.status, queue.status, attempt.status
+                    "SELECT task.status, task.active_attempt_id,
+                            workflow_queue.status, workflow_attempt.status,
+                            user_queue.status, user_attempt.status
                      FROM tasks task
-                     JOIN task_queue queue ON queue.task_id = task.id
-                     JOIN work_attempts attempt ON attempt.queue_id = queue.id
-                     WHERE task.id = ?1
-                     ORDER BY queue.id DESC LIMIT 1",
-                    [&task.id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                     JOIN work_attempts workflow_attempt ON workflow_attempt.id = ?2
+                     JOIN task_queue workflow_queue ON workflow_queue.id = workflow_attempt.queue_id
+                     JOIN work_attempts user_attempt ON user_attempt.id = ?3
+                     JOIN task_queue user_queue ON user_queue.id = user_attempt.queue_id
+                     WHERE task.id = ?1",
+                    (&task.id, &workflow_attempt_id, &user_attempt_id),
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                        ))
+                    },
                 )
                 .map_err(xpressclaw_core::error::Error::from)
             })
             .unwrap();
         assert_eq!(
             terminal,
-            ("cancelled".into(), "failed".into(), "cancelled".into())
+            (
+                "pending".into(),
+                Some(user_attempt_id),
+                "failed".into(),
+                "cancelled".into(),
+                "queued".into(),
+                "queued".into(),
+            )
         );
-        assert!(TaskQueue::new(db).claim_next().unwrap().is_none());
+        assert_eq!(
+            instances.get_instance(&other_instance_id).unwrap().status,
+            "running"
+        );
+        let other_executions = instances.list_step_executions(&other_instance_id).unwrap();
+        assert_eq!(other_executions.len(), 1);
+        assert_eq!(other_executions[0].step_id, "__source_task__");
+        assert_eq!(other_executions[0].status, "running");
+        assert_eq!(
+            TaskQueue::new(db).claim_next().unwrap().unwrap().id,
+            user_queue.id
+        );
     }
 }

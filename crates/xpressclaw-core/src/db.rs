@@ -2434,12 +2434,17 @@ ALTER TABLE workflows ADD COLUMN default_for_tasks INTEGER NOT NULL DEFAULT 0
     CHECK (default_for_tasks IN (0, 1));
 ALTER TABLE workflow_instances ADD COLUMN source_task_id TEXT
     REFERENCES tasks(id) ON DELETE CASCADE;
+ALTER TABLE workflow_step_executions ADD COLUMN continuation_attempt_id TEXT
+    REFERENCES work_attempts(id) ON DELETE SET NULL;
 CREATE UNIQUE INDEX idx_workflow_instances_source_task
     ON workflow_instances(workflow_id, source_task_id)
     WHERE source_task_id IS NOT NULL;
 CREATE INDEX idx_workflow_instances_source_task_lookup
     ON workflow_instances(source_task_id, status)
     WHERE source_task_id IS NOT NULL;
+CREATE UNIQUE INDEX idx_workflow_step_continuation_attempt
+    ON workflow_step_executions(continuation_attempt_id)
+    WHERE continuation_attempt_id IS NOT NULL;
 "#;
 
 const MIGRATION_V39: &str = "

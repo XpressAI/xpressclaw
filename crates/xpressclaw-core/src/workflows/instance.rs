@@ -48,6 +48,11 @@ pub struct StepExecution {
     pub flow_name: String,
     pub step_id: String,
     pub task_id: Option<String>,
+    /// Exact work attempt owned by a same-task continuation. This internal
+    /// link prevents workflow cancellation from affecting unrelated user
+    /// turns on the source task.
+    #[serde(default, skip_serializing)]
+    pub continuation_attempt_id: Option<String>,
     pub status: String, // pending, running, waiting, resuming, completed, failed, cancelled, skipped
     pub input_context: Option<String>,
     pub output: Option<String>,
@@ -671,7 +676,14 @@ impl InstanceManager {
                     rusqlite::params![CONTINUATION_WAITING_STATUS, execution_id],
                 )?;
             } else {
-                dispatch_continuation_in_transaction(&transaction, task_id, &agent_id, prompt)?;
+                let attempt_id =
+                    dispatch_continuation_in_transaction(&transaction, task_id, &agent_id, prompt)?;
+                transaction.execute(
+                    "UPDATE workflow_step_executions
+                     SET continuation_attempt_id = ?1
+                     WHERE id = ?2",
+                    rusqlite::params![attempt_id, execution_id],
+                )?;
             }
             transaction.commit()?;
             Ok::<_, Error>(execution_id)
@@ -736,12 +748,13 @@ impl InstanceManager {
                         "continue step '{step_id}' cannot resume unassigned task '{task_id}'"
                     ))
                 })?;
-            dispatch_continuation_in_transaction(&transaction, task_id, &agent_id, prompt)?;
+            let attempt_id =
+                dispatch_continuation_in_transaction(&transaction, task_id, &agent_id, prompt)?;
             transaction.execute(
                 "UPDATE workflow_step_executions
-                 SET status = 'running'
-                 WHERE id = ?1 AND status = ?2",
-                rusqlite::params![execution_id, CONTINUATION_WAITING_STATUS],
+                 SET status = 'running', continuation_attempt_id = ?1
+                 WHERE id = ?2 AND status = ?3",
+                rusqlite::params![attempt_id, execution_id, CONTINUATION_WAITING_STATUS],
             )?;
             transaction.commit()?;
             Ok::<_, Error>(())
@@ -1203,16 +1216,26 @@ fn dispatch_continuation_in_transaction(
     task_id: &str,
     agent_id: &str,
     prompt: &str,
-) -> Result<()> {
+) -> Result<String> {
     let message =
         TaskConversation::insert_text_message_in_transaction(transaction, task_id, "user", prompt)?;
-    TaskQueue::enqueue_continuation_for_message_in_transaction(
+    let queue_item = TaskQueue::enqueue_continuation_for_message_in_transaction(
         transaction,
         task_id,
         agent_id,
         message.id,
         &message.timestamp,
-    )?;
+    )?
+    .ok_or_else(|| {
+        Error::Workflow(format!(
+            "continue step could not reserve an exclusive response for task '{task_id}'"
+        ))
+    })?;
+    let attempt_id = queue_item.attempt_id.ok_or_else(|| {
+        Error::Workflow(format!(
+            "continue step response for task '{task_id}' has no work attempt"
+        ))
+    })?;
     transaction.execute(
         "UPDATE tasks
          SET status = 'pending', completed_at = NULL,
@@ -1220,7 +1243,7 @@ fn dispatch_continuation_in_transaction(
          WHERE id = ?1",
         [task_id],
     )?;
-    Ok(())
+    Ok(attempt_id)
 }
 
 fn ensure_instance_accepts_work(conn: &rusqlite::Connection, instance_id: &str) -> Result<()> {
@@ -1400,6 +1423,7 @@ fn row_to_step_execution(row: &rusqlite::Row) -> StepExecution {
         flow_name: row.get("flow_name").unwrap_or_default(),
         step_id: row.get("step_id").unwrap_or_default(),
         task_id: row.get("task_id").unwrap_or_default(),
+        continuation_attempt_id: row.get("continuation_attempt_id").unwrap_or_default(),
         status: row.get("status").unwrap_or_default(),
         input_context: row.get("input_context").unwrap_or_default(),
         output: row.get("output").unwrap_or_default(),

@@ -271,17 +271,9 @@ impl TaskQueue {
         message_timestamp: &str,
     ) -> Result<Option<QueueItem>> {
         ensure_task_project_accepts_work(transaction, task_id)?;
-        let queued_attempt_id = transaction
-            .query_row(
-                "SELECT attempt_id FROM task_queue
-                 WHERE task_id = ?1 AND status = 'queued'
-                 ORDER BY id DESC LIMIT 1",
-                [task_id],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .optional()?;
+        let queued_attempt_id = Self::coalescible_queued_attempt(transaction, task_id)?;
 
-        match queued_attempt_id {
+        let created = match queued_attempt_id {
             Some(Some(attempt_id)) => {
                 Self::associate_response_trigger_in_transaction(
                     transaction,
@@ -289,11 +281,13 @@ impl TaskQueue {
                     message_id,
                     message_timestamp,
                 )?;
-                Ok(None)
+                None
             }
-            Some(None) => Err(Error::Task(format!(
-                "queued continuation for task {task_id} has no work attempt"
-            ))),
+            Some(None) => {
+                return Err(Error::Task(format!(
+                    "queued continuation for task {task_id} has no work attempt"
+                )));
+            }
             None => {
                 let item = Self::enqueue_in_transaction(transaction, task_id, agent_id)?;
                 let attempt_id = item.attempt_id.as_deref().ok_or_else(|| {
@@ -307,9 +301,50 @@ impl TaskQueue {
                     message_id,
                     message_timestamp,
                 )?;
-                Ok(Some(item))
+                Some(item)
             }
-        }
+        };
+        // Reopen a terminal or parked task in the same commit that makes its
+        // response dispatchable. The route's earlier task snapshot may have
+        // raced with workflow cancellation or another terminal transition.
+        transaction.execute(
+            "UPDATE tasks
+             SET status = CASE
+                     WHEN status IN ('completed', 'cancelled', 'waiting_for_input', 'blocked')
+                     THEN 'pending' ELSE status END,
+                 completed_at = CASE
+                     WHEN status IN ('completed', 'cancelled', 'waiting_for_input', 'blocked')
+                     THEN NULL ELSE completed_at END,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?1",
+            [task_id],
+        )?;
+        Ok(created)
+    }
+
+    /// Find the newest queued response that may absorb another user message.
+    /// A workflow continuation owns its attempt exclusively: otherwise a user
+    /// message could become part of that attempt and be discarded when only
+    /// the workflow run is cancelled.
+    fn coalescible_queued_attempt(
+        transaction: &rusqlite::Transaction<'_>,
+        task_id: &str,
+    ) -> Result<Option<Option<String>>> {
+        transaction
+            .query_row(
+                "SELECT queue.attempt_id
+                 FROM task_queue queue
+                 WHERE queue.task_id = ?1 AND queue.status = 'queued'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM workflow_step_executions execution
+                       WHERE execution.continuation_attempt_id = queue.attempt_id
+                   )
+                 ORDER BY queue.id DESC LIMIT 1",
+                [task_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(Error::from)
     }
 
     fn associate_response_trigger_in_transaction(
@@ -393,23 +428,17 @@ impl TaskQueue {
                 [message_id],
                 |row| row.get(0),
             )?;
-            let already_queued: bool = transaction.query_row(
-                "SELECT EXISTS(
-                    SELECT 1 FROM task_queue WHERE task_id = ?1 AND status = 'queued'
-                 )",
-                [task_id],
-                |row| row.get(0),
-            )?;
-            if already_queued {
-                transaction.execute(
-                    "UPDATE work_attempts
-                     SET trigger_message_id = ?1, response_queued_at = ?2
-                     WHERE id = (
-                        SELECT attempt_id FROM task_queue
-                        WHERE task_id = ?3 AND status = 'queued'
-                        ORDER BY id DESC LIMIT 1
-                     )",
-                    rusqlite::params![message_id, message_timestamp, task_id],
+            if let Some(attempt_id) = Self::coalescible_queued_attempt(&transaction, task_id)? {
+                let attempt_id = attempt_id.ok_or_else(|| {
+                    Error::Task(format!(
+                        "queued continuation for task {task_id} has no work attempt"
+                    ))
+                })?;
+                Self::associate_response_trigger_in_transaction(
+                    &transaction,
+                    &attempt_id,
+                    message_id,
+                    &message_timestamp,
                 )?;
                 transaction.execute(
                     "UPDATE tasks SET status = 'in_progress', completed_at = NULL,
