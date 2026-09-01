@@ -482,17 +482,35 @@ impl TaskConversation {
         task_id: &str,
         since: Option<&str>,
     ) -> Result<Vec<PromptTaskMessage>> {
+        self.get_user_messages_for_response(task_id, None, since, None)
+    }
+
+    /// Load the user messages owned by one response attempt. Message IDs are
+    /// the durable ordering boundary; `since` is retained only as a fallback
+    /// for legacy attempts that predate explicit trigger-message ownership.
+    pub fn get_user_messages_for_response(
+        &self,
+        task_id: &str,
+        after_message_id: Option<i64>,
+        since: Option<&str>,
+        through_message_id: Option<i64>,
+    ) -> Result<Vec<PromptTaskMessage>> {
         let conn = self.db.conn();
         let mut stmt = conn.prepare(
             "SELECT id, content FROM task_messages
              WHERE task_id = ?1 AND role = 'user'
-               AND (?2 IS NULL OR timestamp >= ?2)
+               AND (
+                   (?2 IS NOT NULL AND id > ?2)
+                   OR (?2 IS NULL AND (?3 IS NULL OR timestamp >= ?3))
+               )
+               AND (?4 IS NULL OR id <= ?4)
              ORDER BY id ASC",
         )?;
         let rows: Vec<(i64, String)> = stmt
-            .query_map(rusqlite::params![task_id, since], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })?
+            .query_map(
+                rusqlite::params![task_id, after_message_id, since, through_message_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?
             .collect::<std::result::Result<_, _>>()?;
         drop(stmt);
 

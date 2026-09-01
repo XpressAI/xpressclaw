@@ -1792,20 +1792,38 @@ fn prepend_unresumed_interrupted_prompt(
 
 fn build_prompt(db: &Arc<Database>, item: &QueueItem, attempt_id: &str) -> Result<AgentPrompt> {
     let task = TaskBoard::new(db.clone()).get(&item.task_id)?;
-    let previous_started: Option<String> = db.with_conn(|conn| {
-        conn.query_row(
-            "SELECT started_at FROM work_attempts
-                 WHERE task_id = ?1 AND id != ?2 AND started_at IS NOT NULL
-                   AND NOT (status = 'interrupted' AND native_session_id IS NULL)
-                 ORDER BY created_at DESC LIMIT 1",
-            rusqlite::params![item.task_id, attempt_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(Error::from)
-    })?;
-    let pending_user_messages = TaskConversation::new(db.clone())
-        .get_user_messages_since(&item.task_id, previous_started.as_deref())?;
+    let (previous_trigger_message_id, previous_started, trigger_message_id) =
+        db.with_conn(|conn| {
+            let trigger_message_id = conn.query_row(
+                "SELECT trigger_message_id FROM work_attempts WHERE id = ?1 AND task_id = ?2",
+                rusqlite::params![attempt_id, item.task_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )?;
+            let previous = conn
+                .query_row(
+                    "SELECT trigger_message_id, started_at FROM work_attempts
+                     WHERE task_id = ?1 AND id != ?2 AND started_at IS NOT NULL
+                       AND NOT (status = 'interrupted' AND native_session_id IS NULL)
+                     ORDER BY created_at DESC LIMIT 1",
+                    rusqlite::params![item.task_id, attempt_id],
+                    |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            let (previous_trigger_message_id, previous_started) = previous
+                .map(|(trigger_message_id, started_at)| (trigger_message_id, Some(started_at)))
+                .unwrap_or_default();
+            Ok::<_, Error>((
+                previous_trigger_message_id,
+                previous_started,
+                trigger_message_id,
+            ))
+        })?;
+    let pending_user_messages = TaskConversation::new(db.clone()).get_user_messages_for_response(
+        &item.task_id,
+        previous_trigger_message_id,
+        previous_started.as_deref(),
+        trigger_message_id,
+    )?;
     if !pending_user_messages.is_empty() {
         let content = pending_user_messages
             .iter()
@@ -4306,6 +4324,73 @@ mod tests {
             "Reserve send_conversation_message for genuine interim updates or publishing workspace files while you continue working."
         ));
         assert!(prompt.contains("Never use the tool to duplicate your final response."));
+    }
+
+    #[test]
+    fn task_prompts_stop_at_their_owned_trigger_message() {
+        use crate::tasks::board::CreateTask;
+
+        let db = Arc::new(Database::open_memory().unwrap());
+        add_test_agent(&db, "atlas");
+        let board = TaskBoard::new(db.clone());
+        SessionManager::new(db.clone())
+            .ensure("atlas", Some("atlas"))
+            .unwrap();
+        let task = board
+            .create(&CreateTask {
+                title: "Keep response boundaries separate".into(),
+                agent_id: Some("atlas".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let conversation = TaskConversation::new(db.clone());
+        let first_message = conversation
+            .add_message(&task.id, "user", "Run the fixed workflow check.")
+            .unwrap();
+        let queue = TaskQueue::new(db.clone());
+        let first = queue
+            .enqueue_continuation_for_message(
+                &task.id,
+                "atlas",
+                first_message.id,
+                &first_message.timestamp,
+            )
+            .unwrap()
+            .unwrap();
+        let claimed_first = queue.claim("atlas").unwrap().unwrap();
+        assert_eq!(claimed_first.id, first.id);
+
+        // The later message owns a separate response attempt. It arrives
+        // before the first attempt builds its prompt and before that attempt's
+        // started_at timestamp, exercising both durable message-ID bounds.
+        let later_message = conversation
+            .add_message(&task.id, "user", "This guidance belongs to the next turn.")
+            .unwrap();
+        let later = queue
+            .enqueue_continuation_for_message(
+                &task.id,
+                "atlas",
+                later_message.id,
+                &later_message.timestamp,
+            )
+            .unwrap()
+            .unwrap();
+
+        let first_attempt_id = first.attempt_id.as_deref().unwrap();
+        let first_prompt = build_prompt(&db, &claimed_first, first_attempt_id).unwrap();
+        assert_eq!(first_prompt.content, "Run the fixed workflow check.");
+        SessionManager::new(db.clone())
+            .transition_attempt(first_attempt_id, "preparing", "Preparing", None, None)
+            .unwrap();
+
+        let claimed_later = queue.claim("atlas").unwrap().unwrap();
+        assert_eq!(claimed_later.id, later.id);
+        let later_prompt =
+            build_prompt(&db, &claimed_later, later.attempt_id.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            later_prompt.content,
+            "This guidance belongs to the next turn."
+        );
     }
 
     #[test]

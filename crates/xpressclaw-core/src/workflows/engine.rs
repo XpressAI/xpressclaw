@@ -1728,9 +1728,10 @@ impl WorkflowEngine {
             return Ok(());
         }
 
-        if definition
-            .find_step(&exec.flow_name, &exec.step_id)
-            .is_some_and(|step| step.step_type == "continue")
+        if !source_task_cancelled
+            && definition
+                .find_step(&exec.flow_name, &exec.step_id)
+                .is_some_and(|step| step.step_type == "continue")
         {
             let Some(owned_attempt_id) = exec.continuation_attempt_id.as_deref() else {
                 return Err(Error::Workflow(format!(
@@ -2249,6 +2250,30 @@ impl WorkflowEngine {
             if let Some(exec) = current_exec {
                 if let Some(ref task_id) = exec.task_id {
                     if let Some(attempt_id) = exec.continuation_attempt_id.as_deref() {
+                        let explicit_task_status = board
+                            .get(task_id)
+                            .ok()
+                            .map(|task| task.status.as_str().to_string())
+                            .filter(|status| matches!(status.as_str(), "completed" | "cancelled"));
+                        if let Some(status) = explicit_task_status {
+                            let output = if status == "cancelled" {
+                                "source task was cancelled".to_string()
+                            } else {
+                                self.completed_task_output(task_id)
+                            };
+                            if let Err(error) = self
+                                .on_execution_task_completed(exec, task_id, &status, &output, None)
+                            {
+                                error!(
+                                    instance_id = instance.id.as_str(),
+                                    execution_id = exec.id.as_str(),
+                                    attempt_id,
+                                    error = %error,
+                                    "failed to recover explicitly terminal continuation task"
+                                );
+                            }
+                            continue;
+                        }
                         match self.terminal_attempt_completion(attempt_id) {
                             Ok(Some((status, output)))
                                 if status == "completed"
@@ -4181,6 +4206,131 @@ flows:
             .get_messages(&task.id)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn recovery_gives_source_cancellation_precedence_over_a_completed_continuation() {
+        let (db, engine) = setup();
+        let workflow_id = create_workflow(
+            &db,
+            r#"
+name: cancellation-beats-continuation-result
+flows:
+  main:
+    steps:
+      - id: review_ui
+        type: continue
+        prompt: Review the UI.
+      - id: must_not_run
+        type: continue
+        prompt: This must not run after source cancellation.
+"#,
+        );
+        WorkflowManager::new(db.clone())
+            .set_default_for_tasks(&workflow_id, true)
+            .unwrap();
+        let task = TaskBoard::new(db.clone())
+            .create(&CreateTask {
+                title: "Cancel after a durable continuation reply".into(),
+                agent_id: Some("atlas".into()),
+                context: Some(json!({ "origin": "session_message" })),
+                ..Default::default()
+            })
+            .unwrap();
+        TaskQueue::new(db.clone())
+            .enqueue(&task.id, "atlas")
+            .unwrap();
+        let instance_id = engine.attach_default_workflows_to_task(&task.id).unwrap()[0].clone();
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE task_queue SET status = 'completed', completed_at = CURRENT_TIMESTAMP
+                 WHERE task_id = ?1",
+                [&task.id],
+            )?;
+            conn.execute(
+                "UPDATE work_attempts SET status = 'completed', completed_at = CURRENT_TIMESTAMP
+                 WHERE task_id = ?1",
+                [&task.id],
+            )?;
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+        TaskBoard::new(db.clone())
+            .update_status(&task.id, "completed", Some("atlas"))
+            .unwrap();
+        engine
+            .on_task_completed(&task.id, "completed", "Initial response")
+            .unwrap();
+
+        let continuation = engine
+            .instances
+            .list_step_executions(&instance_id)
+            .unwrap()
+            .into_iter()
+            .find(|execution| execution.step_id == "review_ui")
+            .unwrap();
+        let continuation_attempt_id = continuation.continuation_attempt_id.clone().unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE task_queue SET status = 'completed', started_at = CURRENT_TIMESTAMP,
+                     completed_at = CURRENT_TIMESTAMP, harness_response = 'Review complete'
+                 WHERE attempt_id = ?1",
+                [&continuation_attempt_id],
+            )?;
+            conn.execute(
+                "UPDATE work_attempts SET status = 'completed', started_at = CURRENT_TIMESTAMP,
+                     response_started_at = CURRENT_TIMESTAMP, completed_at = CURRENT_TIMESTAMP,
+                     result = 'Review complete' WHERE id = ?1",
+                [&continuation_attempt_id],
+            )?;
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+        TaskBoard::new(db.clone())
+            .update_status(&task.id, "in_progress", Some("atlas"))
+            .unwrap();
+        let cancelled = SessionManager::new(db.clone())
+            .cancel_task_attempts(&task.id, "Work cancelled by user")
+            .unwrap()
+            .unwrap();
+        assert!(cancelled.is_empty());
+
+        // Simulate a restart before the task route delivered its workflow
+        // callback. The explicit task state must outrank the older completed
+        // attempt instead of dispatching the next workflow prompt.
+        engine.recover().unwrap();
+        engine.recover().unwrap();
+
+        assert_eq!(
+            TaskBoard::new(db.clone()).get(&task.id).unwrap().status,
+            crate::tasks::board::TaskStatus::Cancelled
+        );
+        assert_eq!(
+            engine.instances.get_instance(&instance_id).unwrap().status,
+            "cancelled"
+        );
+        let executions = engine.instances.list_step_executions(&instance_id).unwrap();
+        assert_eq!(
+            executions
+                .iter()
+                .find(|execution| execution.step_id == "review_ui")
+                .unwrap()
+                .status,
+            "cancelled"
+        );
+        assert!(executions
+            .iter()
+            .all(|execution| execution.step_id != "must_not_run"));
+        assert_eq!(
+            TaskConversation::new(db)
+                .get_messages(&task.id)
+                .unwrap()
+                .iter()
+                .filter(|message| message.role == "user")
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Review the UI."]
+        );
     }
 
     #[test]
