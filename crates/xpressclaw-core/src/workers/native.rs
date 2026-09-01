@@ -1487,7 +1487,6 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
         json!({ "protocol": "acp", "stop_reason": turn.stop_reason, "runner": kind }),
     )?;
     let completion_summary = truncate(&turn.summary, 2_000);
-    let queue = TaskQueue::new(db.clone());
     let Some(_) = TaskConversation::new(db.clone()).complete_final_assistant_attempt(
         FinalAssistantAttempt {
             task_id: &item.task_id,
@@ -1502,34 +1501,13 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
     else {
         return Ok(());
     };
-    let continuation_queued = queue.has_queued_for_task(&item.task_id)?;
-    let waiting_for_user = needs_user_input(&turn.summary);
-    if !waiting_for_user {
-        advance_workflow_attempt(&db, &item.task_id, attempt_id, "completed", &turn.summary);
-    }
-    if !continuation_queued && !waiting_for_user {
-        board.defer_reported_subtasks(&item.task_id, "successful_attempt_completed")?;
-    }
-    let review_gate =
-        crate::workers::github_review::GithubReviewManager::new(db.clone()).gate(&item.task_id)?;
-    let completed_tasks = if continuation_queued {
-        board.update_status(&item.task_id, "in_progress", Some(&item.agent_id))?;
-        Vec::new()
-    } else if waiting_for_user {
-        board.update_status(&item.task_id, "waiting_for_input", Some(&item.agent_id))?;
-        Vec::new()
-    } else if review_gate == crate::workers::github_review::GithubReviewGate::Waiting {
-        board.update_status(&item.task_id, "in_progress", Some(&item.agent_id))?;
-        Vec::new()
-    } else if review_gate == crate::workers::github_review::GithubReviewGate::NeedsInput {
-        board.update_status(&item.task_id, "waiting_for_input", Some(&item.agent_id))?;
-        Vec::new()
-    } else if board.subtasks_complete(&item.task_id)? {
-        board.complete_and_roll_up(&item.task_id, Some(&item.agent_id))?
-    } else {
-        board.update_status(&item.task_id, "in_progress", Some(&item.agent_id))?;
-        Vec::new()
-    };
+    let completed_tasks = finalize_successful_task_attempt(
+        &db,
+        &item.task_id,
+        &item.agent_id,
+        attempt_id,
+        &turn.summary,
+    )?;
     sessions.refresh_status(&item.agent_id)?;
     publish_conversation_result(
         &db,
@@ -1551,6 +1529,48 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
 
 fn attempt_is_terminal(status: &str) -> bool {
     matches!(status, "completed" | "failed" | "cancelled" | "interrupted")
+}
+
+/// Advance a workflow-owned response before deciding whether its shared task
+/// is idle. A successful `continue` step may synchronously enqueue the next
+/// fixed prompt, so the queue snapshot must be taken after that callback.
+fn finalize_successful_task_attempt(
+    db: &Arc<Database>,
+    task_id: &str,
+    agent_id: &str,
+    attempt_id: &str,
+    output: &str,
+) -> Result<Vec<Task>> {
+    let queue = TaskQueue::new(db.clone());
+    let board = TaskBoard::new(db.clone());
+    let waiting_for_user = needs_user_input(output);
+    if !waiting_for_user {
+        advance_workflow_attempt(db, task_id, attempt_id, "completed", output);
+    }
+    let continuation_queued = queue.has_queued_for_task(task_id)?;
+    if !continuation_queued && !waiting_for_user {
+        board.defer_reported_subtasks(task_id, "successful_attempt_completed")?;
+    }
+    let review_gate =
+        crate::workers::github_review::GithubReviewManager::new(db.clone()).gate(task_id)?;
+    if continuation_queued {
+        board.update_status(task_id, "in_progress", Some(agent_id))?;
+        Ok(Vec::new())
+    } else if waiting_for_user {
+        board.update_status(task_id, "waiting_for_input", Some(agent_id))?;
+        Ok(Vec::new())
+    } else if review_gate == crate::workers::github_review::GithubReviewGate::Waiting {
+        board.update_status(task_id, "in_progress", Some(agent_id))?;
+        Ok(Vec::new())
+    } else if review_gate == crate::workers::github_review::GithubReviewGate::NeedsInput {
+        board.update_status(task_id, "waiting_for_input", Some(agent_id))?;
+        Ok(Vec::new())
+    } else if board.subtasks_complete(task_id)? {
+        board.complete_and_roll_up(task_id, Some(agent_id))
+    } else {
+        board.update_status(task_id, "in_progress", Some(agent_id))?;
+        Ok(Vec::new())
+    }
 }
 
 fn fail_item(
@@ -4390,6 +4410,146 @@ mod tests {
         assert_eq!(
             later_prompt.content,
             "This guidance belongs to the next turn."
+        );
+    }
+
+    #[test]
+    fn successful_continuation_refreshes_the_queue_before_completing_its_task() {
+        use crate::tasks::board::CreateTask;
+        use crate::workflows::definition::WorkflowDefinition;
+        use crate::workflows::engine::WorkflowEngine;
+        use crate::workflows::instance::InstanceManager;
+        use crate::workflows::manager::{CreateWorkflow, WorkflowManager};
+
+        let db = Arc::new(Database::open_memory().unwrap());
+        add_test_agent(&db, "atlas");
+        SessionManager::new(db.clone())
+            .ensure("atlas", Some("atlas"))
+            .unwrap();
+        let yaml = r#"
+name: consecutive-continuations
+flows:
+  main:
+    steps:
+      - id: first_check
+        type: continue
+        prompt: Run the first check.
+      - id: second_check
+        type: continue
+        prompt: Run the second check.
+"#;
+        let definition = WorkflowDefinition::parse(yaml).unwrap();
+        let workflows = WorkflowManager::new(db.clone());
+        let workflow = workflows
+            .create(&CreateWorkflow {
+                name: definition.name,
+                description: definition.description,
+                yaml_content: yaml.into(),
+            })
+            .unwrap();
+        workflows.set_default_for_tasks(&workflow.id, true).unwrap();
+
+        let board = TaskBoard::new(db.clone());
+        let task = board
+            .create(&CreateTask {
+                title: "Run both checks".into(),
+                agent_id: Some("atlas".into()),
+                context: Some(json!({ "origin": "session_message" })),
+                ..Default::default()
+            })
+            .unwrap();
+        let queue = TaskQueue::new(db.clone());
+        queue.enqueue(&task.id, "atlas").unwrap();
+        let engine = WorkflowEngine::new(db.clone());
+        let instances = InstanceManager::new(db.clone());
+        let instance_id = engine.attach_default_workflows_to_task(&task.id).unwrap()[0].clone();
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE task_queue SET status = 'completed', completed_at = CURRENT_TIMESTAMP
+                 WHERE task_id = ?1",
+                [&task.id],
+            )?;
+            conn.execute(
+                "UPDATE work_attempts SET status = 'completed', completed_at = CURRENT_TIMESTAMP
+                 WHERE task_id = ?1",
+                [&task.id],
+            )?;
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+        board
+            .update_status(&task.id, "completed", Some("atlas"))
+            .unwrap();
+        engine
+            .on_task_completed(&task.id, "completed", "Initial response")
+            .unwrap();
+
+        let first_execution = instances
+            .list_step_executions(&instance_id)
+            .unwrap()
+            .into_iter()
+            .find(|execution| execution.step_id == "first_check")
+            .unwrap();
+        let first_attempt_id = first_execution.continuation_attempt_id.unwrap();
+        let first_item = queue.claim("atlas").unwrap().unwrap();
+        SessionManager::new(db.clone())
+            .transition_attempt(
+                &first_attempt_id,
+                "running",
+                "Running first check",
+                None,
+                None,
+            )
+            .unwrap();
+        board
+            .update_status(&task.id, "in_progress", Some("atlas"))
+            .unwrap();
+        TaskConversation::new(db.clone())
+            .complete_final_assistant_attempt(FinalAssistantAttempt {
+                task_id: &task.id,
+                queue_id: first_item.id,
+                attempt_id: &first_attempt_id,
+                completion_summary: "First check complete",
+                content: "First check complete",
+                visualizations: &[],
+                published_files: &[],
+            })
+            .unwrap()
+            .unwrap();
+
+        let completed = finalize_successful_task_attempt(
+            &db,
+            &task.id,
+            "atlas",
+            &first_attempt_id,
+            "First check complete",
+        )
+        .unwrap();
+
+        assert!(completed.is_empty());
+        assert!(queue.has_queued_for_task(&task.id).unwrap());
+        assert_eq!(
+            board.get(&task.id).unwrap().status,
+            crate::tasks::board::TaskStatus::InProgress
+        );
+        let executions = instances.list_step_executions(&instance_id).unwrap();
+        assert_eq!(
+            executions
+                .iter()
+                .filter(|execution| execution.step_id == "second_check")
+                .count(),
+            1
+        );
+        assert_eq!(
+            TaskConversation::new(db)
+                .get_messages(&task.id)
+                .unwrap()
+                .iter()
+                .filter(
+                    |message| message.role == "user" && message.content == "Run the second check."
+                )
+                .count(),
+            1
         );
     }
 
