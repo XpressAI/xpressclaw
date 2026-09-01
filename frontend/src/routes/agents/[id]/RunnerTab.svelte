@@ -509,6 +509,7 @@
 		<p class="mt-1 text-[11px] text-muted-foreground">One idempotent shell command per line. Commands run in the workspace before every short-lived ACP task.</p>
 	</div>
 
+	{#if sshAgentAvailable || sshAgentForwarding}
 	<div class="ai-card p-5">
 		<div class="flex items-start gap-3">
 			<input id="ssh-agent-forwarding" type="checkbox" bind:checked={sshAgentForwarding} class="mt-0.5 h-4 w-4 rounded border-input" />
@@ -521,7 +522,7 @@
 					<p class="mt-2 text-[11px] text-muted-foreground">Detected <code>{sshAgentSocket}</code>.</p>
 				{:else}
 					<p class="mt-2 rounded-md border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-amber-600">
-						No live host SSH agent was detected. Start <code>ssh-agent</code>, load a key with <code>ssh-add</code>, then restart XpressClaw from that desktop session.
+						SSH key access is unavailable. Disable this option, use XpressClaw's scoped GitHub credential, or use an HTTPS remote.
 					</p>
 				{/if}
 				{#if sshAgentForwarding}
@@ -532,6 +533,7 @@
 			</div>
 		</div>
 	</div>
+	{/if}
 
 	<div class="ai-card p-5">
 		<div class="flex items-start gap-3">

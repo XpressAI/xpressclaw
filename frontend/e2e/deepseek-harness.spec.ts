@@ -39,7 +39,7 @@ test('DeepSeek Harness is shown during setup and can be selected when adding an 
 				version: '29.6.1', socket: '/var/run/docker.sock', rootless: false, error: null,
 			};
 		} else if (path === '/api/setup/project-environment') {
-			body = { path: '/srv/repos/platform', git_remote: null, git_uses_ssh: false, suggestions: [] };
+			body = { path: '/srv/repos/platform', git_remote: 'git@github.com:XpressAI/platform.git', git_uses_ssh: true, suggestions: [] };
 		} else if (path === '/api/setup/add-session') {
 			submitted = request.postDataJSON() as Record<string, unknown>;
 			body = { success: true, session: 'platform-dsh', session_id: 'platform-dsh', title: 'Platform DSH', project_id: 'platform' };
@@ -50,6 +50,9 @@ test('DeepSeek Harness is shown during setup and can be selected when adding an 
 	});
 
 	await page.goto('/setup');
+	await expect(page.getByText("This repository has an SSH remote. GitHub repositories can use XpressClaw's scoped GitHub credential; use an HTTPS remote for other hosts.")).toBeVisible();
+	await expect(page.getByText('Use my host SSH agent')).toHaveCount(0);
+	await expect(page.getByText(/Start ssh-agent/)).toHaveCount(0);
 	await expect(page.getByRole('button', { name: /DeepSeek Harness/ })).toContainText('DS');
 	await expect(page.getByRole('button', { name: /DeepSeek Harness/ })).toContainText("openma-ai's maintained ACP adapter");
 
