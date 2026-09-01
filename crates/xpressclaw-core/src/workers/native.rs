@@ -1806,7 +1806,7 @@ fn prepend_unresumed_interrupted_prompt(
             "SELECT prompt FROM work_attempts
              WHERE task_id = ?1 AND id != ?2 AND status = 'interrupted'
                AND native_session_id IS NULL AND prompt != ''
-             ORDER BY COALESCE(completed_at, created_at) DESC LIMIT 1",
+             ORDER BY COALESCE(completed_at, created_at) DESC, rowid DESC LIMIT 1",
             rusqlite::params![item.task_id, attempt_id],
             |row| row.get(0),
         )
@@ -1845,7 +1845,7 @@ fn build_prompt(db: &Arc<Database>, item: &QueueItem, attempt_id: &str) -> Resul
                     "SELECT trigger_message_id, started_at FROM work_attempts
                      WHERE task_id = ?1 AND id != ?2 AND started_at IS NOT NULL
                        AND NOT (status = 'interrupted' AND native_session_id IS NULL)
-                     ORDER BY created_at DESC LIMIT 1",
+                     ORDER BY created_at DESC, rowid DESC LIMIT 1",
                     rusqlite::params![item.task_id, attempt_id],
                     |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, String>(1)?)),
                 )
@@ -4368,7 +4368,7 @@ mod tests {
     }
 
     #[test]
-    fn task_prompts_stop_at_their_owned_trigger_message() {
+    fn task_prompts_stop_at_owned_trigger_and_break_prior_attempt_ties() {
         use crate::tasks::board::CreateTask;
 
         let db = Arc::new(Database::open_memory().unwrap());
@@ -4431,6 +4431,43 @@ mod tests {
         assert_eq!(
             later_prompt.content,
             "This guidance belongs to the next turn."
+        );
+        let later_attempt_id = later.attempt_id.as_deref().unwrap();
+        SessionManager::new(db.clone())
+            .transition_attempt(later_attempt_id, "preparing", "Preparing", None, None)
+            .unwrap();
+
+        // SQLite's CURRENT_TIMESTAMP has one-second precision. Force the two
+        // prior attempts to tie so row order must select the immediate one as
+        // the lower message boundary for a third response.
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE work_attempts SET created_at = '2026-09-01 12:00:00'
+                 WHERE id IN (?1, ?2)",
+                rusqlite::params![first_attempt_id, later_attempt_id],
+            )?;
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+        let newest_message = conversation
+            .add_message(&task.id, "user", "Only this belongs to the third turn.")
+            .unwrap();
+        let newest = queue
+            .enqueue_continuation_for_message(
+                &task.id,
+                "atlas",
+                newest_message.id,
+                &newest_message.timestamp,
+            )
+            .unwrap()
+            .unwrap();
+        let claimed_newest = queue.claim("atlas").unwrap().unwrap();
+        assert_eq!(claimed_newest.id, newest.id);
+        let newest_prompt =
+            build_prompt(&db, &claimed_newest, newest.attempt_id.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            newest_prompt.content,
+            "Only this belongs to the third turn."
         );
     }
 
