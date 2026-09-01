@@ -944,6 +944,43 @@ impl TaskQueue {
         self.get(id)
     }
 
+    /// Finalize a running dispatch whose linked attempt is already terminal
+    /// and no longer owns a container. This is the worker-exit counterpart to
+    /// cancellation cleanup: failed container stops retain the running row as
+    /// a lease, then the row becomes releasable when the worker clears the
+    /// container marker after it actually exits.
+    pub fn finalize_released_terminal_dispatch(&self, id: i64) -> Result<QueueItem> {
+        self.db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE task_queue
+                 SET status = CASE
+                         WHEN (SELECT status FROM work_attempts
+                               WHERE id = task_queue.attempt_id) = 'completed'
+                             THEN 'completed'
+                         ELSE 'failed'
+                     END,
+                     completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP),
+                     harness_response = COALESCE(
+                         harness_response,
+                         (SELECT COALESCE(result, error_message, status)
+                          FROM work_attempts WHERE id = task_queue.attempt_id)
+                     )
+                 WHERE id = ?1 AND status = 'running'
+                   AND EXISTS (
+                       SELECT 1 FROM work_attempts terminal
+                       WHERE terminal.id = task_queue.attempt_id
+                         AND terminal.status IN (
+                             'completed', 'failed', 'cancelled', 'interrupted'
+                         )
+                         AND terminal.container_id IS NULL
+                   )",
+                [id],
+            )
+        })?;
+
+        self.get(id)
+    }
+
     /// List queue items, optionally filtered by agent and/or status.
     pub fn list(
         &self,

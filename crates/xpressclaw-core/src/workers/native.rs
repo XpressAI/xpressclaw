@@ -1263,7 +1263,8 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
             }
         }
     }
-    if attempt_is_terminal(&sessions.get_attempt(attempt_id)?.status) {
+    let current = sessions.get_attempt(attempt_id)?;
+    if finish_terminal_dispatch_after_worker_exit(&db, &item, &current.status)? {
         return Ok(());
     }
     let mut mcp_servers = configured_mcp_servers(&config, agent)?;
@@ -1373,6 +1374,8 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
         if docker.stop_preserving(workload_id).await.is_ok() {
             let _ = sessions.clear_container(attempt_id);
         }
+        let current = sessions.get_attempt(attempt_id)?;
+        finish_terminal_dispatch_after_worker_exit(&db, &item, &current.status)?;
         return Ok(());
     }
 
@@ -1423,11 +1426,11 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
         docker.stop_preserving(workload_id).await?;
     }
     sessions.clear_container(attempt_id)?;
-    let mut turn = turn?;
     let current = sessions.get_attempt(attempt_id)?;
-    if matches!(current.status.as_str(), "cancelled" | "interrupted") {
+    if finish_terminal_dispatch_after_worker_exit(&db, &item, &current.status)? {
         return Ok(());
     }
+    let mut turn = turn?;
     if turn.interrupted {
         sessions.add_artifact(
             attempt_id,
@@ -1531,6 +1534,18 @@ fn attempt_is_terminal(status: &str) -> bool {
     matches!(status, "completed" | "failed" | "cancelled" | "interrupted")
 }
 
+fn finish_terminal_dispatch_after_worker_exit(
+    db: &Arc<Database>,
+    item: &QueueItem,
+    attempt_status: &str,
+) -> Result<bool> {
+    if !attempt_is_terminal(attempt_status) {
+        return Ok(false);
+    }
+    TaskQueue::new(db.clone()).finalize_released_terminal_dispatch(item.id)?;
+    Ok(true)
+}
+
 /// Advance workflow-owned responses and source gates before deciding whether
 /// the task is idle. Either callback may synchronously enqueue a fixed prompt,
 /// so the active-response snapshot must be taken afterwards.
@@ -1588,7 +1603,7 @@ fn fail_item(
             // Cancellation updates the durable queue/task state before it
             // stops the container. The waiter may then observe a Docker error;
             // do not overwrite the user's cancellation with a failure.
-            if matches!(attempt.status.as_str(), "cancelled" | "interrupted") {
+            if finish_terminal_dispatch_after_worker_exit(db, item, &attempt.status)? {
                 return Ok(());
             }
             let _ = sessions.transition_attempt(
@@ -6240,7 +6255,7 @@ flows:
     }
 
     #[test]
-    fn cancellation_is_not_overwritten_by_container_exit_error() {
+    fn cancelled_dispatch_releases_only_after_the_worker_exits() {
         let db = Arc::new(Database::open_memory().unwrap());
         db.with_conn(|conn| {
             conn.execute(
@@ -6251,21 +6266,34 @@ flows:
         });
         let queue = TaskQueue::new(db.clone());
         let item = queue.enqueue("task-1", "atlas").unwrap();
+        assert_eq!(queue.claim("atlas").unwrap().unwrap().id, item.id);
         let attempt_id = item.attempt_id.as_deref().unwrap();
         let sessions = SessionManager::new(db.clone());
+        sessions
+            .set_container(attempt_id, "container-still-running")
+            .unwrap();
         sessions
             .transition_attempt(attempt_id, "cancelled", "Cancelled", None, None)
             .unwrap();
         db.with_conn(|conn| {
             conn.execute(
-                "UPDATE task_queue SET status = 'failed', harness_response = 'cancelled by user' WHERE id = ?1",
-                [item.id],
+                "UPDATE tasks SET status = 'cancelled' WHERE id = 'task-1'",
+                [],
             )?;
-            conn.execute("UPDATE tasks SET status = 'cancelled' WHERE id = 'task-1'", [])?;
             Ok::<_, Error>(())
         })
         .unwrap();
 
+        fail_item(
+            &db,
+            &item,
+            "container disappeared",
+            &Arc::new(ConversationEventBus::new()),
+        )
+        .unwrap();
+
+        assert_eq!(queue.get(item.id).unwrap().status, "running");
+        sessions.clear_container(attempt_id).unwrap();
         fail_item(
             &db,
             &item,
@@ -6286,9 +6314,10 @@ flows:
                 .as_str(),
             "cancelled"
         );
+        assert_eq!(queue.get(item.id).unwrap().status, "failed");
         assert_eq!(
             queue.get(item.id).unwrap().harness_response.as_deref(),
-            Some("cancelled by user")
+            Some("cancelled")
         );
     }
 
