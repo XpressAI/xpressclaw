@@ -30,6 +30,26 @@ pub fn open_browser(state: tauri::State<'_, ProfileState>) -> Result<(), String>
     open::that(&url).map_err(|e| e.to_string())
 }
 
+/// IPC command: open an HTTP(S) URL in the Desktop user's browser.
+#[tauri::command]
+pub async fn open_external_url(
+    webview: tauri::WebviewWindow,
+    state: tauri::State<'_, ProfileState>,
+    url: String,
+) -> Result<(), String> {
+    crate::profiles::verify_active_profile_identity(&state, &webview).await?;
+    let url = external_http_url(&url)?;
+    open::that(url.as_str()).map_err(|e| e.to_string())
+}
+
+fn external_http_url(url: &str) -> Result<reqwest::Url, String> {
+    let url = reqwest::Url::parse(url).map_err(|_| "Invalid external URL".to_string())?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err("Only HTTP and HTTPS links can be opened".to_string());
+    }
+    Ok(url)
+}
+
 /// IPC command: get server status summary.
 #[tauri::command]
 pub async fn get_status(state: tauri::State<'_, ProfileState>) -> Result<Value, String> {
@@ -82,4 +102,18 @@ pub async fn get_status(state: tauri::State<'_, ProfileState>) -> Result<Value, 
         "agents": agents,
         "authentication": authentication,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::external_http_url;
+
+    #[test]
+    fn external_urls_are_limited_to_http_and_https() {
+        assert!(external_http_url("https://registry.modelcontextprotocol.io/").is_ok());
+        assert!(external_http_url("http://localhost:8935/docs").is_ok());
+        assert!(external_http_url("file:///etc/passwd").is_err());
+        assert!(external_http_url("javascript:alert(1)").is_err());
+        assert!(external_http_url("not a url").is_err());
+    }
 }

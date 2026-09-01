@@ -1,7 +1,7 @@
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
+import { invoke, isTauri } from '@tauri-apps/api/core';
 import { serverTimestampMs } from './serverTime';
-import { request } from './api';
 
 export function cn(...inputs: ClassValue[]) {
 	return twMerge(clsx(inputs));
@@ -26,17 +26,19 @@ export function formatCost(usd: number): string {
 	return `$${usd.toFixed(2)}`;
 }
 
-/** Open a URL in the system browser via the server, with browser fallback. */
+/** Open a URL in the user's browser, never on the machine hosting the API. */
 export async function openExternal(url: string): Promise<void> {
-	try {
-		await request<void>('/api/open-url', {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ url })
-		});
-	} catch {
-		window.open(url, '_blank');
+	const target = new URL(url);
+	if (target.protocol !== 'http:' && target.protocol !== 'https:') {
+		throw new Error('Only HTTP and HTTPS links can be opened');
 	}
+
+	if (isTauri()) {
+		await invoke('open_external_url', { url: target.href });
+		return;
+	}
+
+	window.open(target.href, '_blank', 'noopener,noreferrer');
 }
 
 /** Compact product mark for an ACP-backed agent. */

@@ -1286,6 +1286,14 @@ async fn require_active_profile_identity(
     require_active_profile_identity_for(state, webview, profile, false).await
 }
 
+pub(crate) async fn verify_active_profile_identity(
+    state: &ProfileState,
+    webview: &tauri::WebviewWindow,
+) -> Result<(), String> {
+    require_active_profile_identity(state, webview).await?;
+    Ok(())
+}
+
 async fn require_active_profile_identity_for(
     state: &ProfileState,
     webview: &tauri::WebviewWindow,
