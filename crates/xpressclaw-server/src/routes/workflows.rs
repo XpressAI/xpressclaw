@@ -842,6 +842,28 @@ flows:
         assert_eq!(other_executions.len(), 1);
         assert_eq!(other_executions[0].step_id, "__source_task__");
         assert_eq!(other_executions[0].status, "running");
+        assert!(SessionManager::new(db.clone())
+            .get_attempt(&workflow_attempt_id)
+            .unwrap()
+            .trigger_message_id
+            .is_none());
+        let surviving_messages = conversation.get_messages(&task.id).unwrap();
+        assert_eq!(
+            surviving_messages
+                .iter()
+                .filter(|message| message.role == "user")
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Please handle this after the workflow prompt."]
+        );
+        let next_prompt_messages = conversation
+            .get_user_messages_since(&task.id, None)
+            .unwrap();
+        assert_eq!(next_prompt_messages.len(), 1);
+        assert_eq!(
+            next_prompt_messages[0].content,
+            "Please handle this after the workflow prompt."
+        );
         assert_eq!(
             TaskQueue::new(db).claim_next().unwrap().unwrap().id,
             user_queue.id
