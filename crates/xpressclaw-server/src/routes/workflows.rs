@@ -748,6 +748,21 @@ flows:
             .find(|execution| execution.continuation_attempt_id.is_some())
             .unwrap();
         let workflow_attempt_id = continuation.continuation_attempt_id.unwrap();
+        let workflow_queue = TaskQueue::new(db.clone()).claim("atlas").unwrap().unwrap();
+        assert_eq!(
+            workflow_queue.attempt_id.as_deref(),
+            Some(workflow_attempt_id.as_str())
+        );
+        let preparing = SessionManager::new(db.clone())
+            .transition_attempt(
+                &workflow_attempt_id,
+                "preparing",
+                "Preparing workflow continuation",
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(preparing.response_started_at.is_none());
         let conversation = TaskConversation::new(db.clone());
         let user_message = conversation
             .add_message(
@@ -781,7 +796,7 @@ flows:
                 .map_err(xpressclaw_core::error::Error::from)
             })
             .unwrap();
-        assert_eq!(active_before, ("queued".into(), "queued".into()));
+        assert_eq!(active_before, ("running".into(), "preparing".into()));
 
         let response = app
             .oneshot(

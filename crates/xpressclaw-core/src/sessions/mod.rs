@@ -725,13 +725,13 @@ impl SessionManager {
                 [queue_id],
             )?;
         }
-        if attempt.status == "queued" {
+        if attempt.response_started_at.is_none() {
             if let Some(message_id) = attempt.trigger_message_id {
                 // Same-task workflow continuations insert their own fixed
                 // user message and own the resulting attempt exclusively.
-                // If that queued continuation is cancelled, remove its
-                // unconsumed prompt as part of the same transaction; leaving
-                // it in task history would make a later user turn execute it.
+                // If that continuation is cancelled before its response
+                // starts, remove its unconsumed prompt in the same transaction;
+                // leaving it in history would make a later user turn execute it.
                 // The extra ownership guard preserves a message if another
                 // live attempt ever references it despite that invariant.
                 transaction.execute(

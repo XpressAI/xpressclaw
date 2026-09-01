@@ -480,7 +480,13 @@ impl WorkflowDefinition {
     /// Check that every automatic task run can be initialized without a form.
     pub fn validate_default_task_trigger(&self) -> Result<()> {
         const TASK_AGENT_SENTINEL: &str = "__xpressclaw_source_task_agent__";
-        if self.inputs.contains_key("source_task") || self.variables.contains_key("source_task") {
+        if self.inputs.contains_key("source_task")
+            || self.variables.contains_key("source_task")
+            || self
+                .flows
+                .values()
+                .any(|flow| find_step_in_list(&flow.steps, "source_task").is_some())
+        {
             return Err(Error::Workflow(
                 "default task workflows reserve 'source_task' for the triggering task metadata"
                     .into(),
@@ -1869,6 +1875,25 @@ flows:
         )
         .unwrap();
         assert!(reserved_source_task
+            .validate_default_task_trigger()
+            .unwrap_err()
+            .to_string()
+            .contains("reserve 'source_task'"));
+
+        let reserved_source_task_step = WorkflowDefinition::parse(
+            r#"
+name: invalid-source-task-step
+flows:
+  main:
+    steps: []
+  on_error:
+    steps:
+      - id: source_task
+        prompt: This must not replace the triggering task metadata.
+"#,
+        )
+        .unwrap();
+        assert!(reserved_source_task_step
             .validate_default_task_trigger()
             .unwrap_err()
             .to_string()
