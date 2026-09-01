@@ -429,7 +429,7 @@
 			{/if}
 		</section>
 
-		{#if sshAgentForwarding || (gitUsesSsh && sshAgentAvailable)}
+		{#if sshAgentAvailable || sshAgentForwarding}
 		<section class="rounded-xl border border-border bg-muted/20 p-4">
 			<label class="flex cursor-pointer items-start gap-3">
 				<input type="checkbox" bind:checked={sshAgentForwarding} class="mt-0.5 rounded border-border" />

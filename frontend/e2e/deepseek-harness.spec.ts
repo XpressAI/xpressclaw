@@ -57,10 +57,13 @@ test('DeepSeek Harness is shown during setup and can be selected when adding an 
 	await expect(page.getByText(/Start ssh-agent/)).toHaveCount(0);
 	sshAgentAvailable = true;
 	await page.reload();
+	await expect(page.getByText('/run/user/1000/ssh-agent.socket')).toBeVisible();
 	await page.getByLabel('Use my host SSH agent').check();
 	gitUsesSsh = false;
 	await page.getByRole('button', { name: /Inspect|Rescan/ }).click();
 	await expect(page.getByLabel('Use my host SSH agent')).toBeChecked();
+	await page.getByLabel('Use my host SSH agent').uncheck();
+	await expect(page.getByLabel('Use my host SSH agent')).toBeVisible();
 	await expect(page.getByRole('button', { name: /DeepSeek Harness/ })).toContainText('DS');
 	await expect(page.getByRole('button', { name: /DeepSeek Harness/ })).toContainText("openma-ai's maintained ACP adapter");
 
