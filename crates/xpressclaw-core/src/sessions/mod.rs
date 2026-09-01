@@ -682,6 +682,7 @@ impl SessionManager {
         transaction: &rusqlite::Transaction<'_>,
         attempt_id: &str,
         prompt_message_id: Option<i64>,
+        restore_task_status: &str,
         summary: &str,
     ) -> Result<Option<WorkAttempt>> {
         let attempt = transaction
@@ -776,7 +777,7 @@ impl SessionManager {
         {
             current_task_status
         } else {
-            "completed".to_string()
+            restore_task_status.to_string()
         };
         transaction.execute(
             "UPDATE tasks
