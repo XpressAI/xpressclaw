@@ -635,6 +635,25 @@ impl SessionManager {
                    AND status NOT IN ('completed', 'failed', 'cancelled', 'interrupted')",
             [task_id],
         )?;
+        for attempt in &attempts {
+            let prompt_message_id = transaction
+                .query_row(
+                    "SELECT continuation_prompt_message_id
+                     FROM workflow_step_executions
+                     WHERE continuation_attempt_id = ?1 AND task_id = ?2
+                       AND continuation_prompt_message_id IS NOT NULL
+                     ORDER BY rowid DESC LIMIT 1",
+                    rusqlite::params![&attempt.id, task_id],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .optional()?
+                .flatten();
+            self.retire_unconsumed_workflow_prompt_in_transaction(
+                transaction,
+                attempt,
+                prompt_message_id,
+            )?;
+        }
         // Queued dispatches are safe to release immediately because their
         // attempts are now terminal. Running rows remain the retained
         // container lease until the caller finishes asynchronous cleanup.
@@ -697,12 +716,10 @@ impl SessionManager {
             )
             .optional()?
             .ok_or_else(|| Error::Task(format!("attempt {attempt_id} not found")))?;
-        if matches!(
+        let attempt_is_terminal = matches!(
             attempt.status.as_str(),
             "completed" | "failed" | "cancelled" | "interrupted"
-        ) {
-            return Ok(None);
-        }
+        );
         // An elicited user answer may adopt the continuation execution so its
         // completion advances the workflow. It remains user-owned work: only
         // the attempt triggered by this execution's original fixed prompt is
@@ -719,41 +736,29 @@ impl SessionManager {
             ))
         })?;
 
-        transaction.execute(
-            "UPDATE work_attempts
-             SET status = 'cancelled', completed_at = CURRENT_TIMESTAMP,
-                 error_message = NULL
-             WHERE id = ?1",
-            [attempt_id],
-        )?;
-        if let Some(queue_id) = attempt.queue_id {
-            // A running dispatch retains the container lease until the server
-            // has stopped it. A queued dispatch can be retired immediately.
+        if !attempt_is_terminal {
             transaction.execute(
-                "UPDATE task_queue
-                 SET status = 'failed', completed_at = CURRENT_TIMESTAMP,
-                     harness_response = 'workflow cancelled by user'
-                 WHERE id = ?1 AND status = 'queued'",
-                [queue_id],
+                "UPDATE work_attempts
+                 SET status = 'cancelled', completed_at = CURRENT_TIMESTAMP,
+                     error_message = NULL
+                 WHERE id = ?1",
+                [attempt_id],
             )?;
-        }
-        if attempt.response_started_at.is_none() {
-            // Same-task workflow continuations insert their own fixed user
-            // message and own the resulting attempt exclusively. If that
-            // continuation is cancelled before its response starts, remove
-            // its unconsumed prompt in the same transaction; leaving it in
-            // history would make a later user turn execute it. The ownership
-            // check above excludes adopted user-answer attempts.
-            transaction.execute(
-                "DELETE FROM task_messages
-                 WHERE id = ?1 AND task_id = ?2 AND role = 'user'
-                   AND NOT EXISTS (
-                       SELECT 1 FROM work_attempts
-                       WHERE trigger_message_id = ?1 AND id != ?3
-                         AND status IN ('queued', 'preparing', 'running',
-                                        'waiting_for_input', 'review')
-                   )",
-                rusqlite::params![prompt_message_id, task_id, attempt_id],
+            if let Some(queue_id) = attempt.queue_id {
+                // A running dispatch retains the container lease until the server
+                // has stopped it. A queued dispatch can be retired immediately.
+                transaction.execute(
+                    "UPDATE task_queue
+                     SET status = 'failed', completed_at = CURRENT_TIMESTAMP,
+                         harness_response = 'workflow cancelled by user'
+                     WHERE id = ?1 AND status = 'queued'",
+                    [queue_id],
+                )?;
+            }
+            self.retire_unconsumed_workflow_prompt_in_transaction(
+                transaction,
+                &attempt,
+                Some(prompt_message_id),
             )?;
         }
 
@@ -797,7 +802,51 @@ impl SessionManager {
              WHERE id = ?3",
             rusqlite::params![session_status, summary, &attempt.session_id],
         )?;
-        Ok(Some(attempt))
+        Ok((!attempt_is_terminal).then_some(attempt))
+    }
+
+    /// Remove a fixed prompt that belongs to a workflow continuation only
+    /// when no response ever began consuming it. This is shared by
+    /// workflow-only and whole-task cancellation so either path closes the
+    /// same prompt-leak boundary.
+    fn retire_unconsumed_workflow_prompt_in_transaction(
+        &self,
+        transaction: &rusqlite::Transaction<'_>,
+        attempt: &WorkAttempt,
+        prompt_message_id: Option<i64>,
+    ) -> Result<()> {
+        let (Some(task_id), Some(prompt_message_id)) =
+            (attempt.task_id.as_deref(), prompt_message_id)
+        else {
+            return Ok(());
+        };
+        if attempt.trigger_message_id != Some(prompt_message_id)
+            || attempt.response_started_at.is_some()
+        {
+            return Ok(());
+        }
+
+        transaction.execute(
+            "DELETE FROM task_messages
+             WHERE id = ?1 AND task_id = ?2 AND role = 'user'
+               AND EXISTS (
+                   SELECT 1 FROM workflow_step_executions
+                   WHERE continuation_attempt_id = ?3
+                     AND continuation_prompt_message_id = ?1
+                     AND task_id = ?2
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM work_attempts
+                   WHERE trigger_message_id = ?1 AND id != ?3
+                     AND (
+                         response_started_at IS NOT NULL
+                         OR status IN ('queued', 'preparing', 'running',
+                                       'waiting_for_input', 'review')
+                     )
+               )",
+            rusqlite::params![prompt_message_id, task_id, &attempt.id],
+        )?;
+        Ok(())
     }
 
     pub(crate) fn record_task_attempt_cancellations(
