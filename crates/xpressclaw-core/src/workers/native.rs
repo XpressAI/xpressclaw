@@ -1450,6 +1450,13 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
         }
         let queue = TaskQueue::new(db.clone());
         queue.complete(item.id, "interrupted to apply new guidance")?;
+        advance_workflow_attempt(
+            &db,
+            &item.task_id,
+            attempt_id,
+            "interrupted",
+            "Agent interrupted to apply new guidance",
+        );
         let next_status = if queue.has_queued_for_task(&item.task_id)? {
             "in_progress"
         } else {
@@ -1495,6 +1502,7 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
     else {
         return Ok(());
     };
+    advance_workflow_attempt(&db, &item.task_id, attempt_id, "completed", &turn.summary);
 
     let continuation_queued = queue.has_queued_for_task(&item.task_id)?;
     let waiting_for_user = needs_user_input(&turn.summary);
@@ -1578,6 +1586,9 @@ fn fail_item(
         TaskConversation::new(db.clone()).add_message(&item.task_id, "assistant", &chat_message)
     {
         warn!(%error, task_id = item.task_id, "failed to persist native task failure");
+    }
+    if let Some(attempt_id) = item.attempt_id.as_deref() {
+        advance_workflow_attempt(db, &item.task_id, attempt_id, "failed", message);
     }
     let board = TaskBoard::new(db.clone());
     let continuation_queued = queue.has_queued_for_task(&item.task_id).unwrap_or(false);
@@ -1680,6 +1691,26 @@ fn advance_workflow(db: &Arc<Database>, task_id: &str, status: &str, output: &st
         if let Err(error) = engine.on_task_completed(task_id, status, output) {
             warn!(task_id, status, error = %error, "failed to advance workflow");
         }
+    }
+}
+
+fn advance_workflow_attempt(
+    db: &Arc<Database>,
+    task_id: &str,
+    attempt_id: &str,
+    status: &str,
+    output: &str,
+) {
+    if let Err(error) = crate::workflows::engine::WorkflowEngine::new(db.clone())
+        .on_attempt_completed(task_id, attempt_id, status, output)
+    {
+        warn!(
+            task_id,
+            attempt_id,
+            status,
+            error = %error,
+            "failed to advance workflow-owned response attempt"
+        );
     }
 }
 
@@ -3834,7 +3865,7 @@ fn strip_verbatim(path: PathBuf) -> PathBuf {
     path
 }
 
-fn needs_user_input(summary: &str) -> bool {
+pub(crate) fn needs_user_input(summary: &str) -> bool {
     if summary.lines().any(|line| {
         line.trim_start()
             .trim_start_matches(['`', '*', '-', '#', ' '])
