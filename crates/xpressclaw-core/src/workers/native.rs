@@ -1543,9 +1543,10 @@ fn finish_terminal_dispatch_after_worker_exit(
     Ok(true)
 }
 
-/// Advance workflow-owned responses and source gates before deciding whether
-/// the task is idle. Either callback may synchronously enqueue a fixed prompt,
-/// so the active-response snapshot must be taken afterwards.
+/// Advance a workflow-owned response before deciding whether the task is idle.
+/// The callback may synchronously enqueue another fixed prompt, so the active-
+/// response snapshot must be taken afterwards. Source gates advance only from
+/// the ordered completion callback below, after review and subtask gates pass.
 fn finalize_successful_task_attempt(
     db: &Arc<Database>,
     task_id: &str,
@@ -1558,9 +1559,6 @@ fn finalize_successful_task_attempt(
     let waiting_for_user = needs_user_input(output);
     if !waiting_for_user {
         advance_workflow_attempt(db, task_id, attempt_id, "completed", output);
-        // Source gates must run before task completion can roll through a
-        // parent. A default continue step may reopen this task synchronously.
-        advance_workflow(db, task_id, "completed", output);
     }
     let response_active = queue.has_active_response_for_task(task_id)?;
     if !response_active && !waiting_for_user {
@@ -4571,6 +4569,148 @@ flows:
         );
     }
 
+    fn setup_default_completion_gate_task() -> (Arc<Database>, Task, String) {
+        use crate::tasks::board::CreateTask;
+        use crate::workflows::engine::WorkflowEngine;
+        use crate::workflows::manager::{CreateWorkflow, WorkflowManager};
+
+        let db = Arc::new(Database::open_memory().unwrap());
+        add_test_agent(&db, "atlas");
+        SessionManager::new(db.clone())
+            .ensure("atlas", Some("atlas"))
+            .unwrap();
+        let workflows = WorkflowManager::new(db.clone());
+        let workflow = workflows
+            .create(&CreateWorkflow {
+                name: "completion-gated-check".into(),
+                description: None,
+                yaml_content: r#"
+name: completion-gated-check
+flows:
+  main:
+    steps:
+      - id: check
+        type: continue
+        prompt: Run the completion-gated check.
+"#
+                .into(),
+            })
+            .unwrap();
+        workflows.set_default_for_tasks(&workflow.id, true).unwrap();
+
+        let task = TaskBoard::new(db.clone())
+            .create(&CreateTask {
+                title: "Finish only after every completion gate".into(),
+                agent_id: Some("atlas".into()),
+                context: Some(json!({ "origin": "session_message" })),
+                ..Default::default()
+            })
+            .unwrap();
+        let instance_id = WorkflowEngine::new(db.clone())
+            .attach_default_workflows_to_task(&task.id)
+            .unwrap()[0]
+            .clone();
+        (db, task, instance_id)
+    }
+
+    fn finish_default_completion_gate_attempt(db: &Arc<Database>, task: &Task) -> Vec<Task> {
+        let queue = TaskQueue::new(db.clone());
+        let queued = queue.enqueue(&task.id, "atlas").unwrap();
+        let item = queue.claim("atlas").unwrap().unwrap();
+        assert_eq!(item.id, queued.id);
+        let attempt_id = item.attempt_id.as_deref().unwrap();
+        SessionManager::new(db.clone())
+            .transition_attempt(attempt_id, "running", "Working", None, None)
+            .unwrap();
+        TaskBoard::new(db.clone())
+            .update_status(&task.id, "in_progress", Some("atlas"))
+            .unwrap();
+        TaskConversation::new(db.clone())
+            .complete_final_assistant_attempt(FinalAssistantAttempt {
+                task_id: &task.id,
+                queue_id: item.id,
+                attempt_id,
+                completion_summary: "Initial work complete",
+                content: "Initial work complete",
+                visualizations: &[],
+                published_files: &[],
+            })
+            .unwrap()
+            .unwrap();
+        finalize_successful_task_attempt(db, &task.id, "atlas", attempt_id, "Initial work complete")
+            .unwrap()
+    }
+
+    fn assert_default_source_gate_is_still_waiting(
+        db: &Arc<Database>,
+        task: &Task,
+        instance_id: &str,
+    ) {
+        use crate::workflows::instance::InstanceManager;
+
+        assert_eq!(
+            TaskBoard::new(db.clone()).get(&task.id).unwrap().status,
+            crate::tasks::board::TaskStatus::InProgress
+        );
+        assert!(!TaskQueue::new(db.clone())
+            .has_active_response_for_task(&task.id)
+            .unwrap());
+        let executions = InstanceManager::new(db.clone())
+            .list_step_executions(instance_id)
+            .unwrap();
+        assert_eq!(executions.len(), 1);
+        assert_eq!(executions[0].step_id, "__source_task__");
+        assert_eq!(executions[0].status, "running");
+        assert!(TaskConversation::new(db.clone())
+            .get_messages(&task.id)
+            .unwrap()
+            .iter()
+            .all(|message| message.content != "Run the completion-gated check."));
+    }
+
+    #[test]
+    fn default_source_waits_for_blocking_subtasks() {
+        use crate::tasks::board::CreateTask;
+
+        let (db, task, instance_id) = setup_default_completion_gate_task();
+        let blocker = TaskBoard::new(db.clone())
+            .create(&CreateTask {
+                title: "Blocking child".into(),
+                parent_task_id: Some(task.id.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert!(finish_default_completion_gate_attempt(&db, &task).is_empty());
+
+        assert_eq!(
+            TaskBoard::new(db.clone()).get(&blocker.id).unwrap().status,
+            crate::tasks::board::TaskStatus::Pending
+        );
+        assert_default_source_gate_is_still_waiting(&db, &task, &instance_id);
+    }
+
+    #[test]
+    fn default_source_waits_for_pending_github_review() {
+        use crate::workers::github_review::{GithubReviewGate, GithubReviewManager};
+
+        let (db, task, instance_id) = setup_default_completion_gate_task();
+        let reviews = GithubReviewManager::new(db.clone());
+        reviews
+            .register(
+                &task.id,
+                "atlas",
+                "XpressAI/xpressclaw",
+                "https://github.com/XpressAI/xpressclaw/pull/204",
+            )
+            .unwrap();
+
+        assert!(finish_default_completion_gate_attempt(&db, &task).is_empty());
+
+        assert_eq!(reviews.gate(&task.id).unwrap(), GithubReviewGate::Waiting);
+        assert_default_source_gate_is_still_waiting(&db, &task, &instance_id);
+    }
+
     #[test]
     fn default_continuation_reopens_a_child_before_parent_roll_up() {
         use crate::tasks::board::CreateTask;
@@ -4653,10 +4793,11 @@ flows:
         )
         .unwrap();
 
-        assert!(completed.is_empty());
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].id, child.id);
         assert_eq!(
             board.get(&child.id).unwrap().status,
-            crate::tasks::board::TaskStatus::InProgress
+            crate::tasks::board::TaskStatus::Pending
         );
         assert_eq!(
             board.get(&parent.id).unwrap().status,
