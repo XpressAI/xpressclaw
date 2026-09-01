@@ -1628,10 +1628,15 @@ fn fail_item(
         advance_workflow_attempt(db, &item.task_id, attempt_id, "failed", message);
     }
     let board = TaskBoard::new(db.clone());
-    let continuation_queued = queue.has_queued_for_task(&item.task_id).unwrap_or(false);
+    // An answer that raced a workflow question may own a separate attempt.
+    // Let any surviving response finish; otherwise the task-wide callback is
+    // the durable fallback that releases the still-owned question execution.
+    let response_active = queue
+        .has_active_response_for_task(&item.task_id)
+        .unwrap_or(false);
     let _ = board.update_status(
         &item.task_id,
-        if continuation_queued {
+        if response_active {
             "in_progress"
         } else {
             "blocked"
@@ -1649,7 +1654,7 @@ fn fail_item(
         );
         event_bus.send(&conversation_id, ConversationEvent::Done);
     }
-    if !continuation_queued {
+    if !response_active {
         advance_workflow(db, &item.task_id, "failed", message);
     }
     Ok(())
@@ -4709,6 +4714,119 @@ flows:
 
         assert_eq!(reviews.gate(&task.id).unwrap(), GithubReviewGate::Waiting);
         assert_default_source_gate_is_still_waiting(&db, &task, &instance_id);
+    }
+
+    #[test]
+    fn failed_answer_queued_before_question_parking_releases_continuation() {
+        use crate::workflows::instance::InstanceManager;
+
+        let (db, task, instance_id) = setup_default_completion_gate_task();
+        finish_default_completion_gate_attempt(&db, &task);
+
+        let queue = TaskQueue::new(db.clone());
+        let question_item = queue.claim("atlas").unwrap().unwrap();
+        let question_attempt_id = question_item.attempt_id.as_deref().unwrap();
+        let sessions = SessionManager::new(db.clone());
+        sessions
+            .transition_attempt(
+                question_attempt_id,
+                "running",
+                "Running completion-gated check",
+                None,
+                None,
+            )
+            .unwrap();
+        let board = TaskBoard::new(db.clone());
+        board
+            .update_status(&task.id, "in_progress", Some("atlas"))
+            .unwrap();
+        let conversation = TaskConversation::new(db.clone());
+        let question = "NEEDS_USER_INPUT: Which screen should I review?";
+        conversation
+            .complete_final_assistant_attempt(FinalAssistantAttempt {
+                task_id: &task.id,
+                queue_id: question_item.id,
+                attempt_id: question_attempt_id,
+                completion_summary: question,
+                content: question,
+                visualizations: &[],
+                published_files: &[],
+            })
+            .unwrap()
+            .unwrap();
+
+        // The answer wins the narrow race before finalization parks the task,
+        // so it cannot adopt the workflow execution's attempt marker.
+        let answer_message = conversation
+            .add_message(&task.id, "user", "Review the Agent Work screen.")
+            .unwrap();
+        let answer_item = queue
+            .enqueue_continuation_for_message(
+                &task.id,
+                "atlas",
+                answer_message.id,
+                &answer_message.timestamp,
+            )
+            .unwrap()
+            .unwrap();
+        let answer_attempt_id = answer_item.attempt_id.as_deref().unwrap();
+        let continuation = InstanceManager::new(db.clone())
+            .list_step_executions(&instance_id)
+            .unwrap()
+            .into_iter()
+            .find(|execution| execution.step_id == "check")
+            .unwrap();
+        assert_eq!(
+            continuation.continuation_attempt_id.as_deref(),
+            Some(question_attempt_id)
+        );
+
+        assert!(finalize_successful_task_attempt(
+            &db,
+            &task.id,
+            "atlas",
+            question_attempt_id,
+            question,
+        )
+        .unwrap()
+        .is_empty());
+        assert_eq!(board.get(&task.id).unwrap().status.as_str(), "in_progress");
+
+        let claimed_answer = queue.claim("atlas").unwrap().unwrap();
+        assert_eq!(claimed_answer.id, answer_item.id);
+        sessions
+            .transition_attempt(
+                answer_attempt_id,
+                "running",
+                "Answering completion-gated check",
+                None,
+                None,
+            )
+            .unwrap();
+        fail_item(
+            &db,
+            &claimed_answer,
+            "answer attempt failed",
+            &Arc::new(ConversationEventBus::new()),
+        )
+        .unwrap();
+
+        assert!(!queue.has_active_response_for_task(&task.id).unwrap());
+        assert_eq!(board.get(&task.id).unwrap().status.as_str(), "blocked");
+        assert_eq!(
+            InstanceManager::new(db.clone())
+                .get_instance(&instance_id)
+                .unwrap()
+                .status,
+            "failed"
+        );
+        assert_eq!(
+            InstanceManager::new(db)
+                .get_step_execution(&continuation.id)
+                .unwrap()
+                .status,
+            "failed"
+        );
     }
 
     #[test]
