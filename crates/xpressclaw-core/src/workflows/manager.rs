@@ -17,6 +17,11 @@ pub struct WorkflowRecord {
     pub description: Option<String>,
     pub yaml_content: String,
     pub enabled: bool,
+    /// Whether this workflow is attached once to every ordinary Agent task.
+    /// This is local execution policy and is intentionally stored outside the
+    /// portable YAML definition.
+    #[serde(default)]
+    pub default_for_tasks: bool,
     pub version: u32,
     pub created_at: String,
     pub updated_at: String,
@@ -94,11 +99,41 @@ impl WorkflowManager {
         })
     }
 
+    /// List enabled workflows that should run once for each ordinary task.
+    pub fn list_default_for_tasks(&self) -> Result<Vec<WorkflowRecord>> {
+        self.db.with_conn(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT * FROM workflows
+                     WHERE enabled = 1 AND default_for_tasks = 1
+                     ORDER BY created_at ASC, id ASC",
+                )
+                .map_err(|e| Error::Database(e.to_string()))?;
+
+            let records = stmt
+                .query_map([], |row| Ok(row_to_workflow(row)))
+                .map_err(|e| Error::Database(e.to_string()))?
+                .filter_map(|record| record.ok())
+                .collect();
+
+            Ok(records)
+        })
+    }
+
     /// Update a workflow's YAML content. Re-parses and validates before saving.
     pub fn update(&self, id: &str, yaml_content: &str) -> Result<WorkflowRecord> {
         let def = WorkflowDefinition::parse(yaml_content)?;
         def.validate()?;
         let previous = self.get(id)?;
+        if previous.default_for_tasks {
+            def.validate_default_task_trigger()?;
+            if def.uses_connector_automation() {
+                return Err(Error::Workflow(
+                    "default task workflows cannot use connector triggers or notification sinks"
+                        .into(),
+                ));
+            }
+        }
         let previous_schedule = WorkflowDefinition::parse(&previous.yaml_content)?.schedule;
         let schedule_changed = previous_schedule != def.schedule;
 
@@ -140,15 +175,36 @@ impl WorkflowManager {
 
     /// Delete a workflow.
     pub fn delete(&self, id: &str) -> Result<()> {
-        let affected = self.db.with_conn(|conn| {
-            conn.execute("DELETE FROM workflows WHERE id = ?1", [id])
-                .map_err(|e| Error::Database(e.to_string()))
-        })?;
-
-        if affected == 0 {
-            return Err(Error::WorkflowNotFound { id: id.to_string() });
-        }
-        Ok(())
+        self.db.with_conn(|conn| {
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let exists = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM workflows WHERE id = ?1)",
+                [id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !exists {
+                return Err(Error::WorkflowNotFound { id: id.to_string() });
+            }
+            let has_active_instances = transaction.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM workflow_instances
+                     WHERE workflow_id = ?1 AND status IN ('running', 'waiting')
+                 )",
+                [id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if has_active_instances {
+                return Err(Error::Workflow(format!(
+                    "workflow '{id}' has active runs; cancel them before deleting it"
+                )));
+            }
+            transaction.execute("DELETE FROM workflows WHERE id = ?1", [id])?;
+            transaction.commit()?;
+            Ok(())
+        })
     }
 
     /// Set the enabled flag on a workflow.
@@ -170,6 +226,45 @@ impl WorkflowManager {
             return Err(Error::WorkflowNotFound { id: id.to_string() });
         }
 
+        self.get(id)
+    }
+
+    /// Enable or disable automatic attachment to ordinary Agent tasks.
+    pub fn set_default_for_tasks(
+        &self,
+        id: &str,
+        default_for_tasks: bool,
+    ) -> Result<WorkflowRecord> {
+        if default_for_tasks {
+            let record = self.get(id)?;
+            let definition = WorkflowDefinition::parse(&record.yaml_content)?;
+            definition.validate_default_task_trigger()?;
+            if definition.uses_connector_automation() {
+                return Err(Error::Workflow(
+                    "default task workflows cannot use connector triggers or notification sinks"
+                        .into(),
+                ));
+            }
+        }
+
+        let now = Utc::now()
+            .naive_utc()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let affected = self.db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE workflows
+                 SET default_for_tasks = ?1,
+                     enabled = CASE WHEN ?1 = 1 THEN 1 ELSE enabled END,
+                     updated_at = ?2
+                 WHERE id = ?3",
+                rusqlite::params![default_for_tasks as i32, now, id],
+            )
+            .map_err(|e| Error::Database(e.to_string()))
+        })?;
+        if affected == 0 {
+            return Err(Error::WorkflowNotFound { id: id.to_string() });
+        }
         self.get(id)
     }
 
@@ -217,6 +312,7 @@ fn row_to_workflow(row: &rusqlite::Row) -> WorkflowRecord {
         description: row.get("description").unwrap_or_default(),
         yaml_content: row.get("yaml_content").unwrap_or_default(),
         enabled: row.get::<_, i32>("enabled").unwrap_or(1) != 0,
+        default_for_tasks: row.get::<_, i32>("default_for_tasks").unwrap_or(0) != 0,
         version: row.get::<_, u32>("version").unwrap_or(1),
         created_at: row.get("created_at").unwrap_or_default(),
         updated_at: row.get("updated_at").unwrap_or_default(),
@@ -366,6 +462,30 @@ flows: {}
     }
 
     #[test]
+    fn deleting_a_workflow_requires_active_runs_to_be_cancelled_first() {
+        let (db, mgr) = setup();
+        let record = mgr
+            .create(&CreateWorkflow {
+                name: "test-workflow".into(),
+                description: None,
+                yaml_content: VALID_YAML.into(),
+            })
+            .unwrap();
+        let instances = crate::workflows::instance::InstanceManager::new(db);
+        let instance = instances.create_instance(&record.id, None, None).unwrap();
+
+        let error = mgr.delete(&record.id).unwrap_err();
+        assert!(matches!(error, Error::Workflow(_)));
+        assert!(mgr.get(&record.id).is_ok());
+
+        instances
+            .update_status(&instance.id, "cancelled", None)
+            .unwrap();
+        mgr.delete(&record.id).unwrap();
+        assert!(mgr.get(&record.id).is_err());
+    }
+
+    #[test]
     fn test_set_enabled() {
         let (_, mgr) = setup();
         let record = mgr
@@ -381,6 +501,39 @@ flows: {}
 
         let enabled = mgr.set_enabled(&record.id, true).unwrap();
         assert!(enabled.enabled);
+    }
+
+    #[test]
+    fn default_task_workflows_are_explicit_and_enabled() {
+        let (_, mgr) = setup();
+        let record = mgr
+            .create(&CreateWorkflow {
+                name: "default-policy".into(),
+                description: None,
+                yaml_content: r#"
+name: default-policy
+flows:
+  main:
+    steps:
+      - id: final_check
+        type: continue
+        prompt: Check the finished task.
+"#
+                .into(),
+            })
+            .unwrap();
+        assert!(!record.default_for_tasks);
+        assert!(mgr.list_default_for_tasks().unwrap().is_empty());
+
+        mgr.set_enabled(&record.id, false).unwrap();
+        let default = mgr.set_default_for_tasks(&record.id, true).unwrap();
+        assert!(default.default_for_tasks);
+        assert!(default.enabled);
+        assert_eq!(mgr.list_default_for_tasks().unwrap().len(), 1);
+
+        let manual = mgr.set_default_for_tasks(&record.id, false).unwrap();
+        assert!(!manual.default_for_tasks);
+        assert!(mgr.list_default_for_tasks().unwrap().is_empty());
     }
 
     #[test]

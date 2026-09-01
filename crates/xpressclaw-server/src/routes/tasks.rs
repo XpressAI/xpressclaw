@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 
 use xpressclaw_core::sessions::SessionManager;
 use xpressclaw_core::tasks::attachments::{decode_image_attachments, ImageAttachmentInput};
-use xpressclaw_core::tasks::board::{CreateTask, Task, TaskBoard, TaskStatus, UpdateTask};
+use xpressclaw_core::tasks::board::{CreateTask, Task, TaskBoard, UpdateTask};
 use xpressclaw_core::tasks::conversation::TaskConversation;
 use xpressclaw_core::tasks::queue::TaskQueue;
 use xpressclaw_core::visualizations::VisualizationManager;
@@ -17,6 +17,7 @@ use xpressclaw_core::workers::acp::{
     AcpElicitationResponseError, AcpInterruptMode, CreateElicitationResponse,
 };
 use xpressclaw_core::workers::{github, github_review::GithubReviewManager, native};
+use xpressclaw_core::workflows::engine::WorkflowEngine;
 
 use crate::state::AppState;
 
@@ -505,6 +506,26 @@ async fn update_task_status(
             Json(json!({ "error": "all subtasks must be completed first" })),
         ));
     }
+    if req.status == "completed" {
+        // A task parked on an ACP elicitation still owns a live attempt even
+        // though the user has decided the visible work is done. Release that
+        // attempt before applying the completion transition so it cannot keep
+        // the task (and any attached default workflow) waiting indefinitely.
+        let parked_attempts = SessionManager::new(state.db.clone())
+            .task_activity(&id, None, None, 1, 50)
+            .map_err(internal_error)?
+            .attempts
+            .into_iter()
+            .filter(|attempt| attempt.status == "waiting_for_input")
+            .map(|attempt| attempt.id)
+            .collect::<Vec<_>>();
+        for attempt_id in parked_attempts {
+            state
+                .interrupt_attempt(&attempt_id)
+                .await
+                .map_err(internal_error)?;
+        }
+    }
     if req.status == "cancelled" {
         let sessions = SessionManager::new(state.db.clone());
         let Some(cancelled) = sessions
@@ -513,6 +534,17 @@ async fn update_task_status(
         else {
             return Ok(Json(json!(board.get(&id).map_err(internal_error)?)));
         };
+        if let Err(error) = WorkflowEngine::new(state.db.clone()).on_task_completed(
+            &id,
+            "cancelled",
+            "Work cancelled by user",
+        ) {
+            tracing::warn!(
+                task_id = id,
+                error = %error,
+                "failed to release workflows attached to cancelled task"
+            );
+        }
         state.elicitations.cancel_task(&id);
 
         let mut sessions_to_stop = std::collections::BTreeMap::<String, bool>::new();
@@ -571,13 +603,37 @@ async fn update_task_status(
         None
     };
     let updated = if req.status == "completed" {
+        let conversation = TaskConversation::new(state.db.clone());
+        let workflows = WorkflowEngine::new(state.db.clone());
         board
-            .complete_and_roll_up(&id, req.agent_id.as_deref())
-            .and_then(|tasks| {
-                tasks
+            .complete_and_roll_up_with(&id, req.agent_id.as_deref(), |completed| {
+                let output = conversation
+                    .get_messages(&completed.id)
+                    .unwrap_or_default()
                     .into_iter()
-                    .next()
-                    .ok_or_else(|| xpressclaw_core::error::Error::Task("task is not ready".into()))
+                    .rev()
+                    .find(|message| message.role == "assistant")
+                    .map(|message| message.content)
+                    .unwrap_or_default();
+                if let Err(error) = workflows.on_task_completed(&completed.id, "completed", &output)
+                {
+                    tracing::warn!(
+                        task_id = completed.id,
+                        error = %error,
+                        "failed to advance workflow after manual task completion"
+                    );
+                }
+                Ok(())
+            })
+            .and_then(|completed_tasks| {
+                if completed_tasks.is_empty() {
+                    return Err(xpressclaw_core::error::Error::Task(
+                        "task is not ready".into(),
+                    ));
+                }
+                // A continue step may have reopened the requested task while
+                // dispatching its fixed prompt, so return its current state.
+                board.get(&id)
             })
     } else {
         board.update_status_with_agent_repository(
@@ -845,11 +901,6 @@ async fn add_message(
         ),
         _ => internal_error(error),
     })?;
-    let conv = TaskConversation::new(state.db.clone());
-    let msg = conv
-        .add_message_with_attachments(&id, &req.role, &content, &attachments)
-        .map_err(internal_error)?;
-
     let summary = if content.is_empty() {
         if attachments.len() == 1 {
             "Sent an image".to_string()
@@ -860,14 +911,12 @@ async fn add_message(
         content.clone()
     };
 
-    let mut continuation = None;
-    let mut delivery = "stored";
-    if let Some(ref agent_id) = task.agent_id {
-        let sessions = SessionManager::new(state.db.clone());
+    let sessions = SessionManager::new(state.db.clone());
+    let active_attempt = if let Some(ref agent_id) = task.agent_id {
         sessions
             .ensure(agent_id, Some(agent_id))
             .map_err(internal_error)?;
-        let active_attempt = sessions
+        sessions
             .task_activity(&id, None, None, 1, 50)
             .map_err(internal_error)?
             .attempts
@@ -877,10 +926,25 @@ async fn add_message(
                     attempt.status.as_str(),
                     "preparing" | "running" | "waiting_for_input" | "review"
                 )
-            });
-        let waiting_for_input = active_attempt
-            .as_ref()
-            .is_some_and(|attempt| attempt.status == "waiting_for_input");
+            })
+    } else {
+        None
+    };
+    let waiting_for_input = active_attempt
+        .as_ref()
+        .is_some_and(|attempt| attempt.status == "waiting_for_input");
+    let conv = TaskConversation::new(state.db.clone());
+    let (msg, continuation) = conv
+        .add_user_message_with_attachments_and_enqueue(
+            &id,
+            task.agent_id.as_deref(),
+            &content,
+            &attachments,
+        )
+        .map_err(internal_error)?;
+
+    let mut delivery = "stored";
+    if let Some(ref agent_id) = task.agent_id {
         sessions
             .append_event(
                 agent_id,
@@ -901,10 +965,6 @@ async fn add_message(
             )
             .map_err(internal_error)?;
 
-        let queue = TaskQueue::new(state.db.clone());
-        continuation = queue
-            .enqueue_continuation_for_message(&id, agent_id, msg.id, &msg.timestamp)
-            .map_err(internal_error)?;
         delivery = if let Some(active_attempt) = active_attempt {
             // A deferred interruption cannot reach a turn parked on an elicitation.
             // Cancel that request and hand off to the queued guidance immediately.
@@ -923,20 +983,6 @@ async fn add_message(
         } else {
             "queued"
         };
-        if continuation.is_some()
-            && !waiting_for_input
-            && matches!(
-                task.status,
-                TaskStatus::WaitingForInput
-                    | TaskStatus::Blocked
-                    | TaskStatus::Completed
-                    | TaskStatus::Cancelled
-            )
-        {
-            board
-                .update_status(&id, "pending", Some(agent_id))
-                .map_err(internal_error)?;
-        }
         tracing::info!(
             task_id = id,
             agent_id,
@@ -1042,6 +1088,8 @@ mod tests {
     use xpressclaw_core::config::Config;
     use xpressclaw_core::db::Database;
     use xpressclaw_core::message_artifacts::PublishedFileAttachment;
+    use xpressclaw_core::tasks::board::TaskStatus;
+    use xpressclaw_core::workflows::manager::{CreateWorkflow, WorkflowManager};
 
     use super::*;
 
@@ -1532,6 +1580,139 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manual_completion_releases_parked_attempt_and_advances_default_workflow() {
+        let (app, db) = test_app_with_db();
+        let workflow = WorkflowManager::new(db.clone())
+            .create(&CreateWorkflow {
+                name: "manual-completion-review".into(),
+                description: None,
+                yaml_content: r#"
+name: manual-completion-review
+flows:
+  main:
+    steps:
+      - id: review_ui
+        type: continue
+        prompt: Check the UI for unnecessary messages.
+"#
+                .into(),
+            })
+            .unwrap();
+        WorkflowManager::new(db.clone())
+            .set_default_for_tasks(&workflow.id, true)
+            .unwrap();
+        let board = TaskBoard::new(db.clone());
+        let parent = board
+            .create(&CreateTask {
+                title: "Unassigned parent".into(),
+                agent_id: Some("developer".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let task = board
+            .create(&CreateTask {
+                title: "Parked source task".into(),
+                agent_id: Some("developer".into()),
+                parent_task_id: Some(parent.id.clone()),
+                context: Some(json!({ "origin": "session_message" })),
+                ..Default::default()
+            })
+            .unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE tasks SET agent_id = NULL WHERE id = ?1",
+                [&parent.id],
+            )?;
+            Ok::<_, xpressclaw_core::error::Error>(())
+        })
+        .unwrap();
+        let engine = WorkflowEngine::new(db.clone());
+        let instance_id = engine.attach_default_workflows_to_task(&task.id).unwrap()[0].clone();
+
+        let queue = TaskQueue::new(db.clone());
+        queue.enqueue(&task.id, "developer").unwrap();
+        let original = queue.claim("developer").unwrap().unwrap();
+        let attempt_id = original.attempt_id.as_deref().unwrap().to_string();
+        let sessions = SessionManager::new(db.clone());
+        sessions
+            .transition_attempt(&attempt_id, "running", "Working", None, None)
+            .unwrap();
+        sessions
+            .transition_attempt(
+                &attempt_id,
+                "waiting_for_input",
+                "Waiting for an answer",
+                None,
+                None,
+            )
+            .unwrap();
+        TaskBoard::new(db.clone())
+            .update_status(&task.id, "waiting_for_input", Some("developer"))
+            .unwrap();
+        TaskConversation::new(db.clone())
+            .add_message(&task.id, "assistant", "Do you want me to continue?")
+            .unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/tasks/{}/status", task.id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({ "status": "completed" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response.into_body()).await;
+        assert_eq!(body["status"], "pending");
+        assert_eq!(board.get(&parent.id).unwrap().status, TaskStatus::Pending);
+        assert!(!board.subtasks_complete(&parent.id).unwrap());
+        assert_eq!(
+            sessions.get_attempt(&attempt_id).unwrap().status,
+            "interrupted"
+        );
+        assert_eq!(queue.get(original.id).unwrap().status, "completed");
+        assert_eq!(queue.pending_count("developer").unwrap(), 1);
+
+        let messages = TaskConversation::new(db.clone())
+            .get_messages(&task.id)
+            .unwrap();
+        let fixed_prompts = messages
+            .iter()
+            .filter(|message| message.role == "user")
+            .collect::<Vec<_>>();
+        assert_eq!(fixed_prompts.len(), 1);
+        assert_eq!(
+            fixed_prompts[0].content,
+            "Check the UI for unnecessary messages."
+        );
+        let execution_statuses = db
+            .with_conn(|conn| {
+                let mut statement = conn.prepare(
+                    "SELECT step_id, status FROM workflow_step_executions
+                     WHERE instance_id = ?1 ORDER BY rowid",
+                )?;
+                let rows = statement
+                    .query_map([&instance_id], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                Ok::<_, xpressclaw_core::error::Error>(rows)
+            })
+            .unwrap();
+        assert_eq!(
+            execution_statuses,
+            vec![
+                ("__source_task__".to_string(), "completed".to_string()),
+                ("review_ui".to_string(), "running".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn cancelling_after_attempt_completion_preserves_terminal_state() {
         let (app, db) = test_app_with_db();
         let resp = app
@@ -1600,6 +1781,93 @@ mod tests {
             TaskBoard::new(db).get(&task_id).unwrap().status,
             TaskStatus::Completed
         );
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_task_releases_its_default_workflow_source_gate() {
+        let (app, db) = test_app_with_db();
+        let workflow = WorkflowManager::new(db.clone())
+            .create(&CreateWorkflow {
+                name: "cancelled-source".into(),
+                description: None,
+                yaml_content: r#"
+name: cancelled-source
+flows:
+  main:
+    steps:
+      - id: review_ui
+        type: continue
+        prompt: Check the UI for unnecessary messages.
+  on_error:
+    steps:
+      - id: retry_cancelled_task
+        type: continue
+        prompt: This must not revive a task the user cancelled.
+"#
+                .into(),
+            })
+            .unwrap();
+        WorkflowManager::new(db.clone())
+            .set_default_for_tasks(&workflow.id, true)
+            .unwrap();
+        let task = TaskBoard::new(db.clone())
+            .create(&CreateTask {
+                title: "Cancel default workflow source".into(),
+                agent_id: Some("developer".into()),
+                context: Some(json!({ "origin": "session_message" })),
+                ..Default::default()
+            })
+            .unwrap();
+        TaskQueue::new(db.clone())
+            .enqueue(&task.id, "developer")
+            .unwrap();
+        let engine = WorkflowEngine::new(db.clone());
+        let instance_id = engine.attach_default_workflows_to_task(&task.id).unwrap()[0].clone();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/tasks/{}/status", task.id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({ "status": "cancelled" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let (instance_status, step_id, execution_status) = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT instance.status, execution.step_id, execution.status
+                     FROM workflow_instances instance
+                     JOIN workflow_step_executions execution
+                       ON execution.instance_id = instance.id
+                     WHERE instance.id = ?1",
+                    [&instance_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .map_err(xpressclaw_core::error::Error::from)
+            })
+            .unwrap();
+        assert_eq!(instance_status, "cancelled");
+        assert_eq!(step_id, "__source_task__");
+        assert_eq!(execution_status, "cancelled");
+        assert_eq!(
+            TaskBoard::new(db.clone()).get(&task.id).unwrap().status,
+            TaskStatus::Cancelled
+        );
+        assert!(TaskConversation::new(db)
+            .get_messages(&task.id)
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

@@ -778,6 +778,16 @@ async fn poll_once(db: &Arc<Database>, config: &Config) -> crate::error::Result<
             None => continue,
         };
 
+        if let Err(error) =
+            WorkflowEngine::new(db.clone()).attach_default_workflows_to_task(&claimed.task_id)
+        {
+            warn!(
+                task_id = claimed.task_id,
+                error = %error,
+                "default task workflow attachment failed"
+            );
+        }
+
         // Check dependencies before dispatching (ADR-020).
         // If not all dependencies are completed, skip this task for now.
         if !board.is_ready(&claimed.task_id).unwrap_or(true) {
@@ -843,7 +853,7 @@ async fn poll_once(db: &Arc<Database>, config: &Config) -> crate::error::Result<
             }
             DriverResult::Failed(reason) => {
                 let _ = queue.fail(claimed.id, reason);
-                let _ = board.update_status(&claimed.task_id, "cancelled", None);
+                let _ = board.update_status(&claimed.task_id, "blocked", None);
                 warn!(task_id = claimed.task_id, reason, "task execution failed");
                 notify_conversation(db, config, &claimed.task_id, &claimed.agent_id, "failed");
                 // Advance workflow if this task is part of one

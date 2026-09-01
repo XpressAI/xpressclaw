@@ -37,7 +37,7 @@
 		|| (serverTimestampMs(right.last_run ?? right.created_at) ?? 0) - (serverTimestampMs(left.last_run ?? left.created_at) ?? 0)
 		|| right.id.localeCompare(left.id)
 	));
-	let enabledWorkflowCount = $derived(workflowList.filter((workflow) => workflow.enabled && workflowMetadata(workflow.yaml_content).cron).length);
+	let enabledWorkflowCount = $derived(workflowList.filter((workflow) => workflow.enabled && (workflow.default_for_tasks || workflowMetadata(workflow.yaml_content).cron)).length);
 	let activeScheduleCount = $derived(scheduleList.filter((schedule) => scheduleEnabled(schedule)).length);
 
 	$effect(() => {
@@ -81,15 +81,19 @@
 		if (!scheduleForm.agent_id && agentList.length > 0) scheduleForm.agent_id = agentList[0].id;
 	}
 
-	function workflowMetadata(yamlContent: string): { steps: number; flows: number; inputs: number; cron: string | null } {
+	function workflowMetadata(yamlContent: string): { steps: number; flows: number; inputs: number; cron: string | null; sourceTaskOnly: boolean } {
 		const stepMatches = yamlContent.match(/^\s+- id:/gm);
-		let definition: { inputs?: Record<string, unknown>; schedule?: { cron?: string }; flows?: Record<string, unknown> } = {};
+		type StepSummary = { type?: string; steps?: StepSummary[]; body?: StepSummary[] };
+		let definition: { inputs?: Record<string, unknown>; schedule?: { cron?: string }; flows?: Record<string, { steps?: StepSummary[] }> } = {};
 		try { definition = yaml.load(yamlContent) as typeof definition; } catch {}
+		const continuesSourceTask = (steps: StepSummary[]): boolean =>
+			steps.some((step) => step.type === 'continue' || continuesSourceTask(step.steps ?? step.body ?? []));
 		return {
 			steps: stepMatches?.length ?? 0,
 			flows: Math.max(1, Object.keys(definition?.flows ?? {}).length),
 			inputs: Object.keys(definition?.inputs ?? {}).length,
 			cron: definition?.schedule?.cron?.trim() || null,
+			sourceTaskOnly: Object.values(definition?.flows ?? {}).some((flow) => continuesSourceTask(flow.steps ?? [])),
 		};
 	}
 
@@ -251,14 +255,18 @@
 									<a href="/workflows/{workflow.id}" class="text-sm font-semibold text-foreground hover:underline">{workflow.name}</a>
 									{#if workflow.description}<p class="mt-0.5 line-clamp-2 text-xs text-muted-foreground">{workflow.description}</p>{/if}
 								</div>
-								{#if metadata.cron}
-									<label class="relative inline-flex shrink-0 cursor-pointer items-center" title={workflow.enabled ? 'Disable schedule' : 'Enable schedule'}>
-										<input type="checkbox" checked={workflow.enabled} onchange={() => toggleWorkflow(workflow)} class="peer sr-only" />
-										<span class="h-[18px] w-8 rounded-full bg-muted transition-colors after:absolute after:start-[2px] after:top-[2px] after:h-3.5 after:w-3.5 after:rounded-full after:bg-white after:transition-all after:content-[''] peer-checked:bg-emerald-600 peer-checked:after:translate-x-full"></span>
-									</label>
-								{:else}
-									<span class="rounded-full bg-muted px-2 py-0.5 text-[10px] text-muted-foreground">Manual</span>
-								{/if}
+								<div class="flex shrink-0 items-center gap-2">
+									{#if workflow.default_for_tasks}<span class="rounded-full bg-violet-500/10 px-2 py-0.5 text-[10px] text-violet-400">Every task</span>{/if}
+									{#if metadata.sourceTaskOnly && !workflow.default_for_tasks}<span class="rounded-full bg-violet-500/10 px-2 py-0.5 text-[10px] text-violet-400">Default only</span>{/if}
+									{#if metadata.cron}
+										<label class="relative inline-flex cursor-pointer items-center" title={workflow.enabled ? 'Disable schedule' : 'Enable schedule'}>
+											<input type="checkbox" checked={workflow.enabled} onchange={() => toggleWorkflow(workflow)} class="peer sr-only" />
+											<span class="h-[18px] w-8 rounded-full bg-muted transition-colors after:absolute after:start-[2px] after:top-[2px] after:h-3.5 after:w-3.5 after:rounded-full after:bg-white after:transition-all after:content-[''] peer-checked:bg-emerald-600 peer-checked:after:translate-x-full"></span>
+										</label>
+									{:else if !workflow.default_for_tasks}
+										<span class="rounded-full bg-muted px-2 py-0.5 text-[10px] text-muted-foreground">Manual</span>
+									{/if}
+								</div>
 							</div>
 							<div class="flex flex-wrap items-center gap-3 text-[10px] text-muted-foreground"><span>{metadata.steps} step{metadata.steps !== 1 ? 's' : ''}</span><span>{metadata.flows} flow{metadata.flows !== 1 ? 's' : ''}</span><span>{metadata.inputs} input{metadata.inputs !== 1 ? 's' : ''}</span><span>v{workflow.version}</span></div>
 							{#if metadata.cron}<div class="rounded bg-muted/50 px-2 py-1 font-mono text-[10px] text-muted-foreground">{workflow.enabled ? 'Scheduled' : 'Schedule paused'} · {metadata.cron}</div>{/if}
@@ -266,7 +274,7 @@
 							<div class="flex flex-wrap items-center justify-between gap-2">
 								<span class="text-[10px] text-muted-foreground">Updated {timeAgo(workflow.updated_at)}</span>
 								<div class="flex items-center gap-1.5">
-									<a href="/workflows/{workflow.id}?run=1" class="rounded-md bg-emerald-600 px-2.5 py-1 text-[10px] font-medium text-white transition-colors hover:bg-emerald-700">Run</a>
+									{#if !metadata.sourceTaskOnly}<a href="/workflows/{workflow.id}?run=1" class="rounded-md bg-emerald-600 px-2.5 py-1 text-[10px] font-medium text-white transition-colors hover:bg-emerald-700">Run</a>{/if}
 									<a href="/workflows/{workflow.id}" class="rounded-md border border-border bg-secondary px-2.5 py-1 text-[10px] font-medium transition-colors hover:bg-accent">View</a>
 									{#if confirmDeleteId === workflow.id}
 										<button type="button" onclick={() => deleteWorkflow(workflow.id)} class="rounded border border-destructive/50 bg-destructive/10 px-2.5 py-1 text-[10px] font-medium text-destructive hover:bg-destructive/20">Delete</button>

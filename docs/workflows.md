@@ -121,6 +121,42 @@ Conversation, and Agent results are published there as they complete. The
 workflow definition remains reusable: running it from another Conversation
 creates a new instance with that Conversation's Project boundary.
 
+### Run a workflow for every task
+
+Turn on **Run for every task** in the workflow editor to attach that workflow
+once to each ordinary Agent task. XpressClaw waits for the task and any already
+queued response to finish before starting the workflow's `main` flow. Hidden
+tasks, idle work, native plan items, and tasks created by another workflow are
+excluded. A durable `(workflow, task)` attachment prevents retries or restarts
+from invoking the default workflow twice.
+
+Default workflows cannot open an input form. A primary `agent` input is bound
+to the task's Agent automatically; every other required input must have a
+default. Because the policy applies across Projects, task and wait blocks must
+use that primary Agent role rather than a fixed Agent. The setting is local
+execution policy, so it is stored with the local workflow record instead of in
+the portable YAML definition.
+
+Use a `continue` step when a policy or final check should go back to the same
+task instead of creating a child task:
+
+```yaml
+flows:
+  main:
+    steps:
+      - id: final_ui_check
+        type: continue
+        prompt: |
+          Ensure that there are no messages in the UI which are unnecessary
+          to the end user.
+```
+
+The fixed prompt is appended as a user message to the source task and queues
+one more response from that task's Agent. The prompt, workflow execution, and
+queue entry share one database transaction, so the step sends its prompt once
+per workflow run even if completion is observed more than once. A `continue`
+step requires a source task and is therefore intended for default workflows.
+
 ## Wait for an external event
 
 A `wait` block suspends the workflow durably. It does not keep an agent turn or

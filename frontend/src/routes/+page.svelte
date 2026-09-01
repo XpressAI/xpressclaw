@@ -194,6 +194,10 @@
 		return steps.some((step) => step.type === 'sink' || usesConnectorSink(step.steps ?? step.body ?? []));
 	}
 
+	function usesSourceTaskContinuation(steps: WorkflowStepSummary[]): boolean {
+		return steps.some((step) => step.type === 'continue' || usesSourceTaskContinuation(step.steps ?? step.body ?? []));
+	}
+
 	function fixedStepAgents(steps: WorkflowStepSummary[]): string[] {
 		return steps.flatMap((step) => {
 			const configured = step.agent?.trim();
@@ -206,6 +210,7 @@
 		const definition = workflowDefinition(workflow);
 		if (!definition || definition.trigger) return false;
 		if (Object.values(definition.flows ?? {}).some((flow) => usesConnectorSink(flow.steps ?? []))) return false;
+		if (Object.values(definition.flows ?? {}).some((flow) => usesSourceTaskContinuation(flow.steps ?? []))) return false;
 		const projectAgentIds = new Set(projectAgents.map((agent) => agent.id));
 		return Object.values(definition.flows ?? {}).every((flow) =>
 			fixedStepAgents(flow.steps ?? []).every((agentId) => projectAgentIds.has(agentId))

@@ -185,20 +185,6 @@
 		</div>
 	{/if}
 
-	{#if readiness?.presentation_artifacts?.supported}
-		<div class="rounded-xl border px-4 py-3 text-xs {readiness.presentation_artifacts.available ? 'border-emerald-500/25 bg-emerald-500/5' : 'border-amber-500/30 bg-amber-500/5'}" data-presentation-readiness>
-			<div class="flex items-center gap-2 font-medium {readiness.presentation_artifacts.available ? 'text-emerald-600' : 'text-amber-600'}">
-				<span aria-hidden="true">{readiness.presentation_artifacts.available ? '✓' : '!'}</span>
-				{readiness.presentation_artifacts.available ? 'PowerPoint artifacts ready' : 'PowerPoint artifacts unavailable'}
-			</div>
-			<p class="mt-1 text-muted-foreground">
-				{readiness.presentation_artifacts.available
-					? `${readiness.presentation_artifacts.runtime} is pinned in this runner; generated decks can be rendered, checked, and attached.`
-					: readiness.presentation_artifacts.reason}
-			</p>
-		</div>
-	{/if}
-
 	{#if overview}
 		{@const projectStatus = statusMeta(overview.session.status)}
 		<section class="overflow-hidden rounded-2xl border border-border bg-card shadow-sm">

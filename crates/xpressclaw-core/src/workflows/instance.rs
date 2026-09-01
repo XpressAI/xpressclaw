@@ -8,6 +8,11 @@ use uuid::Uuid;
 use crate::db::Database;
 use crate::error::{Error, Result};
 use crate::projects::ensure_project_accepts_work;
+use crate::tasks::conversation::TaskConversation;
+use crate::tasks::queue::TaskQueue;
+
+pub(super) const SOURCE_TASK_STEP_ID: &str = "__source_task__";
+pub(super) const CONTINUATION_WAITING_STATUS: &str = "waiting_for_idle";
 
 /// A running (or completed) workflow instance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -16,6 +21,10 @@ pub struct WorkflowInstance {
     pub workflow_id: String,
     pub project_id: Option<String>,
     pub conversation_id: Option<String>,
+    /// Ordinary task that triggered this default workflow. Manual, scheduled,
+    /// and connector runs leave this unset.
+    #[serde(default)]
+    pub source_task_id: Option<String>,
     pub status: String, // running, waiting, completed, failed, cancelled
     pub current_flow: String,
     pub current_step_index: i32,
@@ -39,7 +48,17 @@ pub struct StepExecution {
     pub flow_name: String,
     pub step_id: String,
     pub task_id: Option<String>,
-    pub status: String, // pending, running, waiting, resuming, completed, failed, skipped
+    /// Exact work attempt owned by a same-task continuation. This internal
+    /// link prevents workflow cancellation from affecting unrelated user
+    /// turns on the source task.
+    #[serde(default, skip_serializing)]
+    pub continuation_attempt_id: Option<String>,
+    /// Fixed workflow-authored user message that created the continuation's
+    /// first attempt. Unlike `continuation_attempt_id`, this does not move
+    /// when an elicited user answer adopts the running execution.
+    #[serde(default, skip_serializing)]
+    pub continuation_prompt_message_id: Option<i64>,
+    pub status: String, // pending, running, waiting, resuming, completed, failed, cancelled, skipped
     pub input_context: Option<String>,
     pub output: Option<String>,
     pub attempt: i32,
@@ -58,6 +77,7 @@ pub(super) struct WorkflowInstanceScope<'a> {
     pub conversation_id: Option<&'a str>,
     pub creator_agent_id: Option<&'a str>,
     pub workflow_agent_bindings: &'a [(String, String)],
+    pub source_task_id: Option<&'a str>,
 }
 
 impl InstanceManager {
@@ -221,15 +241,17 @@ impl InstanceManager {
             }
             transaction.execute(
                 "INSERT INTO workflow_instances
-                 (id, workflow_id, project_id, conversation_id, status,
+                 (id, workflow_id, project_id, conversation_id, source_task_id, status,
                   current_flow, current_step_index, trigger_data, variable_store,
                   started_at, definition_yaml)
-                 VALUES (?1, ?2, ?3, ?4, 'running', 'main', 0, ?5, ?6, ?7, ?8)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'running', 'main', ?6, ?7, ?8, ?9, ?10)",
                 rusqlite::params![
                     id,
                     workflow_id,
                     resolved_project,
                     scope.conversation_id,
+                    scope.source_task_id,
+                    if scope.source_task_id.is_some() { -1 } else { 0 },
                     trigger_data,
                     var_store,
                     now,
@@ -319,6 +341,24 @@ impl InstanceManager {
 
             stmt.query_row([id], |row| Ok(row_to_instance(row)))
                 .map_err(|_| Error::WorkflowInstanceNotFound { id: id.to_string() })
+        })
+    }
+
+    /// Find the durable default-workflow attachment for one source task.
+    pub fn find_source_instance(
+        &self,
+        workflow_id: &str,
+        source_task_id: &str,
+    ) -> Result<Option<WorkflowInstance>> {
+        self.db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT * FROM workflow_instances
+                 WHERE workflow_id = ?1 AND source_task_id = ?2",
+                rusqlite::params![workflow_id, source_task_id],
+                |row| Ok(row_to_instance(row)),
+            )
+            .optional()
+            .map_err(Error::from)
         })
     }
 
@@ -531,6 +571,209 @@ impl InstanceManager {
         self.get_step_execution(&id)
     }
 
+    /// Insert a running task-backed execution inside a caller-owned
+    /// transaction. Default workflow attachment uses this so the instance and
+    /// its source-task completion gate become durable together.
+    pub(super) fn create_task_execution_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        instance_id: &str,
+        flow_name: &str,
+        step_id: &str,
+        input_context: Option<&str>,
+        task_id: &str,
+    ) -> Result<String> {
+        ensure_instance_accepts_work(transaction, instance_id)?;
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now()
+            .naive_utc()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let attempt = transaction.query_row(
+            "SELECT COUNT(*) FROM workflow_step_executions
+             WHERE instance_id = ?1 AND step_id = ?2",
+            rusqlite::params![instance_id, step_id],
+            |row| row.get::<_, i32>(0),
+        )? + 1;
+        transaction.execute(
+            "INSERT INTO workflow_step_executions
+             (id, instance_id, flow_name, step_id, task_id, status,
+              input_context, attempt, started_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6, ?7, ?8)",
+            rusqlite::params![
+                id,
+                instance_id,
+                flow_name,
+                step_id,
+                task_id,
+                input_context,
+                attempt,
+                now
+            ],
+        )?;
+        Ok(id)
+    }
+
+    /// Atomically reserve one continuation turn on an instance's source task.
+    /// If another response became active before this transaction acquired the
+    /// writer, the execution is left waiting without publishing its prompt.
+    /// Otherwise the prompt, execution, and response queue become durable in
+    /// one commit. A retry therefore cannot send the same prompt twice.
+    pub fn create_continuation_execution(
+        &self,
+        instance_id: &str,
+        flow_name: &str,
+        step_id: &str,
+        input_context: Option<&str>,
+        task_id: &str,
+        prompt: &str,
+    ) -> Result<StepExecution> {
+        let execution_id = self.db.with_conn(|conn| {
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            ensure_instance_accepts_work(&transaction, instance_id)?;
+            if let Some(existing) = transaction
+                .query_row(
+                    "SELECT id FROM workflow_step_executions
+                     WHERE instance_id = ?1 AND flow_name = ?2 AND step_id = ?3
+                       AND status IN ('running', ?4)
+                     ORDER BY rowid DESC LIMIT 1",
+                    rusqlite::params![instance_id, flow_name, step_id, CONTINUATION_WAITING_STATUS],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+            {
+                transaction.commit()?;
+                return Ok::<_, Error>(existing);
+            }
+
+            let agent_id = transaction
+                .query_row(
+                    "SELECT agent_id FROM tasks WHERE id = ?1",
+                    [task_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .ok_or_else(|| Error::TaskNotFound {
+                    id: task_id.to_string(),
+                })?
+                .filter(|agent_id| !agent_id.trim().is_empty())
+                .ok_or_else(|| {
+                    Error::Workflow(format!(
+                        "continue step '{step_id}' cannot resume unassigned task '{task_id}'"
+                    ))
+                })?;
+            let active_response = task_has_active_response(&transaction, task_id)?;
+            let execution_id = Self::create_task_execution_in_transaction(
+                &transaction,
+                instance_id,
+                flow_name,
+                step_id,
+                input_context,
+                task_id,
+            )?;
+            if active_response {
+                transaction.execute(
+                    "UPDATE workflow_step_executions
+                     SET status = ?1
+                     WHERE id = ?2",
+                    rusqlite::params![CONTINUATION_WAITING_STATUS, execution_id],
+                )?;
+            } else {
+                let (attempt_id, prompt_message_id) =
+                    dispatch_continuation_in_transaction(&transaction, task_id, &agent_id, prompt)?;
+                transaction.execute(
+                    "UPDATE workflow_step_executions
+                     SET continuation_attempt_id = ?1,
+                         continuation_prompt_message_id = ?2
+                     WHERE id = ?3",
+                    rusqlite::params![attempt_id, prompt_message_id, execution_id],
+                )?;
+            }
+            transaction.commit()?;
+            Ok::<_, Error>(execution_id)
+        })?;
+        self.get_step_execution(&execution_id)
+    }
+
+    /// Publish a continuation that was durably held behind an intervening
+    /// source-task response. The idle check and prompt enqueue share the same
+    /// immediate transaction, closing the user-message race in both
+    /// directions.
+    pub fn dispatch_waiting_continuation(
+        &self,
+        execution_id: &str,
+        task_id: &str,
+        prompt: &str,
+    ) -> Result<StepExecution> {
+        self.db.with_conn(|conn| {
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            ensure_step_execution_accepts_work(&transaction, execution_id)?;
+            let (status, step_id, agent_id) = transaction
+                .query_row(
+                    "SELECT execution.status, execution.step_id, task.agent_id
+                     FROM workflow_step_executions execution
+                     JOIN tasks task ON task.id = execution.task_id
+                     WHERE execution.id = ?1 AND execution.task_id = ?2",
+                    rusqlite::params![execution_id, task_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                        ))
+                    },
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    Error::Workflow(format!(
+                        "continuation execution '{execution_id}' is not linked to task '{task_id}'"
+                    ))
+                })?;
+            if status == "running" {
+                transaction.commit()?;
+                return Ok::<_, Error>(());
+            }
+            if status != CONTINUATION_WAITING_STATUS {
+                return Err(Error::Workflow(format!(
+                    "continue step '{step_id}' cannot dispatch from status '{status}'"
+                )));
+            }
+            if task_has_active_response(&transaction, task_id)? {
+                transaction.commit()?;
+                return Ok::<_, Error>(());
+            }
+            let agent_id = agent_id
+                .filter(|agent_id| !agent_id.trim().is_empty())
+                .ok_or_else(|| {
+                    Error::Workflow(format!(
+                        "continue step '{step_id}' cannot resume unassigned task '{task_id}'"
+                    ))
+                })?;
+            let (attempt_id, prompt_message_id) =
+                dispatch_continuation_in_transaction(&transaction, task_id, &agent_id, prompt)?;
+            transaction.execute(
+                "UPDATE workflow_step_executions
+                 SET status = 'running', continuation_attempt_id = ?1,
+                     continuation_prompt_message_id = ?2
+                 WHERE id = ?3 AND status = ?4",
+                rusqlite::params![
+                    attempt_id,
+                    prompt_message_id,
+                    execution_id,
+                    CONTINUATION_WAITING_STATUS
+                ],
+            )?;
+            transaction.commit()?;
+            Ok::<_, Error>(())
+        })?;
+        self.get_step_execution(execution_id)
+    }
+
     /// Atomically link a loop body task to its execution and persist that
     /// execution as the loop cursor's owner. The caller may only enqueue the
     /// task after this transaction commits.
@@ -727,19 +970,108 @@ impl InstanceManager {
         })
     }
 
-    /// Find a step execution by its linked task ID.
+    /// Find a step execution linked to a task, regardless of its current
+    /// status. Recovery callers use completed executions at crash boundaries;
+    /// live completion uses `find_running_executions_by_task` below.
     pub fn find_execution_by_task(&self, task_id: &str) -> Result<Option<StepExecution>> {
         self.db.with_conn(|conn| {
             let mut stmt = conn
-                .prepare("SELECT * FROM workflow_step_executions WHERE task_id = ?1")
+                .prepare(
+                    "SELECT * FROM workflow_step_executions
+                     WHERE task_id = ?1
+                     ORDER BY rowid DESC LIMIT 1",
+                )
                 .map_err(|e| Error::Database(e.to_string()))?;
-
-            let result = stmt
-                .query_row([task_id], |row| Ok(row_to_step_execution(row)))
-                .ok();
-
-            Ok(result)
+            stmt.query_row([task_id], |row| Ok(row_to_step_execution(row)))
+                .optional()
+                .map_err(Error::from)
         })
+    }
+
+    /// Find every active workflow execution waiting on the same task. A task
+    /// may be the source for more than one default workflow. A continuation
+    /// that lost the idle/enqueue race also waits here for that intervening
+    /// response to complete before publishing its fixed prompt.
+    pub fn find_running_executions_by_task(&self, task_id: &str) -> Result<Vec<StepExecution>> {
+        self.db.with_conn(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT execution.*
+                     FROM workflow_step_executions execution
+                     JOIN workflow_instances instance ON instance.id = execution.instance_id
+                     WHERE execution.task_id = ?1
+                       AND execution.status IN ('running', ?3)
+                       AND instance.status = 'running'
+                     ORDER BY CASE WHEN execution.step_id = ?2 THEN 1 ELSE 0 END,
+                              execution.started_at ASC, execution.rowid ASC",
+                )
+                .map_err(|e| Error::Database(e.to_string()))?;
+            let records = stmt
+                .query_map(
+                    rusqlite::params![task_id, SOURCE_TASK_STEP_ID, CONTINUATION_WAITING_STATUS],
+                    |row| Ok(row_to_step_execution(row)),
+                )
+                .map_err(|e| Error::Database(e.to_string()))?
+                .filter_map(|record| record.ok())
+                .collect();
+            Ok(records)
+        })
+    }
+
+    /// Find a running continuation that reuses an instance's source task
+    /// inside a caller-owned transaction. The synthetic source gate also
+    /// points at that task, so exclude it from the result. Ordinary workflow
+    /// steps always own a newly created task.
+    pub(super) fn find_running_source_continuation_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        instance_id: &str,
+    ) -> Result<Option<StepExecution>> {
+        transaction
+            .query_row(
+                "SELECT execution.*
+                 FROM workflow_step_executions execution
+                 JOIN workflow_instances instance ON instance.id = execution.instance_id
+                 WHERE execution.instance_id = ?1
+                   AND instance.status IN ('running', 'waiting')
+                   AND execution.status = 'running'
+                   AND execution.task_id = instance.source_task_id
+                   AND execution.step_id != ?2
+                 ORDER BY execution.started_at DESC, execution.rowid DESC
+                 LIMIT 1",
+                rusqlite::params![instance_id, SOURCE_TASK_STEP_ID],
+                |row| Ok(row_to_step_execution(row)),
+            )
+            .optional()
+            .map_err(Error::from)
+    }
+
+    pub(super) fn cancel_instance_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        instance_id: &str,
+    ) -> Result<()> {
+        let changed = transaction.execute(
+            "UPDATE workflow_instances
+             SET status = 'cancelled', error_message = NULL,
+                 completed_at = CURRENT_TIMESTAMP
+             WHERE id = ?1",
+            [instance_id],
+        )?;
+        if changed == 0 {
+            return Err(Error::WorkflowInstanceNotFound {
+                id: instance_id.to_string(),
+            });
+        }
+        // A user answer can temporarily adopt a continuation execution. Once
+        // the workflow is cancelled it must become ordinary task work again,
+        // so it is no longer excluded from user-message coalescing or future
+        // lifecycle operations.
+        transaction.execute(
+            "UPDATE workflow_step_executions
+             SET continuation_attempt_id = NULL
+             WHERE instance_id = ?1 AND continuation_attempt_id IS NOT NULL",
+            [instance_id],
+        )?;
+        Ok(())
     }
 
     /// Update the status and output of a step execution.
@@ -884,10 +1216,62 @@ impl InstanceManager {
     }
 }
 
+pub(super) fn task_has_active_response(conn: &rusqlite::Connection, task_id: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM task_queue
+            WHERE task_id = ?1 AND status IN ('queued', 'running')
+         ) OR EXISTS(
+            SELECT 1 FROM work_attempts
+            WHERE task_id = ?1
+              AND status IN ('queued', 'preparing', 'running',
+                             'waiting_for_input', 'review')
+         )",
+        [task_id],
+        |row| row.get(0),
+    )
+    .map_err(Error::from)
+}
+
+fn dispatch_continuation_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    task_id: &str,
+    agent_id: &str,
+    prompt: &str,
+) -> Result<(String, i64)> {
+    let message =
+        TaskConversation::insert_text_message_in_transaction(transaction, task_id, "user", prompt)?;
+    let queue_item = TaskQueue::enqueue_continuation_for_message_in_transaction(
+        transaction,
+        task_id,
+        agent_id,
+        message.id,
+        &message.timestamp,
+    )?
+    .ok_or_else(|| {
+        Error::Workflow(format!(
+            "continue step could not reserve an exclusive response for task '{task_id}'"
+        ))
+    })?;
+    let attempt_id = queue_item.attempt_id.ok_or_else(|| {
+        Error::Workflow(format!(
+            "continue step response for task '{task_id}' has no work attempt"
+        ))
+    })?;
+    transaction.execute(
+        "UPDATE tasks
+         SET status = 'pending', completed_at = NULL,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = ?1",
+        [task_id],
+    )?;
+    Ok((attempt_id, message.id))
+}
+
 fn ensure_instance_accepts_work(conn: &rusqlite::Connection, instance_id: &str) -> Result<()> {
-    let (project_id, conversation_project_id) = conn
+    let (project_id, conversation_project_id, status) = conn
         .query_row(
-            "SELECT instance.project_id, conversation.project_id
+            "SELECT instance.project_id, conversation.project_id, instance.status
              FROM workflow_instances instance
              LEFT JOIN conversations conversation
                ON conversation.id = instance.conversation_id
@@ -897,6 +1281,7 @@ fn ensure_instance_accepts_work(conn: &rusqlite::Connection, instance_id: &str) 
                 Ok((
                     row.get::<_, Option<String>>(0)?,
                     row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
                 ))
             },
         )
@@ -922,6 +1307,11 @@ fn ensure_instance_accepts_work(conn: &rusqlite::Connection, instance_id: &str) 
             ensure_project_accepts_work(conn, &derived_project_id)
                 .map_err(|error| Error::Workflow(error.to_string()))?;
         }
+    }
+    if !matches!(status.as_str(), "running" | "waiting") {
+        return Err(Error::Workflow(format!(
+            "workflow instance '{instance_id}' no longer accepts work ({status})"
+        )));
     }
     Ok(())
 }
@@ -1030,6 +1420,7 @@ fn row_to_instance(row: &rusqlite::Row) -> WorkflowInstance {
         workflow_id: row.get("workflow_id").unwrap_or_default(),
         project_id: row.get("project_id").unwrap_or_default(),
         conversation_id: row.get("conversation_id").unwrap_or_default(),
+        source_task_id: row.get("source_task_id").unwrap_or_default(),
         status: row.get("status").unwrap_or_default(),
         current_flow: row
             .get("current_flow")
@@ -1054,6 +1445,10 @@ fn row_to_step_execution(row: &rusqlite::Row) -> StepExecution {
         flow_name: row.get("flow_name").unwrap_or_default(),
         step_id: row.get("step_id").unwrap_or_default(),
         task_id: row.get("task_id").unwrap_or_default(),
+        continuation_attempt_id: row.get("continuation_attempt_id").unwrap_or_default(),
+        continuation_prompt_message_id: row
+            .get("continuation_prompt_message_id")
+            .unwrap_or_default(),
         status: row.get("status").unwrap_or_default(),
         input_context: row.get("input_context").unwrap_or_default(),
         output: row.get("output").unwrap_or_default(),
@@ -1492,6 +1887,41 @@ mod tests {
 
         let not_found = mgr.find_execution_by_task("nonexistent").unwrap();
         assert!(not_found.is_none());
+    }
+
+    #[test]
+    fn active_continuations_are_completed_before_other_default_source_gates() {
+        let (_, mgr) = setup();
+        let first = mgr.create_instance("wf1", None, None).unwrap();
+        let second = mgr.create_instance("wf1", None, None).unwrap();
+
+        let completed_source = mgr
+            .create_step_execution(&first.id, "main", SOURCE_TASK_STEP_ID, None)
+            .unwrap();
+        mgr.set_step_task(&completed_source.id, "shared-task")
+            .unwrap();
+        mgr.update_step_status(&completed_source.id, "completed", None)
+            .unwrap();
+
+        let waiting_source = mgr
+            .create_step_execution(&second.id, "main", SOURCE_TASK_STEP_ID, None)
+            .unwrap();
+        mgr.set_step_task(&waiting_source.id, "shared-task")
+            .unwrap();
+
+        let continuation = mgr
+            .create_step_execution(&first.id, "main", "final_check", None)
+            .unwrap();
+        mgr.set_step_task(&continuation.id, "shared-task").unwrap();
+
+        let active = mgr.find_running_executions_by_task("shared-task").unwrap();
+        assert_eq!(
+            active
+                .iter()
+                .map(|execution| &execution.id)
+                .collect::<Vec<_>>(),
+            vec![&continuation.id, &waiting_source.id]
+        );
     }
 
     #[test]

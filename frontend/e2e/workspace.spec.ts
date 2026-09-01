@@ -318,6 +318,7 @@ async function mockApi(
 			description: string | null;
 			yaml_content: string;
 			enabled: boolean;
+			default_for_tasks?: boolean;
 			version: number;
 			created_at: string;
 			updated_at: string;
@@ -343,6 +344,7 @@ async function mockApi(
 		}[];
 		workflowCreateRequests?: { name: string; description?: string; yaml_content: string }[];
 		workflowRunRequests?: { id: string; inputs: Record<string, unknown>; projectId?: string }[];
+		workflowDefaultRequests?: { id: string; defaultForTasks: boolean }[];
 		workspaceSaveRequests?: { path: string; content: string; expected_revision: string }[];
 		workspaceSaveDelayMs?: number;
 		workspaceReadRequests?: string[];
@@ -818,6 +820,7 @@ async function mockApi(
 					id: 'workflow-created',
 					...payload,
 					enabled: true,
+					default_for_tasks: false,
 					version: 1,
 					created_at: timestamp(100),
 					updated_at: timestamp(100),
@@ -853,6 +856,12 @@ async function mockApi(
 				trigger_data: JSON.stringify(inputs), variable_store: '{}', loop_state: null,
 				started_at: timestamp(200), completed_at: null, error_message: null,
 			};
+		} else if (/^\/api\/workflows\/[^/]+\/default$/.test(path)) {
+			const id = path.split('/')[3];
+			const payload = request.postDataJSON() as { default_for_tasks: boolean };
+			options.workflowDefaultRequests?.push({ id, defaultForTasks: payload.default_for_tasks });
+			const workflow = createdWorkflow ?? options.workflows?.find((candidate) => candidate.id === id);
+			response = { ...workflow, default_for_tasks: payload.default_for_tasks, enabled: true };
 		} else if (/^\/api\/workflows\/[^/]+$/.test(path)) {
 			const id = path.split('/')[3];
 			response = createdWorkflow ?? options.workflows?.find((workflow) => workflow.id === id) ?? {
@@ -3434,7 +3443,7 @@ test('agent Work shows only the five most recently updated tasks', async ({ page
 	await expect(page.getByRole('link', { name: 'All tasks' })).toHaveAttribute('href', '/tasks');
 });
 
-test('agent Work reports the pinned Codex presentation capability', async ({ page }) => {
+test('agent Work keeps internal presentation capability out of the user interface', async ({ page }) => {
 	await mockApi(page, {
 		runnerReadiness: {
 			ready: true,
@@ -3450,9 +3459,8 @@ test('agent Work reports the pinned Codex presentation capability', async ({ pag
 	});
 	await page.goto(`/agents/${agentId}`);
 
-	const readiness = page.locator('[data-presentation-readiness]');
-	await expect(readiness).toContainText('PowerPoint artifacts ready');
-	await expect(readiness).toContainText('PptxGenJS 4.0.1 is pinned in this runner');
+	await expect(page.getByText('PowerPoint artifacts ready')).toHaveCount(0);
+	await expect(page.getByText('PptxGenJS 4.0.1 is pinned in this runner', { exact: false })).toHaveCount(0);
 });
 
 test('agent files browse Git changes and save Monaco edits with a revision', async ({ page }) => {
@@ -4907,6 +4915,46 @@ flows:
 		id: 'workflow-report',
 		inputs: { goal: 'Prepare version 0.3', retries: 2, options: { include_ci: true }, worker: agentId },
 	}]);
+});
+
+test('workflow editor can default a workflow and add a once-per-task fixed prompt', async ({ page }) => {
+	const workflowDefaultRequests: { id: string; defaultForTasks: boolean }[] = [];
+	await mockApi(page, {
+		workflowDefaultRequests,
+		workflows: [{
+			id: 'workflow-ui-policy',
+			name: 'Final UI policy',
+			description: 'Review user-facing UI before finishing.',
+			yaml_content: `name: final-ui-policy
+flows:
+  main:
+    steps: []
+`,
+			enabled: true,
+			default_for_tasks: false,
+			version: 1,
+			created_at: timestamp(100),
+			updated_at: timestamp(100),
+		}],
+	});
+
+	await page.goto('/workflows/workflow-ui-policy');
+	const defaultToggle = page.getByLabel('Run for every new task');
+	await expect(defaultToggle).not.toBeChecked();
+	await defaultToggle.check();
+	await expect.poll(() => workflowDefaultRequests).toEqual([{
+		id: 'workflow-ui-policy',
+		defaultForTasks: true,
+	}]);
+	await expect(defaultToggle).toBeChecked();
+
+	await page.getByRole('button', { name: 'Continue task', exact: true }).click();
+	await page.getByLabel('Fixed prompt').fill('Ensure that there are no messages in the UI that are unnecessary to the end user.');
+	await expect(page.getByRole('button', { name: 'Run', exact: true })).toBeDisabled();
+	await page.getByRole('button', { name: 'YAML', exact: true }).click();
+	const yamlEditor = page.locator('textarea[spellcheck="false"]');
+	await expect(yamlEditor).toHaveValue(/type: continue/);
+	await expect(yamlEditor).toHaveValue(/Ensure that there are no messages in the UI that are unnecessary to the end user\./);
 });
 
 test('appearance follows the saved light, dark, and system preference', async ({ page }) => {
