@@ -1504,7 +1504,7 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
     else {
         return Ok(());
     };
-    let completed_tasks = finalize_successful_task_attempt(
+    finalize_successful_task_attempt(
         &db,
         &item.task_id,
         &item.agent_id,
@@ -1524,9 +1524,6 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
             published_files: &published.attachments,
         },
     );
-    for completed in completed_tasks {
-        advance_workflow(&db, &completed.id, "completed", &turn.summary);
-    }
     Ok(())
 }
 
@@ -1584,7 +1581,10 @@ fn finalize_successful_task_attempt(
         board.update_status(task_id, "waiting_for_input", Some(agent_id))?;
         Ok(Vec::new())
     } else if board.subtasks_complete(task_id)? {
-        board.complete_and_roll_up(task_id, Some(agent_id))
+        board.complete_and_roll_up_with(task_id, Some(agent_id), |completed| {
+            advance_workflow(db, &completed.id, "completed", output);
+            Ok(())
+        })
     } else {
         board.update_status(task_id, "in_progress", Some(agent_id))?;
         Ok(Vec::new())

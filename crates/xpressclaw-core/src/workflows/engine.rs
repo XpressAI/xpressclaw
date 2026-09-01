@@ -2188,9 +2188,22 @@ impl WorkflowEngine {
                     )?;
                     return Ok(None);
                 }
-                let completed =
-                    TaskBoard::new(self.db.clone()).complete_and_roll_up(task_id, None)?;
-                if completed.iter().any(|task| task.id == task_id) {
+                let board = TaskBoard::new(self.db.clone());
+                let completed = board.complete_and_roll_up_with(task_id, None, |completed| {
+                    let output = self.completed_task_output(&completed.id);
+                    if let Err(error) = self.on_task_completed(&completed.id, "completed", &output)
+                    {
+                        warn!(
+                            task_id = completed.id,
+                            error = %error,
+                            "failed to advance recovered workflow before task roll-up"
+                        );
+                    }
+                    Ok(())
+                })?;
+                if completed.iter().any(|task| task.id == task_id)
+                    && board.get(task_id)?.status == crate::tasks::board::TaskStatus::Completed
+                {
                     return Ok(Some("completed".into()));
                 }
             }
@@ -3312,14 +3325,31 @@ flows:
         WorkflowManager::new(db.clone())
             .set_default_for_tasks(&workflow_id, true)
             .unwrap();
-        let task = TaskBoard::new(db.clone())
+        let board = TaskBoard::new(db.clone());
+        let parent = board
+            .create(&CreateTask {
+                title: "Unassigned recovered parent".into(),
+                agent_id: Some("atlas".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let task = board
             .create(&CreateTask {
                 title: "Recover reply boundary".into(),
                 agent_id: Some("atlas".into()),
+                parent_task_id: Some(parent.id.clone()),
                 context: Some(json!({ "origin": "session_message" })),
                 ..Default::default()
             })
             .unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE tasks SET agent_id = NULL WHERE id = ?1",
+                [&parent.id],
+            )?;
+            Ok::<_, Error>(())
+        })
+        .unwrap();
         let queue = TaskQueue::new(db.clone());
         queue.enqueue(&task.id, "atlas").unwrap();
         let instance_id = engine.attach_default_workflows_to_task(&task.id).unwrap()[0].clone();
@@ -3369,9 +3399,14 @@ flows:
             1
         );
         assert_ne!(
-            TaskBoard::new(db).get(&task.id).unwrap().status,
+            board.get(&task.id).unwrap().status,
             crate::tasks::board::TaskStatus::InProgress
         );
+        assert_eq!(
+            board.get(&parent.id).unwrap().status,
+            crate::tasks::board::TaskStatus::Pending
+        );
+        assert!(!board.subtasks_complete(&parent.id).unwrap());
     }
 
     #[test]

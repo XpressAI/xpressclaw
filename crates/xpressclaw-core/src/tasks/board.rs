@@ -1203,6 +1203,22 @@ impl TaskBoard {
     /// Complete a task whose steps are done, then roll that completion through
     /// any ready parents. Parents with queued/running work are left active.
     pub fn complete_and_roll_up(&self, task_id: &str, agent_id: Option<&str>) -> Result<Vec<Task>> {
+        self.complete_and_roll_up_with(task_id, agent_id, |_| Ok(()))
+    }
+
+    /// Complete and roll up one task at a time, invoking `on_completed` before
+    /// considering its parent. A callback may reopen the just-completed task
+    /// (for example by queuing a default workflow continuation); roll-up then
+    /// stops so no ancestor becomes terminal ahead of its blocking child.
+    pub fn complete_and_roll_up_with<F>(
+        &self,
+        task_id: &str,
+        agent_id: Option<&str>,
+        mut on_completed: F,
+    ) -> Result<Vec<Task>>
+    where
+        F: FnMut(&Task) -> Result<()>,
+    {
         let mut completed = Vec::new();
         let mut current_id = Some(task_id.to_string());
 
@@ -1210,8 +1226,14 @@ impl TaskBoard {
             let Some(task) = self.complete_if_ready(&id)? else {
                 break;
             };
-            current_id = task.parent_task_id.clone();
+            let parent_task_id = task.parent_task_id.clone();
+            on_completed(&task)?;
+            let remains_completed = self.get(&task.id)?.status == TaskStatus::Completed;
             completed.push(task);
+            if !remains_completed {
+                break;
+            }
+            current_id = parent_task_id;
         }
 
         // Completion does not change assignment. Keep this argument for API
@@ -2971,6 +2993,38 @@ mod tests {
         let second_completion = board.complete_and_roll_up(&second.id, None).unwrap();
         assert_eq!(second_completion.len(), 2);
         assert_eq!(board.get(&parent.id).unwrap().status, TaskStatus::Completed);
+    }
+
+    #[test]
+    fn reopening_a_completed_child_stops_parent_roll_up() {
+        let (_, board) = setup();
+        let parent = board
+            .create(&CreateTask {
+                title: "Parent".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let child = board
+            .create(&CreateTask {
+                title: "Child".into(),
+                parent_task_id: Some(parent.id.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let transitions = board
+            .complete_and_roll_up_with(&child.id, None, |completed| {
+                if completed.id == child.id {
+                    board.update_status(&child.id, "pending", None)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(board.get(&child.id).unwrap().status, TaskStatus::Pending);
+        assert_eq!(board.get(&parent.id).unwrap().status, TaskStatus::Pending);
+        assert!(!board.subtasks_complete(&parent.id).unwrap());
     }
 
     #[test]

@@ -1011,32 +1011,33 @@ fn finalize_if_satisfied(
     let Some((agent_id, parent_task_id)) = completion else {
         return Ok(());
     };
-    let mut completed_task_ids = vec![item.task_id.clone()];
-    if let Some(parent_task_id) = parent_task_id {
-        completed_task_ids.extend(
-            TaskBoard::new(db.clone())
-                .complete_and_roll_up(&parent_task_id, None)?
-                .into_iter()
-                .map(|task| task.id),
-        );
-    }
+    let board = TaskBoard::new(db.clone());
     let conversation = crate::tasks::conversation::TaskConversation::new(db.clone());
     let workflows = WorkflowEngine::new(db.clone());
-    for task_id in completed_task_ids {
+    let advance_completed_workflow = |task_id: &str| {
         let output = conversation
-            .get_messages(&task_id)
+            .get_messages(task_id)
             .unwrap_or_default()
             .into_iter()
             .rev()
             .find(|message| message.role == "assistant")
             .map(|message| message.content)
             .unwrap_or_else(|| message.clone());
-        if let Err(error) = workflows.on_task_completed(&task_id, "completed", &output) {
+        if let Err(error) = workflows.on_task_completed(task_id, "completed", &output) {
             warn!(
                 task_id,
                 error = %error,
                 "failed to advance workflow after GitHub review completion"
             );
+        }
+    };
+    advance_completed_workflow(&item.task_id);
+    if board.get(&item.task_id)?.status == crate::tasks::board::TaskStatus::Completed {
+        if let Some(parent_task_id) = parent_task_id {
+            board.complete_and_roll_up_with(&parent_task_id, None, |completed| {
+                advance_completed_workflow(&completed.id);
+                Ok(())
+            })?;
         }
     }
     if let Some(agent_id) = agent_id.filter(|agent_id| !agent_id.trim().is_empty()) {
@@ -1532,7 +1533,7 @@ mod tests {
     }
 
     #[test]
-    fn approval_advances_default_workflows_for_task_and_rolled_up_parent() {
+    fn approval_advances_child_default_before_rolling_up_parent() {
         let (db, parent_task_id) = setup_task(None);
         let child = TaskBoard::new(db.clone())
             .create(&CreateTask {
@@ -1582,53 +1583,68 @@ flows:
             .unwrap();
         finalize_if_satisfied(&db, &registered, ReviewOutcome::Approved).unwrap();
 
-        for task_id in [&child.id, &parent_task_id] {
-            assert_eq!(
-                TaskBoard::new(db.clone()).get(task_id).unwrap().status,
-                TaskStatus::Pending
-            );
-            let messages = TaskConversation::new(db.clone())
-                .get_messages(task_id)
-                .unwrap();
-            assert_eq!(
-                messages
-                    .iter()
-                    .filter(|message| message.role == "user"
-                        && message.content == "Verify the completed task one more time.")
-                    .count(),
-                1
-            );
-        }
+        assert_eq!(
+            TaskBoard::new(db.clone()).get(&child.id).unwrap().status,
+            TaskStatus::Pending
+        );
+        assert_eq!(
+            TaskBoard::new(db.clone())
+                .get(&parent_task_id)
+                .unwrap()
+                .status,
+            TaskStatus::Pending
+        );
+        assert!(!TaskBoard::new(db.clone())
+            .subtasks_complete(&parent_task_id)
+            .unwrap());
+        let child_messages = TaskConversation::new(db.clone())
+            .get_messages(&child.id)
+            .unwrap();
+        assert_eq!(
+            child_messages
+                .iter()
+                .filter(|message| message.role == "user"
+                    && message.content == "Verify the completed task one more time.")
+                .count(),
+            1
+        );
+        assert!(TaskConversation::new(db.clone())
+            .get_messages(&parent_task_id)
+            .unwrap()
+            .is_empty());
         assert_eq!(
             TaskQueue::new(db.clone())
                 .pending_count("project-codex")
                 .unwrap(),
-            2
+            1
         );
 
-        for instance_id in [child_instance, parent_instance] {
-            let statuses = db
-                .with_conn(|conn| {
-                    let mut statement = conn.prepare(
-                        "SELECT step_id, status FROM workflow_step_executions
-                         WHERE instance_id = ?1 ORDER BY rowid",
-                    )?;
-                    let values = statement
-                        .query_map([&instance_id], |row| {
-                            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                        })?
-                        .collect::<std::result::Result<Vec<_>, _>>()?;
-                    Ok::<_, Error>(values)
-                })
-                .unwrap();
-            assert_eq!(
-                statuses,
-                vec![
-                    ("__source_task__".to_string(), "completed".to_string()),
-                    ("verify_result".to_string(), "running".to_string()),
-                ]
-            );
-        }
+        let execution_statuses = |instance_id: &str| {
+            db.with_conn(|conn| {
+                let mut statement = conn.prepare(
+                    "SELECT step_id, status FROM workflow_step_executions
+                     WHERE instance_id = ?1 ORDER BY rowid",
+                )?;
+                let values = statement
+                    .query_map([instance_id], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                Ok::<_, Error>(values)
+            })
+            .unwrap()
+        };
+        assert_eq!(
+            execution_statuses(&child_instance),
+            vec![
+                ("__source_task__".to_string(), "completed".to_string()),
+                ("verify_result".to_string(), "running".to_string()),
+            ]
+        );
+        assert_eq!(
+            execution_statuses(&parent_instance),
+            vec![("__source_task__".to_string(), "running".to_string())]
+        );
     }
 
     #[test]

@@ -603,34 +603,33 @@ async fn update_task_status(
         None
     };
     let updated = if req.status == "completed" {
+        let conversation = TaskConversation::new(state.db.clone());
+        let workflows = WorkflowEngine::new(state.db.clone());
         board
-            .complete_and_roll_up(&id, req.agent_id.as_deref())
+            .complete_and_roll_up_with(&id, req.agent_id.as_deref(), |completed| {
+                let output = conversation
+                    .get_messages(&completed.id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .rev()
+                    .find(|message| message.role == "assistant")
+                    .map(|message| message.content)
+                    .unwrap_or_default();
+                if let Err(error) = workflows.on_task_completed(&completed.id, "completed", &output)
+                {
+                    tracing::warn!(
+                        task_id = completed.id,
+                        error = %error,
+                        "failed to advance workflow after manual task completion"
+                    );
+                }
+                Ok(())
+            })
             .and_then(|completed_tasks| {
                 if completed_tasks.is_empty() {
                     return Err(xpressclaw_core::error::Error::Task(
                         "task is not ready".into(),
                     ));
-                }
-                let conversation = TaskConversation::new(state.db.clone());
-                let workflows = WorkflowEngine::new(state.db.clone());
-                for completed in completed_tasks {
-                    let output = conversation
-                        .get_messages(&completed.id)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .rev()
-                        .find(|message| message.role == "assistant")
-                        .map(|message| message.content)
-                        .unwrap_or_default();
-                    if let Err(error) =
-                        workflows.on_task_completed(&completed.id, "completed", &output)
-                    {
-                        tracing::warn!(
-                            task_id = completed.id,
-                            error = %error,
-                            "failed to advance workflow after manual task completion"
-                        );
-                    }
                 }
                 // A continue step may have reopened the requested task while
                 // dispatching its fixed prompt, so return its current state.
@@ -1602,14 +1601,31 @@ flows:
         WorkflowManager::new(db.clone())
             .set_default_for_tasks(&workflow.id, true)
             .unwrap();
-        let task = TaskBoard::new(db.clone())
+        let board = TaskBoard::new(db.clone());
+        let parent = board
+            .create(&CreateTask {
+                title: "Unassigned parent".into(),
+                agent_id: Some("developer".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let task = board
             .create(&CreateTask {
                 title: "Parked source task".into(),
                 agent_id: Some("developer".into()),
+                parent_task_id: Some(parent.id.clone()),
                 context: Some(json!({ "origin": "session_message" })),
                 ..Default::default()
             })
             .unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE tasks SET agent_id = NULL WHERE id = ?1",
+                [&parent.id],
+            )?;
+            Ok::<_, xpressclaw_core::error::Error>(())
+        })
+        .unwrap();
         let engine = WorkflowEngine::new(db.clone());
         let instance_id = engine.attach_default_workflows_to_task(&task.id).unwrap()[0].clone();
 
@@ -1652,6 +1668,8 @@ flows:
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_json(response.into_body()).await;
         assert_eq!(body["status"], "pending");
+        assert_eq!(board.get(&parent.id).unwrap().status, TaskStatus::Pending);
+        assert!(!board.subtasks_complete(&parent.id).unwrap());
         assert_eq!(
             sessions.get_attempt(&attempt_id).unwrap().status,
             "interrupted"
