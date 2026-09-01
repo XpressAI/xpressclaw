@@ -927,6 +927,52 @@ impl InstanceManager {
         })
     }
 
+    /// Find a running continuation that reuses an instance's source task
+    /// inside a caller-owned transaction. The synthetic source gate also
+    /// points at that task, so exclude it from the result. Ordinary workflow
+    /// steps always own a newly created task.
+    pub(super) fn find_running_source_continuation_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        instance_id: &str,
+    ) -> Result<Option<StepExecution>> {
+        transaction
+            .query_row(
+                "SELECT execution.*
+                 FROM workflow_step_executions execution
+                 JOIN workflow_instances instance ON instance.id = execution.instance_id
+                 WHERE execution.instance_id = ?1
+                   AND instance.status IN ('running', 'waiting')
+                   AND execution.status = 'running'
+                   AND execution.task_id = instance.source_task_id
+                   AND execution.step_id != ?2
+                 ORDER BY execution.started_at DESC, execution.rowid DESC
+                 LIMIT 1",
+                rusqlite::params![instance_id, SOURCE_TASK_STEP_ID],
+                |row| Ok(row_to_step_execution(row)),
+            )
+            .optional()
+            .map_err(Error::from)
+    }
+
+    pub(super) fn cancel_instance_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        instance_id: &str,
+    ) -> Result<()> {
+        let changed = transaction.execute(
+            "UPDATE workflow_instances
+             SET status = 'cancelled', error_message = NULL,
+                 completed_at = CURRENT_TIMESTAMP
+             WHERE id = ?1",
+            [instance_id],
+        )?;
+        if changed == 0 {
+            return Err(Error::WorkflowInstanceNotFound {
+                id: instance_id.to_string(),
+            });
+        }
+        Ok(())
+    }
+
     /// Update the status and output of a step execution.
     pub fn update_step_status(&self, id: &str, status: &str, output: Option<&str>) -> Result<()> {
         let now = Utc::now()
@@ -1070,9 +1116,9 @@ impl InstanceManager {
 }
 
 fn ensure_instance_accepts_work(conn: &rusqlite::Connection, instance_id: &str) -> Result<()> {
-    let (project_id, conversation_project_id) = conn
+    let (project_id, conversation_project_id, status) = conn
         .query_row(
-            "SELECT instance.project_id, conversation.project_id
+            "SELECT instance.project_id, conversation.project_id, instance.status
              FROM workflow_instances instance
              LEFT JOIN conversations conversation
                ON conversation.id = instance.conversation_id
@@ -1082,6 +1128,7 @@ fn ensure_instance_accepts_work(conn: &rusqlite::Connection, instance_id: &str) 
                 Ok((
                     row.get::<_, Option<String>>(0)?,
                     row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
                 ))
             },
         )
@@ -1107,6 +1154,11 @@ fn ensure_instance_accepts_work(conn: &rusqlite::Connection, instance_id: &str) 
             ensure_project_accepts_work(conn, &derived_project_id)
                 .map_err(|error| Error::Workflow(error.to_string()))?;
         }
+    }
+    if !matches!(status.as_str(), "running" | "waiting") {
+        return Err(Error::Workflow(format!(
+            "workflow instance '{instance_id}' no longer accepts work ({status})"
+        )));
     }
     Ok(())
 }

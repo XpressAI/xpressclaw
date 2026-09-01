@@ -10,6 +10,7 @@ use crate::agents::registry::AgentRegistry;
 use crate::conversations::{ConversationManager, ConversationMessage, SendMessage};
 use crate::db::Database;
 use crate::error::{Error, Result};
+use crate::sessions::{SessionManager, WorkAttempt};
 use crate::tasks::board::{CreateTask, Task, TaskBoard};
 use crate::tasks::conversation::TaskConversation;
 use crate::tasks::queue::TaskQueue;
@@ -67,6 +68,13 @@ pub struct WorkflowContext {
     pub conversation_id: Option<String>,
 }
 
+/// Work owned by a cancelled workflow continuation that still needs
+/// asynchronous container cleanup at the server boundary.
+pub struct WorkflowCancellation {
+    pub continuation_task_id: Option<String>,
+    pub cancelled_attempts: Vec<WorkAttempt>,
+}
+
 impl WorkflowEngine {
     pub fn new(db: Arc<Database>) -> Self {
         let manager = WorkflowManager::new(db.clone());
@@ -98,6 +106,50 @@ impl WorkflowEngine {
             None,
             None,
         )
+    }
+
+    /// Cancel a workflow run and atomically retire any continuation that is
+    /// reusing its source task. Both continuation creation and this method
+    /// reserve the SQLite writer before checking ownership, so cancellation
+    /// cannot miss a prompt queued concurrently with the request.
+    pub fn cancel_instance(
+        &self,
+        instance_id: &str,
+        summary: &str,
+    ) -> Result<WorkflowCancellation> {
+        let sessions = SessionManager::new(self.db.clone());
+        let (continuation_task_id, attempts) = self.db.with_conn(|conn| {
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let continuation = InstanceManager::find_running_source_continuation_in_transaction(
+                &transaction,
+                instance_id,
+            )?;
+            let continuation_task_id = continuation.and_then(|execution| execution.task_id);
+            let attempts = continuation_task_id
+                .as_deref()
+                .map(|task_id| {
+                    sessions.cancel_task_attempts_in_transaction(&transaction, task_id, summary)
+                })
+                .transpose()?
+                .flatten();
+            InstanceManager::cancel_instance_in_transaction(&transaction, instance_id)?;
+            transaction.commit()?;
+            Ok::<_, Error>((continuation_task_id, attempts))
+        })?;
+
+        let cancelled_attempts = match (continuation_task_id.as_deref(), attempts) {
+            (Some(task_id), Some(attempts)) => {
+                sessions.record_task_attempt_cancellations(task_id, summary, attempts)?
+            }
+            _ => Vec::new(),
+        };
+        Ok(WorkflowCancellation {
+            continuation_task_id,
+            cancelled_attempts,
+        })
     }
 
     pub fn start_instance_in_context_for_conversation_agent(

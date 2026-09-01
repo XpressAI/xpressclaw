@@ -5,6 +5,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use xpressclaw_core::sessions::{SessionManager, WorkAttempt};
 use xpressclaw_core::workflows::definition::WorkflowDefinition;
 use xpressclaw_core::workflows::engine::{WorkflowContext, WorkflowEngine};
 use xpressclaw_core::workflows::instance::InstanceManager;
@@ -278,13 +279,88 @@ async fn cancel_instance(
     Path(instance_id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let im = InstanceManager::new(state.db.clone());
-    im.update_status(&instance_id, "cancelled", None)
-        .map_err(|e| match &e {
-            xpressclaw_core::error::Error::WorkflowInstanceNotFound { .. } => not_found(&e),
-            _ => internal_error(e),
+    let cancellation = WorkflowEngine::new(state.db.clone())
+        .cancel_instance(&instance_id, "Workflow cancelled by user")
+        .map_err(|error| match &error {
+            xpressclaw_core::error::Error::WorkflowInstanceNotFound { .. } => not_found(&error),
+            _ => internal_error(error),
         })?;
+    if let Some(task_id) = cancellation.continuation_task_id.as_deref() {
+        cleanup_cancelled_continuation(&state, task_id, &cancellation.cancelled_attempts).await?;
+    }
     let instance = im.get_instance(&instance_id).map_err(internal_error)?;
     Ok(Json(json!(instance)))
+}
+
+async fn cleanup_cancelled_continuation(
+    state: &AppState,
+    task_id: &str,
+    cancelled: &[WorkAttempt],
+) -> Result<(), (StatusCode, Json<Value>)> {
+    let sessions = SessionManager::new(state.db.clone());
+    state.elicitations.cancel_task(task_id);
+    let mut sessions_to_stop = std::collections::BTreeMap::<String, bool>::new();
+    for attempt in cancelled {
+        state.elicitations.cancel_attempt(&attempt.id);
+        sessions_to_stop
+            .entry(attempt.session_id.clone())
+            .and_modify(|has_container| *has_container |= attempt.container_id.is_some())
+            .or_insert(attempt.container_id.is_some());
+    }
+
+    let docker = if sessions_to_stop
+        .values()
+        .any(|has_container| *has_container)
+    {
+        state.docker().await
+    } else {
+        None
+    };
+    let mut stopped_sessions = std::collections::BTreeSet::new();
+    for (session_id, has_container) in sessions_to_stop {
+        let stopped = if !has_container {
+            true
+        } else if let Some(docker) = docker.as_ref() {
+            docker.stop_preserving(&session_id).await.is_ok()
+        } else {
+            false
+        };
+        if stopped {
+            stopped_sessions.insert(session_id);
+        }
+    }
+    for attempt in cancelled {
+        if stopped_sessions.contains(&attempt.session_id) {
+            let _ = sessions.clear_container(&attempt.id);
+        }
+    }
+    state
+        .db
+        .with_conn(|conn| {
+            for queue_id in cancelled.iter().filter_map(|attempt| attempt.queue_id) {
+                conn.execute(
+                    "UPDATE task_queue SET status = 'failed', completed_at = CURRENT_TIMESTAMP,
+                        harness_response = 'cancelled by user'
+                     WHERE id = ?1 AND status = 'running'",
+                    [queue_id],
+                )?;
+            }
+            Ok::<_, xpressclaw_core::error::Error>(())
+        })
+        .map_err(internal_error)?;
+
+    if let Err(error) = WorkflowEngine::new(state.db.clone()).on_task_completed(
+        task_id,
+        "cancelled",
+        "Workflow cancelled by user",
+    ) {
+        tracing::warn!(
+            task_id,
+            error = %error,
+            "failed to release workflows attached to cancelled continuation"
+        );
+    }
+    Ok(())
 }
 
 fn internal_error(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
@@ -340,6 +416,8 @@ mod tests {
     use xpressclaw_core::agents::registry::AgentRegistry;
     use xpressclaw_core::config::Config;
     use xpressclaw_core::db::Database;
+    use xpressclaw_core::tasks::board::{CreateTask, TaskBoard};
+    use xpressclaw_core::tasks::queue::TaskQueue;
 
     use super::*;
 
@@ -364,7 +442,7 @@ flows:
         prompt: "Build @goal"
 "#;
 
-    fn test_app() -> Router {
+    fn test_app_with_db() -> (Router, Arc<Database>) {
         let db = Arc::new(Database::open_memory().unwrap());
         AgentRegistry::new(db.clone())
             .ensure("atlas", "codex")
@@ -372,12 +450,19 @@ flows:
         let config = Arc::new(Config::load_default().unwrap());
         let state = AppState::new(
             config,
-            db,
+            db.clone(),
             None,
             std::path::PathBuf::from("test.yaml"),
             true,
         );
-        Router::new().nest("/workflows", routes()).with_state(state)
+        (
+            Router::new().nest("/workflows", routes()).with_state(state),
+            db,
+        )
+    }
+
+    fn test_app() -> Router {
+        test_app_with_db().0
     }
 
     async fn body_json(body: Body) -> Value {
@@ -533,5 +618,118 @@ flows:
         let inputs: Value =
             serde_json::from_str(instance["trigger_data"].as_str().unwrap()).unwrap();
         assert_eq!(inputs, json!({"goal": "Prepare 0.3", "retries": 2}));
+    }
+
+    #[tokio::test]
+    async fn cancelling_run_retires_queued_source_task_continuation() {
+        let (app, db) = test_app_with_db();
+        let workflow = WorkflowManager::new(db.clone())
+            .create(&CreateWorkflow {
+                name: "final-ui-check".into(),
+                description: None,
+                yaml_content: r#"
+name: final-ui-check
+flows:
+  main:
+    steps:
+      - id: review_ui
+        type: continue
+        prompt: Ensure the UI contains no unnecessary messages.
+"#
+                .into(),
+            })
+            .unwrap();
+        WorkflowManager::new(db.clone())
+            .set_default_for_tasks(&workflow.id, true)
+            .unwrap();
+
+        let task = TaskBoard::new(db.clone())
+            .create(&CreateTask {
+                title: "Fix the interface".into(),
+                description: None,
+                agent_id: Some("atlas".into()),
+                parent_task_id: None,
+                sop_id: None,
+                conversation_id: None,
+                priority: None,
+                context: None,
+            })
+            .unwrap();
+        TaskQueue::new(db.clone())
+            .enqueue(&task.id, "atlas")
+            .unwrap();
+        let engine = WorkflowEngine::new(db.clone());
+        let instance_id = engine.attach_default_workflows_to_task(&task.id).unwrap()[0].clone();
+
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE task_queue SET status = 'completed', completed_at = CURRENT_TIMESTAMP
+                 WHERE task_id = ?1",
+                [&task.id],
+            )?;
+            conn.execute(
+                "UPDATE work_attempts SET status = 'completed', completed_at = CURRENT_TIMESTAMP
+                 WHERE task_id = ?1",
+                [&task.id],
+            )?;
+            Ok::<_, xpressclaw_core::error::Error>(())
+        })
+        .unwrap();
+        TaskBoard::new(db.clone())
+            .update_status(&task.id, "completed", Some("atlas"))
+            .unwrap();
+        engine
+            .on_task_completed(&task.id, "completed", "Initial response")
+            .unwrap();
+
+        let active_before: (String, String) = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT queue.status, attempt.status
+                     FROM task_queue queue
+                     JOIN work_attempts attempt ON attempt.queue_id = queue.id
+                     WHERE queue.task_id = ?1
+                     ORDER BY queue.id DESC LIMIT 1",
+                    [&task.id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(xpressclaw_core::error::Error::from)
+            })
+            .unwrap();
+        assert_eq!(active_before, ("queued".into(), "queued".into()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/workflows/instances/{instance_id}/cancel"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response.into_body()).await["status"], "cancelled");
+
+        let terminal: (String, String, String) = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT task.status, queue.status, attempt.status
+                     FROM tasks task
+                     JOIN task_queue queue ON queue.task_id = task.id
+                     JOIN work_attempts attempt ON attempt.queue_id = queue.id
+                     WHERE task.id = ?1
+                     ORDER BY queue.id DESC LIMIT 1",
+                    [&task.id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .map_err(xpressclaw_core::error::Error::from)
+            })
+            .unwrap();
+        assert_eq!(
+            terminal,
+            ("cancelled".into(), "failed".into(), "cancelled".into())
+        );
+        assert!(TaskQueue::new(db).claim_next().unwrap().is_none());
     }
 }

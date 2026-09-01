@@ -586,18 +586,37 @@ impl SessionManager {
     ) -> Result<Option<Vec<WorkAttempt>>> {
         let attempts = self.db.with_conn(|conn| {
             let transaction = conn.unchecked_transaction()?;
-            let task_status: String = transaction.query_row(
-                "SELECT status FROM tasks WHERE id = ?1",
-                [task_id],
-                |row| row.get(0),
-            )?;
-            if task_status == "completed" {
-                transaction.commit()?;
-                return Ok::<_, Error>(None);
-            }
+            let attempts =
+                self.cancel_task_attempts_in_transaction(&transaction, task_id, summary)?;
+            transaction.commit()?;
+            Ok::<_, Error>(attempts)
+        })?;
 
-            let mut statement = transaction.prepare(
-                "SELECT id, session_id, task_id, queue_id, kind, runner, status, prompt,
+        attempts
+            .map(|attempts| self.record_task_attempt_cancellations(task_id, summary, attempts))
+            .transpose()
+    }
+
+    /// Apply the durable half of task cancellation inside a caller-owned
+    /// transaction. Workflow cancellation uses this to retire a same-task
+    /// continuation before its owning run becomes terminal in the same
+    /// commit.
+    pub(crate) fn cancel_task_attempts_in_transaction(
+        &self,
+        transaction: &rusqlite::Transaction<'_>,
+        task_id: &str,
+        summary: &str,
+    ) -> Result<Option<Vec<WorkAttempt>>> {
+        let task_status: String =
+            transaction.query_row("SELECT status FROM tasks WHERE id = ?1", [task_id], |row| {
+                row.get(0)
+            })?;
+        if task_status == "completed" {
+            return Ok(None);
+        }
+
+        let mut statement = transaction.prepare(
+            "SELECT id, session_id, task_id, queue_id, kind, runner, status, prompt,
                         native_session_id, container_id, result, error_message,
                         created_at, started_at, completed_at, context_used, context_size,
                         trigger_message_id, response_queued_at, response_started_at
@@ -605,62 +624,64 @@ impl SessionManager {
                  WHERE task_id = ?1
                    AND status NOT IN ('completed', 'failed', 'cancelled', 'interrupted')
                  ORDER BY created_at ASC",
-            )?;
-            let attempts = statement
-                .query_map([task_id], row_to_attempt)?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            drop(statement);
+        )?;
+        let attempts = statement
+            .query_map([task_id], row_to_attempt)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(statement);
 
-            transaction.execute(
-                "UPDATE work_attempts SET status = 'cancelled',
+        transaction.execute(
+            "UPDATE work_attempts SET status = 'cancelled',
                     completed_at = CURRENT_TIMESTAMP, error_message = NULL
                  WHERE task_id = ?1
                    AND status NOT IN ('completed', 'failed', 'cancelled', 'interrupted')",
-                [task_id],
-            )?;
-            // Queued dispatches are safe to release immediately because their
-            // attempts are now terminal. Running rows remain the retained
-            // container lease until the caller finishes asynchronous cleanup.
-            transaction.execute(
-                "UPDATE task_queue SET status = 'failed', completed_at = CURRENT_TIMESTAMP,
+            [task_id],
+        )?;
+        // Queued dispatches are safe to release immediately because their
+        // attempts are now terminal. Running rows remain the retained
+        // container lease until the caller finishes asynchronous cleanup.
+        transaction.execute(
+            "UPDATE task_queue SET status = 'failed', completed_at = CURRENT_TIMESTAMP,
                     harness_response = 'cancelled by user'
                  WHERE task_id = ?1 AND status = 'queued'",
-                [task_id],
-            )?;
-            transaction.execute(
-                "UPDATE tasks SET status = 'cancelled', completed_at = NULL,
+            [task_id],
+        )?;
+        transaction.execute(
+            "UPDATE tasks SET status = 'cancelled', completed_at = NULL,
                     active_attempt_id = NULL,
                     updated_at = CURRENT_TIMESTAMP
                  WHERE id = ?1 AND status != 'completed'",
-                [task_id],
-            )?;
-            transaction.execute(
-                "UPDATE task_pull_requests SET status = 'cancelled', next_poll_at = NULL,
+            [task_id],
+        )?;
+        transaction.execute(
+            "UPDATE task_pull_requests SET status = 'cancelled', next_poll_at = NULL,
                     last_checked_at = CURRENT_TIMESTAMP, last_error = NULL
                 WHERE task_id = ?1 AND status IN ('waiting', 'attention')",
-                [task_id],
-            )?;
-            let mut session_ids = attempts
-                .iter()
-                .map(|attempt| attempt.session_id.as_str())
-                .collect::<Vec<_>>();
-            session_ids.sort_unstable();
-            session_ids.dedup();
-            for session_id in session_ids {
-                let session_status = self.derive_status_with_conn(&transaction, session_id)?;
-                transaction.execute(
-                    "UPDATE logical_sessions SET status = ?1, latest_summary = ?2,
+            [task_id],
+        )?;
+        let mut session_ids = attempts
+            .iter()
+            .map(|attempt| attempt.session_id.as_str())
+            .collect::<Vec<_>>();
+        session_ids.sort_unstable();
+        session_ids.dedup();
+        for session_id in session_ids {
+            let session_status = self.derive_status_with_conn(transaction, session_id)?;
+            transaction.execute(
+                "UPDATE logical_sessions SET status = ?1, latest_summary = ?2,
                         updated_at = CURRENT_TIMESTAMP WHERE id = ?3",
-                    rusqlite::params![session_status, summary, session_id],
-                )?;
-            }
-            transaction.commit()?;
-            Ok(Some(attempts))
-        })?;
+                rusqlite::params![session_status, summary, session_id],
+            )?;
+        }
+        Ok(Some(attempts))
+    }
 
-        let Some(attempts) = attempts else {
-            return Ok(None);
-        };
+    pub(crate) fn record_task_attempt_cancellations(
+        &self,
+        task_id: &str,
+        summary: &str,
+        attempts: Vec<WorkAttempt>,
+    ) -> Result<Vec<WorkAttempt>> {
         let mut cancelled = Vec::with_capacity(attempts.len());
         for attempt in attempts {
             self.append_event(
@@ -677,7 +698,7 @@ impl SessionManager {
             )?;
             cancelled.push(self.get_attempt(&attempt.id)?);
         }
-        Ok(Some(cancelled))
+        Ok(cancelled)
     }
 
     pub fn set_container(&self, attempt_id: &str, container_id: &str) -> Result<()> {
