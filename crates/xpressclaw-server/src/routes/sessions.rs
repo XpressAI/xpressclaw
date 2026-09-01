@@ -136,7 +136,7 @@ async fn prepare_runner(
     }
     if agent.runner.ssh_agent_forwarding && host_ssh_agent_socket().is_none() {
         return Err(bad_request(
-            "host SSH-agent forwarding is enabled, but no live Unix SSH_AUTH_SOCK was detected",
+            "SSH key access is unavailable; disable it in Harness settings, use XpressClaw's scoped GitHub credential, or use an HTTPS remote",
         ));
     }
     if available_runner_image(&docker, &image, &kind)
@@ -217,7 +217,7 @@ async fn readiness(
     }
     if !ssh_agent_ready {
         issues.push(
-            "Host SSH-agent forwarding is enabled, but no live Unix SSH_AUTH_SOCK was detected; start an SSH agent and restart XpressClaw from that desktop session"
+            "SSH key access is unavailable; disable it in Harness settings, use XpressClaw's scoped GitHub credential, or use an HTTPS remote"
                 .to_string(),
         );
     }

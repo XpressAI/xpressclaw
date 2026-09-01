@@ -2932,7 +2932,7 @@ fn build_spec(
     if agent.runner.ssh_agent_forwarding {
         let access = discover_host_ssh_agent().ok_or_else(|| {
             Error::Backend(
-                "host SSH-agent forwarding is enabled, but XpressClaw could not find a live Unix SSH_AUTH_SOCK; start an SSH agent and restart XpressClaw from that desktop session"
+                "SSH key access is unavailable; disable it in Harness settings, use XpressClaw's scoped GitHub credential, or use an HTTPS remote"
                     .to_string(),
             )
         })?;

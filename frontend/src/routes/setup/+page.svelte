@@ -356,7 +356,9 @@
 				</p>
 				{#if gitUsesSsh}
 					<p class="mt-2 rounded-md border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-amber-600">
-						This repository has an SSH remote. Enable host SSH-agent access below if it is not covered by XpressClaw's scoped GitHub credential.
+						{sshAgentAvailable
+							? "This repository has an SSH remote. Enable host SSH-agent access below if it is not covered by XpressClaw's scoped GitHub credential."
+							: "This repository has an SSH remote. GitHub repositories can use XpressClaw's scoped GitHub credential; use an HTTPS remote for other hosts."}
 					</p>
 				{/if}
 			{:else}
@@ -427,6 +429,7 @@
 			{/if}
 		</section>
 
+		{#if sshAgentAvailable || sshAgentForwarding}
 		<section class="rounded-xl border border-border bg-muted/20 p-4">
 			<label class="flex cursor-pointer items-start gap-3">
 				<input type="checkbox" bind:checked={sshAgentForwarding} class="mt-0.5 rounded border-border" />
@@ -435,19 +438,14 @@
 					<span class="mt-0.5 block text-xs leading-relaxed text-muted-foreground">Let Git use keys already unlocked on this computer. XpressClaw forwards only the agent socket plus SSH config and known-host entries; it never mounts private-key files.</span>
 				</span>
 			</label>
-			{#if sshAgentAvailable}
-				<p class="mt-2 text-[11px] text-muted-foreground">Detected <code>{sshAgentSocket}</code>.</p>
-			{:else}
-				<p class="mt-3 rounded-md border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-amber-600">
-					No live host SSH agent was detected. Start <code>ssh-agent</code>, load a key with <code>ssh-add</code>, then restart XpressClaw from that desktop session.
-				</p>
-			{/if}
+			<p class="mt-2 text-[11px] text-muted-foreground">Detected <code>{sshAgentSocket}</code>.</p>
 			{#if sshAgentForwarding}
 				<p class="mt-3 rounded-md border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-amber-600">
 					The harness can authenticate or sign with any key loaded in your SSH agent. Enable this only for harnesses and tasks you trust.
 				</p>
 			{/if}
 		</section>
+		{/if}
 
 		<section class="rounded-xl border border-border bg-muted/20 p-4">
 			{#if runnerKind === 'custom'}
