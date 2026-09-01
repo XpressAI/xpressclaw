@@ -2017,6 +2017,43 @@ impl WorkflowEngine {
                     continue;
                 }
             };
+
+            // Source gates and continue steps can commit their completed
+            // execution immediately before advancing. If the process exits
+            // in that window, replay the latest completion callback. It is
+            // safe to do so because there is no newer execution, and
+            // continuation creation is atomic and idempotent.
+            if let Some(execution) = execs.last().filter(|execution| {
+                execution.status == "completed"
+                    && (execution.step_id == SOURCE_TASK_STEP_ID
+                        || definition
+                            .find_step(&execution.flow_name, &execution.step_id)
+                            .is_some_and(|step| step.step_type == "continue"))
+            }) {
+                if let Some(task_id) = execution.task_id.as_deref() {
+                    if let Ok(task) = board.get(task_id) {
+                        let status = task.status.as_str();
+                        if matches!(status, "completed" | "cancelled") {
+                            let output = execution
+                                .output
+                                .clone()
+                                .unwrap_or_else(|| self.completed_task_output(task_id));
+                            if let Err(error) = self
+                                .on_execution_task_completed(execution, task_id, status, &output)
+                            {
+                                error!(
+                                    instance_id = instance.id.as_str(),
+                                    execution_id = execution.id.as_str(),
+                                    error = %error,
+                                    "failed to advance completed default workflow execution during recovery"
+                                );
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
+
             let current_step =
                 usize::try_from(instance.current_step_index)
                     .ok()
@@ -2501,6 +2538,216 @@ flows:
         assert_eq!(
             engine.instances.get_instance(instance_id).unwrap().status,
             "completed"
+        );
+        assert_eq!(
+            TaskConversation::new(db)
+                .get_messages(&task.id)
+                .unwrap()
+                .iter()
+                .filter(|message| message.role == "user")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn recovery_advances_a_completed_default_source_gate() {
+        let (db, engine) = setup();
+        let workflow_id = create_workflow(
+            &db,
+            r#"
+name: recover-source-gate
+flows:
+  main:
+    steps:
+      - id: review_ui
+        type: continue
+        prompt: Check the UI for unnecessary messages.
+"#,
+        );
+        WorkflowManager::new(db.clone())
+            .set_default_for_tasks(&workflow_id, true)
+            .unwrap();
+        let task = TaskBoard::new(db.clone())
+            .create(&CreateTask {
+                title: "Recover source completion".into(),
+                agent_id: Some("atlas".into()),
+                context: Some(json!({ "origin": "session_message" })),
+                ..Default::default()
+            })
+            .unwrap();
+        TaskQueue::new(db.clone())
+            .enqueue(&task.id, "atlas")
+            .unwrap();
+        let instance_id = engine.attach_default_workflows_to_task(&task.id).unwrap()[0].clone();
+        let source_execution =
+            engine.instances.list_step_executions(&instance_id).unwrap()[0].clone();
+        assert_eq!(
+            engine
+                .instances
+                .get_instance(&instance_id)
+                .unwrap()
+                .current_step_index,
+            -1
+        );
+
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE task_queue SET status = 'completed', completed_at = CURRENT_TIMESTAMP
+                 WHERE task_id = ?1",
+                [&task.id],
+            )?;
+            conn.execute(
+                "UPDATE work_attempts SET status = 'completed', completed_at = CURRENT_TIMESTAMP
+                 WHERE task_id = ?1",
+                [&task.id],
+            )?;
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+        TaskBoard::new(db.clone())
+            .update_status(&task.id, "completed", Some("atlas"))
+            .unwrap();
+        // Model a crash after the source execution commits but before the
+        // first workflow step is created.
+        engine
+            .instances
+            .update_step_status(&source_execution.id, "completed", Some("initial output"))
+            .unwrap();
+
+        engine.recover().unwrap();
+        engine.recover().unwrap();
+
+        let executions = engine.instances.list_step_executions(&instance_id).unwrap();
+        assert_eq!(executions.len(), 2);
+        assert_eq!(executions[1].step_id, "review_ui");
+        assert_eq!(executions[1].status, "running");
+        let messages = TaskConversation::new(db.clone())
+            .get_messages(&task.id)
+            .unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.role == "user")
+                .count(),
+            1
+        );
+        let variables: Value =
+            serde_json::from_str(&engine.instances.get_variable_store(&instance_id).unwrap())
+                .unwrap();
+        assert_eq!(variables["source_task"]["status"], "completed");
+        assert_eq!(variables["source_task"]["output"], "initial output");
+    }
+
+    #[test]
+    fn recovery_advances_a_completed_continue_step_once() {
+        let (db, engine) = setup();
+        let workflow_id = create_workflow(
+            &db,
+            r#"
+name: recover-continuation
+inputs:
+  worker:
+    type: agent
+    primary: true
+    required: true
+flows:
+  main:
+    steps:
+      - id: review_ui
+        type: continue
+        prompt: Check the UI for unnecessary messages.
+      - id: record_result
+        agent: "@worker"
+        prompt: Record that the UI review completed.
+"#,
+        );
+        WorkflowManager::new(db.clone())
+            .set_default_for_tasks(&workflow_id, true)
+            .unwrap();
+        let task = TaskBoard::new(db.clone())
+            .create(&CreateTask {
+                title: "Recover continuation completion".into(),
+                agent_id: Some("atlas".into()),
+                context: Some(json!({ "origin": "session_message" })),
+                ..Default::default()
+            })
+            .unwrap();
+        TaskQueue::new(db.clone())
+            .enqueue(&task.id, "atlas")
+            .unwrap();
+        let instance_id = engine.attach_default_workflows_to_task(&task.id).unwrap()[0].clone();
+
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE task_queue SET status = 'completed', completed_at = CURRENT_TIMESTAMP
+                 WHERE task_id = ?1",
+                [&task.id],
+            )?;
+            conn.execute(
+                "UPDATE work_attempts SET status = 'completed', completed_at = CURRENT_TIMESTAMP
+                 WHERE task_id = ?1",
+                [&task.id],
+            )?;
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+        TaskBoard::new(db.clone())
+            .update_status(&task.id, "completed", Some("atlas"))
+            .unwrap();
+        engine
+            .on_task_completed(&task.id, "completed", "initial output")
+            .unwrap();
+        let continuation = engine
+            .instances
+            .list_step_executions(&instance_id)
+            .unwrap()
+            .into_iter()
+            .find(|execution| execution.step_id == "review_ui")
+            .unwrap();
+
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE task_queue SET status = 'completed', completed_at = CURRENT_TIMESTAMP
+                 WHERE task_id = ?1 AND status IN ('queued', 'running')",
+                [&task.id],
+            )?;
+            conn.execute(
+                "UPDATE work_attempts SET status = 'completed', completed_at = CURRENT_TIMESTAMP
+                 WHERE task_id = ?1 AND status NOT IN ('completed', 'failed', 'cancelled', 'interrupted')",
+                [&task.id],
+            )?;
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+        TaskBoard::new(db.clone())
+            .update_status(&task.id, "completed", Some("atlas"))
+            .unwrap();
+        // Model a crash after the continuation execution commits but before
+        // the next workflow step is created.
+        engine
+            .instances
+            .update_step_status(&continuation.id, "completed", Some("review complete"))
+            .unwrap();
+
+        engine.recover().unwrap();
+        engine.recover().unwrap();
+
+        let executions = engine.instances.list_step_executions(&instance_id).unwrap();
+        assert_eq!(
+            executions
+                .iter()
+                .filter(|execution| execution.step_id == "record_result")
+                .count(),
+            1
+        );
+        assert_eq!(
+            executions
+                .iter()
+                .find(|execution| execution.step_id == "record_result")
+                .unwrap()
+                .status,
+            "running"
         );
         assert_eq!(
             TaskConversation::new(db)

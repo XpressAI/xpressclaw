@@ -17,6 +17,7 @@ use xpressclaw_core::workers::acp::{
     AcpElicitationResponseError, AcpInterruptMode, CreateElicitationResponse,
 };
 use xpressclaw_core::workers::{github, github_review::GithubReviewManager, native};
+use xpressclaw_core::workflows::engine::WorkflowEngine;
 
 use crate::state::AppState;
 
@@ -513,6 +514,17 @@ async fn update_task_status(
         else {
             return Ok(Json(json!(board.get(&id).map_err(internal_error)?)));
         };
+        if let Err(error) = WorkflowEngine::new(state.db.clone()).on_task_completed(
+            &id,
+            "cancelled",
+            "Work cancelled by user",
+        ) {
+            tracing::warn!(
+                task_id = id,
+                error = %error,
+                "failed to release workflows attached to cancelled task"
+            );
+        }
         state.elicitations.cancel_task(&id);
 
         let mut sessions_to_stop = std::collections::BTreeMap::<String, bool>::new();
@@ -1042,6 +1054,7 @@ mod tests {
     use xpressclaw_core::config::Config;
     use xpressclaw_core::db::Database;
     use xpressclaw_core::message_artifacts::PublishedFileAttachment;
+    use xpressclaw_core::workflows::manager::{CreateWorkflow, WorkflowManager};
 
     use super::*;
 
@@ -1600,6 +1613,80 @@ mod tests {
             TaskBoard::new(db).get(&task_id).unwrap().status,
             TaskStatus::Completed
         );
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_task_releases_its_default_workflow_source_gate() {
+        let (app, db) = test_app_with_db();
+        let workflow = WorkflowManager::new(db.clone())
+            .create(&CreateWorkflow {
+                name: "cancelled-source".into(),
+                description: None,
+                yaml_content: r#"
+name: cancelled-source
+flows:
+  main:
+    steps:
+      - id: review_ui
+        type: continue
+        prompt: Check the UI for unnecessary messages.
+"#
+                .into(),
+            })
+            .unwrap();
+        WorkflowManager::new(db.clone())
+            .set_default_for_tasks(&workflow.id, true)
+            .unwrap();
+        let task = TaskBoard::new(db.clone())
+            .create(&CreateTask {
+                title: "Cancel default workflow source".into(),
+                agent_id: Some("developer".into()),
+                context: Some(json!({ "origin": "session_message" })),
+                ..Default::default()
+            })
+            .unwrap();
+        TaskQueue::new(db.clone())
+            .enqueue(&task.id, "developer")
+            .unwrap();
+        let engine = WorkflowEngine::new(db.clone());
+        let instance_id = engine.attach_default_workflows_to_task(&task.id).unwrap()[0].clone();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/tasks/{}/status", task.id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({ "status": "cancelled" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let (instance_status, step_id, execution_status) = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT instance.status, execution.step_id, execution.status
+                     FROM workflow_instances instance
+                     JOIN workflow_step_executions execution
+                       ON execution.instance_id = instance.id
+                     WHERE instance.id = ?1",
+                    [&instance_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .map_err(xpressclaw_core::error::Error::from)
+            })
+            .unwrap();
+        assert_eq!(instance_status, "failed");
+        assert_eq!(step_id, "__source_task__");
+        assert_eq!(execution_status, "failed");
     }
 
     #[tokio::test]
