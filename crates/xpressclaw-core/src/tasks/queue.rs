@@ -674,6 +674,28 @@ impl TaskQueue {
         })
     }
 
+    /// Whether this task still owns queued or in-flight response work. Queue
+    /// rows are included because a running row may deliberately outlive its
+    /// terminal attempt while retaining the dispatch lease on a container.
+    pub fn has_active_response_for_task(&self, task_id: &str) -> Result<bool> {
+        self.db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM task_queue
+                    WHERE task_id = ?1 AND status IN ('queued', 'running')
+                 ) OR EXISTS(
+                    SELECT 1 FROM work_attempts
+                    WHERE task_id = ?1
+                      AND status IN ('queued', 'preparing', 'running',
+                                     'waiting_for_input', 'review')
+                 )",
+                [task_id],
+                |row| row.get(0),
+            )
+            .map_err(Error::from)
+        })
+    }
+
     /// Get a queue item by ID.
     pub fn get(&self, id: i64) -> Result<QueueItem> {
         self.db.with_conn(|conn| {

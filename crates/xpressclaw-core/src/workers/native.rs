@@ -1531,9 +1531,9 @@ fn attempt_is_terminal(status: &str) -> bool {
     matches!(status, "completed" | "failed" | "cancelled" | "interrupted")
 }
 
-/// Advance a workflow-owned response before deciding whether its shared task
-/// is idle. A successful `continue` step may synchronously enqueue the next
-/// fixed prompt, so the queue snapshot must be taken after that callback.
+/// Advance workflow-owned responses and source gates before deciding whether
+/// the task is idle. Either callback may synchronously enqueue a fixed prompt,
+/// so the active-response snapshot must be taken afterwards.
 fn finalize_successful_task_attempt(
     db: &Arc<Database>,
     task_id: &str,
@@ -1546,14 +1546,17 @@ fn finalize_successful_task_attempt(
     let waiting_for_user = needs_user_input(output);
     if !waiting_for_user {
         advance_workflow_attempt(db, task_id, attempt_id, "completed", output);
+        // Source gates must run before task completion can roll through a
+        // parent. A default continue step may reopen this task synchronously.
+        advance_workflow(db, task_id, "completed", output);
     }
-    let continuation_queued = queue.has_queued_for_task(task_id)?;
-    if !continuation_queued && !waiting_for_user {
+    let response_active = queue.has_active_response_for_task(task_id)?;
+    if !response_active && !waiting_for_user {
         board.defer_reported_subtasks(task_id, "successful_attempt_completed")?;
     }
     let review_gate =
         crate::workers::github_review::GithubReviewManager::new(db.clone()).gate(task_id)?;
-    if continuation_queued {
+    if response_active {
         board.update_status(task_id, "in_progress", Some(agent_id))?;
         Ok(Vec::new())
     } else if waiting_for_user {
@@ -4551,6 +4554,108 @@ flows:
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn default_continuation_reopens_a_child_before_parent_roll_up() {
+        use crate::tasks::board::CreateTask;
+        use crate::workflows::engine::WorkflowEngine;
+        use crate::workflows::instance::InstanceManager;
+        use crate::workflows::manager::{CreateWorkflow, WorkflowManager};
+
+        let db = Arc::new(Database::open_memory().unwrap());
+        add_test_agent(&db, "atlas");
+        SessionManager::new(db.clone())
+            .ensure("atlas", Some("atlas"))
+            .unwrap();
+        let workflows = WorkflowManager::new(db.clone());
+        let workflow = workflows
+            .create(&CreateWorkflow {
+                name: "final-check".into(),
+                description: None,
+                yaml_content: r#"
+name: final-check
+flows:
+  main:
+    steps:
+      - id: check
+        type: continue
+        prompt: Run the final check.
+"#
+                .into(),
+            })
+            .unwrap();
+        workflows.set_default_for_tasks(&workflow.id, true).unwrap();
+
+        let board = TaskBoard::new(db.clone());
+        let parent = board
+            .create(&CreateTask {
+                title: "Unassigned parent".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let child = board
+            .create(&CreateTask {
+                title: "Assigned child".into(),
+                agent_id: Some("atlas".into()),
+                parent_task_id: Some(parent.id.clone()),
+                context: Some(json!({ "origin": "session_message" })),
+                ..Default::default()
+            })
+            .unwrap();
+        let engine = WorkflowEngine::new(db.clone());
+        let instance_id = engine.attach_default_workflows_to_task(&child.id).unwrap()[0].clone();
+        let queue = TaskQueue::new(db.clone());
+        let queued = queue.enqueue(&child.id, "atlas").unwrap();
+        let item = queue.claim("atlas").unwrap().unwrap();
+        assert_eq!(item.id, queued.id);
+        let attempt_id = item.attempt_id.as_deref().unwrap();
+        SessionManager::new(db.clone())
+            .transition_attempt(attempt_id, "running", "Working", None, None)
+            .unwrap();
+        board
+            .update_status(&child.id, "in_progress", Some("atlas"))
+            .unwrap();
+        TaskConversation::new(db.clone())
+            .complete_final_assistant_attempt(FinalAssistantAttempt {
+                task_id: &child.id,
+                queue_id: item.id,
+                attempt_id,
+                completion_summary: "Initial work complete",
+                content: "Initial work complete",
+                visualizations: &[],
+                published_files: &[],
+            })
+            .unwrap()
+            .unwrap();
+
+        let completed = finalize_successful_task_attempt(
+            &db,
+            &child.id,
+            "atlas",
+            attempt_id,
+            "Initial work complete",
+        )
+        .unwrap();
+
+        assert!(completed.is_empty());
+        assert_eq!(
+            board.get(&child.id).unwrap().status,
+            crate::tasks::board::TaskStatus::InProgress
+        );
+        assert_eq!(
+            board.get(&parent.id).unwrap().status,
+            crate::tasks::board::TaskStatus::Pending
+        );
+        assert!(!board.subtasks_complete(&parent.id).unwrap());
+        assert!(queue.has_active_response_for_task(&child.id).unwrap());
+        let executions = InstanceManager::new(db)
+            .list_step_executions(&instance_id)
+            .unwrap();
+        assert_eq!(executions[0].step_id, "__source_task__");
+        assert_eq!(executions[0].status, "completed");
+        assert_eq!(executions[1].step_id, "check");
+        assert_eq!(executions[1].status, "running");
     }
 
     #[test]
