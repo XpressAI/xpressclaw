@@ -175,15 +175,36 @@ impl WorkflowManager {
 
     /// Delete a workflow.
     pub fn delete(&self, id: &str) -> Result<()> {
-        let affected = self.db.with_conn(|conn| {
-            conn.execute("DELETE FROM workflows WHERE id = ?1", [id])
-                .map_err(|e| Error::Database(e.to_string()))
-        })?;
-
-        if affected == 0 {
-            return Err(Error::WorkflowNotFound { id: id.to_string() });
-        }
-        Ok(())
+        self.db.with_conn(|conn| {
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let exists = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM workflows WHERE id = ?1)",
+                [id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !exists {
+                return Err(Error::WorkflowNotFound { id: id.to_string() });
+            }
+            let has_active_instances = transaction.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM workflow_instances
+                     WHERE workflow_id = ?1 AND status IN ('running', 'waiting')
+                 )",
+                [id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if has_active_instances {
+                return Err(Error::Workflow(format!(
+                    "workflow '{id}' has active runs; cancel them before deleting it"
+                )));
+            }
+            transaction.execute("DELETE FROM workflows WHERE id = ?1", [id])?;
+            transaction.commit()?;
+            Ok(())
+        })
     }
 
     /// Set the enabled flag on a workflow.
@@ -438,6 +459,30 @@ flows: {}
     fn test_delete_not_found() {
         let (_, mgr) = setup();
         assert!(mgr.delete("nonexistent").is_err());
+    }
+
+    #[test]
+    fn deleting_a_workflow_requires_active_runs_to_be_cancelled_first() {
+        let (db, mgr) = setup();
+        let record = mgr
+            .create(&CreateWorkflow {
+                name: "test-workflow".into(),
+                description: None,
+                yaml_content: VALID_YAML.into(),
+            })
+            .unwrap();
+        let instances = crate::workflows::instance::InstanceManager::new(db);
+        let instance = instances.create_instance(&record.id, None, None).unwrap();
+
+        let error = mgr.delete(&record.id).unwrap_err();
+        assert!(matches!(error, Error::Workflow(_)));
+        assert!(mgr.get(&record.id).is_ok());
+
+        instances
+            .update_status(&instance.id, "cancelled", None)
+            .unwrap();
+        mgr.delete(&record.id).unwrap();
+        assert!(mgr.get(&record.id).is_err());
     }
 
     #[test]

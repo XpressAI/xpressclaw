@@ -111,8 +111,31 @@ async fn delete_workflow(
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<Value>)> {
     let mgr = WorkflowManager::new(state.db.clone());
+    mgr.get(&id).map_err(|error| match &error {
+        xpressclaw_core::error::Error::WorkflowNotFound { .. } => not_found(&error),
+        _ => internal_error(error),
+    })?;
+
+    let engine = WorkflowEngine::new(state.db.clone());
+    let active_instances = InstanceManager::new(state.db.clone())
+        .list_running_instances()
+        .map_err(internal_error)?
+        .into_iter()
+        .filter(|instance| instance.workflow_id == id)
+        .collect::<Vec<_>>();
+    for instance in active_instances {
+        let cancellation = engine
+            .cancel_instance(&instance.id, "Workflow deleted by user")
+            .map_err(internal_error)?;
+        if let Some(task_id) = cancellation.continuation_task_id.as_deref() {
+            cleanup_cancelled_continuation(&state, task_id, &cancellation.cancelled_attempts)
+                .await?;
+        }
+    }
+
     mgr.delete(&id).map_err(|e| match &e {
         xpressclaw_core::error::Error::WorkflowNotFound { .. } => not_found(&e),
+        xpressclaw_core::error::Error::Workflow(_) => conflict(&e),
         _ => internal_error(e),
     })?;
     Ok(StatusCode::NO_CONTENT)
@@ -417,6 +440,13 @@ fn bad_request(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
     )
 }
 
+fn conflict(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({ "error": e.to_string() })),
+    )
+}
+
 fn reject_new_connector_automation(yaml_content: &str) -> Result<(), (StatusCode, Json<Value>)> {
     let definition = WorkflowDefinition::parse(yaml_content).map_err(|e| bad_request(&e))?;
     if definition.uses_connector_automation() {
@@ -651,6 +681,145 @@ flows:
         let inputs: Value =
             serde_json::from_str(instance["trigger_data"].as_str().unwrap()).unwrap();
         assert_eq!(inputs, json!({"goal": "Prepare 0.3", "retries": 2}));
+    }
+
+    #[tokio::test]
+    async fn deleting_workflow_retires_its_queued_same_task_continuation() {
+        let (app, db) = test_app_with_db();
+        let manager = WorkflowManager::new(db.clone());
+        let workflow = manager
+            .create(&CreateWorkflow {
+                name: "final-ui-check".into(),
+                description: None,
+                yaml_content: r#"
+name: final-ui-check
+flows:
+  main:
+    steps:
+      - id: review_ui
+        type: continue
+        prompt: Ensure the UI contains no unnecessary messages.
+"#
+                .into(),
+            })
+            .unwrap();
+        manager.set_default_for_tasks(&workflow.id, true).unwrap();
+
+        let board = TaskBoard::new(db.clone());
+        let task = board
+            .create(&CreateTask {
+                title: "Fix the interface".into(),
+                agent_id: Some("atlas".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        TaskQueue::new(db.clone())
+            .enqueue(&task.id, "atlas")
+            .unwrap();
+        let engine = WorkflowEngine::new(db.clone());
+        let instance_id = engine.attach_default_workflows_to_task(&task.id).unwrap()[0].clone();
+
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE task_queue SET status = 'completed', completed_at = CURRENT_TIMESTAMP
+                 WHERE task_id = ?1",
+                [&task.id],
+            )?;
+            conn.execute(
+                "UPDATE work_attempts SET status = 'completed', completed_at = CURRENT_TIMESTAMP
+                 WHERE task_id = ?1",
+                [&task.id],
+            )?;
+            Ok::<_, xpressclaw_core::error::Error>(())
+        })
+        .unwrap();
+        board
+            .update_status(&task.id, "completed", Some("atlas"))
+            .unwrap();
+        engine
+            .on_task_completed(&task.id, "completed", "Initial response")
+            .unwrap();
+
+        let continuation = InstanceManager::new(db.clone())
+            .list_step_executions(&instance_id)
+            .unwrap()
+            .into_iter()
+            .find(|execution| execution.continuation_attempt_id.is_some())
+            .unwrap();
+        let attempt_id = continuation.continuation_attempt_id.unwrap();
+        let prompt_message_id = continuation.continuation_prompt_message_id.unwrap();
+        assert_eq!(
+            TaskConversation::new(db.clone())
+                .get_messages(&task.id)
+                .unwrap()
+                .into_iter()
+                .filter(|message| message.role == "user")
+                .map(|message| message.content)
+                .collect::<Vec<_>>(),
+            vec!["Ensure the UI contains no unnecessary messages."]
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/workflows/{}", workflow.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        assert!(manager.get(&workflow.id).is_err());
+        assert!(InstanceManager::new(db.clone())
+            .get_instance(&instance_id)
+            .is_err());
+        let lifecycle: (String, String, Option<i64>, String, Option<String>) = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT attempt.status, queue.status, attempt.trigger_message_id,
+                            task.status, task.active_attempt_id
+                     FROM work_attempts attempt
+                     JOIN task_queue queue ON queue.id = attempt.queue_id
+                     JOIN tasks task ON task.id = attempt.task_id
+                     WHERE attempt.id = ?1",
+                    [&attempt_id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .map_err(xpressclaw_core::error::Error::from)
+            })
+            .unwrap();
+        assert_eq!(
+            lifecycle,
+            (
+                "cancelled".into(),
+                "failed".into(),
+                None,
+                "completed".into(),
+                None,
+            )
+        );
+        let prompt_survives = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM task_messages WHERE id = ?1)",
+                    [prompt_message_id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(xpressclaw_core::error::Error::from)
+            })
+            .unwrap();
+        assert!(!prompt_survives);
+        assert!(TaskQueue::new(db).claim("atlas").unwrap().is_none());
     }
 
     #[tokio::test]
