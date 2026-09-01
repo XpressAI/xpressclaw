@@ -1691,7 +1691,7 @@ flows:
             .unwrap();
         assert_eq!(instance_status, "cancelled");
         assert_eq!(step_id, "__source_task__");
-        assert_eq!(execution_status, "failed");
+        assert_eq!(execution_status, "cancelled");
         assert_eq!(
             TaskBoard::new(db.clone()).get(&task.id).unwrap().status,
             TaskStatus::Cancelled

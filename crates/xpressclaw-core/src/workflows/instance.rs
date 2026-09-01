@@ -12,6 +12,7 @@ use crate::tasks::conversation::TaskConversation;
 use crate::tasks::queue::TaskQueue;
 
 pub(super) const SOURCE_TASK_STEP_ID: &str = "__source_task__";
+pub(super) const CONTINUATION_WAITING_STATUS: &str = "waiting_for_idle";
 
 /// A running (or completed) workflow instance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,7 +48,7 @@ pub struct StepExecution {
     pub flow_name: String,
     pub step_id: String,
     pub task_id: Option<String>,
-    pub status: String, // pending, running, waiting, resuming, completed, failed, skipped
+    pub status: String, // pending, running, waiting, resuming, completed, failed, cancelled, skipped
     pub input_context: Option<String>,
     pub output: Option<String>,
     pub attempt: i32,
@@ -602,10 +603,11 @@ impl InstanceManager {
         Ok(id)
     }
 
-    /// Atomically append one fixed user prompt to an instance's source task,
-    /// link the workflow execution to that task, and queue its next response
-    /// cycle. An execution can therefore never exist without its prompt, and a
-    /// retry cannot send the same prompt twice.
+    /// Atomically reserve one continuation turn on an instance's source task.
+    /// If another response became active before this transaction acquired the
+    /// writer, the execution is left waiting without publishing its prompt.
+    /// Otherwise the prompt, execution, and response queue become durable in
+    /// one commit. A retry therefore cannot send the same prompt twice.
     pub fn create_continuation_execution(
         &self,
         instance_id: &str,
@@ -625,9 +627,9 @@ impl InstanceManager {
                 .query_row(
                     "SELECT id FROM workflow_step_executions
                      WHERE instance_id = ?1 AND flow_name = ?2 AND step_id = ?3
-                       AND status = 'running'
+                       AND status IN ('running', ?4)
                      ORDER BY rowid DESC LIMIT 1",
-                    rusqlite::params![instance_id, flow_name, step_id],
+                    rusqlite::params![instance_id, flow_name, step_id, CONTINUATION_WAITING_STATUS],
                     |row| row.get::<_, String>(0),
                 )
                 .optional()?
@@ -652,12 +654,7 @@ impl InstanceManager {
                         "continue step '{step_id}' cannot resume unassigned task '{task_id}'"
                     ))
                 })?;
-            let message = TaskConversation::insert_text_message_in_transaction(
-                &transaction,
-                task_id,
-                "user",
-                prompt,
-            )?;
+            let active_response = task_has_active_response(&transaction, task_id)?;
             let execution_id = Self::create_task_execution_in_transaction(
                 &transaction,
                 instance_id,
@@ -666,24 +663,90 @@ impl InstanceManager {
                 input_context,
                 task_id,
             )?;
-            TaskQueue::enqueue_continuation_for_message_in_transaction(
-                &transaction,
-                task_id,
-                &agent_id,
-                message.id,
-                &message.timestamp,
-            )?;
-            transaction.execute(
-                "UPDATE tasks
-                 SET status = 'pending', completed_at = NULL,
-                     updated_at = CURRENT_TIMESTAMP
-                 WHERE id = ?1",
-                [task_id],
-            )?;
+            if active_response {
+                transaction.execute(
+                    "UPDATE workflow_step_executions
+                     SET status = ?1
+                     WHERE id = ?2",
+                    rusqlite::params![CONTINUATION_WAITING_STATUS, execution_id],
+                )?;
+            } else {
+                dispatch_continuation_in_transaction(&transaction, task_id, &agent_id, prompt)?;
+            }
             transaction.commit()?;
             Ok::<_, Error>(execution_id)
         })?;
         self.get_step_execution(&execution_id)
+    }
+
+    /// Publish a continuation that was durably held behind an intervening
+    /// source-task response. The idle check and prompt enqueue share the same
+    /// immediate transaction, closing the user-message race in both
+    /// directions.
+    pub fn dispatch_waiting_continuation(
+        &self,
+        execution_id: &str,
+        task_id: &str,
+        prompt: &str,
+    ) -> Result<StepExecution> {
+        self.db.with_conn(|conn| {
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            ensure_step_execution_accepts_work(&transaction, execution_id)?;
+            let (status, step_id, agent_id) = transaction
+                .query_row(
+                    "SELECT execution.status, execution.step_id, task.agent_id
+                     FROM workflow_step_executions execution
+                     JOIN tasks task ON task.id = execution.task_id
+                     WHERE execution.id = ?1 AND execution.task_id = ?2",
+                    rusqlite::params![execution_id, task_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                        ))
+                    },
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    Error::Workflow(format!(
+                        "continuation execution '{execution_id}' is not linked to task '{task_id}'"
+                    ))
+                })?;
+            if status == "running" {
+                transaction.commit()?;
+                return Ok::<_, Error>(());
+            }
+            if status != CONTINUATION_WAITING_STATUS {
+                return Err(Error::Workflow(format!(
+                    "continue step '{step_id}' cannot dispatch from status '{status}'"
+                )));
+            }
+            if task_has_active_response(&transaction, task_id)? {
+                transaction.commit()?;
+                return Ok::<_, Error>(());
+            }
+            let agent_id = agent_id
+                .filter(|agent_id| !agent_id.trim().is_empty())
+                .ok_or_else(|| {
+                    Error::Workflow(format!(
+                        "continue step '{step_id}' cannot resume unassigned task '{task_id}'"
+                    ))
+                })?;
+            dispatch_continuation_in_transaction(&transaction, task_id, &agent_id, prompt)?;
+            transaction.execute(
+                "UPDATE workflow_step_executions
+                 SET status = 'running'
+                 WHERE id = ?1 AND status = ?2",
+                rusqlite::params![execution_id, CONTINUATION_WAITING_STATUS],
+            )?;
+            transaction.commit()?;
+            Ok::<_, Error>(())
+        })?;
+        self.get_step_execution(execution_id)
     }
 
     /// Atomically link a loop body task to its execution and persist that
@@ -901,7 +964,9 @@ impl InstanceManager {
     }
 
     /// Find every active workflow execution waiting on the same task. A task
-    /// may be the source for more than one default workflow.
+    /// may be the source for more than one default workflow. A continuation
+    /// that lost the idle/enqueue race also waits here for that intervening
+    /// response to complete before publishing its fixed prompt.
     pub fn find_running_executions_by_task(&self, task_id: &str) -> Result<Vec<StepExecution>> {
         self.db.with_conn(|conn| {
             let mut stmt = conn
@@ -910,16 +975,17 @@ impl InstanceManager {
                      FROM workflow_step_executions execution
                      JOIN workflow_instances instance ON instance.id = execution.instance_id
                      WHERE execution.task_id = ?1
-                       AND execution.status = 'running'
+                       AND execution.status IN ('running', ?3)
                        AND instance.status = 'running'
                      ORDER BY CASE WHEN execution.step_id = ?2 THEN 1 ELSE 0 END,
                               execution.started_at ASC, execution.rowid ASC",
                 )
                 .map_err(|e| Error::Database(e.to_string()))?;
             let records = stmt
-                .query_map([task_id, SOURCE_TASK_STEP_ID], |row| {
-                    Ok(row_to_step_execution(row))
-                })
+                .query_map(
+                    rusqlite::params![task_id, SOURCE_TASK_STEP_ID, CONTINUATION_WAITING_STATUS],
+                    |row| Ok(row_to_step_execution(row)),
+                )
                 .map_err(|e| Error::Database(e.to_string()))?
                 .filter_map(|record| record.ok())
                 .collect();
@@ -1113,6 +1179,48 @@ impl InstanceManager {
             Ok(count)
         })
     }
+}
+
+pub(super) fn task_has_active_response(conn: &rusqlite::Connection, task_id: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM task_queue
+            WHERE task_id = ?1 AND status IN ('queued', 'running')
+         ) OR EXISTS(
+            SELECT 1 FROM work_attempts
+            WHERE task_id = ?1
+              AND status IN ('queued', 'preparing', 'running',
+                             'waiting_for_input', 'review')
+         )",
+        [task_id],
+        |row| row.get(0),
+    )
+    .map_err(Error::from)
+}
+
+fn dispatch_continuation_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    task_id: &str,
+    agent_id: &str,
+    prompt: &str,
+) -> Result<()> {
+    let message =
+        TaskConversation::insert_text_message_in_transaction(transaction, task_id, "user", prompt)?;
+    TaskQueue::enqueue_continuation_for_message_in_transaction(
+        transaction,
+        task_id,
+        agent_id,
+        message.id,
+        &message.timestamp,
+    )?;
+    transaction.execute(
+        "UPDATE tasks
+         SET status = 'pending', completed_at = NULL,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = ?1",
+        [task_id],
+    )?;
+    Ok(())
 }
 
 fn ensure_instance_accepts_work(conn: &rusqlite::Connection, instance_id: &str) -> Result<()> {

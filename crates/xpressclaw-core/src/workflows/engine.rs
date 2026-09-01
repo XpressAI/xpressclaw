@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::{NaiveDateTime, TimeZone, Utc};
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{error, info, warn};
@@ -21,7 +22,8 @@ use super::definition::{
     parse_wait_duration, Step, WorkflowDefinition, WorkflowInputType, WorkflowTrigger,
 };
 use super::instance::{
-    InstanceManager, StepExecution, WorkflowInstance, WorkflowInstanceScope, SOURCE_TASK_STEP_ID,
+    task_has_active_response, InstanceManager, StepExecution, WorkflowInstance,
+    WorkflowInstanceScope, CONTINUATION_WAITING_STATUS, SOURCE_TASK_STEP_ID,
 };
 use super::manager::WorkflowManager;
 use super::waits::{activity_cursor_from_parts, validate_resource, WaitState};
@@ -652,10 +654,10 @@ impl WorkflowEngine {
         })?;
         let prompt = context::render_template(step.prompt.as_deref().unwrap_or_default(), ctx);
         if prompt.trim().is_empty() {
-            return Err(Error::Workflow(format!(
-                "continue step '{}' rendered an empty prompt",
-                step.id
-            )));
+            let message = format!("continue step '{}' rendered an empty prompt", step.id);
+            self.instances
+                .update_status(instance_id, "failed", Some(&message))?;
+            return Err(Error::Workflow(message));
         }
         let execution = self.instances.create_continuation_execution(
             instance_id,
@@ -665,13 +667,23 @@ impl WorkflowEngine {
             task_id,
             &prompt,
         )?;
-        info!(
-            instance_id,
-            step_id = step.id,
-            task_id,
-            execution_id = execution.id,
-            "queued workflow prompt in source task"
-        );
+        if execution.status == CONTINUATION_WAITING_STATUS {
+            info!(
+                instance_id,
+                step_id = step.id,
+                task_id,
+                execution_id = execution.id,
+                "workflow prompt is waiting for the source task to become idle"
+            );
+        } else {
+            info!(
+                instance_id,
+                step_id = step.id,
+                task_id,
+                execution_id = execution.id,
+                "queued workflow prompt in source task"
+            );
+        }
         Ok(())
     }
 
@@ -1500,6 +1512,11 @@ impl WorkflowEngine {
         };
         let source_task_cancelled =
             task_status == "cancelled" && instance.source_task_id.as_deref() == Some(task_id);
+        let persisted_step_status = if source_task_cancelled {
+            "cancelled"
+        } else {
+            step_status
+        };
 
         if exec.step_id == SOURCE_TASK_STEP_ID {
             // A user message sent during the original turn may already have a
@@ -1516,8 +1533,11 @@ impl WorkflowEngine {
             source.insert("output".into(), parse_task_output(task_output));
             var_store.insert("source_task".into(), Value::Object(source));
             self.save_variable_store(&exec.instance_id, &var_store)?;
-            self.instances
-                .update_step_status(&exec.id, step_status, Some(task_output))?;
+            self.instances.update_step_status(
+                &exec.id,
+                persisted_step_status,
+                Some(task_output),
+            )?;
 
             if source_task_cancelled {
                 return self.cancel_source_task_instance(&instance, task_output);
@@ -1552,6 +1572,73 @@ impl WorkflowEngine {
             );
         }
 
+        if exec.status == CONTINUATION_WAITING_STATUS {
+            if source_task_cancelled {
+                self.instances.update_step_status(
+                    &exec.id,
+                    persisted_step_status,
+                    Some(task_output),
+                )?;
+                return self.cancel_source_task_instance(&instance, task_output);
+            }
+            if step_status == "failed" {
+                self.instances
+                    .update_step_status(&exec.id, "failed", Some(task_output))?;
+                if definition.flows.contains_key("on_error") {
+                    return self.execute_step(
+                        &exec.instance_id,
+                        "on_error",
+                        0,
+                        &definition,
+                        &trigger_data,
+                        &var_store,
+                    );
+                }
+                self.instances.update_status(
+                    &exec.instance_id,
+                    "failed",
+                    Some(&format!(
+                        "source task failed while continue step '{}' waited for idle: {task_output}",
+                        exec.step_id
+                    )),
+                )?;
+                return Ok(());
+            }
+
+            let step = definition
+                .find_step(&exec.flow_name, &exec.step_id)
+                .filter(|step| step.step_type == "continue")
+                .ok_or_else(|| {
+                    Error::Workflow(format!(
+                        "idle continuation execution '{}' no longer resolves to a continue step",
+                        exec.id
+                    ))
+                })?;
+            let ctx = context::build_context(&trigger_data, &definition.variables, &var_store);
+            let prompt = context::render_template(step.prompt.as_deref().unwrap_or_default(), &ctx);
+            if prompt.trim().is_empty() {
+                let message = format!("continue step '{}' rendered an empty prompt", exec.step_id);
+                self.instances
+                    .update_step_status(&exec.id, "failed", Some(&message))?;
+                self.instances
+                    .update_status(&exec.instance_id, "failed", Some(&message))?;
+                return Err(Error::Workflow(message));
+            }
+            let execution = self
+                .instances
+                .dispatch_waiting_continuation(&exec.id, task_id, &prompt)?;
+            if execution.status == "running" {
+                info!(
+                    instance_id = exec.instance_id.as_str(),
+                    step_id = exec.step_id.as_str(),
+                    task_id,
+                    execution_id = exec.id.as_str(),
+                    "queued workflow prompt after the source task became idle"
+                );
+            }
+            return Ok(());
+        }
+
         if step_status == "completed"
             && definition
                 .find_step(&exec.flow_name, &exec.step_id)
@@ -1565,7 +1652,7 @@ impl WorkflowEngine {
         }
 
         self.instances
-            .update_step_status(&exec.id, step_status, Some(task_output))?;
+            .update_step_status(&exec.id, persisted_step_status, Some(task_output))?;
 
         if source_task_cancelled {
             return self.cancel_source_task_instance(&instance, task_output);
@@ -1713,22 +1800,8 @@ impl WorkflowEngine {
     }
 
     fn task_has_active_response(&self, task_id: &str) -> Result<bool> {
-        self.db.with_conn(|conn| {
-            conn.query_row(
-                "SELECT EXISTS(
-                    SELECT 1 FROM task_queue
-                    WHERE task_id = ?1 AND status IN ('queued', 'running')
-                 ) OR EXISTS(
-                    SELECT 1 FROM work_attempts
-                    WHERE task_id = ?1
-                      AND status IN ('queued', 'preparing', 'running',
-                                     'waiting_for_input', 'review')
-                 )",
-                [task_id],
-                |row| row.get(0),
-            )
-            .map_err(Error::from)
-        })
+        self.db
+            .with_conn(|conn| task_has_active_response(conn, task_id))
     }
 
     /// A user's cancellation of the source task is terminal for every
@@ -1931,6 +2004,47 @@ impl WorkflowEngine {
             .unwrap_or_default()
     }
 
+    /// Recover the completion status delivered to a workflow. Task rows use
+    /// `cancelled` for both explicit cancellation and some failed dispatches,
+    /// so a terminal workflow execution or attempt is the more precise source
+    /// when one is available.
+    fn recoverable_task_status(
+        &self,
+        task_id: &str,
+        task_status: &str,
+        execution_status: Option<&str>,
+    ) -> Result<Option<String>> {
+        match execution_status {
+            Some("failed") => return Ok(Some("failed".into())),
+            Some("cancelled") => return Ok(Some("cancelled".into())),
+            _ => {}
+        }
+        if task_status == "completed" {
+            return Ok(Some("completed".into()));
+        }
+        if task_status != "cancelled" {
+            return Ok(None);
+        }
+        let attempt_status = self.db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT status FROM work_attempts
+                 WHERE task_id = ?1
+                 ORDER BY rowid DESC LIMIT 1",
+                [task_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(Error::from)
+        })?;
+        Ok(Some(
+            match attempt_status.as_deref() {
+                Some("failed" | "interrupted") => "failed",
+                _ => "cancelled",
+            }
+            .into(),
+        ))
+    }
+
     /// Recover running workflow instances after a restart.
     pub fn recover(&self) -> Result<()> {
         let running = self.instances.list_running_instances()?;
@@ -1954,22 +2068,29 @@ impl WorkflowEngine {
                 }
                 continue;
             }
-            let current_exec = execs.iter().rfind(|e| e.status == "running");
+            let current_exec = execs.iter().rfind(|execution| {
+                matches!(
+                    execution.status.as_str(),
+                    "running" | CONTINUATION_WAITING_STATUS
+                )
+            });
 
             if let Some(exec) = current_exec {
                 if let Some(ref task_id) = exec.task_id {
                     match board.get(task_id) {
                         Ok(task) => {
                             let status = task.status.as_str();
-                            if status == "completed" || status == "cancelled" {
+                            if let Some(status) =
+                                self.recoverable_task_status(task_id, status, Some(&exec.status))?
+                            {
                                 info!(
                                     instance_id = instance.id.as_str(),
                                     task_id = task_id.as_str(),
-                                    task_status = status,
-                                    "recovering completed task for workflow"
+                                    task_status = status.as_str(),
+                                    "recovering terminal task for workflow"
                                 );
                                 let output = self.completed_task_output(task_id);
-                                if let Err(e) = self.on_task_completed(task_id, status, &output) {
+                                if let Err(e) = self.on_task_completed(task_id, &status, &output) {
                                     error!(
                                         instance_id = instance.id.as_str(),
                                         task_id = task_id.as_str(),
@@ -2107,34 +2228,39 @@ impl WorkflowEngine {
                 }
             };
 
-            // Source gates and continue steps can commit their completed
-            // execution immediately before advancing. If the process exits
-            // in that window, replay the latest completion callback. It is
-            // safe to do so because there is no newer execution, and
+            // Source gates and continue steps can commit their terminal
+            // execution immediately before advancing or dispatching an error
+            // flow. If the process exits in that window, replay the latest
+            // callback. It is safe because there is no newer execution, and
             // continuation creation is atomic and idempotent.
             if let Some(execution) = execs.last().filter(|execution| {
-                execution.status == "completed"
-                    && (execution.step_id == SOURCE_TASK_STEP_ID
-                        || definition
-                            .find_step(&execution.flow_name, &execution.step_id)
-                            .is_some_and(|step| step.step_type == "continue"))
+                matches!(
+                    execution.status.as_str(),
+                    "completed" | "failed" | "cancelled"
+                ) && (execution.step_id == SOURCE_TASK_STEP_ID
+                    || definition
+                        .find_step(&execution.flow_name, &execution.step_id)
+                        .is_some_and(|step| step.step_type == "continue"))
             }) {
                 if let Some(task_id) = execution.task_id.as_deref() {
                     if let Ok(task) = board.get(task_id) {
-                        let status = task.status.as_str();
-                        if matches!(status, "completed" | "cancelled") {
+                        if let Some(status) = self.recoverable_task_status(
+                            task_id,
+                            task.status.as_str(),
+                            Some(&execution.status),
+                        )? {
                             let output = execution
                                 .output
                                 .clone()
                                 .unwrap_or_else(|| self.completed_task_output(task_id));
                             if let Err(error) = self
-                                .on_execution_task_completed(execution, task_id, status, &output)
+                                .on_execution_task_completed(execution, task_id, &status, &output)
                             {
                                 error!(
                                     instance_id = instance.id.as_str(),
                                     execution_id = execution.id.as_str(),
                                     error = %error,
-                                    "failed to advance completed default workflow execution during recovery"
+                                    "failed to advance terminal default workflow execution during recovery"
                                 );
                             }
                             continue;
@@ -2640,6 +2766,226 @@ flows:
     }
 
     #[test]
+    fn continuation_waits_when_a_user_response_wins_the_enqueue_race() {
+        let (db, engine) = setup();
+        let workflow_id = create_workflow(
+            &db,
+            r#"
+name: serialized-ui-check
+flows:
+  main:
+    steps:
+      - id: review_ui
+        type: continue
+        prompt: Check the UI after answering the user.
+"#,
+        );
+        WorkflowManager::new(db.clone())
+            .set_default_for_tasks(&workflow_id, true)
+            .unwrap();
+        let task = TaskBoard::new(db.clone())
+            .create(&CreateTask {
+                title: "Serialize responses".into(),
+                agent_id: Some("atlas".into()),
+                context: Some(json!({ "origin": "session_message" })),
+                ..Default::default()
+            })
+            .unwrap();
+        TaskQueue::new(db.clone())
+            .enqueue(&task.id, "atlas")
+            .unwrap();
+        let instance_id = engine.attach_default_workflows_to_task(&task.id).unwrap()[0].clone();
+        let source_execution =
+            engine.instances.list_step_executions(&instance_id).unwrap()[0].clone();
+
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE task_queue SET status = 'completed', completed_at = CURRENT_TIMESTAMP
+                 WHERE task_id = ?1",
+                [&task.id],
+            )?;
+            conn.execute(
+                "UPDATE work_attempts SET status = 'completed', completed_at = CURRENT_TIMESTAMP
+                 WHERE task_id = ?1",
+                [&task.id],
+            )?;
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+        TaskBoard::new(db.clone())
+            .update_status(&task.id, "completed", Some("atlas"))
+            .unwrap();
+
+        // Model the exact race boundary: the source callback passed its first
+        // idle read and committed the predecessor, then a user message queued
+        // before continuation creation acquired the SQLite writer.
+        engine
+            .instances
+            .update_step_status(&source_execution.id, "completed", Some("initial output"))
+            .unwrap();
+        let conversation = TaskConversation::new(db.clone());
+        let user_message = conversation
+            .add_message(&task.id, "user", "Please answer this first.")
+            .unwrap();
+        TaskQueue::new(db.clone())
+            .enqueue_continuation_for_message(
+                &task.id,
+                "atlas",
+                user_message.id,
+                &user_message.timestamp,
+            )
+            .unwrap()
+            .unwrap();
+
+        let instance = engine.instances.get_instance(&instance_id).unwrap();
+        let definition = engine.definition_for_instance(&instance).unwrap();
+        let trigger_data: Value = instance
+            .trigger_data
+            .as_deref()
+            .and_then(|value| serde_json::from_str(value).ok())
+            .unwrap_or(Value::Null);
+        let variables = engine.load_variable_store(&instance_id).unwrap();
+        engine
+            .execute_step(
+                &instance_id,
+                "main",
+                0,
+                &definition,
+                &trigger_data,
+                &variables,
+            )
+            .unwrap();
+
+        let continuation = engine.instances.list_step_executions(&instance_id).unwrap()[1].clone();
+        assert_eq!(continuation.status, CONTINUATION_WAITING_STATUS);
+        assert_eq!(conversation.get_messages(&task.id).unwrap().len(), 1);
+
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE task_queue SET status = 'completed', completed_at = CURRENT_TIMESTAMP
+                 WHERE task_id = ?1 AND status = 'queued'",
+                [&task.id],
+            )?;
+            conn.execute(
+                "UPDATE work_attempts SET status = 'completed', completed_at = CURRENT_TIMESTAMP
+                 WHERE task_id = ?1 AND status = 'queued'",
+                [&task.id],
+            )?;
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+        TaskBoard::new(db.clone())
+            .update_status(&task.id, "completed", Some("atlas"))
+            .unwrap();
+        engine
+            .on_task_completed(&task.id, "completed", "answered user message")
+            .unwrap();
+
+        let messages = conversation.get_messages(&task.id).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].id, user_message.id);
+        assert_eq!(
+            messages[1].content,
+            "Check the UI after answering the user."
+        );
+        assert_eq!(
+            engine
+                .instances
+                .get_step_execution(&continuation.id)
+                .unwrap()
+                .status,
+            "running"
+        );
+        let trigger_ids = db
+            .with_conn(|conn| {
+                let mut statement = conn.prepare(
+                    "SELECT trigger_message_id FROM work_attempts
+                     WHERE task_id = ?1 ORDER BY rowid",
+                )?;
+                let values = statement
+                    .query_map([&task.id], |row| row.get::<_, Option<i64>>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                Ok::<_, Error>(values)
+            })
+            .unwrap();
+        assert_eq!(
+            trigger_ids,
+            vec![None, Some(user_message.id), Some(messages[1].id)]
+        );
+
+        engine
+            .on_task_completed(&task.id, "completed", "duplicate callback")
+            .unwrap();
+        assert_eq!(conversation.get_messages(&task.id).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn empty_continuation_prompt_fails_the_instance() {
+        let (db, engine) = setup();
+        let workflow_id = create_workflow(
+            &db,
+            r#"
+name: empty-ui-check
+variables:
+  instruction: ""
+flows:
+  main:
+    steps:
+      - id: review_ui
+        type: continue
+        prompt: "@instruction"
+"#,
+        );
+        WorkflowManager::new(db.clone())
+            .set_default_for_tasks(&workflow_id, true)
+            .unwrap();
+        let task = TaskBoard::new(db.clone())
+            .create(&CreateTask {
+                title: "Reject empty prompt".into(),
+                agent_id: Some("atlas".into()),
+                context: Some(json!({ "origin": "session_message" })),
+                ..Default::default()
+            })
+            .unwrap();
+        TaskQueue::new(db.clone())
+            .enqueue(&task.id, "atlas")
+            .unwrap();
+        let instance_id = engine.attach_default_workflows_to_task(&task.id).unwrap()[0].clone();
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE task_queue SET status = 'completed', completed_at = CURRENT_TIMESTAMP
+                 WHERE task_id = ?1",
+                [&task.id],
+            )?;
+            conn.execute(
+                "UPDATE work_attempts SET status = 'completed', completed_at = CURRENT_TIMESTAMP
+                 WHERE task_id = ?1",
+                [&task.id],
+            )?;
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+        TaskBoard::new(db.clone())
+            .update_status(&task.id, "completed", Some("atlas"))
+            .unwrap();
+
+        let error = engine
+            .on_task_completed(&task.id, "completed", "initial output")
+            .unwrap_err();
+        assert!(error.to_string().contains("rendered an empty prompt"));
+        let instance = engine.instances.get_instance(&instance_id).unwrap();
+        assert_eq!(instance.status, "failed");
+        assert!(instance
+            .error_message
+            .as_deref()
+            .is_some_and(|message| message.contains("rendered an empty prompt")));
+        assert!(TaskConversation::new(db)
+            .get_messages(&task.id)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
     fn recovery_advances_a_completed_default_source_gate() {
         let (db, engine) = setup();
         let workflow_id = create_workflow(
@@ -2726,6 +3072,98 @@ flows:
                 .unwrap();
         assert_eq!(variables["source_task"]["status"], "completed");
         assert_eq!(variables["source_task"]["output"], "initial output");
+    }
+
+    #[test]
+    fn recovery_dispatches_error_flow_after_a_failed_source_gate() {
+        let (db, engine) = setup();
+        let workflow_id = create_workflow(
+            &db,
+            r#"
+name: recover-failed-source-gate
+inputs:
+  worker:
+    type: agent
+    primary: true
+    required: true
+flows:
+  main:
+    steps:
+      - id: review_ui
+        type: continue
+        prompt: This prompt must not be sent after failure.
+  on_error:
+    steps:
+      - id: record_failure
+        agent: "@worker"
+        prompt: Record the source task failure.
+"#,
+        );
+        WorkflowManager::new(db.clone())
+            .set_default_for_tasks(&workflow_id, true)
+            .unwrap();
+        let task = TaskBoard::new(db.clone())
+            .create(&CreateTask {
+                title: "Recover failed source".into(),
+                agent_id: Some("atlas".into()),
+                context: Some(json!({ "origin": "session_message" })),
+                ..Default::default()
+            })
+            .unwrap();
+        TaskQueue::new(db.clone())
+            .enqueue(&task.id, "atlas")
+            .unwrap();
+        let instance_id = engine.attach_default_workflows_to_task(&task.id).unwrap()[0].clone();
+        let source_execution =
+            engine.instances.list_step_executions(&instance_id).unwrap()[0].clone();
+
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE task_queue
+                 SET status = 'failed', completed_at = CURRENT_TIMESTAMP,
+                     harness_response = 'agent failed'
+                 WHERE task_id = ?1",
+                [&task.id],
+            )?;
+            conn.execute(
+                "UPDATE work_attempts
+                 SET status = 'failed', completed_at = CURRENT_TIMESTAMP,
+                     error_message = 'agent failed'
+                 WHERE task_id = ?1",
+                [&task.id],
+            )?;
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+        // Failed dispatches use the task's cancelled terminal state. The
+        // durable execution status preserves the distinction from an explicit
+        // user cancellation at this crash boundary.
+        TaskBoard::new(db.clone())
+            .update_status(&task.id, "cancelled", Some("atlas"))
+            .unwrap();
+        engine
+            .instances
+            .update_step_status(&source_execution.id, "failed", Some("agent failed"))
+            .unwrap();
+
+        engine.recover().unwrap();
+        engine.recover().unwrap();
+
+        let instance = engine.instances.get_instance(&instance_id).unwrap();
+        assert_eq!(instance.status, "running");
+        assert_eq!(instance.current_flow, "on_error");
+        let executions = engine.instances.list_step_executions(&instance_id).unwrap();
+        assert_eq!(
+            executions
+                .iter()
+                .filter(|execution| execution.step_id == "record_failure")
+                .count(),
+            1
+        );
+        assert!(TaskConversation::new(db)
+            .get_messages(&task.id)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
