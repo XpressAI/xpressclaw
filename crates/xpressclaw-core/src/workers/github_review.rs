@@ -23,6 +23,7 @@ use crate::sessions::SessionManager;
 use crate::tasks::board::{TaskBoard, TaskStatus};
 use crate::tasks::queue::TaskQueue;
 use crate::workers::{github, native};
+use crate::workflows::engine::WorkflowEngine;
 
 const MIN_POLL_INTERVAL_SECONDS: i64 = 15;
 const MAX_POLL_INTERVAL_SECONDS: i64 = 300;
@@ -1010,8 +1011,33 @@ fn finalize_if_satisfied(
     let Some((agent_id, parent_task_id)) = completion else {
         return Ok(());
     };
+    let mut completed_task_ids = vec![item.task_id.clone()];
     if let Some(parent_task_id) = parent_task_id {
-        let _ = TaskBoard::new(db.clone()).complete_and_roll_up(&parent_task_id, None)?;
+        completed_task_ids.extend(
+            TaskBoard::new(db.clone())
+                .complete_and_roll_up(&parent_task_id, None)?
+                .into_iter()
+                .map(|task| task.id),
+        );
+    }
+    let conversation = crate::tasks::conversation::TaskConversation::new(db.clone());
+    let workflows = WorkflowEngine::new(db.clone());
+    for task_id in completed_task_ids {
+        let output = conversation
+            .get_messages(&task_id)
+            .unwrap_or_default()
+            .into_iter()
+            .rev()
+            .find(|message| message.role == "assistant")
+            .map(|message| message.content)
+            .unwrap_or_else(|| message.clone());
+        if let Err(error) = workflows.on_task_completed(&task_id, "completed", &output) {
+            warn!(
+                task_id,
+                error = %error,
+                "failed to advance workflow after GitHub review completion"
+            );
+        }
     }
     if let Some(agent_id) = agent_id.filter(|agent_id| !agent_id.trim().is_empty()) {
         SessionManager::new(db.clone()).refresh_status(&agent_id)?;
@@ -1503,6 +1529,106 @@ mod tests {
             .unwrap();
         assert_eq!(messages.len(), 1);
         assert!(messages[0].content.contains("GitHub review complete"));
+    }
+
+    #[test]
+    fn approval_advances_default_workflows_for_task_and_rolled_up_parent() {
+        let (db, parent_task_id) = setup_task(None);
+        let child = TaskBoard::new(db.clone())
+            .create(&CreateTask {
+                title: "Publish the reviewed change".into(),
+                agent_id: Some("project-codex".into()),
+                parent_task_id: Some(parent_task_id.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        let workflow = crate::workflows::manager::WorkflowManager::new(db.clone())
+            .create(&crate::workflows::manager::CreateWorkflow {
+                name: "post-review-check".into(),
+                description: None,
+                yaml_content: r#"
+name: post-review-check
+flows:
+  main:
+    steps:
+      - id: verify_result
+        type: continue
+        prompt: Verify the completed task one more time.
+"#
+                .into(),
+            })
+            .unwrap();
+        crate::workflows::manager::WorkflowManager::new(db.clone())
+            .set_default_for_tasks(&workflow.id, true)
+            .unwrap();
+        let workflows = WorkflowEngine::new(db.clone());
+        let parent_instance = workflows
+            .attach_default_workflows_to_task(&parent_task_id)
+            .unwrap()[0]
+            .clone();
+        let child_instance = workflows
+            .attach_default_workflows_to_task(&child.id)
+            .unwrap()[0]
+            .clone();
+
+        let manager = GithubReviewManager::new(db.clone());
+        let registered = manager
+            .register(
+                &child.id,
+                "project-codex",
+                "XpressAI/xpressclaw",
+                "https://github.com/XpressAI/xpressclaw/pull/151",
+            )
+            .unwrap();
+        finalize_if_satisfied(&db, &registered, ReviewOutcome::Approved).unwrap();
+
+        for task_id in [&child.id, &parent_task_id] {
+            assert_eq!(
+                TaskBoard::new(db.clone()).get(task_id).unwrap().status,
+                TaskStatus::Pending
+            );
+            let messages = TaskConversation::new(db.clone())
+                .get_messages(task_id)
+                .unwrap();
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter(|message| message.role == "user"
+                        && message.content == "Verify the completed task one more time.")
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(
+            TaskQueue::new(db.clone())
+                .pending_count("project-codex")
+                .unwrap(),
+            2
+        );
+
+        for instance_id in [child_instance, parent_instance] {
+            let statuses = db
+                .with_conn(|conn| {
+                    let mut statement = conn.prepare(
+                        "SELECT step_id, status FROM workflow_step_executions
+                         WHERE instance_id = ?1 ORDER BY rowid",
+                    )?;
+                    let values = statement
+                        .query_map([&instance_id], |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                        })?
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    Ok::<_, Error>(values)
+                })
+                .unwrap();
+            assert_eq!(
+                statuses,
+                vec![
+                    ("__source_task__".to_string(), "completed".to_string()),
+                    ("verify_result".to_string(), "running".to_string()),
+                ]
+            );
+        }
     }
 
     #[test]

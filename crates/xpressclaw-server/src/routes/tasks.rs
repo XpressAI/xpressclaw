@@ -506,6 +506,26 @@ async fn update_task_status(
             Json(json!({ "error": "all subtasks must be completed first" })),
         ));
     }
+    if req.status == "completed" {
+        // A task parked on an ACP elicitation still owns a live attempt even
+        // though the user has decided the visible work is done. Release that
+        // attempt before applying the completion transition so it cannot keep
+        // the task (and any attached default workflow) waiting indefinitely.
+        let parked_attempts = SessionManager::new(state.db.clone())
+            .task_activity(&id, None, None, 1, 50)
+            .map_err(internal_error)?
+            .attempts
+            .into_iter()
+            .filter(|attempt| attempt.status == "waiting_for_input")
+            .map(|attempt| attempt.id)
+            .collect::<Vec<_>>();
+        for attempt_id in parked_attempts {
+            state
+                .interrupt_attempt(&attempt_id)
+                .await
+                .map_err(internal_error)?;
+        }
+    }
     if req.status == "cancelled" {
         let sessions = SessionManager::new(state.db.clone());
         let Some(cancelled) = sessions
@@ -585,11 +605,36 @@ async fn update_task_status(
     let updated = if req.status == "completed" {
         board
             .complete_and_roll_up(&id, req.agent_id.as_deref())
-            .and_then(|tasks| {
-                tasks
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| xpressclaw_core::error::Error::Task("task is not ready".into()))
+            .and_then(|completed_tasks| {
+                if completed_tasks.is_empty() {
+                    return Err(xpressclaw_core::error::Error::Task(
+                        "task is not ready".into(),
+                    ));
+                }
+                let conversation = TaskConversation::new(state.db.clone());
+                let workflows = WorkflowEngine::new(state.db.clone());
+                for completed in completed_tasks {
+                    let output = conversation
+                        .get_messages(&completed.id)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .rev()
+                        .find(|message| message.role == "assistant")
+                        .map(|message| message.content)
+                        .unwrap_or_default();
+                    if let Err(error) =
+                        workflows.on_task_completed(&completed.id, "completed", &output)
+                    {
+                        tracing::warn!(
+                            task_id = completed.id,
+                            error = %error,
+                            "failed to advance workflow after manual task completion"
+                        );
+                    }
+                }
+                // A continue step may have reopened the requested task while
+                // dispatching its fixed prompt, so return its current state.
+                board.get(&id)
             })
     } else {
         board.update_status_with_agent_repository(
@@ -1541,6 +1586,120 @@ mod tests {
                 .and_then(|context| context.get("plan_disposition"))
                 .and_then(Value::as_str),
             Some("deferred")
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_completion_releases_parked_attempt_and_advances_default_workflow() {
+        let (app, db) = test_app_with_db();
+        let workflow = WorkflowManager::new(db.clone())
+            .create(&CreateWorkflow {
+                name: "manual-completion-review".into(),
+                description: None,
+                yaml_content: r#"
+name: manual-completion-review
+flows:
+  main:
+    steps:
+      - id: review_ui
+        type: continue
+        prompt: Check the UI for unnecessary messages.
+"#
+                .into(),
+            })
+            .unwrap();
+        WorkflowManager::new(db.clone())
+            .set_default_for_tasks(&workflow.id, true)
+            .unwrap();
+        let task = TaskBoard::new(db.clone())
+            .create(&CreateTask {
+                title: "Parked source task".into(),
+                agent_id: Some("developer".into()),
+                context: Some(json!({ "origin": "session_message" })),
+                ..Default::default()
+            })
+            .unwrap();
+        let engine = WorkflowEngine::new(db.clone());
+        let instance_id = engine.attach_default_workflows_to_task(&task.id).unwrap()[0].clone();
+
+        let queue = TaskQueue::new(db.clone());
+        queue.enqueue(&task.id, "developer").unwrap();
+        let original = queue.claim("developer").unwrap().unwrap();
+        let attempt_id = original.attempt_id.as_deref().unwrap().to_string();
+        let sessions = SessionManager::new(db.clone());
+        sessions
+            .transition_attempt(&attempt_id, "running", "Working", None, None)
+            .unwrap();
+        sessions
+            .transition_attempt(
+                &attempt_id,
+                "waiting_for_input",
+                "Waiting for an answer",
+                None,
+                None,
+            )
+            .unwrap();
+        TaskBoard::new(db.clone())
+            .update_status(&task.id, "waiting_for_input", Some("developer"))
+            .unwrap();
+        TaskConversation::new(db.clone())
+            .add_message(&task.id, "assistant", "Do you want me to continue?")
+            .unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/tasks/{}/status", task.id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({ "status": "completed" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response.into_body()).await;
+        assert_eq!(body["status"], "pending");
+        assert_eq!(
+            sessions.get_attempt(&attempt_id).unwrap().status,
+            "interrupted"
+        );
+        assert_eq!(queue.get(original.id).unwrap().status, "completed");
+        assert_eq!(queue.pending_count("developer").unwrap(), 1);
+
+        let messages = TaskConversation::new(db.clone())
+            .get_messages(&task.id)
+            .unwrap();
+        let fixed_prompts = messages
+            .iter()
+            .filter(|message| message.role == "user")
+            .collect::<Vec<_>>();
+        assert_eq!(fixed_prompts.len(), 1);
+        assert_eq!(
+            fixed_prompts[0].content,
+            "Check the UI for unnecessary messages."
+        );
+        let execution_statuses = db
+            .with_conn(|conn| {
+                let mut statement = conn.prepare(
+                    "SELECT step_id, status FROM workflow_step_executions
+                     WHERE instance_id = ?1 ORDER BY rowid",
+                )?;
+                let rows = statement
+                    .query_map([&instance_id], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                Ok::<_, xpressclaw_core::error::Error>(rows)
+            })
+            .unwrap();
+        assert_eq!(
+            execution_statuses,
+            vec![
+                ("__source_task__".to_string(), "completed".to_string()),
+                ("review_ui".to_string(), "running".to_string()),
+            ]
         );
     }
 
