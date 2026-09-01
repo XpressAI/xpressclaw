@@ -334,19 +334,10 @@ async fn cleanup_cancelled_continuation(
             let _ = sessions.clear_container(&attempt.id);
         }
     }
-    state
-        .db
-        .with_conn(|conn| {
-            for queue_id in cancelled.iter().filter_map(|attempt| attempt.queue_id) {
-                conn.execute(
-                    "UPDATE task_queue SET status = 'failed', completed_at = CURRENT_TIMESTAMP,
-                        harness_response = 'cancelled by user'
-                     WHERE id = ?1 AND status = 'running'",
-                    [queue_id],
-                )?;
-            }
-            Ok::<_, xpressclaw_core::error::Error>(())
-        })
+    // The running queue row remains the dispatch lease while a retained
+    // container may still be executing. Release only sessions whose stop was
+    // confirmed (attempts without a container are confirmed by definition).
+    release_stopped_continuation_dispatches(&state.db, cancelled, &stopped_sessions)
         .map_err(internal_error)?;
 
     let output = TaskConversation::new(state.db.clone())
@@ -381,6 +372,28 @@ async fn cleanup_cancelled_continuation(
         );
     }
     Ok(())
+}
+
+fn release_stopped_continuation_dispatches(
+    db: &xpressclaw_core::db::Database,
+    cancelled: &[WorkAttempt],
+    stopped_sessions: &std::collections::BTreeSet<String>,
+) -> xpressclaw_core::error::Result<()> {
+    db.with_conn(|conn| {
+        for queue_id in cancelled
+            .iter()
+            .filter(|attempt| stopped_sessions.contains(&attempt.session_id))
+            .filter_map(|attempt| attempt.queue_id)
+        {
+            conn.execute(
+                "UPDATE task_queue SET status = 'failed', completed_at = CURRENT_TIMESTAMP,
+                    harness_response = 'cancelled by user'
+                 WHERE id = ?1 AND status = 'running'",
+                [queue_id],
+            )?;
+        }
+        Ok(())
+    })
 }
 
 fn internal_error(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
@@ -883,5 +896,137 @@ flows:
             TaskQueue::new(db).claim_next().unwrap().unwrap().id,
             user_queue.id
         );
+    }
+
+    #[test]
+    fn failed_container_stop_retains_the_continuation_dispatch_lease() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        AgentRegistry::new(db.clone())
+            .ensure("atlas", "codex")
+            .unwrap();
+        let workflow = WorkflowManager::new(db.clone())
+            .create(&CreateWorkflow {
+                name: "final-ui-check".into(),
+                description: None,
+                yaml_content: r#"
+name: final-ui-check
+flows:
+  main:
+    steps:
+      - id: review_ui
+        type: continue
+        prompt: Ensure the UI contains no unnecessary messages.
+"#
+                .into(),
+            })
+            .unwrap();
+        WorkflowManager::new(db.clone())
+            .set_default_for_tasks(&workflow.id, true)
+            .unwrap();
+
+        let board = TaskBoard::new(db.clone());
+        let task = board
+            .create(&CreateTask {
+                title: "Fix the interface".into(),
+                agent_id: Some("atlas".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let queue = TaskQueue::new(db.clone());
+        queue.enqueue(&task.id, "atlas").unwrap();
+        let engine = WorkflowEngine::new(db.clone());
+        let instance_id = engine.attach_default_workflows_to_task(&task.id).unwrap()[0].clone();
+
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE task_queue SET status = 'completed', completed_at = CURRENT_TIMESTAMP
+                 WHERE task_id = ?1",
+                [&task.id],
+            )?;
+            conn.execute(
+                "UPDATE work_attempts SET status = 'completed', completed_at = CURRENT_TIMESTAMP
+                 WHERE task_id = ?1",
+                [&task.id],
+            )?;
+            Ok::<_, xpressclaw_core::error::Error>(())
+        })
+        .unwrap();
+        board
+            .update_status(&task.id, "completed", Some("atlas"))
+            .unwrap();
+        engine
+            .on_task_completed(&task.id, "completed", "Initial response")
+            .unwrap();
+
+        let continuation = InstanceManager::new(db.clone())
+            .list_step_executions(&instance_id)
+            .unwrap()
+            .into_iter()
+            .find(|execution| execution.continuation_attempt_id.is_some())
+            .unwrap();
+        let attempt_id = continuation.continuation_attempt_id.unwrap();
+        let running = queue.claim("atlas").unwrap().unwrap();
+        assert_eq!(running.attempt_id.as_deref(), Some(attempt_id.as_str()));
+        let sessions = SessionManager::new(db.clone());
+        sessions
+            .transition_attempt(&attempt_id, "running", "Running UI review", None, None)
+            .unwrap();
+        sessions
+            .set_container(&attempt_id, "container-still-running")
+            .unwrap();
+
+        let cancellation = engine
+            .cancel_instance(&instance_id, "Workflow cancelled by user")
+            .unwrap();
+        assert_eq!(cancellation.cancelled_attempts.len(), 1);
+        release_stopped_continuation_dispatches(
+            &db,
+            &cancellation.cancelled_attempts,
+            &std::collections::BTreeSet::new(),
+        )
+        .unwrap();
+
+        let retained: (String, String, Option<String>) = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT queue.status, attempt.status, attempt.container_id
+                     FROM task_queue queue
+                     JOIN work_attempts attempt ON attempt.queue_id = queue.id
+                     WHERE attempt.id = ?1",
+                    [&attempt_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .map_err(xpressclaw_core::error::Error::from)
+            })
+            .unwrap();
+        assert_eq!(
+            retained,
+            (
+                "running".into(),
+                "cancelled".into(),
+                Some("container-still-running".into()),
+            )
+        );
+
+        let next_task = board
+            .create(&CreateTask {
+                title: "Next task".into(),
+                agent_id: Some("atlas".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let next = queue.enqueue(&next_task.id, "atlas").unwrap();
+        assert!(queue.claim_next().unwrap().is_none());
+
+        let stopped_sessions = std::collections::BTreeSet::from(["atlas".to_string()]);
+        sessions.clear_container(&attempt_id).unwrap();
+        release_stopped_continuation_dispatches(
+            &db,
+            &cancellation.cancelled_attempts,
+            &stopped_sessions,
+        )
+        .unwrap();
+        assert_eq!(queue.get(running.id).unwrap().status, "failed");
+        assert_eq!(queue.claim_next().unwrap().unwrap().id, next.id);
     }
 }
