@@ -53,6 +53,11 @@ pub struct StepExecution {
     /// turns on the source task.
     #[serde(default, skip_serializing)]
     pub continuation_attempt_id: Option<String>,
+    /// Fixed workflow-authored user message that created the continuation's
+    /// first attempt. Unlike `continuation_attempt_id`, this does not move
+    /// when an elicited user answer adopts the running execution.
+    #[serde(default, skip_serializing)]
+    pub continuation_prompt_message_id: Option<i64>,
     pub status: String, // pending, running, waiting, resuming, completed, failed, cancelled, skipped
     pub input_context: Option<String>,
     pub output: Option<String>,
@@ -676,13 +681,14 @@ impl InstanceManager {
                     rusqlite::params![CONTINUATION_WAITING_STATUS, execution_id],
                 )?;
             } else {
-                let attempt_id =
+                let (attempt_id, prompt_message_id) =
                     dispatch_continuation_in_transaction(&transaction, task_id, &agent_id, prompt)?;
                 transaction.execute(
                     "UPDATE workflow_step_executions
-                     SET continuation_attempt_id = ?1
-                     WHERE id = ?2",
-                    rusqlite::params![attempt_id, execution_id],
+                     SET continuation_attempt_id = ?1,
+                         continuation_prompt_message_id = ?2
+                     WHERE id = ?3",
+                    rusqlite::params![attempt_id, prompt_message_id, execution_id],
                 )?;
             }
             transaction.commit()?;
@@ -748,13 +754,19 @@ impl InstanceManager {
                         "continue step '{step_id}' cannot resume unassigned task '{task_id}'"
                     ))
                 })?;
-            let attempt_id =
+            let (attempt_id, prompt_message_id) =
                 dispatch_continuation_in_transaction(&transaction, task_id, &agent_id, prompt)?;
             transaction.execute(
                 "UPDATE workflow_step_executions
-                 SET status = 'running', continuation_attempt_id = ?1
-                 WHERE id = ?2 AND status = ?3",
-                rusqlite::params![attempt_id, execution_id, CONTINUATION_WAITING_STATUS],
+                 SET status = 'running', continuation_attempt_id = ?1,
+                     continuation_prompt_message_id = ?2
+                 WHERE id = ?3 AND status = ?4",
+                rusqlite::params![
+                    attempt_id,
+                    prompt_message_id,
+                    execution_id,
+                    CONTINUATION_WAITING_STATUS
+                ],
             )?;
             transaction.commit()?;
             Ok::<_, Error>(())
@@ -1049,6 +1061,16 @@ impl InstanceManager {
                 id: instance_id.to_string(),
             });
         }
+        // A user answer can temporarily adopt a continuation execution. Once
+        // the workflow is cancelled it must become ordinary task work again,
+        // so it is no longer excluded from user-message coalescing or future
+        // lifecycle operations.
+        transaction.execute(
+            "UPDATE workflow_step_executions
+             SET continuation_attempt_id = NULL
+             WHERE instance_id = ?1 AND continuation_attempt_id IS NOT NULL",
+            [instance_id],
+        )?;
         Ok(())
     }
 
@@ -1216,7 +1238,7 @@ fn dispatch_continuation_in_transaction(
     task_id: &str,
     agent_id: &str,
     prompt: &str,
-) -> Result<String> {
+) -> Result<(String, i64)> {
     let message =
         TaskConversation::insert_text_message_in_transaction(transaction, task_id, "user", prompt)?;
     let queue_item = TaskQueue::enqueue_continuation_for_message_in_transaction(
@@ -1243,7 +1265,7 @@ fn dispatch_continuation_in_transaction(
          WHERE id = ?1",
         [task_id],
     )?;
-    Ok(attempt_id)
+    Ok((attempt_id, message.id))
 }
 
 fn ensure_instance_accepts_work(conn: &rusqlite::Connection, instance_id: &str) -> Result<()> {
@@ -1424,6 +1446,9 @@ fn row_to_step_execution(row: &rusqlite::Row) -> StepExecution {
         step_id: row.get("step_id").unwrap_or_default(),
         task_id: row.get("task_id").unwrap_or_default(),
         continuation_attempt_id: row.get("continuation_attempt_id").unwrap_or_default(),
+        continuation_prompt_message_id: row
+            .get("continuation_prompt_message_id")
+            .unwrap_or_default(),
         status: row.get("status").unwrap_or_default(),
         input_context: row.get("input_context").unwrap_or_default(),
         output: row.get("output").unwrap_or_default(),

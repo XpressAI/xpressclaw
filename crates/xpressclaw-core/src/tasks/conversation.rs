@@ -10,6 +10,7 @@ use crate::error::{Error, Result};
 use crate::message_artifacts::PublishedFileAttachment;
 use crate::projects::ensure_project_accepts_work;
 use crate::tasks::attachments::DecodedImageAttachment;
+use crate::tasks::queue::{QueueItem, TaskQueue};
 use crate::visualizations::{
     store_task_message_visualizations, MessageVisualization, PreparedVisualization,
     VisualizationManager,
@@ -104,6 +105,48 @@ impl TaskConversation {
                 visualizations: &[],
             },
         )
+    }
+
+    /// Commit a user-authored task message and its response attempt in one
+    /// immediate transaction. A workflow continuation can therefore observe
+    /// either both records or neither; it cannot claim an unqueued user
+    /// message as part of its fixed-prompt response.
+    pub fn add_user_message_with_attachments_and_enqueue(
+        &self,
+        task_id: &str,
+        agent_id: Option<&str>,
+        content: &str,
+        attachments: &[DecodedImageAttachment],
+    ) -> Result<(TaskMessage, Option<QueueItem>)> {
+        let conn = self.db.conn();
+        let tx =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+        let message = Self::insert_message_in_transaction(
+            &tx,
+            task_id,
+            "user",
+            content,
+            MessageExtras {
+                image_attachments: attachments,
+                published_files: &[],
+                attempt_id: None,
+                visualizations: &[],
+            },
+        )?;
+        let continuation = agent_id
+            .map(|agent_id| {
+                TaskQueue::enqueue_continuation_for_message_in_transaction(
+                    &tx,
+                    task_id,
+                    agent_id,
+                    message.id,
+                    &message.timestamp,
+                )
+            })
+            .transpose()?
+            .flatten();
+        tx.commit()?;
+        Ok((message, continuation))
     }
 
     /// Persist a final assistant response and its copied visualizations/files

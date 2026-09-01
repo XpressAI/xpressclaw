@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 
 use xpressclaw_core::sessions::SessionManager;
 use xpressclaw_core::tasks::attachments::{decode_image_attachments, ImageAttachmentInput};
-use xpressclaw_core::tasks::board::{CreateTask, Task, TaskBoard, TaskStatus, UpdateTask};
+use xpressclaw_core::tasks::board::{CreateTask, Task, TaskBoard, UpdateTask};
 use xpressclaw_core::tasks::conversation::TaskConversation;
 use xpressclaw_core::tasks::queue::TaskQueue;
 use xpressclaw_core::visualizations::VisualizationManager;
@@ -902,11 +902,6 @@ async fn add_message(
         ),
         _ => internal_error(error),
     })?;
-    let conv = TaskConversation::new(state.db.clone());
-    let msg = conv
-        .add_message_with_attachments(&id, &req.role, &content, &attachments)
-        .map_err(internal_error)?;
-
     let summary = if content.is_empty() {
         if attachments.len() == 1 {
             "Sent an image".to_string()
@@ -917,14 +912,12 @@ async fn add_message(
         content.clone()
     };
 
-    let mut continuation = None;
-    let mut delivery = "stored";
-    if let Some(ref agent_id) = task.agent_id {
-        let sessions = SessionManager::new(state.db.clone());
+    let sessions = SessionManager::new(state.db.clone());
+    let active_attempt = if let Some(ref agent_id) = task.agent_id {
         sessions
             .ensure(agent_id, Some(agent_id))
             .map_err(internal_error)?;
-        let active_attempt = sessions
+        sessions
             .task_activity(&id, None, None, 1, 50)
             .map_err(internal_error)?
             .attempts
@@ -934,10 +927,25 @@ async fn add_message(
                     attempt.status.as_str(),
                     "preparing" | "running" | "waiting_for_input" | "review"
                 )
-            });
-        let waiting_for_input = active_attempt
-            .as_ref()
-            .is_some_and(|attempt| attempt.status == "waiting_for_input");
+            })
+    } else {
+        None
+    };
+    let waiting_for_input = active_attempt
+        .as_ref()
+        .is_some_and(|attempt| attempt.status == "waiting_for_input");
+    let conv = TaskConversation::new(state.db.clone());
+    let (msg, continuation) = conv
+        .add_user_message_with_attachments_and_enqueue(
+            &id,
+            task.agent_id.as_deref(),
+            &content,
+            &attachments,
+        )
+        .map_err(internal_error)?;
+
+    let mut delivery = "stored";
+    if let Some(ref agent_id) = task.agent_id {
         sessions
             .append_event(
                 agent_id,
@@ -958,10 +966,6 @@ async fn add_message(
             )
             .map_err(internal_error)?;
 
-        let queue = TaskQueue::new(state.db.clone());
-        continuation = queue
-            .enqueue_continuation_for_message(&id, agent_id, msg.id, &msg.timestamp)
-            .map_err(internal_error)?;
         delivery = if let Some(active_attempt) = active_attempt {
             // A deferred interruption cannot reach a turn parked on an elicitation.
             // Cancel that request and hand off to the queued guidance immediately.
@@ -980,20 +984,6 @@ async fn add_message(
         } else {
             "queued"
         };
-        if continuation.is_some()
-            && !waiting_for_input
-            && matches!(
-                task.status,
-                TaskStatus::WaitingForInput
-                    | TaskStatus::Blocked
-                    | TaskStatus::Completed
-                    | TaskStatus::Cancelled
-            )
-        {
-            board
-                .update_status(&id, "pending", Some(agent_id))
-                .map_err(internal_error)?;
-        }
         tracing::info!(
             task_id = id,
             agent_id,
@@ -1099,6 +1089,7 @@ mod tests {
     use xpressclaw_core::config::Config;
     use xpressclaw_core::db::Database;
     use xpressclaw_core::message_artifacts::PublishedFileAttachment;
+    use xpressclaw_core::tasks::board::TaskStatus;
     use xpressclaw_core::workflows::manager::{CreateWorkflow, WorkflowManager};
 
     use super::*;

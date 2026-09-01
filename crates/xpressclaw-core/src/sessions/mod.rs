@@ -681,6 +681,7 @@ impl SessionManager {
         &self,
         transaction: &rusqlite::Transaction<'_>,
         attempt_id: &str,
+        prompt_message_id: Option<i64>,
         summary: &str,
     ) -> Result<Option<WorkAttempt>> {
         let attempt = transaction
@@ -699,6 +700,16 @@ impl SessionManager {
             attempt.status.as_str(),
             "completed" | "failed" | "cancelled" | "interrupted"
         ) {
+            return Ok(None);
+        }
+        // An elicited user answer may adopt the continuation execution so its
+        // completion advances the workflow. It remains user-owned work: only
+        // the attempt triggered by this execution's original fixed prompt is
+        // cancelled with the workflow.
+        let Some(prompt_message_id) = prompt_message_id else {
+            return Ok(None);
+        };
+        if attempt.trigger_message_id != Some(prompt_message_id) {
             return Ok(None);
         }
         let task_id = attempt.task_id.as_deref().ok_or_else(|| {
@@ -726,26 +737,23 @@ impl SessionManager {
             )?;
         }
         if attempt.response_started_at.is_none() {
-            if let Some(message_id) = attempt.trigger_message_id {
-                // Same-task workflow continuations insert their own fixed
-                // user message and own the resulting attempt exclusively.
-                // If that continuation is cancelled before its response
-                // starts, remove its unconsumed prompt in the same transaction;
-                // leaving it in history would make a later user turn execute it.
-                // The extra ownership guard preserves a message if another
-                // live attempt ever references it despite that invariant.
-                transaction.execute(
-                    "DELETE FROM task_messages
-                     WHERE id = ?1 AND task_id = ?2 AND role = 'user'
-                       AND NOT EXISTS (
-                           SELECT 1 FROM work_attempts
-                           WHERE trigger_message_id = ?1 AND id != ?3
-                             AND status IN ('queued', 'preparing', 'running',
-                                            'waiting_for_input', 'review')
-                       )",
-                    rusqlite::params![message_id, task_id, attempt_id],
-                )?;
-            }
+            // Same-task workflow continuations insert their own fixed user
+            // message and own the resulting attempt exclusively. If that
+            // continuation is cancelled before its response starts, remove
+            // its unconsumed prompt in the same transaction; leaving it in
+            // history would make a later user turn execute it. The ownership
+            // check above excludes adopted user-answer attempts.
+            transaction.execute(
+                "DELETE FROM task_messages
+                 WHERE id = ?1 AND task_id = ?2 AND role = 'user'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM work_attempts
+                       WHERE trigger_message_id = ?1 AND id != ?3
+                         AND status IN ('queued', 'preparing', 'running',
+                                        'waiting_for_input', 'review')
+                   )",
+                rusqlite::params![prompt_message_id, task_id, attempt_id],
+            )?;
         }
 
         let replacement_attempt_id = transaction

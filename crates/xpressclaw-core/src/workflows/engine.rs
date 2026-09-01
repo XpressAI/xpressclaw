@@ -130,8 +130,14 @@ impl WorkflowEngine {
                 &transaction,
                 instance_id,
             )?;
-            let (continuation_task_id, continuation_attempt_id) = continuation
-                .map(|execution| (execution.task_id, execution.continuation_attempt_id))
+            let (continuation_task_id, continuation_attempt_id, prompt_message_id) = continuation
+                .map(|execution| {
+                    (
+                        execution.task_id,
+                        execution.continuation_attempt_id,
+                        execution.continuation_prompt_message_id,
+                    )
+                })
                 .unwrap_or_default();
             let cancelled_attempt = continuation_attempt_id
                 .as_deref()
@@ -139,6 +145,7 @@ impl WorkflowEngine {
                     sessions.cancel_workflow_attempt_in_transaction(
                         &transaction,
                         attempt_id,
+                        prompt_message_id,
                         summary,
                     )
                 })
@@ -3006,18 +3013,15 @@ flows:
             .update_step_status(&source_execution.id, "completed", Some("initial output"))
             .unwrap();
         let conversation = TaskConversation::new(db.clone());
-        let user_message = conversation
-            .add_message(&task.id, "user", "Please answer this first.")
-            .unwrap();
-        TaskQueue::new(db.clone())
-            .enqueue_continuation_for_message(
+        let (user_message, user_queue) = conversation
+            .add_user_message_with_attachments_and_enqueue(
                 &task.id,
-                "atlas",
-                user_message.id,
-                &user_message.timestamp,
+                Some("atlas"),
+                "Please answer this first.",
+                &[],
             )
-            .unwrap()
             .unwrap();
+        assert!(user_queue.is_some());
 
         let instance = engine.instances.get_instance(&instance_id).unwrap();
         let definition = engine.definition_for_instance(&instance).unwrap();
@@ -3506,6 +3510,156 @@ flows:
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn cancelling_a_continuation_preserves_its_adopted_user_answer() {
+        let (db, engine) = setup();
+        let workflow_id = create_workflow(
+            &db,
+            r#"
+name: preserve-adopted-answer
+flows:
+  main:
+    steps:
+      - id: review_ui
+        type: continue
+        prompt: Review the UI before finishing.
+"#,
+        );
+        WorkflowManager::new(db.clone())
+            .set_default_for_tasks(&workflow_id, true)
+            .unwrap();
+        let task = TaskBoard::new(db.clone())
+            .create(&CreateTask {
+                title: "Preserve the user's answer".into(),
+                agent_id: Some("atlas".into()),
+                context: Some(json!({ "origin": "session_message" })),
+                ..Default::default()
+            })
+            .unwrap();
+        let queue = TaskQueue::new(db.clone());
+        queue.enqueue(&task.id, "atlas").unwrap();
+        let instance_id = engine.attach_default_workflows_to_task(&task.id).unwrap()[0].clone();
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE task_queue SET status = 'completed', completed_at = CURRENT_TIMESTAMP
+                 WHERE task_id = ?1",
+                [&task.id],
+            )?;
+            conn.execute(
+                "UPDATE work_attempts SET status = 'completed', completed_at = CURRENT_TIMESTAMP
+                 WHERE task_id = ?1",
+                [&task.id],
+            )?;
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+        TaskBoard::new(db.clone())
+            .update_status(&task.id, "completed", Some("atlas"))
+            .unwrap();
+        engine
+            .on_task_completed(&task.id, "completed", "Initial response")
+            .unwrap();
+
+        let continuation = engine
+            .instances
+            .list_step_executions(&instance_id)
+            .unwrap()
+            .into_iter()
+            .find(|execution| execution.step_id == "review_ui")
+            .unwrap();
+        let prompt_message_id = continuation.continuation_prompt_message_id.unwrap();
+        let question_attempt_id = continuation.continuation_attempt_id.clone().unwrap();
+        let question_queue = queue.claim("atlas").unwrap().unwrap();
+        SessionManager::new(db.clone())
+            .transition_attempt(
+                &question_attempt_id,
+                "running",
+                "Reviewing the UI",
+                None,
+                None,
+            )
+            .unwrap();
+        let conversation = TaskConversation::new(db.clone());
+        let question = "NEEDS_USER_INPUT: Which screen should I review?";
+        conversation
+            .complete_final_assistant_attempt(crate::tasks::conversation::FinalAssistantAttempt {
+                task_id: &task.id,
+                queue_id: question_queue.id,
+                attempt_id: &question_attempt_id,
+                completion_summary: question,
+                content: question,
+                visualizations: &[],
+                published_files: &[],
+            })
+            .unwrap()
+            .unwrap();
+        TaskBoard::new(db.clone())
+            .update_status(&task.id, "waiting_for_input", Some("atlas"))
+            .unwrap();
+        engine
+            .on_attempt_completed(&task.id, &question_attempt_id, "completed", question)
+            .unwrap();
+
+        let (answer_message, answer_queue) = conversation
+            .add_user_message_with_attachments_and_enqueue(
+                &task.id,
+                Some("atlas"),
+                "Review the Agent Work screen.",
+                &[],
+            )
+            .unwrap();
+        let answer_queue = answer_queue.unwrap();
+        let answer_attempt_id = answer_queue.attempt_id.clone().unwrap();
+        let adopted = engine
+            .instances
+            .get_step_execution(&continuation.id)
+            .unwrap();
+        assert_eq!(
+            adopted.continuation_attempt_id.as_deref(),
+            Some(answer_attempt_id.as_str())
+        );
+        assert_eq!(
+            adopted.continuation_prompt_message_id,
+            Some(prompt_message_id)
+        );
+        assert_ne!(answer_message.id, prompt_message_id);
+
+        let cancellation = engine
+            .cancel_instance(&instance_id, "Workflow cancelled by user")
+            .unwrap();
+        assert!(cancellation.cancelled_attempts.is_empty());
+        assert_eq!(
+            engine.instances.get_instance(&instance_id).unwrap().status,
+            "cancelled"
+        );
+        assert!(engine
+            .instances
+            .get_step_execution(&continuation.id)
+            .unwrap()
+            .continuation_attempt_id
+            .is_none());
+        assert_eq!(queue.get(answer_queue.id).unwrap().status, "queued");
+        let answer_attempt = SessionManager::new(db.clone())
+            .get_attempt(&answer_attempt_id)
+            .unwrap();
+        assert_eq!(answer_attempt.status, "queued");
+        assert_eq!(answer_attempt.trigger_message_id, Some(answer_message.id));
+        assert_eq!(
+            conversation
+                .get_messages(&task.id)
+                .unwrap()
+                .iter()
+                .filter(|message| message.role == "user")
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "Review the UI before finishing.",
+                "Review the Agent Work screen."
+            ]
+        );
+        assert_eq!(queue.claim("atlas").unwrap().unwrap().id, answer_queue.id);
     }
 
     #[test]

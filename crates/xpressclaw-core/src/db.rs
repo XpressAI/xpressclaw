@@ -2447,6 +2447,14 @@ CREATE UNIQUE INDEX idx_workflow_step_continuation_attempt
     WHERE continuation_attempt_id IS NOT NULL;
 "#;
 
+const MIGRATION_V45: &str = r#"
+-- Retain the exact fixed prompt owned by a same-task continuation even when
+-- a later user answer adopts the execution's active attempt. Workflow
+-- cancellation can then distinguish its own unstarted prompt from user text.
+ALTER TABLE workflow_step_executions ADD COLUMN continuation_prompt_message_id INTEGER
+    REFERENCES task_messages(id) ON DELETE SET NULL;
+"#;
+
 const MIGRATION_V39: &str = "
 -- Cascading Project deletion is a recoverable two-phase operation. The
 -- durable marker is set before workers and retained runtimes are stopped, so
@@ -2544,6 +2552,7 @@ fn schema_migrations() -> &'static [(u32, &'static str)] {
         (42, MIGRATION_V42),
         (43, MIGRATION_V43),
         (44, MIGRATION_V44),
+        (45, MIGRATION_V45),
     ]
 }
 
@@ -2564,7 +2573,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "44");
+        assert_eq!(version, "45");
         let visualization_table: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
