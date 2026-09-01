@@ -1630,6 +1630,11 @@ flows:
       - id: review_ui
         type: continue
         prompt: Check the UI for unnecessary messages.
+  on_error:
+    steps:
+      - id: retry_cancelled_task
+        type: continue
+        prompt: This must not revive a task the user cancelled.
 "#
                 .into(),
             })
@@ -1684,9 +1689,17 @@ flows:
                 .map_err(xpressclaw_core::error::Error::from)
             })
             .unwrap();
-        assert_eq!(instance_status, "failed");
+        assert_eq!(instance_status, "cancelled");
         assert_eq!(step_id, "__source_task__");
         assert_eq!(execution_status, "failed");
+        assert_eq!(
+            TaskBoard::new(db.clone()).get(&task.id).unwrap().status,
+            TaskStatus::Cancelled
+        );
+        assert!(TaskConversation::new(db)
+            .get_messages(&task.id)
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

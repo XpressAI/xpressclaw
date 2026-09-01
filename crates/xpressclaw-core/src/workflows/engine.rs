@@ -1446,6 +1446,8 @@ impl WorkflowEngine {
             "cancelled" => "failed",
             _ => "failed",
         };
+        let source_task_cancelled =
+            task_status == "cancelled" && instance.source_task_id.as_deref() == Some(task_id);
 
         if exec.step_id == SOURCE_TASK_STEP_ID {
             // A user message sent during the original turn may already have a
@@ -1464,6 +1466,10 @@ impl WorkflowEngine {
             self.save_variable_store(&exec.instance_id, &var_store)?;
             self.instances
                 .update_step_status(&exec.id, step_status, Some(task_output))?;
+
+            if source_task_cancelled {
+                return self.cancel_source_task_instance(&instance, task_output);
+            }
 
             if step_status == "failed" {
                 if definition.flows.contains_key("on_error") {
@@ -1508,6 +1514,10 @@ impl WorkflowEngine {
 
         self.instances
             .update_step_status(&exec.id, step_status, Some(task_output))?;
+
+        if source_task_cancelled {
+            return self.cancel_source_task_instance(&instance, task_output);
+        }
 
         // Try to parse output as JSON and store under step_id
         let output_value = parse_task_output(task_output);
@@ -1667,6 +1677,33 @@ impl WorkflowEngine {
             )
             .map_err(Error::from)
         })
+    }
+
+    /// A user's cancellation of the source task is terminal for every
+    /// workflow attached to that task. In particular, an `on_error` flow must
+    /// not enqueue a same-task continuation and revive cancelled work.
+    fn cancel_source_task_instance(
+        &self,
+        instance: &WorkflowInstance,
+        task_output: &str,
+    ) -> Result<()> {
+        if let Some(loop_state) = instance
+            .loop_state
+            .as_deref()
+            .and_then(|state| serde_json::from_str::<LoopState>(state).ok())
+        {
+            self.instances.update_step_status(
+                &loop_state.parent_execution_id,
+                "failed",
+                Some(task_output),
+            )?;
+            self.instances.update_loop_state(&instance.id, None)?;
+        }
+        self.instances.update_status(
+            &instance.id,
+            "cancelled",
+            Some(&format!("source task cancelled: {task_output}")),
+        )
     }
 
     /// Resume one durable wait with a matched event payload. The event is
