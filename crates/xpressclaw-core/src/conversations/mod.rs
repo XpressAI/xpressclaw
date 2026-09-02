@@ -1800,6 +1800,7 @@ mod tests {
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].id, failed.id);
         assert_eq!(turns[0].status, "cancelled");
+        assert_eq!(turns[0].trigger_message_id, Some(deleted.id));
         let session: (String, Option<String>) = mgr
             .db
             .with_conn(|conn| {
@@ -1825,6 +1826,33 @@ mod tests {
             })
             .unwrap();
         assert_eq!(attention, 0);
+
+        let later = mgr
+            .send_message(
+                &conv.id,
+                &SendMessage {
+                    sender_type: "user".into(),
+                    sender_id: "local".into(),
+                    sender_name: Some("You".into()),
+                    content: "New work after dismissal".into(),
+                    message_type: None,
+                },
+            )
+            .unwrap();
+        let boundary = queue
+            .last_interrupted_trigger_before(&conv.id, "atlas", later.id)
+            .unwrap();
+        assert_eq!(boundary, Some(deleted.id));
+        let reconstructed = mgr
+            .get_messages_between(&conv.id, boundary.unwrap(), later.id, 80)
+            .unwrap();
+        assert_eq!(
+            reconstructed
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Retain this coalesced context", "New work after dismissal"]
+        );
     }
 
     #[test]
