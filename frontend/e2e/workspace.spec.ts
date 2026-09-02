@@ -3825,7 +3825,7 @@ test('DeepSeek Harness is preserved in Agent runner settings', async ({ page }) 
 	await expect(page.locator('#runner-image')).toHaveValue(
 		'ghcr.io/xpressai/xpressclaw-runner-deepseek-harness:latest',
 	);
-	await expect(page.getByText('Use my host SSH agent')).toHaveCount(0);
+	await expect(page.getByLabel('Share my host SSH access')).not.toBeChecked();
 	await expect(page.getByText(/Start ssh-agent/)).toHaveCount(0);
 	await page.getByLabel('Host Docker or Podman access').check();
 	await expect(page.locator('#runner-image')).toHaveValue(

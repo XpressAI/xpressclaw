@@ -22,7 +22,6 @@ const catalog = {
 
 test('DeepSeek Harness is shown during setup and can be selected when adding an Agent', async ({ page }) => {
 	let submitted: Record<string, unknown> | null = null;
-	let sshAgentAvailable = false;
 	let gitUsesSsh = true;
 	await page.route('**/api/**', async (route) => {
 		const request = route.request();
@@ -31,7 +30,7 @@ test('DeepSeek Harness is shown during setup and can be selected when adding an 
 		if (path === '/api/setup/system-info') {
 			body = {
 				os: 'linux', arch: 'x86_64', working_directory: '/srv/repos/platform',
-				ssh_agent_available: sshAgentAvailable, ssh_agent_socket: sshAgentAvailable ? '/run/user/1000/ssh-agent.socket' : null,
+				ssh_agent_available: false, ssh_agent_socket: null,
 			};
 		} else if (path === '/api/setup/agent-catalog') {
 			body = catalog;
@@ -52,18 +51,15 @@ test('DeepSeek Harness is shown during setup and can be selected when adding an 
 	});
 
 	await page.goto('/setup');
-	await expect(page.getByText("This repository has an SSH remote. GitHub repositories can use XpressClaw's scoped GitHub credential; use an HTTPS remote for other hosts.")).toBeVisible();
-	await expect(page.getByText('Use my host SSH agent')).toHaveCount(0);
+	await expect(page.getByText("This repository has an SSH remote. Enable host SSH access below if it is not covered by XpressClaw's scoped GitHub credential.")).toBeVisible();
+	await expect(page.getByLabel('Share my host SSH access')).not.toBeChecked();
 	await expect(page.getByText(/Start ssh-agent/)).toHaveCount(0);
-	sshAgentAvailable = true;
-	await page.reload();
-	await expect(page.getByText('/run/user/1000/ssh-agent.socket')).toBeVisible();
-	await page.getByLabel('Use my host SSH agent').check();
+	await page.getByLabel('Share my host SSH access').check();
 	gitUsesSsh = false;
 	await page.getByRole('button', { name: /Inspect|Rescan/ }).click();
-	await expect(page.getByLabel('Use my host SSH agent')).toBeChecked();
-	await page.getByLabel('Use my host SSH agent').uncheck();
-	await expect(page.getByLabel('Use my host SSH agent')).toBeVisible();
+	await expect(page.getByLabel('Share my host SSH access')).toBeChecked();
+	await page.getByLabel('Share my host SSH access').uncheck();
+	await expect(page.getByLabel('Share my host SSH access')).toBeVisible();
 	await expect(page.getByRole('button', { name: /DeepSeek Harness/ })).toContainText('DS');
 	await expect(page.getByRole('button', { name: /DeepSeek Harness/ })).toContainText("openma-ai's maintained ACP adapter");
 

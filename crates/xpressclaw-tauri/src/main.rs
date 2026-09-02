@@ -316,6 +316,9 @@ fn main() {
                         "RUST_LOG",
                         std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
                     );
+                if let Some(socket) = std::env::var_os("SSH_AUTH_SOCK") {
+                    cmd.env("SSH_AUTH_SOCK", socket);
+                }
             }
 
             #[cfg(not(target_os = "macos"))]
