@@ -114,6 +114,7 @@ async function mockDashboard(page: Page, options: {
 	delayDeletedSnapshot?: boolean;
 	refreshProjects?: boolean;
 	rollingWindow?: boolean;
+	deleteRecentEventOnRefresh?: boolean;
 	stream?: boolean;
 } = {}) {
 	const scopes: string[] = [];
@@ -182,6 +183,9 @@ async function mockDashboard(page: Page, options: {
 					{ id: projectId, name: 'Platform renamed' },
 					{ id: 'project-new', name: 'New Project' },
 				];
+			}
+			if (options.deleteRecentEventOnRefresh && requestNumber > 1) {
+				response.feed.events = response.feed.events.filter((item) => item.event_id !== 'evt-existing');
 			}
 			return route.fulfill({ json: response });
 		}
@@ -508,6 +512,18 @@ test('live activity during a slow summary refresh queues one trailing refresh', 
 	mocked.releaseFirstRefresh();
 	await expect.poll(mocked.snapshotRequestCount).toBe(3);
 	await expect(page.locator('[data-kpi="working-agents"]')).toContainText('9');
+});
+
+test('a refreshed snapshot removes deleted recent activity without dropping newer live events', async ({ page }) => {
+	await installMockEventSource(page);
+	const mocked = await mockDashboard(page, { deleteRecentEventOnRefresh: true });
+	await page.goto('/dashboard');
+	await expect(page.locator('[data-feed-event="evt-existing"]')).toBeVisible();
+
+	await emitDashboardEvent(page, event({ cursor: 51, event_id: 'evt-after-delete' }));
+	await expect.poll(mocked.snapshotRequestCount).toBeGreaterThan(1);
+	await expect(page.locator('[data-feed-event="evt-existing"]')).toHaveCount(0);
+	await expect(page.locator('[data-feed-event="evt-after-delete"]')).toBeVisible();
 });
 
 test('live activity coalesced into a failed summary refresh receives one retry', async ({ page }) => {

@@ -389,7 +389,16 @@
 	}
 
 	function reconcileFeed(refreshed: DashboardSnapshot, retained: DashboardEvent[]): DashboardSnapshot['feed'] {
-		const reconciled = uniqueEvents([...refreshed.feed.events, ...retained])
+		const oldestRefreshedCursor = refreshed.feed.events.at(-1)?.cursor;
+		// The returned page is authoritative up to the snapshot cursor. Keep
+		// newer events that raced the request and older paginated history, but
+		// do not revive rows the server deleted from inside this page.
+		const outsideRefreshedPage = retained.filter((event) => {
+			if (event.cursor > refreshed.cursor) return true;
+			if (oldestRefreshedCursor === undefined) return refreshed.feed.has_more;
+			return event.cursor < oldestRefreshedCursor;
+		});
+		const reconciled = uniqueEvents([...refreshed.feed.events, ...outsideRefreshedPage])
 			.slice(0, MAX_FEED_EVENTS);
 		const retainedIds = new Set(reconciled.map((event) => event.event_id));
 		const mayHaveOlder = hasMoreOlder || refreshed.feed.has_more;

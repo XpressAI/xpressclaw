@@ -1029,7 +1029,8 @@ impl ConversationManager {
                 )));
             }
 
-            let running_turns = runtime::cancel_message_turns(&transaction, conv_id, message_id)?;
+            let running_turns =
+                runtime::reconcile_message_deletion_turns(&transaction, conv_id, message_id)?;
             transaction.execute(
                 "DELETE FROM conversation_message_attachments WHERE message_id = ?1",
                 [message_id],
@@ -1541,6 +1542,58 @@ mod tests {
         assert_eq!(session_status, "idle");
         assert_eq!(last_message_at.as_deref(), Some(first.created_at.as_str()));
         assert_eq!(dashboard_event_count, 0);
+    }
+
+    #[test]
+    fn deleting_a_coalesced_message_keeps_the_earlier_queued_response() {
+        let mgr = test_manager();
+        let conv = mgr
+            .create(&CreateConversation {
+                title: Some("Retarget queued work".into()),
+                icon: None,
+                participant_ids: vec!["atlas".into()],
+            })
+            .unwrap();
+        let first = mgr
+            .send_message(
+                &conv.id,
+                &SendMessage {
+                    sender_type: "user".into(),
+                    sender_id: "local".into(),
+                    sender_name: Some("You".into()),
+                    content: "Keep this request".into(),
+                    message_type: None,
+                },
+            )
+            .unwrap();
+        let second = mgr
+            .send_message(
+                &conv.id,
+                &SendMessage {
+                    sender_type: "user".into(),
+                    sender_id: "local".into(),
+                    sender_name: Some("You".into()),
+                    content: "Delete only this follow-up".into(),
+                    message_type: None,
+                },
+            )
+            .unwrap();
+        let queue = runtime::ConversationTurnQueue::new(mgr.db.clone());
+        assert!(queue.enqueue(&conv.id, "atlas", first.id).unwrap());
+        assert!(!queue.enqueue(&conv.id, "atlas", second.id).unwrap());
+
+        let interrupted = mgr.delete_message(&conv.id, second.id).unwrap();
+
+        assert!(interrupted.is_empty());
+        let turns = queue.list_for_conversation(&conv.id, 10).unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].status, "queued");
+        assert_eq!(turns[0].trigger_message_id, Some(first.id));
+        assert_eq!(
+            turns[0].response_queued_at.as_deref(),
+            Some(first.created_at.as_str())
+        );
+        assert_eq!(mgr.get_messages(&conv.id, 10, None).unwrap().len(), 1);
     }
 
     #[test]

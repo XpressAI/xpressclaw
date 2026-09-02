@@ -10,7 +10,7 @@ use zerocopy::IntoBytes;
 use crate::config::{
     AgentConfig, AgentLlmConfig, BudgetConfig, Config, OnExceeded, RateLimitConfig, WakeOnConfig,
 };
-use crate::conversations::runtime::cancel_message_turns;
+use crate::conversations::runtime::reconcile_message_deletion_turns;
 use crate::db::{task_search_key, Database};
 use crate::error::{Error, Result};
 use crate::memory::vector::simple_embedding;
@@ -1567,7 +1567,7 @@ fn import_conversation_messages(
             params![message.record_id, message_id],
         )?;
         if deleted_at.is_some() {
-            cancel_message_turns(connection, &message.conversation_id, message_id)?;
+            reconcile_message_deletion_turns(connection, &message.conversation_id, message_id)?;
             connection.execute(
                 "DELETE FROM conversation_message_attachments WHERE message_id = ?1",
                 [message_id],

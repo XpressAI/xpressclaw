@@ -650,49 +650,13 @@ impl ConversationTurnQueue {
         )?;
 
         let after_id = turn.trigger_message_id.unwrap_or(0);
-        let latest_addressed = {
-            let mut statement = transaction.prepare(
-                "SELECT id, sender_type, sender_id, content, metadata, created_at
-                 FROM conversation_messages
-                 WHERE conversation_id = ?1 AND id > ?2 AND deleted_at IS NULL
-                 ORDER BY id DESC",
-            )?;
-            let messages =
-                statement.query_map(rusqlite::params![turn.conversation_id, after_id], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                    ))
-                })?;
-            let mut latest = None;
-            for message in messages {
-                let (id, sender_type, sender_id, content, metadata, created_at) = message?;
-                let agent_mentions = Self::agent_mentions(&content);
-                let routed_target_agent_id = serde_json::from_str::<serde_json::Value>(&metadata)
-                    .ok()
-                    .and_then(|value| {
-                        value
-                            .get("target_agent_id")
-                            .and_then(|target| target.as_str())
-                            .map(str::to_owned)
-                    });
-                if Self::message_targets_agent(
-                    &sender_type,
-                    &sender_id,
-                    &turn.agent_id,
-                    &agent_mentions,
-                    routed_target_agent_id.as_deref(),
-                ) {
-                    latest = Some((id, created_at));
-                    break;
-                }
-            }
-            latest
-        };
+        let latest_addressed = latest_addressed_message(
+            transaction,
+            &turn.conversation_id,
+            &turn.agent_id,
+            after_id,
+            None,
+        )?;
         if let Some((latest_addressed, response_queued_at)) = latest_addressed {
             let id = Uuid::new_v4().to_string();
             transaction.execute(
@@ -775,14 +739,35 @@ impl ConversationTurnQueue {
     }
 }
 
-/// Cancel every unfinished or failed response caused by a message. This is
-/// shared by local deletion and synchronized tombstones; server callers use
+/// Reconcile responses when a message is deleted. Coalesced queued turns are
+/// retargeted when earlier visible work remains; all other unfinished or
+/// failed responses caused by the message are cancelled. Server callers use
 /// the returned running IDs to interrupt the corresponding ACP processes.
-pub(crate) fn cancel_message_turns(
+pub(crate) fn reconcile_message_deletion_turns(
     connection: &rusqlite::Connection,
     conversation_id: &str,
     message_id: i64,
 ) -> Result<Vec<String>> {
+    let mut queued_statement = connection.prepare(
+        "SELECT id, agent_id FROM conversation_turns
+         WHERE conversation_id = ?1 AND trigger_message_id = ?2 AND status = 'queued'",
+    )?;
+    let queued_turns = queued_statement
+        .query_map(rusqlite::params![conversation_id, message_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(queued_statement);
+    for (turn_id, agent_id) in queued_turns {
+        retarget_queued_turn_before_message(
+            connection,
+            conversation_id,
+            &turn_id,
+            &agent_id,
+            message_id,
+        )?;
+    }
+
     let mut running_statement = connection.prepare(
         "SELECT id FROM conversation_turns
          WHERE conversation_id = ?1 AND trigger_message_id = ?2 AND status = 'running'",
@@ -823,6 +808,97 @@ pub(crate) fn cancel_message_turns(
         refresh_agent_session_state(connection, conversation_id, &agent_id)?;
     }
     Ok(running_turns)
+}
+
+/// A queued turn owns a high-water message, not only that message. If its
+/// newest coalesced message is deleted, keep the response owed to any earlier
+/// visible activity that still targets the same Agent.
+fn retarget_queued_turn_before_message(
+    connection: &rusqlite::Connection,
+    conversation_id: &str,
+    turn_id: &str,
+    agent_id: &str,
+    before_message_id: i64,
+) -> Result<bool> {
+    let last_completed_trigger = connection.query_row(
+        "SELECT COALESCE(MAX(trigger_message_id), 0) FROM conversation_turns
+         WHERE conversation_id = ?1 AND agent_id = ?2 AND status = 'completed'
+           AND trigger_message_id < ?3",
+        rusqlite::params![conversation_id, agent_id, before_message_id],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let candidate = latest_addressed_message(
+        connection,
+        conversation_id,
+        agent_id,
+        last_completed_trigger,
+        Some(before_message_id),
+    )?;
+    let Some((trigger_message_id, response_queued_at)) = candidate else {
+        return Ok(false);
+    };
+    Ok(connection.execute(
+        "UPDATE conversation_turns
+         SET trigger_message_id = ?1, response_queued_at = ?2
+         WHERE id = ?3 AND status = 'queued' AND trigger_message_id = ?4",
+        rusqlite::params![
+            trigger_message_id,
+            response_queued_at,
+            turn_id,
+            before_message_id
+        ],
+    )? == 1)
+}
+
+fn latest_addressed_message(
+    connection: &rusqlite::Connection,
+    conversation_id: &str,
+    agent_id: &str,
+    after_message_id: i64,
+    before_message_id: Option<i64>,
+) -> Result<Option<(i64, String)>> {
+    let mut statement = connection.prepare(
+        "SELECT id, sender_type, sender_id, content, metadata, created_at
+         FROM conversation_messages
+         WHERE conversation_id = ?1 AND id > ?2
+           AND (?3 IS NULL OR id < ?3) AND deleted_at IS NULL
+         ORDER BY id DESC",
+    )?;
+    let messages = statement.query_map(
+        rusqlite::params![conversation_id, after_message_id, before_message_id],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        },
+    )?;
+    for message in messages {
+        let (id, sender_type, sender_id, content, metadata, created_at) = message?;
+        let agent_mentions = ConversationTurnQueue::agent_mentions(&content);
+        let routed_target_agent_id = serde_json::from_str::<serde_json::Value>(&metadata)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("target_agent_id")
+                    .and_then(|target| target.as_str())
+                    .map(str::to_owned)
+            });
+        if ConversationTurnQueue::message_targets_agent(
+            &sender_type,
+            &sender_id,
+            agent_id,
+            &agent_mentions,
+            routed_target_agent_id.as_deref(),
+        ) {
+            return Ok(Some((id, created_at)));
+        }
+    }
+    Ok(None)
 }
 
 fn refresh_agent_session_state(
