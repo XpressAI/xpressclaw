@@ -73,7 +73,7 @@ pub fn fetch(
     project_dir: &Path,
     force: bool,
 ) -> Result<SyncOutcome> {
-    fetch_with_interrupt_handler(db, config, config_path, project_dir, force, |_| {})
+    fetch_internal(db, config, config_path, project_dir, force, false, |_| {})
 }
 
 /// Fetch while reporting live Conversation turns immediately after their
@@ -91,9 +91,36 @@ pub fn fetch_with_interrupt_handler<F>(
 where
     F: FnOnce(&[String]),
 {
+    fetch_internal(
+        db,
+        config,
+        config_path,
+        project_dir,
+        force,
+        true,
+        interrupt_handler,
+    )
+}
+
+fn fetch_internal<F>(
+    db: &Database,
+    config: &mut Config,
+    config_path: &Path,
+    project_dir: &Path,
+    force: bool,
+    allow_active_conversations: bool,
+    interrupt_handler: F,
+) -> Result<SyncOutcome>
+where
+    F: FnOnce(&[String]),
+{
     let manifest = ProjectSyncManifest::load(project_dir)?;
     if state::project_exists(db, &manifest.project_id)? {
-        state::ensure_fetch_ready(db, &manifest.project_id)?;
+        if allow_active_conversations {
+            state::ensure_fetch_ready(db, &manifest.project_id)?;
+        } else {
+            state::ensure_quiescent(db, &manifest.project_id)?;
+        }
     }
 
     let checkout = GitCheckout::open(&manifest.store, false)?;
@@ -113,7 +140,11 @@ where
 
     let existing_state = state::load_sync_state(db, &manifest)?;
     if state::project_exists(db, &manifest.project_id)? {
-        let local = state::export_snapshot_for_fetch(db, config, &manifest)?;
+        let local = if allow_active_conversations {
+            state::export_snapshot_for_fetch(db, config, &manifest)?
+        } else {
+            state::export_snapshot(db, config, &manifest)?
+        };
         let local_digest = local.digest()?;
         match existing_state.as_ref() {
             Some(previous) if previous.remote_snapshot_hash == remote_digest && !force => {
@@ -151,10 +182,17 @@ where
         }
     }
 
-    let interrupted_conversation_turn_ids =
-        state::import_snapshot(db, config, config_path, project_dir, &snapshot)?;
+    let interrupted_conversation_turn_ids = if allow_active_conversations {
+        state::import_snapshot_for_fetch(db, config, config_path, project_dir, &snapshot)?
+    } else {
+        state::import_snapshot(db, config, config_path, project_dir, &snapshot)?
+    };
     interrupt_handler(&interrupted_conversation_turn_ids);
-    let merged = state::export_snapshot_for_fetch(db, config, &manifest)?;
+    let merged = if allow_active_conversations {
+        state::export_snapshot_for_fetch(db, config, &manifest)?
+    } else {
+        state::export_snapshot(db, config, &manifest)?
+    };
     let digest = merged.digest()?;
     state::save_sync_state(db, &manifest, &commit, &digest, &remote_digest)?;
     Ok(SyncOutcome {
@@ -538,6 +576,28 @@ mod tests {
                 .unwrap();
         });
         publish(&source_db, &source_config, &source_dir).unwrap();
+
+        let error = fetch(
+            &replica_db,
+            &mut replica_config,
+            &replica_config_path,
+            &replica_dir,
+            false,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("active tasks, Conversations, and workflows"));
+        let turn_status = replica_db
+            .with_conn(|connection| {
+                connection.query_row(
+                    "SELECT status FROM conversation_turns WHERE id = 'running-turn'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(turn_status, "running");
 
         let mut interrupted = Vec::new();
         let error = fetch_with_interrupt_handler(

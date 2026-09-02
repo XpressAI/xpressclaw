@@ -764,6 +764,27 @@ pub(super) fn import_snapshot(
     project_dir: &Path,
     snapshot: &PortableSnapshot,
 ) -> Result<Vec<String>> {
+    import_snapshot_with_conversations(db, config, config_path, project_dir, snapshot, false)
+}
+
+pub(super) fn import_snapshot_for_fetch(
+    db: &Database,
+    config: &mut Config,
+    config_path: &Path,
+    project_dir: &Path,
+    snapshot: &PortableSnapshot,
+) -> Result<Vec<String>> {
+    import_snapshot_with_conversations(db, config, config_path, project_dir, snapshot, true)
+}
+
+fn import_snapshot_with_conversations(
+    db: &Database,
+    config: &mut Config,
+    config_path: &Path,
+    project_dir: &Path,
+    snapshot: &PortableSnapshot,
+    allow_active_conversations: bool,
+) -> Result<Vec<String>> {
     // Reload the file-backed form so values supplied only through environment
     // overrides are never materialized into xpressclaw.yaml by a fetch.
     let mut updated_config = if config_path.exists() {
@@ -776,7 +797,8 @@ pub(super) fn import_snapshot(
 
     let transaction_result = db.with_conn(|connection| -> Result<Vec<String>> {
         let transaction = Transaction::new_unchecked(connection, TransactionBehavior::Immediate)?;
-        let interrupted_turn_ids = import_transaction(&transaction, snapshot)?;
+        let interrupted_turn_ids =
+            import_transaction(&transaction, snapshot, allow_active_conversations)?;
         if fs::read(config_path).ok().as_deref() != original_config.as_deref() {
             return Err(Error::Sync(
                 "xpressclaw.yaml changed during fetch; no synchronized state was imported".into(),
@@ -936,7 +958,11 @@ fn portable_budget(budget: &PortableBudgetSettings) -> Result<BudgetConfig> {
     })
 }
 
-fn import_transaction(connection: &Connection, snapshot: &PortableSnapshot) -> Result<Vec<String>> {
+fn import_transaction(
+    connection: &Connection,
+    snapshot: &PortableSnapshot,
+    allow_active_conversations: bool,
+) -> Result<Vec<String>> {
     let project_exists: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
         [&snapshot.project.id],
@@ -945,8 +971,9 @@ fn import_transaction(connection: &Connection, snapshot: &PortableSnapshot) -> R
     if project_exists {
         ensure_project_accepts_work(connection, &snapshot.project.id)?;
     }
-    if project_is_active(connection, &snapshot.project.id, false)? {
-        return Err(quiescent_error(false));
+    let include_conversation_turns = !allow_active_conversations;
+    if project_is_active(connection, &snapshot.project.id, include_conversation_turns)? {
+        return Err(quiescent_error(include_conversation_turns));
     }
     validate_local_scopes(connection, snapshot)?;
     let project = &snapshot.project;
@@ -1873,7 +1900,7 @@ mod tests {
         target
             .with_conn(|connection| {
                 let transaction = connection.unchecked_transaction()?;
-                import_transaction(&transaction, &snapshot)?;
+                import_transaction(&transaction, &snapshot, false)?;
                 transaction.commit()?;
                 Ok::<_, Error>(())
             })
@@ -2311,7 +2338,7 @@ mod tests {
         let interrupted = db
             .with_conn(|connection| {
                 let transaction = connection.unchecked_transaction()?;
-                let interrupted = import_transaction(&transaction, &deleted)?;
+                let interrupted = import_transaction(&transaction, &deleted, true)?;
                 transaction.commit()?;
                 Ok::<_, Error>(interrupted)
             })
@@ -2409,7 +2436,7 @@ mod tests {
 
         db.with_conn(|connection| {
             let transaction = connection.unchecked_transaction().unwrap();
-            let error = import_transaction(&transaction, &snapshot).unwrap_err();
+            let error = import_transaction(&transaction, &snapshot, false).unwrap_err();
             assert!(error
                 .to_string()
                 .contains("dependency graph contains a cycle"));
