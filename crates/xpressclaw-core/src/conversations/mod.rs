@@ -1640,6 +1640,15 @@ mod tests {
         assert!(!queue.enqueue(&conv.id, "atlas", deleted.id).unwrap());
         let running = queue.claim_next().unwrap().unwrap();
         assert_eq!(running.trigger_message_id, Some(deleted.id));
+        mgr.db
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE conversation_agent_sessions SET native_session_id = 'tainted-session'
+                     WHERE conversation_id = ?1 AND agent_id = 'atlas'",
+                    [&conv.id],
+                )
+            })
+            .unwrap();
 
         let interrupted = mgr.delete_message(&conv.id, deleted.id).unwrap();
 
@@ -1658,6 +1667,11 @@ mod tests {
                 .unwrap(),
             None
         );
+        assert!(queue
+            .session(&conv.id, "atlas")
+            .unwrap()
+            .native_session_id
+            .is_none());
     }
 
     #[test]

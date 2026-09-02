@@ -817,6 +817,12 @@ pub(crate) fn reconcile_message_deletion_turns(
         rusqlite::params![conversation_id, message_id],
     )?;
     for (_, agent_id) in &running_turns {
+        connection.execute(
+            "UPDATE conversation_agent_sessions
+             SET native_session_id = NULL, updated_at = CURRENT_TIMESTAMP
+             WHERE conversation_id = ?1 AND agent_id = ?2",
+            rusqlite::params![conversation_id, agent_id],
+        )?;
         let replacement = match latest_addressed_message(
             connection,
             conversation_id,
