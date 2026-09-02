@@ -382,6 +382,22 @@ impl ConversationTurnQueue {
         })
     }
 
+    pub fn last_interrupted_trigger_before(
+        &self,
+        conversation_id: &str,
+        agent_id: &str,
+        before_message_id: i64,
+    ) -> Result<Option<i64>> {
+        self.db.with_conn(|conn| {
+            latest_interrupted_trigger_before_message(
+                conn,
+                conversation_id,
+                agent_id,
+                before_message_id,
+            )
+        })
+    }
+
     pub fn is_running(&self, turn_id: &str) -> Result<bool> {
         self.db.with_conn(|conn| {
             conn.query_row(
@@ -819,8 +835,8 @@ pub(crate) fn reconcile_message_deletion_turns(
     let mut agent_statement = connection.prepare(
         "SELECT DISTINCT agent_id FROM conversation_turns
          WHERE conversation_id = ?1
-           AND ((trigger_message_id = ?2 AND status IN ('queued', 'failed'))
-                OR (trigger_message_id >= ?2 AND status = 'running'))",
+           AND ((trigger_message_id = ?2 AND status = 'queued')
+                OR (trigger_message_id >= ?2 AND status IN ('running', 'failed')))",
     )?;
     let affected_agents = agent_statement
         .query_map(rusqlite::params![conversation_id, message_id], |row| {
@@ -834,8 +850,8 @@ pub(crate) fn reconcile_message_deletion_turns(
          SET status = 'cancelled', completed_at = CURRENT_TIMESTAMP,
              error_message = NULL
          WHERE conversation_id = ?1
-           AND ((trigger_message_id = ?2 AND status IN ('queued', 'failed'))
-                OR (trigger_message_id >= ?2 AND status = 'running'))",
+           AND ((trigger_message_id = ?2 AND status = 'queued')
+                OR (trigger_message_id >= ?2 AND status IN ('running', 'failed')))",
         rusqlite::params![conversation_id, message_id],
     )?;
     for (_, agent_id) in &running_turns {
@@ -930,13 +946,50 @@ fn latest_terminal_trigger_before_message(
     agent_id: &str,
     before_message_id: i64,
 ) -> Result<Option<i64>> {
+    latest_prompt_boundary_before_message(
+        connection,
+        conversation_id,
+        agent_id,
+        before_message_id,
+        true,
+    )
+}
+
+fn latest_interrupted_trigger_before_message(
+    connection: &rusqlite::Connection,
+    conversation_id: &str,
+    agent_id: &str,
+    before_message_id: i64,
+) -> Result<Option<i64>> {
+    latest_prompt_boundary_before_message(
+        connection,
+        conversation_id,
+        agent_id,
+        before_message_id,
+        false,
+    )
+}
+
+fn latest_prompt_boundary_before_message(
+    connection: &rusqlite::Connection,
+    conversation_id: &str,
+    agent_id: &str,
+    before_message_id: i64,
+    include_completed: bool,
+) -> Result<Option<i64>> {
     connection
         .query_row(
             "SELECT MAX(trigger_message_id) FROM conversation_turns
-         WHERE conversation_id = ?1 AND agent_id = ?2
-           AND status IN ('completed', 'cancelled', 'failed')
-           AND trigger_message_id < ?3",
-            rusqlite::params![conversation_id, agent_id, before_message_id],
+             WHERE conversation_id = ?1 AND agent_id = ?2
+               AND (status IN ('cancelled', 'failed')
+                    OR (?4 AND status = 'completed'))
+               AND trigger_message_id < ?3",
+            rusqlite::params![
+                conversation_id,
+                agent_id,
+                before_message_id,
+                include_completed
+            ],
             |row| row.get::<_, Option<i64>>(0),
         )
         .map_err(Error::from)

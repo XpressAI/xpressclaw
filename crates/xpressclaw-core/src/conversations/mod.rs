@@ -1753,6 +1753,81 @@ mod tests {
     }
 
     #[test]
+    fn deleting_an_earlier_message_dismisses_a_failed_coalesced_turn() {
+        let mgr = test_manager();
+        let conv = mgr
+            .create(&CreateConversation {
+                title: Some("Dismiss a failed coalesced prompt".into()),
+                icon: None,
+                participant_ids: vec!["atlas".into()],
+            })
+            .unwrap();
+        let deleted = mgr
+            .send_message(
+                &conv.id,
+                &SendMessage {
+                    sender_type: "user".into(),
+                    sender_id: "local".into(),
+                    sender_name: Some("You".into()),
+                    content: "Delete this failed request".into(),
+                    message_type: None,
+                },
+            )
+            .unwrap();
+        let retained = mgr
+            .send_message(
+                &conv.id,
+                &SendMessage {
+                    sender_type: "user".into(),
+                    sender_id: "local".into(),
+                    sender_name: Some("You".into()),
+                    content: "Retain this coalesced context".into(),
+                    message_type: None,
+                },
+            )
+            .unwrap();
+        let queue = runtime::ConversationTurnQueue::new(mgr.db.clone());
+        assert!(queue.enqueue(&conv.id, "atlas", deleted.id).unwrap());
+        assert!(!queue.enqueue(&conv.id, "atlas", retained.id).unwrap());
+        let failed = queue.claim_next().unwrap().unwrap();
+        assert_eq!(failed.trigger_message_id, Some(retained.id));
+        queue.fail(&failed, "agent refused the prompt").unwrap();
+
+        let interrupted = mgr.delete_message(&conv.id, deleted.id).unwrap();
+
+        assert!(interrupted.is_empty());
+        let turns = queue.list_for_conversation(&conv.id, 10).unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].id, failed.id);
+        assert_eq!(turns[0].status, "cancelled");
+        let session: (String, Option<String>) = mgr
+            .db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT status, last_error FROM conversation_agent_sessions
+                     WHERE conversation_id = ?1 AND agent_id = 'atlas'",
+                    [&conv.id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+            })
+            .unwrap();
+        assert_eq!(session, ("idle".into(), None));
+        let attention = mgr
+            .db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM dashboard_events
+                     WHERE target_type = 'conversation' AND target_id = ?1
+                       AND needs_attention = 1",
+                    [&conv.id],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(attention, 0);
+    }
+
+    #[test]
     fn deleting_a_completed_prompt_resets_the_resumable_session() {
         let mgr = test_manager();
         let conv = mgr
