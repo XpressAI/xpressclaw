@@ -75,7 +75,7 @@ pub fn fetch(
 ) -> Result<SyncOutcome> {
     let manifest = ProjectSyncManifest::load(project_dir)?;
     if state::project_exists(db, &manifest.project_id)? {
-        state::ensure_quiescent(db, &manifest.project_id)?;
+        state::ensure_fetch_ready(db, &manifest.project_id)?;
     }
 
     let checkout = GitCheckout::open(&manifest.store, false)?;
@@ -95,7 +95,7 @@ pub fn fetch(
 
     let existing_state = state::load_sync_state(db, &manifest)?;
     if state::project_exists(db, &manifest.project_id)? {
-        let local = state::export_snapshot(db, config, &manifest)?;
+        let local = state::export_snapshot_for_fetch(db, config, &manifest)?;
         let local_digest = local.digest()?;
         match existing_state.as_ref() {
             Some(previous) if previous.remote_snapshot_hash == remote_digest && !force => {
@@ -135,7 +135,7 @@ pub fn fetch(
 
     let interrupted_conversation_turn_ids =
         state::import_snapshot(db, config, config_path, project_dir, &snapshot)?;
-    let merged = state::export_snapshot(db, config, &manifest)?;
+    let merged = state::export_snapshot_for_fetch(db, config, &manifest)?;
     let digest = merged.digest()?;
     state::save_sync_state(db, &manifest, &commit, &digest, &remote_digest)?;
     Ok(SyncOutcome {

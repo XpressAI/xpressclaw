@@ -121,14 +121,26 @@ pub(super) fn project_has_portable_data(db: &Database, project_id: &str) -> Resu
 }
 
 pub(super) fn ensure_quiescent(db: &Database, project_id: &str) -> Result<()> {
-    let active = db.with_conn(|connection| project_is_active(connection, project_id))?;
+    let active = db.with_conn(|connection| project_is_active(connection, project_id, true))?;
     if active {
-        return Err(quiescent_error());
+        return Err(quiescent_error(true));
     }
     Ok(())
 }
 
-fn project_is_active(connection: &Connection, project_id: &str) -> Result<bool> {
+pub(super) fn ensure_fetch_ready(db: &Database, project_id: &str) -> Result<()> {
+    let active = db.with_conn(|connection| project_is_active(connection, project_id, false))?;
+    if active {
+        return Err(quiescent_error(false));
+    }
+    Ok(())
+}
+
+fn project_is_active(
+    connection: &Connection,
+    project_id: &str,
+    include_conversation_turns: bool,
+) -> Result<bool> {
     connection
         .query_row(
             "SELECT
@@ -138,28 +150,32 @@ fn project_is_active(connection: &Connection, project_id: &str) -> Result<bool> 
                     WHERE task.project_id = ?1
                       AND attempt.status IN ('queued', 'preparing', 'running', 'waiting_for_input', 'review')
                 )
-                OR EXISTS(
+                OR (?2 AND EXISTS(
                     SELECT 1 FROM conversation_turns turn
                     JOIN conversations conversation ON conversation.id = turn.conversation_id
                     WHERE conversation.project_id = ?1
                       AND turn.status IN ('queued', 'running')
-                )
+                ))
                 OR EXISTS(
                     SELECT 1 FROM workflow_instances instance
                     WHERE instance.project_id = ?1
                       AND instance.status IN ('running', 'waiting')
                 )",
-            [project_id],
+            params![project_id, include_conversation_turns],
             |row| row.get::<_, bool>(0),
         )
         .map_err(Error::from)
 }
 
-fn quiescent_error() -> Error {
-    Error::Sync(
-        "Project synchronization requires a quiescent Project; stop the server or wait for active tasks, Conversations, and workflows"
-            .into(),
-    )
+fn quiescent_error(include_conversation_turns: bool) -> Error {
+    let active_work = if include_conversation_turns {
+        "tasks, Conversations, and workflows"
+    } else {
+        "tasks and workflows"
+    };
+    Error::Sync(format!(
+        "Project synchronization requires a quiescent Project; stop the server or wait for active {active_work}"
+    ))
 }
 
 pub(super) fn export_snapshot(
@@ -167,9 +183,27 @@ pub(super) fn export_snapshot(
     config: &Config,
     manifest: &ProjectSyncManifest,
 ) -> Result<PortableSnapshot> {
+    export_snapshot_with_conversations(db, config, manifest, false)
+}
+
+pub(super) fn export_snapshot_for_fetch(
+    db: &Database,
+    config: &Config,
+    manifest: &ProjectSyncManifest,
+) -> Result<PortableSnapshot> {
+    export_snapshot_with_conversations(db, config, manifest, true)
+}
+
+fn export_snapshot_with_conversations(
+    db: &Database,
+    config: &Config,
+    manifest: &ProjectSyncManifest,
+    allow_active_conversations: bool,
+) -> Result<PortableSnapshot> {
     db.with_conn(|connection| {
         let transaction = Transaction::new_unchecked(connection, TransactionBehavior::Immediate)?;
-        let snapshot = export_transaction(&transaction, config, manifest)?;
+        let snapshot =
+            export_transaction(&transaction, config, manifest, allow_active_conversations)?;
         snapshot.validate_for_sync(&manifest.project_id)?;
         transaction.commit()?;
         Ok(snapshot)
@@ -180,9 +214,11 @@ fn export_transaction(
     connection: &Connection,
     config: &Config,
     manifest: &ProjectSyncManifest,
+    allow_active_conversations: bool,
 ) -> Result<PortableSnapshot> {
-    if project_is_active(connection, &manifest.project_id)? {
-        return Err(quiescent_error());
+    let include_conversation_turns = !allow_active_conversations;
+    if project_is_active(connection, &manifest.project_id, include_conversation_turns)? {
+        return Err(quiescent_error(include_conversation_turns));
     }
     let project = connection
         .query_row(
@@ -909,8 +945,8 @@ fn import_transaction(connection: &Connection, snapshot: &PortableSnapshot) -> R
     if project_exists {
         ensure_project_accepts_work(connection, &snapshot.project.id)?;
     }
-    if project_is_active(connection, &snapshot.project.id)? {
-        return Err(quiescent_error());
+    if project_is_active(connection, &snapshot.project.id, false)? {
+        return Err(quiescent_error(false));
     }
     validate_local_scopes(connection, snapshot)?;
     let project = &snapshot.project;
@@ -2256,18 +2292,28 @@ mod tests {
                 Value::String("2026-01-02 00:00:00".into()),
             );
 
+        db.with_conn(|connection| {
+            connection.execute_batch(
+                "INSERT INTO conversation_agent_sessions
+                    (conversation_id, agent_id, native_session_id, status)
+                 VALUES ('conversation-one', 'atlas', 'active-session', 'running');
+                 INSERT INTO conversation_turns
+                    (id, conversation_id, agent_id, trigger_message_id, status)
+                 SELECT 'running-turn', 'conversation-one', 'atlas', id, 'running'
+                 FROM conversation_messages WHERE content = 'one';",
+            )
+        })
+        .unwrap();
+
+        assert!(ensure_fetch_ready(&db, "project-one").is_ok());
+        assert!(ensure_quiescent(&db, "project-one").is_err());
+        assert!(export_snapshot_for_fetch(&db, &config, &manifest()).is_ok());
         let interrupted = db
             .with_conn(|connection| {
-                connection.execute_batch(
-                    "INSERT INTO conversation_agent_sessions
-                        (conversation_id, agent_id, native_session_id, status)
-                     VALUES ('conversation-one', 'atlas', 'active-session', 'running');
-                     INSERT INTO conversation_turns
-                        (id, conversation_id, agent_id, trigger_message_id, status)
-                     SELECT 'running-turn', 'conversation-one', 'atlas', id, 'running'
-                     FROM conversation_messages WHERE content = 'one';",
-                )?;
-                import_conversation_messages(connection, &deleted)
+                let transaction = connection.unchecked_transaction()?;
+                let interrupted = import_transaction(&transaction, &deleted)?;
+                transaction.commit()?;
+                Ok::<_, Error>(interrupted)
             })
             .unwrap();
 

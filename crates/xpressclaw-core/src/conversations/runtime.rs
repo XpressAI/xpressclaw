@@ -439,6 +439,8 @@ impl ConversationTurnQueue {
                 .optional()?
                 .ok_or_else(|| Error::Conversation(format!("turn {turn_id} not found")))?;
             let was_running = original.status == "running";
+            let invalidates_native_session =
+                matches!(original.status.as_str(), "running" | "failed");
             let changed = transaction.execute(
                 "UPDATE conversation_turns
                  SET status = 'cancelled', completed_at = CURRENT_TIMESTAMP,
@@ -447,16 +449,18 @@ impl ConversationTurnQueue {
                    AND status IN ('queued', 'running', 'failed')",
                 rusqlite::params![turn_id, conversation_id],
             )? == 1;
-            if changed && was_running {
-                // The native ACP session may already contain the cancelled
-                // prompt. Deferred work must start from reconstructed visible
-                // history instead of resuming that session.
+            if changed && invalidates_native_session {
+                // Once a response started, the native ACP session may already
+                // contain the cancelled or failed prompt. Later work must use
+                // reconstructed visible history instead of resuming it.
                 transaction.execute(
                     "UPDATE conversation_agent_sessions
                      SET native_session_id = NULL, updated_at = CURRENT_TIMESTAMP
                      WHERE conversation_id = ?1 AND agent_id = ?2",
                     rusqlite::params![&original.conversation_id, &original.agent_id],
                 )?;
+            }
+            if changed && was_running {
                 let after_id = original.trigger_message_id.unwrap_or(0);
                 if let Some((message_id, _)) = latest_addressed_message(
                     &transaction,
@@ -1272,6 +1276,15 @@ mod tests {
             .enqueue(&conversation.id, "atlas", message.id)
             .unwrap();
         let running = queue.claim_next().unwrap().unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE conversation_agent_sessions SET native_session_id = 'resumed-session'
+                 WHERE conversation_id = ?1 AND agent_id = 'atlas'",
+                [&conversation.id],
+            )?;
+            Ok::<_, rusqlite::Error>(())
+        })
+        .unwrap();
         queue.fail(&running, "Harness refused the request").unwrap();
 
         let before = db
@@ -1291,14 +1304,14 @@ mod tests {
         assert!(cancellation.changed);
         assert!(!cancellation.was_running);
         assert_eq!(cancellation.turn.status, "cancelled");
-        let (session_status, still_needs_attention) = db
+        let ((session_status, native_session_id), still_needs_attention) = db
             .with_conn(|conn| {
                 Ok::<_, rusqlite::Error>((
                     conn.query_row(
-                        "SELECT status FROM conversation_agent_sessions
+                        "SELECT status, native_session_id FROM conversation_agent_sessions
                          WHERE conversation_id = ?1 AND agent_id = 'atlas'",
                         [&conversation.id],
-                        |row| row.get::<_, String>(0),
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
                     )?,
                     conn.query_row(
                         "SELECT COUNT(*) FROM dashboard_events
@@ -1311,6 +1324,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(session_status, "idle");
+        assert_eq!(native_session_id, None);
         assert_eq!(still_needs_attention, 0);
     }
 
