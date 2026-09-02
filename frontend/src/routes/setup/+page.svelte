@@ -37,8 +37,6 @@
 	let runnerCommand = $state('');
 	let subscriptionAuth = $state(true);
 	let sshAgentForwarding = $state(false);
-	let sshAgentAvailable = $state(false);
-	let sshAgentSocket = $state('');
 	let containerEngine = $state<'none' | 'host'>('none');
 	let workspaceMode = $state<'existing' | 'managed'>('existing');
 	let workspacePath = $state('');
@@ -75,8 +73,6 @@
 		if (systemResult.status === 'fulfilled') {
 			workspacePath = systemResult.value.working_directory ?? '';
 			hostOs = systemResult.value.os;
-			sshAgentAvailable = systemResult.value.ssh_agent_available;
-			sshAgentSocket = systemResult.value.ssh_agent_socket ?? '';
 			suggestAgentName(workspacePath);
 		}
 		if (catalogResult.status === 'fulfilled') {
@@ -356,9 +352,7 @@
 				</p>
 				{#if gitUsesSsh}
 					<p class="mt-2 rounded-md border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-amber-600">
-						{sshAgentAvailable
-							? "This repository has an SSH remote. Enable host SSH-agent access below if it is not covered by XpressClaw's scoped GitHub credential."
-							: "This repository has an SSH remote. GitHub repositories can use XpressClaw's scoped GitHub credential; use an HTTPS remote for other hosts."}
+						This repository has an SSH remote. Enable host SSH access below if it is not covered by XpressClaw's scoped GitHub credential.
 					</p>
 				{/if}
 			{:else}
@@ -429,23 +423,20 @@
 			{/if}
 		</section>
 
-		{#if sshAgentAvailable || sshAgentForwarding}
 		<section class="rounded-xl border border-border bg-muted/20 p-4">
 			<label class="flex cursor-pointer items-start gap-3">
 				<input type="checkbox" bind:checked={sshAgentForwarding} class="mt-0.5 rounded border-border" />
 				<span>
-					<span class="block text-sm font-medium text-foreground">Use my host SSH agent</span>
-					<span class="mt-0.5 block text-xs leading-relaxed text-muted-foreground">Let Git use keys already unlocked on this computer. XpressClaw forwards only the agent socket plus SSH config and known-host entries; it never mounts private-key files.</span>
+					<span class="block text-sm font-medium text-foreground">Share my host SSH access</span>
+					<span class="mt-0.5 block text-xs leading-relaxed text-muted-foreground">Give this runner the same access to <code>~/.ssh</code> as a coding agent running directly on this computer. Leave this off to keep those files out of the runner.</span>
 				</span>
 			</label>
-			<p class="mt-2 text-[11px] text-muted-foreground">Detected <code>{sshAgentSocket}</code>.</p>
 			{#if sshAgentForwarding}
 				<p class="mt-3 rounded-md border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-amber-600">
-					The harness can authenticate or sign with any key loaded in your SSH agent. Enable this only for harnesses and tasks you trust.
+					The harness can read and change every file in <code>~/.ssh</code> and use unlocked SSH-agent keys when available. Enable this only for harnesses and tasks you trust.
 				</p>
 			{/if}
 		</section>
-		{/if}
 
 		<section class="rounded-xl border border-border bg-muted/20 p-4">
 			{#if runnerKind === 'custom'}

@@ -134,11 +134,6 @@ async fn prepare_runner(
             "host container-engine access requires a local Docker-compatible Unix socket",
         ));
     }
-    if agent.runner.ssh_agent_forwarding && host_ssh_agent_socket().is_none() {
-        return Err(bad_request(
-            "SSH key access is unavailable; disable it in Harness settings, use XpressClaw's scoped GitHub credential, or use an HTTPS remote",
-        ));
-    }
     if available_runner_image(&docker, &image, &kind)
         .await
         .is_none()
@@ -178,7 +173,6 @@ async fn readiness(
             .is_some_and(|docker| docker.host_engine_socket().is_some());
     let ssh_agent_socket = host_ssh_agent_socket();
     let ssh_agent_available = ssh_agent_socket.is_some();
-    let ssh_agent_ready = !agent.runner.ssh_agent_forwarding || ssh_agent_available;
     let runtime_image = match docker.as_ref() {
         Some(docker) => available_runner_image(docker, &image, &kind).await,
         None => None,
@@ -215,12 +209,6 @@ async fn readiness(
             "Host container-engine access needs a local Docker or Podman Unix socket".to_string(),
         );
     }
-    if !ssh_agent_ready {
-        issues.push(
-            "SSH key access is unavailable; disable it in Harness settings, use XpressClaw's scoped GitHub credential, or use an HTTPS remote"
-                .to_string(),
-        );
-    }
     if !command_present {
         issues.push(
             "Custom ACP server command is not configured; add it in the Runner tab".to_string(),
@@ -233,7 +221,7 @@ async fn readiness(
     }
     Ok(json!({
         "protocol": "acp",
-        "ready": docker_available && image_present && workspace_present && auth_present && command_present && container_engine_available && ssh_agent_ready,
+        "ready": docker_available && image_present && workspace_present && auth_present && command_present && container_engine_available,
         "docker_available": docker_available,
         "container_runtime": docker.as_ref().map(|docker| docker.runtime()),
         "container_runtime_version": docker.as_ref().and_then(|docker| docker.runtime_version()),

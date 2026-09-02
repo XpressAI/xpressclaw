@@ -20,8 +20,6 @@
 	let model = $state('');
 	let subscriptionAuth = $state(true);
 	let sshAgentForwarding = $state(false);
-	let sshAgentAvailable = $state(false);
-	let sshAgentSocket = $state('');
 	let containerEngine = $state<'none' | 'host'>('none');
 	let commandText = $state('');
 	let configOptions = $state<AcpConfigOption[]>([]);
@@ -129,17 +127,14 @@
 
 	onMount(async () => {
 		try {
-			const [events, catalog, agents, systemInfo] = await Promise.all([
+			const [events, catalog, agents] = await Promise.all([
 				sessions.events(agentId).catch(() => []),
 				mcpServers.list().catch(() => ({ servers: [] })),
-				setup.agentCatalog().catch(() => ({ agents: [] })),
-				setup.systemInfo().catch(() => null)
+				setup.agentCatalog().catch(() => ({ agents: [] }))
 			]);
 			applyAdvertisedControls(events);
 			serverCatalog = catalog.servers;
 			agentCatalog = agents.agents;
-			sshAgentAvailable = systemInfo?.ssh_agent_available ?? false;
-			sshAgentSocket = systemInfo?.ssh_agent_socket ?? '';
 		} catch {
 			configOptions = [];
 			serverCatalog = [];
@@ -509,31 +504,22 @@
 		<p class="mt-1 text-[11px] text-muted-foreground">One idempotent shell command per line. Commands run in the workspace before every short-lived ACP task.</p>
 	</div>
 
-	{#if sshAgentAvailable || sshAgentForwarding}
 	<div class="ai-card p-5">
 		<div class="flex items-start gap-3">
 			<input id="ssh-agent-forwarding" type="checkbox" bind:checked={sshAgentForwarding} class="mt-0.5 h-4 w-4 rounded border-input" />
 			<div>
-				<label for="ssh-agent-forwarding" class="text-sm font-medium">Use my host SSH agent</label>
+				<label for="ssh-agent-forwarding" class="text-sm font-medium">Share my host SSH access</label>
 				<p class="mt-1 text-xs leading-relaxed text-muted-foreground">
-					Forward the host SSH-agent socket so Git can use keys you already unlocked for an existing clone. XpressClaw also exposes the host SSH config and known-host entries when present, but never mounts private-key files.
+					Give this runner the same access to <code>~/.ssh</code> as a coding agent running directly on this computer. Leave this off to keep those files out of the runner.
 				</p>
-				{#if sshAgentAvailable}
-					<p class="mt-2 text-[11px] text-muted-foreground">Detected <code>{sshAgentSocket}</code>.</p>
-				{:else}
-					<p class="mt-2 rounded-md border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-amber-600">
-						SSH key access is unavailable. Disable this option, use XpressClaw's scoped GitHub credential, or use an HTTPS remote.
-					</p>
-				{/if}
 				{#if sshAgentForwarding}
 					<p class="mt-2 rounded-md border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-amber-600">
-						The harness can authenticate or sign with any key loaded in that SSH agent for the life of this retained environment. Enable this only for harnesses and tasks you trust.
+						The harness can read and change every file in <code>~/.ssh</code> and use unlocked SSH-agent keys when available. Enable this only for harnesses and tasks you trust.
 					</p>
 				{/if}
 			</div>
 		</div>
 	</div>
-	{/if}
 
 	<div class="ai-card p-5">
 		<div class="flex items-start gap-3">

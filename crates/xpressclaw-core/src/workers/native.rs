@@ -74,6 +74,7 @@ const CODEX_INITIAL_AGENT_MODE: &str = "INITIAL_AGENT_MODE";
 const CODEX_FULL_ACCESS_MODE: &str = "agent-full-access";
 const DOCKER_DESKTOP_SSH_AGENT_SOURCE: &str = "/run/host-services/ssh-auth.sock";
 const SSH_AGENT_SOCKET_TARGET: &str = "/tmp/xpressclaw-ssh-agent.sock";
+const SSH_HOME_TARGET: &str = "/home/node/.ssh";
 const SSH_CONFIG_TARGET: &str = "/tmp/xpressclaw-host-ssh-config";
 const SSH_KNOWN_HOSTS_TARGET: &str = "/tmp/xpressclaw-host-known-hosts";
 const SSH_RUNTIME_DIR_TARGET: &str = "/run/xpressclaw/ssh";
@@ -2930,34 +2931,33 @@ fn build_spec(
         "NO_COLOR=1".to_string(),
     ];
     if agent.runner.ssh_agent_forwarding {
-        let access = discover_host_ssh_agent().ok_or_else(|| {
-            Error::Backend(
-                "SSH key access is unavailable; disable it in Harness settings, use XpressClaw's scoped GitHub credential, or use an HTTPS remote"
-                    .to_string(),
-            )
-        })?;
-        let retained_known_hosts =
-            prepare_retained_ssh_known_hosts(&config.system.data_dir, &agent.name)?;
-        let forwarded_config = access
-            .config
-            .as_deref()
-            .map(|contents| {
-                prepare_forwarded_ssh_config(&config.system.data_dir, &agent.name, contents)
-            })
-            .transpose()?;
-        let socket_mount_source = ssh_agent_mount_source(
-            &access.socket,
-            docker.is_docker_desktop(),
-            cfg!(target_os = "macos"),
-        );
-        apply_ssh_agent_forwarding(
-            &access,
-            &socket_mount_source,
-            &retained_known_hosts,
-            forwarded_config.as_deref(),
-            &mut volumes,
-            &mut environment,
-        );
+        if let Some(host_ssh) = host_ssh_directory() {
+            mount_host_ssh_directory(&host_ssh, &mut volumes);
+        }
+        if let Some(access) = discover_host_ssh_agent() {
+            let retained_known_hosts =
+                prepare_retained_ssh_known_hosts(&config.system.data_dir, &agent.name)?;
+            let forwarded_config = access
+                .config
+                .as_deref()
+                .map(|contents| {
+                    prepare_forwarded_ssh_config(&config.system.data_dir, &agent.name, contents)
+                })
+                .transpose()?;
+            let socket_mount_source = ssh_agent_mount_source(
+                &access.socket,
+                docker.is_docker_desktop(),
+                cfg!(target_os = "macos"),
+            );
+            apply_ssh_agent_forwarding(
+                &access,
+                &socket_mount_source,
+                &retained_known_hosts,
+                forwarded_config.as_deref(),
+                &mut volumes,
+                &mut environment,
+            );
+        }
     }
     apply_codex_mode_default(kind, &agent.runner, &mut environment);
     let mut runner_environment = agent.runner.environment.iter().collect::<Vec<_>>();
@@ -3226,8 +3226,8 @@ struct HostSshAgentAccess {
 }
 
 /// Return the live host SSH-agent socket that XpressClaw would forward. The
-/// path is exposed for readiness diagnostics only; private key files are never
-/// inspected or mounted.
+/// path is exposed for readiness diagnostics only; discovery does not inspect
+/// private-key contents.
 pub fn host_ssh_agent_socket() -> Option<PathBuf> {
     discover_host_ssh_agent().map(|access| access.socket)
 }
@@ -3809,8 +3809,7 @@ fn apply_ssh_agent_forwarding(
         source: socket_mount_source.display().to_string(),
         target: SSH_AGENT_SOCKET_TARGET.to_string(),
         read_only: false,
-        // A shared label makes rootless Podman/Docker usable on SELinux hosts
-        // without exposing any private-key files.
+        // A shared label makes rootless Podman/Docker usable on SELinux hosts.
         selinux_relabel: SelinuxRelabel::Shared,
     });
     environment.push(format!("SSH_AUTH_SOCK={SSH_AGENT_SOCKET_TARGET}"));
@@ -3862,6 +3861,18 @@ fn apply_ssh_agent_forwarding(
     environment.push(format!("GIT_SSH_COMMAND={command}"));
 }
 
+fn mount_host_ssh_directory(host_ssh: &Path, volumes: &mut Vec<VolumeMount>) {
+    if volumes.iter().any(|mount| mount.target == SSH_HOME_TARGET) {
+        return;
+    }
+    volumes.push(VolumeMount {
+        source: host_ssh.display().to_string(),
+        target: SSH_HOME_TARGET.to_string(),
+        read_only: false,
+        selinux_relabel: SelinuxRelabel::Shared,
+    });
+}
+
 fn ssh_agent_mount_source(host_socket: &Path, docker_desktop: bool, macos_host: bool) -> PathBuf {
     if docker_desktop && macos_host {
         PathBuf::from(DOCKER_DESKTOP_SSH_AGENT_SOURCE)
@@ -3889,6 +3900,13 @@ fn host_home() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
+}
+
+fn host_ssh_directory() -> Option<PathBuf> {
+    let directory = host_home()?.join(".ssh");
+    directory
+        .is_dir()
+        .then(|| directory.canonicalize().unwrap_or(directory))
 }
 
 fn parse_volume(raw: &str) -> Option<VolumeMount> {
@@ -5629,7 +5647,7 @@ flows:
 
     #[cfg(unix)]
     #[test]
-    fn forwards_only_a_live_ssh_agent_and_non_secret_ssh_configuration() {
+    fn shares_host_ssh_files_and_forwards_a_live_agent_when_enabled() {
         let root = std::env::temp_dir().join(format!(
             "xpressclaw-ssh-forwarding-{}-{}",
             std::process::id(),
@@ -5706,6 +5724,7 @@ flows:
 
         let mut volumes = Vec::new();
         let mut environment = Vec::new();
+        mount_host_ssh_directory(&ssh_dir, &mut volumes);
         apply_ssh_agent_forwarding(
             &access,
             &socket,
@@ -5715,6 +5734,12 @@ flows:
             &mut environment,
         );
 
+        assert!(volumes.iter().any(|mount| {
+            mount.source == ssh_dir.display().to_string()
+                && mount.target == SSH_HOME_TARGET
+                && !mount.read_only
+                && mount.selinux_relabel == SelinuxRelabel::Shared
+        }));
         assert!(volumes.iter().any(|mount| {
             mount.source == socket.display().to_string()
                 && mount.target == SSH_AGENT_SOCKET_TARGET
@@ -5735,12 +5760,6 @@ flows:
                 && !mount.read_only
                 && mount.selinux_relabel == SelinuxRelabel::Shared
         }));
-        assert!(!volumes
-            .iter()
-            .any(|mount| mount.source.ends_with("id_ed25519")
-                || mount.source.ends_with("80-putty.ppk")
-                || mount.source.ends_with("85-ssh2.key")
-                || mount.source.ends_with("90-secret.conf")));
         assert!(environment
             .iter()
             .any(|entry| entry == &format!("SSH_AUTH_SOCK={SSH_AGENT_SOCKET_TARGET}")));
