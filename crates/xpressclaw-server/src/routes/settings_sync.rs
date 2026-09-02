@@ -101,21 +101,28 @@ async fn fetch_project(
     let config_path = state.config_path.clone();
     let mut runtime_config = state.config().as_ref().clone();
     let force = request.map(|Json(request)| request.force).unwrap_or(false);
+    let turn_controls = state.turn_controls.clone();
+    let elicitations = state.elicitations.clone();
 
     let (outcome, mut updated_config) = tokio::task::spawn_blocking(move || {
-        let outcome = sync::fetch(&db, &mut runtime_config, &config_path, &project_dir, force)?;
+        let outcome = sync::fetch_with_interrupt_handler(
+            &db,
+            &mut runtime_config,
+            &config_path,
+            &project_dir,
+            force,
+            |turn_ids| {
+                for turn_id in turn_ids {
+                    turn_controls.request_interrupt(turn_id, AcpInterruptMode::Immediate);
+                    elicitations.cancel_attempt(turn_id);
+                }
+            },
+        )?;
         Ok::<_, Error>((outcome, runtime_config))
     })
     .await
     .map_err(join_error)?
     .map_err(core_error)?;
-
-    for turn_id in &outcome.interrupted_conversation_turn_ids {
-        state
-            .turn_controls
-            .request_interrupt(turn_id, AcpInterruptMode::Immediate);
-        state.elicitations.cancel_attempt(turn_id);
-    }
 
     // fetch deliberately reloads the file-backed configuration so environment
     // credentials are never written to disk. Restore those runtime-only

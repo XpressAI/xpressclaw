@@ -73,6 +73,24 @@ pub fn fetch(
     project_dir: &Path,
     force: bool,
 ) -> Result<SyncOutcome> {
+    fetch_with_interrupt_handler(db, config, config_path, project_dir, force, |_| {})
+}
+
+/// Fetch while reporting live Conversation turns immediately after their
+/// synchronized cancellation commits. The handler runs before fallible
+/// post-import snapshot and bookkeeping work, so callers can always interrupt
+/// an ACP process whose turn was cancelled by a remote tombstone.
+pub fn fetch_with_interrupt_handler<F>(
+    db: &Database,
+    config: &mut Config,
+    config_path: &Path,
+    project_dir: &Path,
+    force: bool,
+    interrupt_handler: F,
+) -> Result<SyncOutcome>
+where
+    F: FnOnce(&[String]),
+{
     let manifest = ProjectSyncManifest::load(project_dir)?;
     if state::project_exists(db, &manifest.project_id)? {
         state::ensure_fetch_ready(db, &manifest.project_id)?;
@@ -135,6 +153,7 @@ pub fn fetch(
 
     let interrupted_conversation_turn_ids =
         state::import_snapshot(db, config, config_path, project_dir, &snapshot)?;
+    interrupt_handler(&interrupted_conversation_turn_ids);
     let merged = state::export_snapshot_for_fetch(db, config, &manifest)?;
     let digest = merged.digest()?;
     state::save_sync_state(db, &manifest, &commit, &digest, &remote_digest)?;
@@ -423,5 +442,138 @@ mod tests {
         assert_eq!(messages, 3);
         let merged = publish(&first_db, &first_config_after, &first_dir).unwrap();
         assert_eq!(merged.counts.conversation_messages, 3);
+    }
+
+    #[test]
+    fn interrupted_turns_are_reported_before_post_import_failure() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let remote = root.path().join("remote.git");
+        fs::create_dir(&remote).unwrap();
+        assert!(Command::new("git")
+            .args(["init", "--bare", "--quiet"])
+            .current_dir(&remote)
+            .status()
+            .unwrap()
+            .success());
+
+        let source_dir = root.path().join("source");
+        let replica_dir = root.path().join("replica");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&replica_dir).unwrap();
+
+        let source_db = Database::open_memory().unwrap();
+        add_project_with_message(&source_db, "delete me");
+        source_db.with_conn(|connection| {
+            connection
+                .execute(
+                    "INSERT INTO agents (id, name, backend, config, project_id)
+                     VALUES ('atlas', 'Atlas', 'codex', '{}', 'project-one')",
+                    [],
+                )
+                .unwrap();
+        });
+        let source_config = Config {
+            agents: vec![crate::config::AgentConfig {
+                name: "atlas".into(),
+                backend: "codex".into(),
+                ..crate::config::AgentConfig::default()
+            }],
+            ..Config::default()
+        };
+        source_config
+            .save(&source_dir.join("xpressclaw.yaml"))
+            .unwrap();
+        initialize(
+            &source_db,
+            &source_dir,
+            "project-one",
+            &remote.display().to_string(),
+            "shared",
+            "projects/project-one",
+            true,
+        )
+        .unwrap();
+        publish(&source_db, &source_config, &source_dir).unwrap();
+
+        fs::copy(
+            source_dir.join(MANIFEST_FILE),
+            replica_dir.join(MANIFEST_FILE),
+        )
+        .unwrap();
+        let replica_db = Database::open_memory().unwrap();
+        let (mut replica_config, replica_config_path) = save_config(&replica_dir);
+        fetch(
+            &replica_db,
+            &mut replica_config,
+            &replica_config_path,
+            &replica_dir,
+            false,
+        )
+        .unwrap();
+        replica_db.with_conn(|connection| {
+            connection
+                .execute_batch(
+                    "INSERT INTO conversation_agent_sessions
+                        (conversation_id, agent_id, native_session_id, status)
+                     VALUES ('conversation-one', 'atlas', 'active-session', 'running');
+                     INSERT INTO conversation_turns
+                        (id, conversation_id, agent_id, trigger_message_id, status)
+                     SELECT 'running-turn', 'conversation-one', 'atlas', id, 'running'
+                     FROM conversation_messages WHERE content = 'delete me';",
+                )
+                .unwrap();
+        });
+
+        source_db.with_conn(|connection| {
+            connection
+                .execute(
+                    "UPDATE conversation_messages
+                     SET deleted_at = '2026-01-02 00:00:00'
+                     WHERE content = 'delete me'",
+                    [],
+                )
+                .unwrap();
+        });
+        publish(&source_db, &source_config, &source_dir).unwrap();
+
+        let mut interrupted = Vec::new();
+        let error = fetch_with_interrupt_handler(
+            &replica_db,
+            &mut replica_config,
+            &replica_config_path,
+            &replica_dir,
+            false,
+            |turn_ids| {
+                interrupted.extend_from_slice(turn_ids);
+                replica_db.with_conn(|connection| {
+                    connection
+                        .execute_batch(
+                            "INSERT INTO tasks (id, title, status, agent_id, project_id)
+                             VALUES ('racing-task', 'Racing task', 'in_progress', 'atlas', 'project-one');
+                             INSERT INTO work_attempts
+                                (id, session_id, task_id, runner, status)
+                             VALUES ('racing-attempt', 'atlas', 'racing-task', 'native', 'running');",
+                        )
+                        .unwrap();
+                });
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("active tasks and workflows"));
+        assert_eq!(interrupted, ["running-turn"]);
+        let turn_status = replica_db
+            .with_conn(|connection| {
+                connection.query_row(
+                    "SELECT status FROM conversation_turns WHERE id = 'running-turn'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(turn_status, "cancelled");
     }
 }
