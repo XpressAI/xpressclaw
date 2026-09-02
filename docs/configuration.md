@@ -248,9 +248,11 @@ mounts host `~/.ssh` read-write at the runner user's normal SSH location and
 forwards a live SSH-agent socket when one is available. When an agent is
 forwarded, new host keys accepted by the runner are also kept in private,
 Agent-scoped storage under XpressClaw's data directory, so changed-key checks
-survive retained-container recreation. The mounted SSH directory reflects host
-file changes directly; replacing a forwarded agent socket recreates the
-retained container on the next turn.
+survive retained-container recreation. Mounted SSH files reflect host changes
+directly. When an agent is forwarded, a runner-only config overlay points all
+SSH client commands at that socket even if the host config names a host-only
+`IdentityAgent` path; config changes refresh that overlay on the next turn.
+Replacing a forwarded agent socket also recreates the retained container.
 
 On macOS, when the selected daemon identifies itself as Docker Desktop,
 XpressClaw uses Docker Desktop's `/run/host-services/ssh-auth.sock` bridge

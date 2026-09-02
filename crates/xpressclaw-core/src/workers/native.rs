@@ -74,6 +74,7 @@ const CODEX_INITIAL_AGENT_MODE: &str = "INITIAL_AGENT_MODE";
 const CODEX_FULL_ACCESS_MODE: &str = "agent-full-access";
 const DOCKER_DESKTOP_SSH_AGENT_SOURCE: &str = "/run/host-services/ssh-auth.sock";
 const SSH_AGENT_SOCKET_TARGET: &str = "/tmp/xpressclaw-ssh-agent.sock";
+const SSH_DEFAULT_CONFIG_TARGET: &str = "/home/node/.ssh/config";
 const SSH_HOME_TARGET: &str = "/home/node/.ssh";
 const SSH_CONFIG_TARGET: &str = "/tmp/xpressclaw-host-ssh-config";
 const SSH_KNOWN_HOSTS_TARGET: &str = "/tmp/xpressclaw-host-known-hosts";
@@ -3793,7 +3794,11 @@ fn prepare_forwarded_ssh_config(
     })?;
     set_private_directory_permissions(&runtime_dir)?;
     let config = runtime_dir.join("config");
-    write_private_atomic(&config, contents)?;
+    let mut effective =
+        format!("Host *\n  IdentityAgent {SSH_AGENT_SOCKET_TARGET}\n  IdentitiesOnly no\n")
+            .into_bytes();
+    effective.extend_from_slice(contents);
+    write_private_atomic(&config, &effective)?;
     Ok(config)
 }
 
@@ -3837,6 +3842,17 @@ fn apply_ssh_agent_forwarding(
             read_only: true,
             selinux_relabel: SelinuxRelabel::Shared,
         });
+        if !volumes
+            .iter()
+            .any(|mount| mount.target == SSH_DEFAULT_CONFIG_TARGET)
+        {
+            volumes.push(VolumeMount {
+                source: config.display().to_string(),
+                target: SSH_DEFAULT_CONFIG_TARGET.to_string(),
+                read_only: true,
+                selinux_relabel: SelinuxRelabel::Shared,
+            });
+        }
         command.push_str(&format!(" -F {SSH_CONFIG_TARGET}"));
     }
     command.push_str(&format!(
@@ -5721,6 +5737,11 @@ flows:
             access.config.as_deref().unwrap(),
         )
         .unwrap();
+        let effective_config = std::fs::read_to_string(&forwarded_config).unwrap();
+        assert!(effective_config.starts_with(&format!(
+            "Host *\n  IdentityAgent {SSH_AGENT_SOCKET_TARGET}\n  IdentitiesOnly no\n"
+        )));
+        assert!(effective_config.ends_with(materialized_config));
 
         let mut volumes = Vec::new();
         let mut environment = Vec::new();
@@ -5749,6 +5770,11 @@ flows:
         assert!(volumes.iter().any(|mount| {
             mount.source == forwarded_config.display().to_string()
                 && mount.target == SSH_CONFIG_TARGET
+                && mount.read_only
+        }));
+        assert!(volumes.iter().any(|mount| {
+            mount.source == forwarded_config.display().to_string()
+                && mount.target == SSH_DEFAULT_CONFIG_TARGET
                 && mount.read_only
         }));
         assert!(volumes
@@ -5805,10 +5831,6 @@ flows:
                 .mode()
                 & 0o777,
             0o600
-        );
-        assert_eq!(
-            std::fs::read(&forwarded_config).unwrap(),
-            access.config.as_deref().unwrap()
         );
         assert_eq!(
             std::fs::metadata(&forwarded_config)

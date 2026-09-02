@@ -36,6 +36,9 @@ When enabled, XpressClaw:
   case keeps new host keys in private Agent-scoped storage so they
   survive container recreation, and uses the host known-host set as an
   additional trust source;
+- overlays the effective SSH client configuration with the forwarded socket,
+  so host `IdentityAgent` paths do not break direct `ssh`, `scp`, or `rsync`
+  commands inside the runner;
 - uses a shared SELinux label for those explicit mounts and adds the socket's
   host group to the container, matching rootless Podman and Docker hosts; and
 - includes opaque socket and known-host device/inode generations plus the

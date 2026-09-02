@@ -106,9 +106,10 @@ substitution to other ACP agents.
 Repositories that use another SSH remote can opt into **Share my host SSH
 access**. XpressClaw mounts host `~/.ssh` read-write and forwards a live SSH
 agent when one is available. A missing agent does not block file-based SSH
-access. This setting is disabled by default because every process in the
-runner can read or change the mounted SSH files and use every key exposed by a
-forwarded agent.
+access. When an agent is forwarded, a runner-only config overlay makes direct
+SSH commands use it even if the host config names a host-only socket path. This
+setting is disabled by default because every process in the runner can read or
+change the mounted SSH files and use every key exposed by a forwarded agent.
 
 ## Customization
 
