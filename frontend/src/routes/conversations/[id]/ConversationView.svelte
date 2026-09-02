@@ -184,13 +184,16 @@
 	}
 
 	async function refreshActivity() {
+		const latestMessageIdAtRequest = messages.at(-1)?.id ?? 0;
 		try {
 			const [nextMessages, nextTurns, nextTasks] = await Promise.all([
 				conversations.messages(conversationId, MESSAGE_PAGE_SIZE),
 				conversations.turns(conversationId),
 				conversations.tasks(conversationId),
 			]);
-			if (olderMessagesLoaded) messages = mergeMessages(messages, nextMessages);
+			if (olderMessagesLoaded) {
+				messages = reconcileRecentMessages(messages, nextMessages, latestMessageIdAtRequest);
+			}
 			else {
 				messages = nextMessages;
 				hasOlderMessages = nextMessages.length === MESSAGE_PAGE_SIZE;
@@ -204,6 +207,15 @@
 		const byId = new Map(existing.map((message) => [message.id, message]));
 		for (const message of incoming) byId.set(message.id, message);
 		return [...byId.values()].sort((left, right) => left.id - right.id);
+	}
+
+	function reconcileRecentMessages(existing: ConversationMessage[], incoming: ConversationMessage[], latestIdAtRequest: number): ConversationMessage[] {
+		const oldestIncomingId = incoming[0]?.id;
+		const outsideSnapshot = existing.filter((message) =>
+			(oldestIncomingId !== undefined && message.id < oldestIncomingId)
+			|| message.id > latestIdAtRequest
+		);
+		return mergeMessages(outsideSnapshot, incoming);
 	}
 
 	function afterRender(): Promise<void> {

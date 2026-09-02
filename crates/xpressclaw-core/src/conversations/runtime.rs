@@ -820,9 +820,10 @@ fn retarget_queued_turn_before_message(
     agent_id: &str,
     before_message_id: i64,
 ) -> Result<bool> {
-    let last_completed_trigger = connection.query_row(
+    let last_terminal_trigger = connection.query_row(
         "SELECT COALESCE(MAX(trigger_message_id), 0) FROM conversation_turns
-         WHERE conversation_id = ?1 AND agent_id = ?2 AND status = 'completed'
+         WHERE conversation_id = ?1 AND agent_id = ?2
+           AND status IN ('completed', 'cancelled', 'failed')
            AND trigger_message_id < ?3",
         rusqlite::params![conversation_id, agent_id, before_message_id],
         |row| row.get::<_, i64>(0),
@@ -831,7 +832,7 @@ fn retarget_queued_turn_before_message(
         connection,
         conversation_id,
         agent_id,
-        last_completed_trigger,
+        last_terminal_trigger,
         Some(before_message_id),
     )?;
     let Some((trigger_message_id, response_queued_at)) = candidate else {

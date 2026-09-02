@@ -1597,6 +1597,66 @@ mod tests {
     }
 
     #[test]
+    fn deleting_a_new_message_does_not_retry_cancelled_work() {
+        let mgr = test_manager();
+        let conv = mgr
+            .create(&CreateConversation {
+                title: Some("Do not retry cancelled work".into()),
+                icon: None,
+                participant_ids: vec!["atlas".into()],
+            })
+            .unwrap();
+        let cancelled_message = mgr
+            .send_message(
+                &conv.id,
+                &SendMessage {
+                    sender_type: "user".into(),
+                    sender_id: "local".into(),
+                    sender_name: Some("You".into()),
+                    content: "Cancel this request".into(),
+                    message_type: None,
+                },
+            )
+            .unwrap();
+        let queue = runtime::ConversationTurnQueue::new(mgr.db.clone());
+        assert!(queue
+            .enqueue(&conv.id, "atlas", cancelled_message.id)
+            .unwrap());
+        let cancelled_turn = queue.list_for_conversation(&conv.id, 10).unwrap().remove(0);
+        assert!(queue.cancel(&conv.id, &cancelled_turn.id).unwrap().changed);
+
+        let deleted_message = mgr
+            .send_message(
+                &conv.id,
+                &SendMessage {
+                    sender_type: "user".into(),
+                    sender_id: "local".into(),
+                    sender_name: Some("You".into()),
+                    content: "Delete this later request".into(),
+                    message_type: None,
+                },
+            )
+            .unwrap();
+        assert!(queue
+            .enqueue(&conv.id, "atlas", deleted_message.id)
+            .unwrap());
+
+        let interrupted = mgr.delete_message(&conv.id, deleted_message.id).unwrap();
+
+        assert!(interrupted.is_empty());
+        let turns = queue.list_for_conversation(&conv.id, 10).unwrap();
+        assert_eq!(turns.len(), 2);
+        assert!(turns.iter().all(|turn| turn.status == "cancelled"));
+        assert_eq!(
+            turns
+                .iter()
+                .filter(|turn| turn.trigger_message_id == Some(cancelled_message.id))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn agent_publication_requires_current_membership_and_source_task_scope() {
         let mgr = test_manager();
         let conv = mgr

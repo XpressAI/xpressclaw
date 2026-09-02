@@ -368,6 +368,7 @@ async function mockApi(
 		conversationTurns?: Record<string, unknown>[];
 		conversationMessageRequests?: Record<string, unknown>[];
 		conversationMessageDeleteRequests?: number[];
+		deleteConversationMessageAfterHistoryLoad?: number;
 		conversationTurnCancelRequests?: string[];
 		conversationTaskRequests?: Record<string, unknown>[];
 		projectSyncStatuses?: Record<string, unknown>[];
@@ -797,7 +798,25 @@ async function mockApi(
 				};
 				conversationMessages.push(sent);
 				response = { message: sent, queued_agents: [agentId] };
-			} else response = conversationMessages;
+			} else {
+				const requestedLimit = Number(url.searchParams.get('limit'));
+				const limit = Number.isFinite(requestedLimit) && requestedLimit > 0
+					? requestedLimit
+					: conversationMessages.length;
+				const requestedBefore = Number(url.searchParams.get('before_id'));
+				const before = Number.isFinite(requestedBefore) && requestedBefore > 0
+					? requestedBefore
+					: null;
+				const eligible = before === null
+					? conversationMessages
+					: conversationMessages.filter((message) => Number(message.id) < before);
+				response = eligible.slice(-limit);
+				if (before !== null && options.deleteConversationMessageAfterHistoryLoad !== undefined) {
+					conversationMessages = conversationMessages.filter(
+						(message) => Number(message.id) !== options.deleteConversationMessageAfterHistoryLoad,
+					);
+				}
+			}
 		} else if (path.startsWith(`/api/conversations/${conversationId}/messages/`) && request.method() === 'DELETE') {
 			const messageId = Number(path.slice(path.lastIndexOf('/') + 1));
 			options.conversationMessageDeleteRequests?.push(messageId);
@@ -1815,6 +1834,46 @@ test('conversation failures, active responses, and messages all have clear actio
 		.getByRole('button', { name: 'Delete message' }).click();
 	await expect.poll(() => deletedMessages).toEqual([41]);
 	await expect(page.getByText('This message can be removed')).toHaveCount(0);
+});
+
+test('conversation refresh removes a deleted recent message after older history was loaded', async ({ page }) => {
+	const conversation = {
+		id: conversationId,
+		project_id: projectId,
+		title: 'Recover missed deletions',
+		icon: null,
+		created_at: timestamp(1),
+		updated_at: timestamp(100),
+		last_message_at: timestamp(100),
+		participants: [
+			{ participant_type: 'user', participant_id: 'local', joined_at: timestamp(1) },
+			{ participant_type: 'agent', participant_id: agentId, joined_at: timestamp(2) },
+		],
+	};
+	const conversationMessages = Array.from({ length: 81 }, (_, index) => {
+		const id = index + 1;
+		return {
+			id,
+			conversation_id: conversationId,
+			sender_type: 'user', sender_id: 'local', sender_name: 'You',
+			content: id === 70 ? 'Deleted while disconnected' : `Retained message ${id}`,
+			message_type: 'message', linked_task_id: null, metadata: {}, attachments: [],
+			created_at: timestamp(id),
+		};
+	});
+	await mockApi(page, {
+		conversations: [conversation],
+		conversationMessages,
+		deleteConversationMessageAfterHistoryLoad: 70,
+	});
+	await page.goto(`/conversations/${conversationId}`);
+	await expect(page.getByText('Deleted while disconnected')).toBeVisible();
+
+	await page.getByRole('button', { name: 'Load earlier messages' }).click();
+
+	await expect(page.getByText('Retained message 1', { exact: true })).toBeVisible();
+	await expect(page.getByText('Retained message 71', { exact: true })).toBeVisible();
+	await expect(page.getByText('Deleted while disconnected')).toHaveCount(0, { timeout: 5_000 });
 });
 
 test('context usage is stateful and tool completion details stay on one row', async ({ page }) => {

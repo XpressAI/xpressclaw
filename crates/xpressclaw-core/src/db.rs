@@ -2502,6 +2502,26 @@ UPDATE conversation_agent_sessions
          AND turn.status = 'failed'
    );
 
+UPDATE dashboard_events
+   SET needs_attention = 0
+ WHERE target_type = 'task'
+   AND needs_attention = 1
+   AND NOT EXISTS (
+       SELECT 1 FROM tasks task
+        WHERE task.id = dashboard_events.target_id
+          AND task.status IN ('waiting_for_input', 'blocked')
+   );
+UPDATE dashboard_events
+   SET needs_attention = 0
+ WHERE target_type = 'conversation'
+   AND needs_attention = 1
+   AND NOT EXISTS (
+       SELECT 1 FROM conversation_agent_sessions session
+        WHERE session.conversation_id = dashboard_events.target_id
+          AND session.agent_id = dashboard_events.agent_id
+          AND session.status = 'failed'
+   );
+
 -- Attention is current state, not permanent history. Keep the activity row as
 -- an audit trail, but stop presenting it as unresolved once the user clears the
 -- underlying task or Conversation failure.
@@ -2758,6 +2778,76 @@ mod tests {
             )
             .unwrap();
         assert_eq!(cleanup, (0, 0, 0, Some("2026-01-01 00:00:00".into())));
+    }
+
+    #[test]
+    fn v46_backfills_resolved_dashboard_attention() {
+        ensure_sqlite_vec();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        register_sql_functions(&conn).unwrap();
+        for &(target, sql) in schema_migrations() {
+            if target > 45 {
+                break;
+            }
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.execute_batch(
+            r#"INSERT INTO projects (id, name) VALUES ('project', 'Project');
+               INSERT INTO agents (id, name, backend, config, project_id)
+               VALUES ('atlas', 'Atlas', 'native', '{}', 'project');
+               INSERT INTO tasks (id, title, status, agent_id, project_id)
+               VALUES ('resolved-task', 'Resolved task', 'completed', 'atlas', 'project'),
+                      ('active-task', 'Active task', 'blocked', 'atlas', 'project');
+               INSERT INTO conversations (id, project_id, title)
+               VALUES ('resolved-conversation', 'project', 'Resolved conversation'),
+                      ('active-conversation', 'project', 'Active conversation');
+               INSERT INTO conversation_agent_sessions
+                   (conversation_id, agent_id, status, last_error)
+               VALUES ('resolved-conversation', 'atlas', 'failed', 'Old failure'),
+                      ('active-conversation', 'atlas', 'failed', 'Current failure');
+               INSERT INTO conversation_turns
+                   (id, conversation_id, agent_id, status, error_message)
+               VALUES ('active-turn', 'active-conversation', 'atlas', 'failed', 'Current failure');
+               INSERT INTO dashboard_events
+                   (event_id, event_kind, target_type, target_id, target_title,
+                    href, agent_id, needs_attention)
+               VALUES ('resolved-task-event', 'failure', 'task', 'resolved-task',
+                       'Resolved task', '/tasks/resolved-task', 'atlas', 1),
+                      ('active-task-event', 'failure', 'task', 'active-task',
+                       'Active task', '/tasks/active-task', 'atlas', 1),
+                      ('resolved-conversation-event', 'failure', 'conversation',
+                       'resolved-conversation', 'Resolved conversation',
+                       '/conversations/resolved-conversation', 'atlas', 1),
+                      ('active-conversation-event', 'failure', 'conversation',
+                       'active-conversation', 'Active conversation',
+                       '/conversations/active-conversation', 'atlas', 1);"#,
+        )
+        .unwrap();
+
+        conn.execute_batch(MIGRATION_V46).unwrap();
+
+        let attention = conn
+            .prepare(
+                "SELECT event_id, needs_attention FROM dashboard_events
+                 WHERE event_id LIKE '%-event' ORDER BY event_id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            attention,
+            vec![
+                ("active-conversation-event".into(), true),
+                ("active-task-event".into(), true),
+                ("resolved-conversation-event".into(), false),
+                ("resolved-task-event".into(), false),
+            ]
+        );
     }
 
     #[test]
