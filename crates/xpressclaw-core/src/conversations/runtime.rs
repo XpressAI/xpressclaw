@@ -845,24 +845,38 @@ pub(crate) fn reconcile_message_deletion_turns(
         .collect::<std::result::Result<Vec<_>, _>>()?;
     drop(agent_statement);
 
-    // A failed coalesced turn has no immediate replacement. Move its terminal
-    // boundary back to the deleted message so later work reconstructs any
-    // still-visible messages that followed it instead of treating them as
-    // successfully consumed.
-    connection.execute(
-        "UPDATE conversation_turns
-         SET trigger_message_id = ?2
-         WHERE conversation_id = ?1 AND status = 'failed'
-           AND trigger_message_id > ?2",
-        rusqlite::params![conversation_id, message_id],
-    )?;
+    // A failed coalesced turn has no immediate replacement. Dismiss it back
+    // to the preceding interrupted boundary so later work reconstructs every
+    // still-visible message from the failed prompt, whether the deleted
+    // message was its first or high-water input.
+    for agent_id in &affected_agents {
+        let previous_interrupted_trigger = latest_interrupted_trigger_before_message(
+            connection,
+            conversation_id,
+            agent_id,
+            message_id,
+        )?;
+        connection.execute(
+            "UPDATE conversation_turns
+             SET trigger_message_id = ?3, status = 'cancelled',
+                 completed_at = CURRENT_TIMESTAMP, error_message = NULL
+             WHERE conversation_id = ?1 AND agent_id = ?4
+               AND status = 'failed' AND trigger_message_id >= ?2",
+            rusqlite::params![
+                conversation_id,
+                message_id,
+                previous_interrupted_trigger,
+                agent_id
+            ],
+        )?;
+    }
     connection.execute(
         "UPDATE conversation_turns
          SET status = 'cancelled', completed_at = CURRENT_TIMESTAMP,
              error_message = NULL
          WHERE conversation_id = ?1
            AND ((trigger_message_id = ?2 AND status = 'queued')
-                OR (trigger_message_id >= ?2 AND status IN ('running', 'failed')))",
+                OR (trigger_message_id >= ?2 AND status = 'running'))",
         rusqlite::params![conversation_id, message_id],
     )?;
     for (_, agent_id) in &running_turns {
