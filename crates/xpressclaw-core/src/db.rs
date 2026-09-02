@@ -449,8 +449,9 @@ fn backfill_pending_conversation_turns(transaction: &rusqlite::Transaction<'_>) 
 }
 
 /// Apply the normal deletion reconciliation to tombstones first seen while
-/// upgrading from v45. Keep the sync marker until this Rust pass has located
-/// every adopted row, then remove it as part of the same migration transaction.
+/// upgrading from v45. Preserve a durable dashboard deletion version for any
+/// previously visible message, keep the sync marker until this Rust pass has
+/// located every adopted row, then remove it in the same migration transaction.
 fn reconcile_adopted_conversation_tombstones(transaction: &rusqlite::Connection) -> Result<()> {
     let adopted = {
         let mut statement = transaction.prepare(
@@ -469,6 +470,23 @@ fn reconcile_adopted_conversation_tombstones(transaction: &rusqlite::Connection)
     };
     for (message_id, conversation_id) in adopted {
         reconcile_message_deletion_turns(transaction, &conversation_id, message_id)?;
+        transaction.execute(
+            "INSERT INTO dashboard_events (
+                event_id, event_kind, occurred_at, project_id, project_name,
+                agent_id, agent_name, source_kind, source_label,
+                target_type, target_id, target_title, href, severity,
+                needs_attention, preview, work_kind, work_id
+             )
+             SELECT event_id, 'conversation_message_deleted',
+                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    project_id, project_name, agent_id, agent_name,
+                    'system', 'XpressClaw', target_type, target_id,
+                    target_title, href, 'info', 0, '', work_kind, work_id
+             FROM dashboard_events
+             WHERE event_id = 'conversation-message:' || ?1
+             ORDER BY cursor DESC LIMIT 1",
+            [message_id],
+        )?;
     }
     transaction.execute(
         "UPDATE conversation_messages
@@ -2514,11 +2532,6 @@ DELETE FROM message_visualizations
  WHERE conversation_message_id IN (
        SELECT id FROM conversation_messages WHERE deleted_at IS NOT NULL
  );
-DELETE FROM dashboard_events
- WHERE event_id IN (
-       SELECT 'conversation-message:' || id
-       FROM conversation_messages WHERE deleted_at IS NOT NULL
- );
 UPDATE conversations
    SET last_message_at = (
        SELECT created_at FROM conversation_messages
@@ -2815,11 +2828,7 @@ mod tests {
                    (id, conversation_message_id, reference_index, title, status,
                     error_code, retrieval_token)
                VALUES ('visualization', 2, 0, 'Old artifact', 'unavailable',
-                       'missing', 'retrieval-token');
-               INSERT INTO dashboard_events
-                   (event_id, event_kind, target_type, target_id, target_title, href)
-               VALUES ('conversation-message:2', 'conversation_message',
-                       'conversation', 'conversation', 'Upgrade', '/conversations/conversation');"#,
+                       'missing', 'retrieval-token');"#,
         )
         .unwrap();
 
@@ -2837,19 +2846,39 @@ mod tests {
         assert_eq!(adopted.0.as_deref(), Some("2026-01-03 00:00:00"));
         assert_eq!(adopted.1, "{}");
         assert!(adopted.2);
-        let cleanup: (i64, i64, i64, Option<String>) = conn
+        let cleanup: (i64, i64, i64, Option<String>, Option<String>) = conn
             .query_row(
                 "SELECT
                     (SELECT COUNT(*) FROM conversation_message_attachments),
                     (SELECT COUNT(*) FROM message_visualizations),
                     (SELECT COUNT(*) FROM dashboard_events
                       WHERE event_id = 'conversation-message:2'),
+                    (SELECT event_kind FROM dashboard_events
+                      WHERE event_id = 'conversation-message:2'
+                      ORDER BY cursor DESC LIMIT 1),
                     (SELECT last_message_at FROM conversations WHERE id = 'conversation')",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .unwrap();
-        assert_eq!(cleanup, (0, 0, 0, Some("2026-01-04 00:00:00".into())));
+        assert_eq!(
+            cleanup,
+            (
+                0,
+                0,
+                2,
+                Some("conversation_message_deleted".into()),
+                Some("2026-01-04 00:00:00".into())
+            )
+        );
 
         let reconciliation: (i64, i64, i64, i64) = conn
             .query_row(
