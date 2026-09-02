@@ -1502,7 +1502,7 @@ fn import_conversation_messages(
             )
             .optional()?;
         let already_existed = existing.is_some();
-        let (message_id, deleted_at) = if let Some(existing) = existing {
+        let (message_id, deleted_at, became_deleted) = if let Some(existing) = existing {
             if existing.conversation_id != message.conversation_id
                 || existing.sender_type != message.sender_type
                 || existing.sender_id != message.sender_id
@@ -1521,6 +1521,7 @@ fn import_conversation_messages(
             // The message body and identity are immutable, but this relationship
             // is intentionally mutable: deleting a task clears it via the local
             // foreign key and that cleared association must synchronize.
+            let was_deleted = existing.deleted_at.is_some();
             let deleted_at = match (existing.deleted_at, remote_deleted_at.clone()) {
                 (Some(local), Some(remote)) => Some(local.max(remote)),
                 (Some(local), None) => Some(local),
@@ -1533,7 +1534,8 @@ fn import_conversation_messages(
                  WHERE id = ?3",
                 params![message.linked_task_id, deleted_at, existing.id],
             )?;
-            (existing.id, deleted_at)
+            let became_deleted = !was_deleted && deleted_at.is_some();
+            (existing.id, deleted_at, became_deleted)
         } else {
             let metadata = serde_json::to_string(&message_metadata).map_err(|error| {
                 Error::Sync(format!(
@@ -1558,7 +1560,7 @@ fn import_conversation_messages(
                     remote_deleted_at
                 ],
             )?;
-            (connection.last_insert_rowid(), remote_deleted_at)
+            (connection.last_insert_rowid(), remote_deleted_at, false)
         };
         connection.execute(
             "INSERT OR IGNORE INTO conversation_message_sync
@@ -1567,7 +1569,9 @@ fn import_conversation_messages(
             params![message.record_id, message_id],
         )?;
         if deleted_at.is_some() {
-            reconcile_message_deletion_turns(connection, &message.conversation_id, message_id)?;
+            if became_deleted {
+                reconcile_message_deletion_turns(connection, &message.conversation_id, message_id)?;
+            }
             connection.execute(
                 "DELETE FROM conversation_message_attachments WHERE message_id = ?1",
                 [message_id],
@@ -2163,8 +2167,29 @@ mod tests {
 
         let mut loaded = Config::load(&config_path).unwrap();
         import_snapshot(&db, &mut loaded, &config_path, directory.path(), &deleted).unwrap();
+        db.with_conn(|connection| {
+            connection.execute(
+                "INSERT INTO conversation_agent_sessions
+                    (conversation_id, agent_id, native_session_id)
+                 VALUES ('conversation-one', 'atlas', 'new-session')",
+                [],
+            )
+        })
+        .unwrap();
+        import_snapshot(&db, &mut loaded, &config_path, directory.path(), &deleted).unwrap();
         import_snapshot(&db, &mut loaded, &config_path, directory.path(), &stale).unwrap();
 
+        let native_session_id = db
+            .with_conn(|connection| {
+                connection.query_row(
+                    "SELECT native_session_id FROM conversation_agent_sessions
+                     WHERE conversation_id = 'conversation-one' AND agent_id = 'atlas'",
+                    [],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(native_session_id.as_deref(), Some("new-session"));
         let visible = crate::conversations::ConversationManager::new(std::sync::Arc::new(db))
             .get_messages("conversation-one", 20, None)
             .unwrap();

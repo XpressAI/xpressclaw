@@ -1831,6 +1831,15 @@ mod tests {
         let queue = runtime::ConversationTurnQueue::new(mgr.db.clone());
         assert!(queue.enqueue(&conv.id, "atlas", first.id).unwrap());
         let running = queue.claim_next().unwrap().unwrap();
+        mgr.db
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE conversation_agent_sessions SET native_session_id = 'resumed-session'
+                     WHERE conversation_id = ?1 AND agent_id = 'atlas'",
+                    [&conv.id],
+                )
+            })
+            .unwrap();
         let follow_up = mgr
             .send_message(
                 &conv.id,
@@ -1863,6 +1872,11 @@ mod tests {
                 .unwrap(),
             Some(first.id)
         );
+        assert!(queue
+            .session(&conv.id, "atlas")
+            .unwrap()
+            .native_session_id
+            .is_none());
     }
 
     #[test]

@@ -432,6 +432,15 @@ impl ConversationTurnQueue {
                 rusqlite::params![turn_id, conversation_id],
             )? == 1;
             if changed && was_running {
+                // The native ACP session may already contain the cancelled
+                // prompt. Deferred work must start from reconstructed visible
+                // history instead of resuming that session.
+                transaction.execute(
+                    "UPDATE conversation_agent_sessions
+                     SET native_session_id = NULL, updated_at = CURRENT_TIMESTAMP
+                     WHERE conversation_id = ?1 AND agent_id = ?2",
+                    rusqlite::params![&original.conversation_id, &original.agent_id],
+                )?;
                 let after_id = original.trigger_message_id.unwrap_or(0);
                 if let Some((message_id, _)) = latest_addressed_message(
                     &transaction,
