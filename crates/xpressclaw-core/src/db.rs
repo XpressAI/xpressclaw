@@ -8,7 +8,7 @@ use tracing::info;
 use unicode_casefold::UnicodeCaseFold;
 use unicode_normalization::UnicodeNormalization;
 
-use crate::conversations::runtime::ConversationTurnQueue;
+use crate::conversations::runtime::{reconcile_message_deletion_turns, ConversationTurnQueue};
 use crate::error::{Error, Result};
 use crate::workflows::context;
 use crate::workflows::definition::{WorkflowDefinition, WorkflowInputType};
@@ -185,6 +185,15 @@ impl Database {
 
                 if target == 40 {
                     backfill_workflow_agent_bindings(&transaction).map_err(|error| {
+                        Error::Migration {
+                            version: target,
+                            message: error.to_string(),
+                        }
+                    })?;
+                }
+
+                if target == 46 {
+                    reconcile_adopted_conversation_tombstones(&transaction).map_err(|error| {
                         Error::Migration {
                             version: target,
                             message: error.to_string(),
@@ -434,6 +443,38 @@ fn backfill_pending_conversation_turns(transaction: &rusqlite::Transaction<'_>) 
         "UPDATE conversation_messages
          SET processed = 1
          WHERE sender_type = 'user' AND processed = 0",
+        [],
+    )?;
+    Ok(())
+}
+
+/// Apply the normal deletion reconciliation to tombstones first seen while
+/// upgrading from v45. Keep the sync marker until this Rust pass has located
+/// every adopted row, then remove it as part of the same migration transaction.
+fn reconcile_adopted_conversation_tombstones(transaction: &rusqlite::Connection) -> Result<()> {
+    let adopted = {
+        let mut statement = transaction.prepare(
+            "SELECT id, conversation_id FROM conversation_messages
+             WHERE deleted_at IS NOT NULL
+               AND json_valid(metadata)
+               AND json_type(metadata, '$.xpressclaw_deleted_at') = 'text'
+             ORDER BY id ASC",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+    for (message_id, conversation_id) in adopted {
+        reconcile_message_deletion_turns(transaction, &conversation_id, message_id)?;
+    }
+    transaction.execute(
+        "UPDATE conversation_messages
+         SET metadata = json_remove(metadata, '$.xpressclaw_deleted_at')
+         WHERE json_valid(metadata)
+           AND json_type(metadata, '$.xpressclaw_deleted_at') = 'text'",
         [],
     )?;
     Ok(())
@@ -2462,7 +2503,6 @@ const MIGRATION_V46: &str = r#"
 ALTER TABLE conversation_messages ADD COLUMN deleted_at TIMESTAMP;
 UPDATE conversation_messages
    SET deleted_at = json_extract(metadata, '$.xpressclaw_deleted_at'),
-       metadata = json_remove(metadata, '$.xpressclaw_deleted_at'),
        processed = 1
  WHERE json_valid(metadata)
    AND json_type(metadata, '$.xpressclaw_deleted_at') = 'text';
@@ -2726,8 +2766,15 @@ mod tests {
             conn.execute_batch(sql).unwrap();
         }
         conn.execute_batch(
-            r#"INSERT INTO conversations (id, title, last_message_at)
+            r#"INSERT INTO agents (id, name, backend, config)
+               VALUES ('atlas', 'Atlas', 'native', '{}'),
+                      ('beta', 'Beta', 'native', '{}');
+               INSERT INTO conversations (id, title, last_message_at)
                VALUES ('conversation', 'Upgrade', '2026-01-02 00:00:00');
+               INSERT INTO conversation_participants
+                   (conversation_id, participant_type, participant_id)
+               VALUES ('conversation', 'agent', 'atlas'),
+                      ('conversation', 'agent', 'beta');
                INSERT INTO conversation_messages
                    (conversation_id, sender_type, sender_id, content, metadata,
                     created_at, processed)
@@ -2736,7 +2783,17 @@ mod tests {
                     '2026-01-01 00:00:00', 1),
                    ('conversation', 'user', 'local', 'Remove',
                     '{"xpressclaw_deleted_at":"2026-01-03 00:00:00"}',
-                    '2026-01-02 00:00:00', 0);
+                    '2026-01-02 00:00:00', 0),
+                   ('conversation', 'user', 'local', 'Keep this follow-up', '{}',
+                    '2026-01-04 00:00:00', 1);
+               INSERT INTO conversation_agent_sessions
+                   (conversation_id, agent_id, native_session_id, status)
+               VALUES ('conversation', 'atlas', 'tainted-atlas-session', 'running'),
+                      ('conversation', 'beta', 'tainted-beta-session', 'queued');
+               INSERT INTO conversation_turns
+                   (id, conversation_id, agent_id, trigger_message_id, status)
+               VALUES ('running-turn', 'conversation', 'atlas', 3, 'running'),
+                      ('queued-turn', 'conversation', 'beta', 2, 'queued');
                INSERT INTO conversation_message_attachments
                    (id, message_id, name, mime_type, data, size)
                VALUES ('attachment', 2, 'note.txt', 'text/plain', X'78', 1);
@@ -2753,6 +2810,7 @@ mod tests {
         .unwrap();
 
         conn.execute_batch(MIGRATION_V46).unwrap();
+        reconcile_adopted_conversation_tombstones(&conn).unwrap();
 
         let adopted: (Option<String>, String, bool) = conn
             .query_row(
@@ -2777,7 +2835,31 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
-        assert_eq!(cleanup, (0, 0, 0, Some("2026-01-01 00:00:00".into())));
+        assert_eq!(cleanup, (0, 0, 0, Some("2026-01-04 00:00:00".into())));
+
+        let reconciliation: (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM conversation_agent_sessions
+                      WHERE native_session_id IS NULL AND status = 'queued'),
+                    (SELECT COUNT(*) FROM conversation_turns
+                      WHERE agent_id = 'atlas' AND trigger_message_id = 3
+                        AND status = 'cancelled'),
+                    (SELECT COUNT(*) FROM conversation_turns
+                      WHERE agent_id = 'atlas' AND trigger_message_id = 3
+                        AND status = 'queued'),
+                    (SELECT COUNT(*) FROM conversation_turns
+                      WHERE agent_id = 'beta' AND trigger_message_id = 1
+                        AND status = 'queued')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            reconciliation,
+            (2, 1, 1, 1),
+            "migration should clear both sessions, requeue later running work, and retarget queued work"
+        );
     }
 
     #[test]

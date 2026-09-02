@@ -851,18 +851,7 @@ async fn execute_conversation_turn(
         .native_session_id
         .map(AcpSessionStart::Resume)
         .unwrap_or(AcpSessionStart::New);
-    let previous_trigger_message_id = if matches!(&session_start, AcpSessionStart::Resume(_)) {
-        match turn.trigger_message_id {
-            Some(trigger_message_id) => queue.last_terminal_trigger_before(
-                &turn.conversation_id,
-                &turn.agent_id,
-                trigger_message_id,
-            )?,
-            None => None,
-        }
-    } else {
-        None
-    };
+    let previous_trigger_message_id = conversation_prompt_boundary(&queue, &turn)?;
     let prompt = build_conversation_prompt(
         &manager,
         &conversation,
@@ -1018,6 +1007,23 @@ fn build_conversation_prompt(
         conversation.project_id.as_deref().unwrap_or("unassigned"),
         history,
     ))
+}
+
+/// A terminal response remains the prompt boundary even when cancellation or
+/// deletion rotates the native session. Replaying from the beginning would
+/// put stopped work back into the replacement session.
+fn conversation_prompt_boundary(
+    queue: &ConversationTurnQueue,
+    turn: &ConversationTurn,
+) -> Result<Option<i64>> {
+    match turn.trigger_message_id {
+        Some(trigger_message_id) => queue.last_terminal_trigger_before(
+            &turn.conversation_id,
+            &turn.agent_id,
+            trigger_message_id,
+        ),
+        None => Ok(None),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -4308,7 +4314,7 @@ mod tests {
             Ok::<_, rusqlite::Error>(())
         })
         .unwrap();
-        let manager = ConversationManager::new(db);
+        let manager = ConversationManager::new(db.clone());
         let conversation = manager
             .create_in_project(
                 Some("p"),
@@ -4393,9 +4399,32 @@ mod tests {
         ));
         assert!(prompt.contains("Never use the tool to duplicate your final response."));
 
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO conversation_agent_sessions
+                 (conversation_id, agent_id, status)
+                 VALUES (?1, 'atlas', 'queued')",
+                [&conversation.id],
+            )?;
+            conn.execute(
+                "INSERT INTO conversation_turns
+                 (id, conversation_id, agent_id, trigger_message_id, status)
+                 VALUES ('cancelled-turn', ?1, 'atlas', ?2, 'cancelled')",
+                rusqlite::params![conversation.id, first.id],
+            )?;
+            Ok::<_, rusqlite::Error>(())
+        })
+        .unwrap();
+        let queue = ConversationTurnQueue::new(db);
+        assert!(queue
+            .session(&conversation.id, "atlas")
+            .unwrap()
+            .native_session_id
+            .is_none());
+        let boundary = conversation_prompt_boundary(&queue, &turn).unwrap();
+        assert_eq!(boundary, Some(first.id));
         let incremental_prompt =
-            build_conversation_prompt(&manager, &conversation, &turn, &agent, Some(first.id))
-                .unwrap();
+            build_conversation_prompt(&manager, &conversation, &turn, &agent, boundary).unwrap();
         assert!(!incremental_prompt.contains("First context"));
         assert!(incremental_prompt.contains("Claimed request"));
         assert!(!incremental_prompt.contains("Arrived after claim"));
