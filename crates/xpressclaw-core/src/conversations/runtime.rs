@@ -366,19 +366,19 @@ impl ConversationTurnQueue {
         })
     }
 
-    pub fn last_completed_trigger(
+    pub fn last_terminal_trigger_before(
         &self,
         conversation_id: &str,
         agent_id: &str,
+        before_message_id: i64,
     ) -> Result<Option<i64>> {
         self.db.with_conn(|conn| {
-            conn.query_row(
-                "SELECT MAX(trigger_message_id) FROM conversation_turns
-				 WHERE conversation_id = ?1 AND agent_id = ?2 AND status = 'completed'",
-                rusqlite::params![conversation_id, agent_id],
-                |row| row.get(0),
+            latest_terminal_trigger_before_message(
+                conn,
+                conversation_id,
+                agent_id,
+                before_message_id,
             )
-            .map_err(Error::from)
         })
     }
 
@@ -746,7 +746,7 @@ impl ConversationTurnQueue {
         self.db.with_conn(|conn| {
             let mut statement = conn.prepare(
                 "SELECT * FROM conversation_turns WHERE conversation_id = ?1
-                 ORDER BY queued_at DESC LIMIT ?2",
+                 ORDER BY queued_at DESC, rowid DESC LIMIT ?2",
             )?;
             let turns = statement
                 .query_map(rusqlite::params![conversation_id, limit], row_to_turn)?
@@ -831,7 +831,8 @@ pub(crate) fn reconcile_message_deletion_turns(
                     conversation_id,
                     agent_id,
                     message_id,
-                )?;
+                )?
+                .unwrap_or(0);
                 latest_addressed_message(
                     connection,
                     conversation_id,
@@ -876,7 +877,8 @@ fn retarget_queued_turn_before_message(
         conversation_id,
         agent_id,
         before_message_id,
-    )?;
+    )?
+    .unwrap_or(0);
     let candidate = latest_addressed_message(
         connection,
         conversation_id,
@@ -905,15 +907,15 @@ fn latest_terminal_trigger_before_message(
     conversation_id: &str,
     agent_id: &str,
     before_message_id: i64,
-) -> Result<i64> {
+) -> Result<Option<i64>> {
     connection
         .query_row(
-            "SELECT COALESCE(MAX(trigger_message_id), 0) FROM conversation_turns
+            "SELECT MAX(trigger_message_id) FROM conversation_turns
          WHERE conversation_id = ?1 AND agent_id = ?2
            AND status IN ('completed', 'cancelled', 'failed')
            AND trigger_message_id < ?3",
             rusqlite::params![conversation_id, agent_id, before_message_id],
-            |row| row.get::<_, i64>(0),
+            |row| row.get::<_, Option<i64>>(0),
         )
         .map_err(Error::from)
 }
@@ -1042,6 +1044,43 @@ mod tests {
         let manager = ConversationManager::new(db.clone());
         let queue = ConversationTurnQueue::new(db.clone());
         (db, manager, queue)
+    }
+
+    #[test]
+    fn conversation_turns_break_queued_at_ties_by_insertion_order() {
+        let (db, manager, queue) = setup();
+        let conversation = manager
+            .create_in_project(
+                Some("p"),
+                &CreateConversation {
+                    title: Some("Ordered failures".into()),
+                    icon: None,
+                    participant_ids: vec!["atlas".into()],
+                },
+            )
+            .unwrap();
+        db.with_conn(|conn| {
+            for (id, status) in [("older", "failed"), ("newer", "cancelled")] {
+                conn.execute(
+                    "INSERT INTO conversation_turns
+                     (id, conversation_id, agent_id, status, queued_at)
+                     VALUES (?1, ?2, 'atlas', ?3, '2026-01-01 00:00:00')",
+                    rusqlite::params![id, conversation.id, status],
+                )?;
+            }
+            Ok::<_, rusqlite::Error>(())
+        })
+        .unwrap();
+
+        let turns = queue.list_for_conversation(&conversation.id, 10).unwrap();
+
+        assert_eq!(
+            turns
+                .iter()
+                .map(|turn| turn.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["newer", "older"]
+        );
     }
 
     #[test]

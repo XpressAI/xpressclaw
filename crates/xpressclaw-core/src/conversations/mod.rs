@@ -1652,6 +1652,12 @@ mod tests {
         assert!(turns
             .iter()
             .any(|turn| { turn.status == "queued" && turn.trigger_message_id == Some(first.id) }));
+        assert_eq!(
+            queue
+                .last_terminal_trigger_before(&conv.id, "atlas", first.id)
+                .unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -1705,6 +1711,12 @@ mod tests {
         assert!(turns.iter().any(|turn| {
             turn.status == "queued" && turn.trigger_message_id == Some(follow_up.id)
         }));
+        assert_eq!(
+            queue
+                .last_terminal_trigger_before(&conv.id, "atlas", follow_up.id)
+                .unwrap(),
+            Some(first.id)
+        );
     }
 
     #[test]

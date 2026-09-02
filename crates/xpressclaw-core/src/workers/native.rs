@@ -852,7 +852,14 @@ async fn execute_conversation_turn(
         .map(AcpSessionStart::Resume)
         .unwrap_or(AcpSessionStart::New);
     let previous_trigger_message_id = if matches!(&session_start, AcpSessionStart::Resume(_)) {
-        queue.last_completed_trigger(&turn.conversation_id, &turn.agent_id)?
+        match turn.trigger_message_id {
+            Some(trigger_message_id) => queue.last_terminal_trigger_before(
+                &turn.conversation_id,
+                &turn.agent_id,
+                trigger_message_id,
+            )?,
+            None => None,
+        }
     } else {
         None
     };
@@ -4312,7 +4319,7 @@ mod tests {
                 },
             )
             .unwrap();
-        manager
+        let first = manager
             .send_message(
                 &conversation.id,
                 &SendMessage {
@@ -4385,6 +4392,13 @@ mod tests {
             "Reserve send_conversation_message for genuine interim updates or publishing workspace files while you continue working."
         ));
         assert!(prompt.contains("Never use the tool to duplicate your final response."));
+
+        let incremental_prompt =
+            build_conversation_prompt(&manager, &conversation, &turn, &agent, Some(first.id))
+                .unwrap();
+        assert!(!incremental_prompt.contains("First context"));
+        assert!(incremental_prompt.contains("Claimed request"));
+        assert!(!incremental_prompt.contains("Arrived after claim"));
     }
 
     #[test]
