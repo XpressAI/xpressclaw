@@ -1524,7 +1524,7 @@ mod tests {
             .unwrap()
             .iter()
             .any(|turn| turn.status == "queued" && turn.trigger_message_id == Some(first.id)));
-        let (deleted_at, turn_status, session_status, last_message_at, dashboard_event_count) = mgr
+        let (deleted_at, turn_status, session_status, last_message_at, dashboard_event_kind) = mgr
             .db
             .with_conn(|conn| {
                 Ok::<_, Error>((
@@ -1550,11 +1550,13 @@ mod tests {
                         |row| row.get::<_, Option<String>>(0),
                     )?,
                     conn.query_row(
-                        "SELECT COUNT(*) FROM dashboard_events
-                         WHERE event_id = 'conversation-message:' || ?1",
+                        "SELECT event_kind FROM dashboard_events
+                         WHERE event_id = 'conversation-message:' || ?1
+                         ORDER BY cursor DESC LIMIT 1",
                         [deleted.id],
-                        |row| row.get::<_, i64>(0),
-                    )?,
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?,
                 ))
             })
             .unwrap();
@@ -1562,7 +1564,10 @@ mod tests {
         assert_eq!(turn_status, "cancelled");
         assert_eq!(session_status, "queued");
         assert_eq!(last_message_at.as_deref(), Some(first.created_at.as_str()));
-        assert_eq!(dashboard_event_count, 0);
+        assert_eq!(
+            dashboard_event_kind.as_deref(),
+            Some("conversation_message_deleted")
+        );
         assert_eq!(mgr.deleted_message_ids(&conv.id).unwrap(), vec![deleted.id]);
     }
 

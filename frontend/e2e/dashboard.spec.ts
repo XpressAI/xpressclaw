@@ -115,6 +115,7 @@ async function mockDashboard(page: Page, options: {
 	refreshProjects?: boolean;
 	rollingWindow?: boolean;
 	deleteRecentEventOnRefresh?: boolean;
+	deleteOlderEventOnRefresh?: boolean;
 	stream?: boolean;
 } = {}) {
 	const scopes: string[] = [];
@@ -186,6 +187,14 @@ async function mockDashboard(page: Page, options: {
 			}
 			if (options.deleteRecentEventOnRefresh && requestNumber > 1) {
 				response.feed.events = response.feed.events.filter((item) => item.event_id !== 'evt-existing');
+			}
+			if (options.deleteOlderEventOnRefresh && requestNumber > 1) {
+				response.feed.events = [event({
+					cursor: 50,
+					event_id: 'evt-older',
+					event_kind: 'conversation_message_deleted',
+					preview: '',
+				}), ...response.feed.events];
 			}
 			return route.fulfill({ json: response });
 		}
@@ -524,6 +533,19 @@ test('a refreshed snapshot removes deleted recent activity without dropping newe
 	await expect.poll(mocked.snapshotRequestCount).toBeGreaterThan(1);
 	await expect(page.locator('[data-feed-event="evt-existing"]')).toHaveCount(0);
 	await expect(page.locator('[data-feed-event="evt-after-delete"]')).toBeVisible();
+});
+
+test('a durable deletion removes activity from loaded older dashboard history', async ({ page }) => {
+	await installMockEventSource(page);
+	const mocked = await mockDashboard(page, { deleteOlderEventOnRefresh: true });
+	await page.goto('/dashboard');
+	await page.getByRole('button', { name: 'Load earlier activity' }).click();
+	await expect(page.locator('[data-feed-event="evt-older"]')).toBeVisible();
+
+	await emitDashboardEvent(page, event({ cursor: 51, event_id: 'evt-after-older-delete' }));
+	await expect.poll(mocked.snapshotRequestCount).toBeGreaterThan(1);
+	await expect(page.locator('[data-feed-event="evt-older"]')).toHaveCount(0);
+	await expect(page.locator('[data-feed-event="evt-after-older-delete"]')).toBeVisible();
 });
 
 test('live activity coalesced into a failed summary refresh receives one retry', async ({ page }) => {

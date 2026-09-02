@@ -489,7 +489,9 @@
 			const current = latest.get(event.event_id);
 			if (!current || event.cursor > current.cursor) latest.set(event.event_id, event);
 		}
-		return [...latest.values()].sort((left, right) => right.cursor - left.cursor);
+		return [...latest.values()]
+			.filter((event) => event.event_kind !== 'conversation_message_deleted')
+			.sort((left, right) => right.cursor - left.cursor);
 	}
 
 	function updateLiveEdge() {

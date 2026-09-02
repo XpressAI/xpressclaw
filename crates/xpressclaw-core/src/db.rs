@@ -2591,7 +2591,21 @@ CREATE TRIGGER dashboard_conversation_message_delete
 AFTER UPDATE OF deleted_at ON conversation_messages
 WHEN OLD.deleted_at IS NULL AND NEW.deleted_at IS NOT NULL
 BEGIN
-    DELETE FROM dashboard_events WHERE event_id = 'conversation-message:' || NEW.id;
+    -- Keep a durable, non-displayable version of the stable event ID so live
+    -- replay and refreshed pages can evict a deleted message from previously
+    -- loaded dashboard history.
+    INSERT INTO dashboard_events (
+        event_id, event_kind, occurred_at, project_id, project_name,
+        agent_id, agent_name, source_kind, source_label,
+        target_type, target_id, target_title, href, severity,
+        needs_attention, preview, work_kind, work_id
+    )
+    SELECT event_id, 'conversation_message_deleted', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+           project_id, project_name, agent_id, agent_name, 'system', 'XpressClaw',
+           target_type, target_id, target_title, href, 'info', 0, '', work_kind, work_id
+    FROM dashboard_events
+    WHERE event_id = 'conversation-message:' || NEW.id
+    ORDER BY cursor DESC LIMIT 1;
 END;
 "#;
 

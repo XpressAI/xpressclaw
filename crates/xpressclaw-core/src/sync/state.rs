@@ -1580,10 +1580,6 @@ fn import_conversation_messages(
                 "DELETE FROM message_visualizations WHERE conversation_message_id = ?1",
                 [message_id],
             )?;
-            connection.execute(
-                "DELETE FROM dashboard_events WHERE event_id = 'conversation-message:' || ?1",
-                [message_id],
-            )?;
         }
         imported.push((
             &message.record_id,
