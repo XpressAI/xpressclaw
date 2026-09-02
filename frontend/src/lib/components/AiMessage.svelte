@@ -23,6 +23,8 @@
 		visualizationUrl,
 		visualizationFollowUpTarget = 'this thread',
 		onvisualizationfollowup,
+		ondelete,
+		deleting = false,
 		children,
 	}: {
 		role: MessageRole;
@@ -39,6 +41,8 @@
 		visualizationUrl?: (artifact: MessageVisualization) => string;
 		visualizationFollowUpTarget?: string;
 		onvisualizationfollowup?: (prompt: string, title?: string) => Promise<void>;
+		ondelete?: () => void;
+		deleting?: boolean;
 		children?: Snippet;
 	} = $props();
 
@@ -121,6 +125,15 @@
 			<span class="font-medium {isSystem ? 'text-muted-foreground' : 'text-foreground'}">{sender}</span>
 			{#if badge}<span class="ai-status-pill h-5 bg-accent px-1.5 text-[9px] font-semibold uppercase tracking-wide text-accent-foreground">{badge}</span>{/if}
 			<span>{timestampLabel}</span>
+			{#if ondelete}
+				<button
+					type="button"
+					onclick={ondelete}
+					disabled={deleting}
+					aria-label={deleting ? 'Deleting message' : 'Delete message'}
+					class="rounded px-1.5 py-0.5 text-[10px] opacity-100 hover:bg-destructive/10 hover:text-destructive disabled:opacity-50 sm:opacity-0 sm:group-hover/message:opacity-100 focus-visible:opacity-100"
+				>{deleting ? 'Deleting…' : 'Delete'}</button>
+			{/if}
 		</div>
 		<div
 			bind:this={contentElement}

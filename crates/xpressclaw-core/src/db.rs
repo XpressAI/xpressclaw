@@ -2455,6 +2455,86 @@ ALTER TABLE workflow_step_executions ADD COLUMN continuation_prompt_message_id I
     REFERENCES task_messages(id) ON DELETE SET NULL;
 "#;
 
+const MIGRATION_V46: &str = r#"
+-- Conversation messages are synchronized immutable records. A deletion marker
+-- hides a message everywhere without allowing a later Project fetch to revive
+-- it from an older checkout.
+ALTER TABLE conversation_messages ADD COLUMN deleted_at TIMESTAMP;
+UPDATE conversation_messages
+   SET deleted_at = json_extract(metadata, '$.xpressclaw_deleted_at'),
+       metadata = json_remove(metadata, '$.xpressclaw_deleted_at'),
+       processed = 1
+ WHERE json_valid(metadata)
+   AND json_type(metadata, '$.xpressclaw_deleted_at') = 'text';
+DELETE FROM conversation_message_attachments
+ WHERE message_id IN (
+       SELECT id FROM conversation_messages WHERE deleted_at IS NOT NULL
+ );
+DELETE FROM message_visualizations
+ WHERE conversation_message_id IN (
+       SELECT id FROM conversation_messages WHERE deleted_at IS NOT NULL
+ );
+DELETE FROM dashboard_events
+ WHERE event_id IN (
+       SELECT 'conversation-message:' || id
+       FROM conversation_messages WHERE deleted_at IS NOT NULL
+ );
+UPDATE conversations
+   SET last_message_at = (
+       SELECT created_at FROM conversation_messages
+        WHERE conversation_id = conversations.id AND deleted_at IS NULL
+        ORDER BY julianday(created_at) DESC, id DESC LIMIT 1
+   )
+ WHERE EXISTS (
+       SELECT 1 FROM conversation_messages
+        WHERE conversation_id = conversations.id AND deleted_at IS NOT NULL
+ );
+CREATE INDEX idx_conversation_messages_visible
+    ON conversation_messages(conversation_id, id)
+    WHERE deleted_at IS NULL;
+UPDATE conversation_agent_sessions
+   SET status = 'idle', last_error = NULL, updated_at = CURRENT_TIMESTAMP
+ WHERE status = 'failed'
+   AND NOT EXISTS (
+       SELECT 1 FROM conversation_turns turn
+       WHERE turn.conversation_id = conversation_agent_sessions.conversation_id
+         AND turn.agent_id = conversation_agent_sessions.agent_id
+         AND turn.status = 'failed'
+   );
+
+-- Attention is current state, not permanent history. Keep the activity row as
+-- an audit trail, but stop presenting it as unresolved once the user clears the
+-- underlying task or Conversation failure.
+CREATE TRIGGER dashboard_task_attention_clear
+AFTER UPDATE OF status ON tasks
+WHEN OLD.status IN ('waiting_for_input', 'blocked')
+ AND NEW.status NOT IN ('waiting_for_input', 'blocked')
+BEGIN
+    UPDATE dashboard_events
+       SET needs_attention = 0
+     WHERE target_type = 'task' AND target_id = NEW.id AND needs_attention = 1;
+END;
+
+CREATE TRIGGER dashboard_conversation_attention_clear
+AFTER UPDATE OF status ON conversation_agent_sessions
+WHEN OLD.status = 'failed' AND NEW.status != 'failed'
+BEGIN
+    UPDATE dashboard_events
+       SET needs_attention = 0
+     WHERE target_type = 'conversation'
+       AND target_id = NEW.conversation_id
+       AND agent_id = NEW.agent_id
+       AND needs_attention = 1;
+END;
+
+CREATE TRIGGER dashboard_conversation_message_delete
+AFTER UPDATE OF deleted_at ON conversation_messages
+WHEN OLD.deleted_at IS NULL AND NEW.deleted_at IS NOT NULL
+BEGIN
+    DELETE FROM dashboard_events WHERE event_id = 'conversation-message:' || NEW.id;
+END;
+"#;
+
 const MIGRATION_V39: &str = "
 -- Cascading Project deletion is a recoverable two-phase operation. The
 -- durable marker is set before workers and retained runtimes are stopped, so
@@ -2553,6 +2633,7 @@ fn schema_migrations() -> &'static [(u32, &'static str)] {
         (43, MIGRATION_V43),
         (44, MIGRATION_V44),
         (45, MIGRATION_V45),
+        (46, MIGRATION_V46),
     ]
 }
 
@@ -2573,7 +2654,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "45");
+        assert_eq!(version, "46");
         let visualization_table: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -2610,6 +2691,73 @@ mod tests {
             )
             .unwrap();
         assert_eq!(memory_owner, "projects");
+    }
+
+    #[test]
+    fn v46_adopts_synced_message_tombstones_and_removes_local_artifacts() {
+        ensure_sqlite_vec();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        register_sql_functions(&conn).unwrap();
+        for &(target, sql) in schema_migrations() {
+            if target > 45 {
+                break;
+            }
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.execute_batch(
+            r#"INSERT INTO conversations (id, title, last_message_at)
+               VALUES ('conversation', 'Upgrade', '2026-01-02 00:00:00');
+               INSERT INTO conversation_messages
+                   (conversation_id, sender_type, sender_id, content, metadata,
+                    created_at, processed)
+               VALUES
+                   ('conversation', 'user', 'local', 'Keep', '{}',
+                    '2026-01-01 00:00:00', 1),
+                   ('conversation', 'user', 'local', 'Remove',
+                    '{"xpressclaw_deleted_at":"2026-01-03 00:00:00"}',
+                    '2026-01-02 00:00:00', 0);
+               INSERT INTO conversation_message_attachments
+                   (id, message_id, name, mime_type, data, size)
+               VALUES ('attachment', 2, 'note.txt', 'text/plain', X'78', 1);
+               INSERT INTO message_visualizations
+                   (id, conversation_message_id, reference_index, title, status,
+                    error_code, retrieval_token)
+               VALUES ('visualization', 2, 0, 'Old artifact', 'unavailable',
+                       'missing', 'retrieval-token');
+               INSERT INTO dashboard_events
+                   (event_id, event_kind, target_type, target_id, target_title, href)
+               VALUES ('conversation-message:2', 'conversation_message',
+                       'conversation', 'conversation', 'Upgrade', '/conversations/conversation');"#,
+        )
+        .unwrap();
+
+        conn.execute_batch(MIGRATION_V46).unwrap();
+
+        let adopted: (Option<String>, String, bool) = conn
+            .query_row(
+                "SELECT deleted_at, metadata, processed
+                 FROM conversation_messages WHERE id = 2",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(adopted.0.as_deref(), Some("2026-01-03 00:00:00"));
+        assert_eq!(adopted.1, "{}");
+        assert!(adopted.2);
+        let cleanup: (i64, i64, i64, Option<String>) = conn
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM conversation_message_attachments),
+                    (SELECT COUNT(*) FROM message_visualizations),
+                    (SELECT COUNT(*) FROM dashboard_events
+                      WHERE event_id = 'conversation-message:2'),
+                    (SELECT last_message_at FROM conversations WHERE id = 'conversation')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(cleanup, (0, 0, 0, Some("2026-01-01 00:00:00".into())));
     }
 
     #[test]

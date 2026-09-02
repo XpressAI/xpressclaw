@@ -980,7 +980,7 @@ impl ConversationManager {
             if let Some(bid) = before_id {
                 let mut stmt = conn.prepare(
                     "SELECT * FROM conversation_messages
-                     WHERE conversation_id = ?1 AND id < ?2
+                     WHERE conversation_id = ?1 AND id < ?2 AND deleted_at IS NULL
                      ORDER BY id DESC LIMIT ?3",
                 )?;
                 let mut msgs: Vec<ConversationMessage> = stmt
@@ -993,7 +993,7 @@ impl ConversationManager {
                 let mut stmt = conn.prepare(
                     "SELECT * FROM (
                         SELECT * FROM conversation_messages
-                        WHERE conversation_id = ?1
+                        WHERE conversation_id = ?1 AND deleted_at IS NULL
                         ORDER BY id DESC LIMIT ?2
                      ) ORDER BY id ASC",
                 )?;
@@ -1003,6 +1003,60 @@ impl ConversationManager {
                     .collect();
                 Ok(msgs)
             }
+        })
+    }
+
+    /// Hide a message, remove its local artifacts, and cancel every response
+    /// that the message caused. The row itself remains as a synchronized
+    /// tombstone so an older Project checkout cannot make it reappear.
+    pub fn delete_message(&self, conv_id: &str, message_id: i64) -> Result<Vec<String>> {
+        self.db.with_conn(|conn| {
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let exists = transaction.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM conversation_messages
+                    WHERE id = ?1 AND conversation_id = ?2 AND deleted_at IS NULL
+                 )",
+                rusqlite::params![message_id, conv_id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !exists {
+                return Err(Error::Conversation(format!(
+                    "message {message_id} not found in conversation {conv_id}"
+                )));
+            }
+
+            let running_turns = runtime::cancel_message_turns(&transaction, conv_id, message_id)?;
+            transaction.execute(
+                "DELETE FROM conversation_message_attachments WHERE message_id = ?1",
+                [message_id],
+            )?;
+            transaction.execute(
+                "DELETE FROM message_visualizations WHERE conversation_message_id = ?1",
+                [message_id],
+            )?;
+            transaction.execute(
+                "UPDATE conversation_messages
+                 SET deleted_at = CURRENT_TIMESTAMP, processed = 1
+                 WHERE id = ?1 AND conversation_id = ?2 AND deleted_at IS NULL",
+                rusqlite::params![message_id, conv_id],
+            )?;
+            transaction.execute(
+                "UPDATE conversations
+                 SET last_message_at = (
+                         SELECT created_at FROM conversation_messages
+                         WHERE conversation_id = ?1 AND deleted_at IS NULL
+                         ORDER BY julianday(created_at) DESC, id DESC LIMIT 1
+                     ),
+                     updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?1",
+                [conv_id],
+            )?;
+            transaction.commit()?;
+            Ok(running_turns)
         })
     }
 
@@ -1110,7 +1164,8 @@ impl ConversationManager {
             .with_conn(|conn| {
                 conn.query_row(
                     "SELECT COUNT(*) FROM conversation_messages
-                     WHERE conversation_id = ?1 AND sender_type = 'user' AND processed = 0",
+                     WHERE conversation_id = ?1 AND sender_type = 'user'
+                       AND processed = 0 AND deleted_at IS NULL",
                     [conv_id],
                     |row| row.get::<_, i64>(0),
                 )
@@ -1140,7 +1195,7 @@ impl ConversationManager {
         self.db.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT * FROM conversation_messages
-                 WHERE conversation_id = ?1 AND id > ?2
+                 WHERE conversation_id = ?1 AND id > ?2 AND deleted_at IS NULL
                  ORDER BY id ASC",
             )?;
             let msgs = stmt
@@ -1166,6 +1221,7 @@ impl ConversationManager {
                 "SELECT * FROM (
                     SELECT * FROM conversation_messages
                     WHERE conversation_id = ?1 AND id > ?2 AND id <= ?3
+                      AND deleted_at IS NULL
                     ORDER BY id DESC LIMIT ?4
                  ) ORDER BY id ASC",
             )?;
@@ -1397,6 +1453,94 @@ mod tests {
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].id, m1.id);
         assert_eq!(msgs[1].id, m2.id);
+    }
+
+    #[test]
+    fn deleting_a_message_cancels_its_response_and_leaves_a_sync_tombstone() {
+        let mgr = test_manager();
+        let conv = mgr
+            .create(&CreateConversation {
+                title: Some("Delete one message".into()),
+                icon: None,
+                participant_ids: vec!["atlas".into()],
+            })
+            .unwrap();
+        let first = mgr
+            .send_message(
+                &conv.id,
+                &SendMessage {
+                    sender_type: "user".into(),
+                    sender_id: "local".into(),
+                    sender_name: Some("You".into()),
+                    content: "Keep this".into(),
+                    message_type: None,
+                },
+            )
+            .unwrap();
+        let deleted = mgr
+            .send_message(
+                &conv.id,
+                &SendMessage {
+                    sender_type: "user".into(),
+                    sender_id: "local".into(),
+                    sender_name: Some("You".into()),
+                    content: "Delete this".into(),
+                    message_type: None,
+                },
+            )
+            .unwrap();
+        mgr.add_attachment(deleted.id, "note.txt", "text/plain", b"secret", None)
+            .unwrap();
+        let queue = runtime::ConversationTurnQueue::new(mgr.db.clone());
+        queue.enqueue(&conv.id, "atlas", deleted.id).unwrap();
+        let running = queue.claim_next().unwrap().unwrap();
+
+        let interrupted = mgr.delete_message(&conv.id, deleted.id).unwrap();
+
+        assert_eq!(interrupted.as_slice(), std::slice::from_ref(&running.id));
+        let visible = mgr.get_messages(&conv.id, 50, None).unwrap();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].id, first.id);
+        assert!(mgr.attachments(deleted.id).unwrap().is_empty());
+        let (deleted_at, turn_status, session_status, last_message_at, dashboard_event_count) = mgr
+            .db
+            .with_conn(|conn| {
+                Ok::<_, Error>((
+                    conn.query_row(
+                        "SELECT deleted_at FROM conversation_messages WHERE id = ?1",
+                        [deleted.id],
+                        |row| row.get::<_, Option<String>>(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT status FROM conversation_turns WHERE id = ?1",
+                        [&running.id],
+                        |row| row.get::<_, String>(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT status FROM conversation_agent_sessions
+                         WHERE conversation_id = ?1 AND agent_id = 'atlas'",
+                        [&conv.id],
+                        |row| row.get::<_, String>(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT last_message_at FROM conversations WHERE id = ?1",
+                        [&conv.id],
+                        |row| row.get::<_, Option<String>>(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM dashboard_events
+                         WHERE event_id = 'conversation-message:' || ?1",
+                        [deleted.id],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                ))
+            })
+            .unwrap();
+        assert!(deleted_at.is_some());
+        assert_eq!(turn_status, "cancelled");
+        assert_eq!(session_status, "idle");
+        assert_eq!(last_message_at.as_deref(), Some(first.created_at.as_str()));
+        assert_eq!(dashboard_event_count, 0);
     }
 
     #[test]

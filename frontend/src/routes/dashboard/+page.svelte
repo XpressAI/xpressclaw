@@ -2,8 +2,11 @@
 	import { onMount, tick } from 'svelte';
 	import {
 		ApiError,
+		conversations,
 		dashboard,
+		tasks,
 		type DashboardActiveWork,
+		type DashboardAttentionItem,
 		type DashboardEvent,
 		type DashboardRange,
 		type DashboardSnapshot,
@@ -34,6 +37,7 @@
 	let historyLimitReached = $state(false);
 	let olderCursor = $state<number | null>(null);
 	let error = $state('');
+	let clearingAttentionId = $state<string | null>(null);
 	let liveState = $state<LiveState>('connecting');
 	let mounted = $state(false);
 	let now = $state(Date.now());
@@ -236,7 +240,10 @@
 		const follow = atLiveEdge;
 		const previousHeight = scroller?.scrollHeight ?? 0;
 		const previousTop = scroller?.scrollTop ?? 0;
-		const combined = uniqueEvents([event, ...feed]);
+		const currentFeed = event.needs_attention ? feed : feed.map((existing) =>
+			attentionResolvedBy(existing, event) ? { ...existing, needs_attention: false } : existing
+		);
+		const combined = uniqueEvents([event, ...currentFeed]);
 		feed = combined.slice(0, MAX_FEED_EVENTS);
 		if (combined.length > MAX_FEED_EVENTS || (combined.length >= MAX_FEED_EVENTS && hasMoreOlder)) {
 			hasMoreOlder = false;
@@ -257,6 +264,53 @@
 			else scroller.scrollTop = previousTop + scroller.scrollHeight - previousHeight;
 		}
 		scheduleSummaryRefresh('data');
+	}
+
+	function attentionResolvedBy(existing: DashboardEvent, update: DashboardEvent): boolean {
+		if (update.event_kind !== 'cancellation' && update.event_kind !== 'completion' && update.event_kind !== 'status_change') return false;
+		if (existing.target_type === 'task' && update.target_type === 'task') {
+			return existing.target_id === update.target_id;
+		}
+		if (existing.target_type === 'conversation' && update.target_type === 'conversation') {
+			return existing.target_id === update.target_id && existing.agent_id === update.agent_id;
+		}
+		return existing.work_kind === update.work_kind && existing.work_id === update.work_id;
+	}
+
+	async function clearAttention(item: DashboardAttentionItem) {
+		if (clearingAttentionId !== null) return;
+		if (item.work_kind === 'task' && !window.confirm(`Cancel “${item.target_title}”?`)) return;
+		clearingAttentionId = item.id;
+		error = '';
+		try {
+			if (item.work_kind === 'conversation_turn') {
+				await conversations.cancelTurn(item.target_id, item.work_id);
+			} else {
+				await tasks.updateStatus(item.work_id, 'cancelled');
+			}
+			if (snapshot) {
+				snapshot = {
+					...snapshot,
+					counters: {
+						...snapshot.counters,
+						needs_attention: Math.max(0, snapshot.counters.needs_attention - 1),
+					},
+					attention: snapshot.attention.filter((candidate) => candidate.id !== item.id),
+				};
+			}
+			feed = feed.map((event) =>
+				event.needs_attention
+					&& (event.work_kind
+						? event.work_kind === item.work_kind && event.work_id === item.work_id
+						: event.target_type === item.target_type && event.target_id === item.target_id)
+					? { ...event, needs_attention: false }
+					: event
+			);
+		} catch (caught) {
+			error = caught instanceof Error ? caught.message : 'The attention item could not be cleared.';
+		} finally {
+			clearingAttentionId = null;
+		}
 	}
 
 	function scheduleSummaryRefresh(trigger: 'data' | 'probe', delay = trigger === 'data' ? 900 : 0) {
@@ -293,7 +347,7 @@
 					|| refreshProjectId !== projectId || refreshRange !== range
 				) return;
 				const refreshedFeed = refreshProjectId
-					? (snapshot?.feed ?? refreshed.feed)
+					? reconcileScopedFeed(refreshed)
 					: reconcileAllProjectsFeed(refreshed);
 				projectOptions = refreshed.projects;
 				snapshot = { ...refreshed, feed: refreshedFeed };
@@ -327,6 +381,14 @@
 		const retained = feed.filter((event) =>
 			event.project_id === null || currentProjectIds.has(event.project_id)
 		);
+		return reconcileFeed(refreshed, retained);
+	}
+
+	function reconcileScopedFeed(refreshed: DashboardSnapshot): DashboardSnapshot['feed'] {
+		return reconcileFeed(refreshed, feed);
+	}
+
+	function reconcileFeed(refreshed: DashboardSnapshot, retained: DashboardEvent[]): DashboardSnapshot['feed'] {
 		const reconciled = uniqueEvents([...refreshed.feed.events, ...retained])
 			.slice(0, MAX_FEED_EVENTS);
 		const retainedIds = new Set(reconciled.map((event) => event.event_id));
@@ -549,11 +611,14 @@
 					<div class="flex items-center gap-2 px-1"><span class="attention-mark">!</span><h2 id="attention-heading" class="text-xs font-semibold uppercase tracking-[0.14em] text-[hsl(var(--warning))]">Needs your attention</h2></div>
 					<div class="mt-2 flex gap-2 overflow-x-auto pb-1 scrollbar-hide">
 						{#each snapshot.attention as item (item.id)}
-							<a href={item.href} class="attention-chip group">
-								<span class="attention-pulse" aria-hidden="true"></span>
-								<span class="min-w-0"><span class="block truncate text-xs font-semibold">{item.target_title}</span><span class="block truncate text-[10px] text-muted-foreground">{item.project_name ?? 'No Project'} · {item.summary}</span></span>
-								<span class="ml-auto text-muted-foreground transition group-hover:translate-x-0.5 group-hover:text-foreground" aria-hidden="true">→</span>
-							</a>
+							<div class="attention-chip group">
+								<a href={item.href} class="flex min-w-0 flex-1 items-center gap-2">
+									<span class="attention-pulse" aria-hidden="true"></span>
+									<span class="min-w-0"><span class="block truncate text-xs font-semibold">{item.target_title}</span><span class="block truncate text-[10px] text-muted-foreground">{item.project_name ?? 'No Project'} · {item.summary}</span></span>
+									<span class="ml-auto text-muted-foreground transition group-hover:translate-x-0.5 group-hover:text-foreground" aria-hidden="true">→</span>
+								</a>
+								<button type="button" onclick={() => void clearAttention(item)} disabled={clearingAttentionId !== null} class="shrink-0 rounded-md border border-[hsl(var(--warning)/.25)] bg-card px-2 py-1 text-[10px] font-semibold text-muted-foreground hover:text-foreground disabled:opacity-50">{clearingAttentionId === item.id ? 'Clearing…' : item.work_kind === 'task' ? 'Cancel task' : 'Dismiss'}</button>
+							</div>
 						{/each}
 					</div>
 				</section>

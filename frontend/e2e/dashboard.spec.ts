@@ -82,6 +82,8 @@ function snapshot(empty = false, cursorBase = 40) {
 			href: '/tasks/task-attention',
 			summary: 'The Agent needs your input',
 			updated_at: iso(1),
+			work_kind: 'task',
+			work_id: 'task-attention',
 		}],
 		feed: {
 			events: empty ? [] : [event({ cursor: cursorBase }), event({
@@ -118,6 +120,7 @@ async function mockDashboard(page: Page, options: {
 	let snapshotRequests = 0;
 	let feedRequests = 0;
 	let selectedProjectDeleted = false;
+	const attentionActions: string[] = [];
 	let releaseFirstRefresh = () => {};
 	let releaseDeletedSnapshot = () => {};
 	const firstRefreshGate = new Promise<void>((resolve) => {
@@ -215,6 +218,10 @@ async function mockDashboard(page: Page, options: {
 			});
 		}
 		if (url.pathname === '/api/health') return route.fulfill({ json: { status: 'ok' } });
+		if (url.pathname === '/api/tasks/task-attention/status' && route.request().method() === 'PATCH') {
+			attentionActions.push('task-attention');
+			return route.fulfill({ json: { id: 'task-attention', status: 'cancelled' } });
+		}
 		if (url.pathname === '/api/setup/check-docker') return route.fulfill({ json: { available: true, installed: true, can_start: false } });
 		if (url.pathname === '/api/projects') return route.fulfill({ json: [] });
 		if (url.pathname === '/api/conversations') return route.fulfill({ json: [] });
@@ -229,6 +236,7 @@ async function mockDashboard(page: Page, options: {
 		snapshotRequestCount: () => snapshotRequests,
 		releaseFirstRefresh,
 		releaseDeletedSnapshot,
+		attentionActions,
 		deleteSelectedProject: () => (selectedProjectDeleted = true),
 	};
 }
@@ -379,7 +387,7 @@ function contrast(foreground: string, background: string) {
 
 test('brand opens the real-time Control center with deduplicated live navigation', async ({ page }, testInfo) => {
 	await page.setViewportSize({ width: 1440, height: 1050 });
-	const { scopes } = await mockDashboard(page);
+	const { scopes, attentionActions } = await mockDashboard(page);
 	await page.goto('/projects');
 	await page.locator('a[aria-label="Open Control center"]').first().click();
 	await expect(page).toHaveURL(/\/dashboard$/);
@@ -398,6 +406,10 @@ test('brand opens the real-time Control center with deduplicated live navigation
 	await expect(stableEvent.locator('img')).toHaveCount(0);
 	expect(await page.evaluate(() => (window as unknown as { dashboardPwned?: number }).dashboardPwned)).toBeUndefined();
 	await expect(page.locator('[data-live-feed] [data-feed-event="evt-existing"]')).toHaveCount(1);
+	page.once('dialog', (dialog) => dialog.accept());
+	await page.getByRole('button', { name: 'Cancel task' }).click();
+	await expect.poll(() => attentionActions).toEqual(['task-attention']);
+	await expect(page.getByRole('heading', { name: 'Needs your attention' })).toHaveCount(0);
 	await page.getByRole('button', { name: 'Load earlier activity' }).click();
 	await expect(page.locator('[data-feed-event="evt-older"]')).toContainText('Earlier bounded activity');
 

@@ -26,6 +26,8 @@
 	let turns = $state<ConversationTurn[]>([]);
 	let loading = $state(true);
 	let sending = $state(false);
+	let deletingMessageId = $state<number | null>(null);
+	let cancellingTurnId = $state<string | null>(null);
 	let draftReady = $state(false);
 	let composing = $state(false);
 	let content = $state('');
@@ -54,6 +56,7 @@
 	let participantAgents = $derived(projectAgents.filter((agent) => participantAgentIds.includes(agent.id)));
 	let availableAgents = $derived(projectAgents.filter((agent) => !participantAgentIds.includes(agent.id)));
 	let activeTurns = $derived(turns.filter((turn) => turn.status === 'queued' || turn.status === 'running'));
+	let failedTurns = $derived(latestFailedTurns(turns));
 	let allFiles = $derived(messages.flatMap((message) => (message.attachments ?? []).map((attachment) => ({ attachment, message }))));
 	let imageAttachmentPreviews = $derived(attachments.flatMap((attachment, attachmentIndex) =>
 		attachment.mime_type.startsWith('image/')
@@ -116,6 +119,17 @@
 		// Older servers do not expose the explicit response timestamp, so retain
 		// their legacy running anchor without conflating preparation on new APIs.
 		return turn.response_started_at === undefined ? turn.started_at : turn.response_started_at;
+	}
+
+	function latestFailedTurns(allTurns: ConversationTurn[]): ConversationTurn[] {
+		const seenAgents = new Set<string>();
+		const failed: ConversationTurn[] = [];
+		for (const turn of allTurns) {
+			if (seenAgents.has(turn.agent_id)) continue;
+			seenAgents.add(turn.agent_id);
+			if (turn.status === 'failed') failed.push(turn);
+		}
+		return failed;
 	}
 
 	async function loadAll(scroll = false) {
@@ -219,7 +233,15 @@
 
 	function connectEvents() {
 		eventSource = new EventSource(`/api/conversations/${encodeURIComponent(conversationId)}/events`);
-		eventSource.onmessage = () => void refreshActivity().then(() => scrollToLatest());
+		eventSource.onmessage = (event) => {
+			try {
+				const update = JSON.parse(event.data) as { type?: string; message_id?: number };
+				if (update.type === 'message_deleted' && update.message_id !== undefined) {
+					messages = messages.filter((message) => message.id !== update.message_id);
+				}
+			} catch {}
+			void refreshActivity().then(() => scrollToLatest());
+		};
 		eventSource.onerror = () => {
 			// EventSource hides the handshake status. Probe one protected route so
 			// the shared API client can route an expired session to login.
@@ -303,6 +325,38 @@
 		await conversations.sendMessage(conversationId, prompt);
 		await refreshActivity();
 		await scrollToLatest();
+	}
+
+	async function deleteConversationMessage(message: ConversationMessage) {
+		if (deletingMessageId !== null) return;
+		if (!window.confirm('Delete this message? Any response that is still running for it will be cancelled.')) return;
+		deletingMessageId = message.id;
+		error = '';
+		try {
+			await conversations.deleteMessage(conversationId, message.id);
+			messages = messages.filter((candidate) => candidate.id !== message.id);
+			await refreshActivity();
+		} catch (cause) {
+			error = cause instanceof Error ? cause.message : 'Could not delete the message.';
+		} finally {
+			deletingMessageId = null;
+		}
+	}
+
+	async function cancelConversationTurn(turn: ConversationTurn) {
+		if (cancellingTurnId !== null) return;
+		if ((turn.status === 'queued' || turn.status === 'running')
+			&& !window.confirm(`Cancel ${turnAgentName(turn)}'s response?`)) return;
+		cancellingTurnId = turn.id;
+		error = '';
+		try {
+			await conversations.cancelTurn(conversationId, turn.id);
+			await refreshActivity();
+		} catch (cause) {
+			error = cause instanceof Error ? cause.message : 'Could not clear the response.';
+		} finally {
+			cancellingTurnId = null;
+		}
 	}
 
 	function handleKeydown(event: KeyboardEvent) {
@@ -457,7 +511,7 @@
 			<nav class="mt-3 flex gap-5 text-xs"><button type="button" onclick={() => (viewMode = 'conversation')} class="border-b-2 px-1 pb-2 {viewMode === 'conversation' ? 'border-primary text-foreground' : 'border-transparent text-muted-foreground'}">Conversation</button><button type="button" onclick={() => (viewMode = 'files')} class="border-b-2 px-1 pb-2 {viewMode === 'files' ? 'border-primary text-foreground' : 'border-transparent text-muted-foreground'}">Files <span class="ml-1 rounded-full bg-muted px-1.5">{allFiles.length}</span></button></nav>
 		</header>
 
-		{#if error}<div class="mx-4 mt-3 shrink-0 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive sm:mx-6">{error}</div>{/if}
+		{#if error}<div role="alert" class="mx-4 mt-3 flex shrink-0 items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive sm:mx-6"><span class="min-w-0 flex-1">{error}</span><button type="button" onclick={() => (error = '')} aria-label="Dismiss error" class="flex h-5 w-5 shrink-0 items-center justify-center rounded text-base leading-none hover:bg-destructive/10">×</button></div>{/if}
 
 		{#if viewMode === 'files'}
 			<div class="workspace-scroll-y flex-1 p-4 sm:p-6"><div class="mx-auto max-w-4xl"><h2 class="font-semibold">Published files</h2><p class="mb-4 text-sm text-muted-foreground">Files shared by people and Agents in this conversation.</p>{#if hasOlderMessages}<button type="button" onclick={() => void loadOlderMessages()} disabled={loadingOlderMessages} class="mb-4 rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground hover:text-foreground disabled:opacity-50">{loadingOlderMessages ? 'Loading…' : 'Load files from earlier messages'}</button>{/if}{#if allFiles.length === 0}<div class="rounded-xl border border-dashed border-border p-10 text-center text-sm text-muted-foreground">No files have been published yet.</div>{:else}<div class="grid gap-3 sm:grid-cols-2">{#each allFiles as item (item.attachment.id)}<a href={conversations.attachmentUrl(conversationId, item.attachment.id)} target="_blank" rel="noopener noreferrer" class="flex items-center gap-3 rounded-xl border border-border bg-card p-4 hover:border-primary/40"><span class="flex h-10 w-10 items-center justify-center rounded-lg bg-muted text-lg">{item.attachment.mime_type.startsWith('image/') ? '▧' : '↧'}</span><span class="min-w-0 flex-1"><span class="block truncate text-sm font-medium">{item.attachment.name}</span><span class="text-[11px] text-muted-foreground">{formatBytes(item.attachment.size)} · {item.message.sender_name || item.message.sender_id}</span></span></a>{/each}</div>{/if}</div></div>
@@ -483,6 +537,8 @@
 								visualizationUrl={(artifact) => conversations.visualizationUrl(conversationId, message.id, artifact.id)}
 								visualizationFollowUpTarget="this Conversation"
 								onvisualizationfollowup={sendVisualizationFollowUp}
+								ondelete={() => void deleteConversationMessage(message)}
+								deleting={deletingMessageId === message.id}
 							>
 								{#if linkedTask}
 									<a href="/tasks/{linkedTask.id}" class="mt-3 flex items-center gap-2 rounded-lg bg-background/40 px-3 py-2 text-xs shadow-[var(--shadow-hairline)]">
@@ -503,11 +559,22 @@
 								{/if}
 							</AiMessage>
 						{/each}
+						{#if failedTurns.length}
+							<div class="space-y-2 py-2 pl-10">
+								{#each failedTurns as turn (turn.id)}
+									<div role="status" class="flex items-start gap-3 rounded-lg border border-destructive/25 bg-destructive/5 px-3 py-2 text-xs">
+										<span class="mt-1 h-2 w-2 shrink-0 rounded-full bg-destructive"></span>
+										<span class="min-w-0 flex-1"><span class="font-medium">{turnAgentName(turn)} could not respond.</span>{#if turn.error_message}<span class="mt-0.5 block break-words text-muted-foreground">{turn.error_message}</span>{/if}</span>
+										<button type="button" onclick={() => void cancelConversationTurn(turn)} disabled={cancellingTurnId !== null} class="shrink-0 rounded-md border border-border bg-card px-2 py-1 text-[11px] font-medium hover:bg-accent disabled:opacity-50">{cancellingTurnId === turn.id ? 'Clearing…' : 'Dismiss'}</button>
+									</div>
+								{/each}
+							</div>
+						{/if}
 						{#if activeTurns.length}
 							<div class="space-y-2 py-2 pl-10">
 								{#each activeTurns as turn (turn.id)}
 									{@const responseStart = responseStartedAt(turn)}
-									<AgentLoading
+									<div class="flex items-center gap-2"><div class="min-w-0 flex-1"><AgentLoading
 										label={turn.status === 'queued'
 											? `${turnAgentName(turn)} is queued to respond`
 											: responseStart
@@ -517,7 +584,7 @@
 										startedAt={turn.status === 'queued'
 											? turn.response_queued_at ?? turn.queued_at
 											: responseStart ?? turn.started_at}
-									/>
+									/></div><button type="button" onclick={() => void cancelConversationTurn(turn)} disabled={cancellingTurnId !== null} class="shrink-0 rounded-md border border-border px-2 py-1 text-[11px] text-muted-foreground hover:bg-accent hover:text-foreground disabled:opacity-50">{cancellingTurnId === turn.id ? 'Cancelling…' : 'Cancel'}</button></div>
 								{/each}
 							</div>
 						{/if}

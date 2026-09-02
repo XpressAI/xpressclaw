@@ -10,6 +10,7 @@ use zerocopy::IntoBytes;
 use crate::config::{
     AgentConfig, AgentLlmConfig, BudgetConfig, Config, OnExceeded, RateLimitConfig, WakeOnConfig,
 };
+use crate::conversations::runtime::cancel_message_turns;
 use crate::db::{task_search_key, Database};
 use crate::error::{Error, Result};
 use crate::memory::vector::simple_embedding;
@@ -22,7 +23,7 @@ use super::model::{
     PortableMemoryLink, PortableMemoryNote, PortableParticipant, PortableProject,
     PortableRateLimitSettings, PortableRunnerSettings, PortableSnapshot, PortableTask,
     PortableTaskDependency, PortableTaskMessage, PortableWakeOnSettings, PortableWorkflow,
-    StoreDescriptor, STORE_VERSION,
+    StoreDescriptor, CONVERSATION_MESSAGE_DELETED_AT_KEY, STORE_VERSION,
 };
 
 #[derive(Debug, Clone)]
@@ -581,6 +582,7 @@ fn export_conversation_messages(
         linked_task_id: Option<String>,
         metadata: String,
         created_at: String,
+        deleted_at: Option<String>,
         record_id: Option<String>,
         parent_record_id: Option<String>,
     }
@@ -590,6 +592,7 @@ fn export_conversation_messages(
         "SELECT message.id, message.conversation_id, message.sender_type, message.sender_id,
                 message.sender_name, message.content, message.message_type,
                 message.linked_task_id, message.metadata, message.created_at,
+                message.deleted_at,
                 sync.record_id, sync.parent_record_id
          FROM conversation_messages message
          JOIN conversations conversation ON conversation.id = message.conversation_id
@@ -609,8 +612,9 @@ fn export_conversation_messages(
                 linked_task_id: row.get(7)?,
                 metadata: row.get(8)?,
                 created_at: row.get(9)?,
-                record_id: row.get(10)?,
-                parent_record_id: row.get(11)?,
+                deleted_at: row.get(10)?,
+                record_id: row.get(11)?,
+                parent_record_id: row.get(12)?,
             })
         },
     )?;
@@ -632,6 +636,18 @@ fn export_conversation_messages(
             params![record_id, message.id, parent_record_id],
         )?;
         previous_by_conversation.insert(message.conversation_id.clone(), record_id.clone());
+        let mut metadata = parse_json(message.metadata, "Conversation message metadata")?;
+        if let Some(deleted_at) = message.deleted_at {
+            metadata
+                .as_object_mut()
+                .ok_or_else(|| {
+                    Error::Sync("Conversation message metadata must be an object".into())
+                })?
+                .insert(
+                    CONVERSATION_MESSAGE_DELETED_AT_KEY.into(),
+                    Value::String(deleted_at),
+                );
+        }
         result.push(PortableConversationMessage {
             record_id,
             parent_record_id,
@@ -642,7 +658,7 @@ fn export_conversation_messages(
             content: message.content,
             message_type: message.message_type,
             linked_task_id: message.linked_task_id,
-            metadata: parse_json(message.metadata, "Conversation message metadata")?,
+            metadata,
             created_at: message.created_at,
         });
     }
@@ -1444,6 +1460,7 @@ fn import_conversation_messages(
         message_type: String,
         metadata: String,
         created_at: String,
+        deleted_at: Option<String>,
     }
 
     let mut imported = Vec::with_capacity(snapshot.conversation_messages.len());
@@ -1456,11 +1473,14 @@ fn import_conversation_messages(
     }))?;
     for index in order {
         let message = &snapshot.conversation_messages[index];
+        let (message_metadata, remote_deleted_at) =
+            conversation_message_metadata(&message.metadata)?;
         let existing: Option<ExistingMessage> = connection
             .query_row(
                 "SELECT message.id, message.conversation_id, message.sender_type,
                         message.sender_id, message.sender_name, message.content,
-                        message.message_type, message.metadata, message.created_at
+                        message.message_type, message.metadata, message.created_at,
+                        message.deleted_at
                  FROM conversation_message_sync sync
                  JOIN conversation_messages message ON message.id = sync.message_id
                  WHERE sync.record_id = ?1",
@@ -1476,12 +1496,13 @@ fn import_conversation_messages(
                         message_type: row.get(6)?,
                         metadata: row.get(7)?,
                         created_at: row.get(8)?,
+                        deleted_at: row.get(9)?,
                     })
                 },
             )
             .optional()?;
         let already_existed = existing.is_some();
-        let message_id = if let Some(existing) = existing {
+        let (message_id, deleted_at) = if let Some(existing) = existing {
             if existing.conversation_id != message.conversation_id
                 || existing.sender_type != message.sender_type
                 || existing.sender_id != message.sender_id
@@ -1489,7 +1510,7 @@ fn import_conversation_messages(
                 || existing.content != message.content
                 || existing.message_type != message.message_type
                 || parse_json(existing.metadata, "Conversation message metadata")?
-                    != message.metadata
+                    != message_metadata
                 || existing.created_at != message.created_at
             {
                 return Err(Error::Sync(format!(
@@ -1500,13 +1521,21 @@ fn import_conversation_messages(
             // The message body and identity are immutable, but this relationship
             // is intentionally mutable: deleting a task clears it via the local
             // foreign key and that cleared association must synchronize.
+            let deleted_at = match (existing.deleted_at, remote_deleted_at.clone()) {
+                (Some(local), Some(remote)) => Some(local.max(remote)),
+                (Some(local), None) => Some(local),
+                (None, remote) => remote,
+            };
             connection.execute(
-                "UPDATE conversation_messages SET linked_task_id = ?1 WHERE id = ?2",
-                params![message.linked_task_id, existing.id],
+                "UPDATE conversation_messages
+                 SET linked_task_id = ?1, deleted_at = ?2,
+                     processed = CASE WHEN ?2 IS NULL THEN processed ELSE 1 END
+                 WHERE id = ?3",
+                params![message.linked_task_id, deleted_at, existing.id],
             )?;
-            existing.id
+            (existing.id, deleted_at)
         } else {
-            let metadata = serde_json::to_string(&message.metadata).map_err(|error| {
+            let metadata = serde_json::to_string(&message_metadata).map_err(|error| {
                 Error::Sync(format!(
                     "failed to serialize Conversation message metadata: {error}"
                 ))
@@ -1514,8 +1543,8 @@ fn import_conversation_messages(
             connection.execute(
                 "INSERT INTO conversation_messages
                     (conversation_id, sender_type, sender_id, sender_name, content,
-                     message_type, linked_task_id, metadata, created_at, processed)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1)",
+                     message_type, linked_task_id, metadata, created_at, processed, deleted_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10)",
                 params![
                     message.conversation_id,
                     message.sender_type,
@@ -1525,10 +1554,11 @@ fn import_conversation_messages(
                     message.message_type,
                     message.linked_task_id,
                     metadata,
-                    message.created_at
+                    message.created_at,
+                    remote_deleted_at
                 ],
             )?;
-            connection.last_insert_rowid()
+            (connection.last_insert_rowid(), remote_deleted_at)
         };
         connection.execute(
             "INSERT OR IGNORE INTO conversation_message_sync
@@ -1536,6 +1566,21 @@ fn import_conversation_messages(
              VALUES (?1, ?2, NULL)",
             params![message.record_id, message_id],
         )?;
+        if deleted_at.is_some() {
+            cancel_message_turns(connection, &message.conversation_id, message_id)?;
+            connection.execute(
+                "DELETE FROM conversation_message_attachments WHERE message_id = ?1",
+                [message_id],
+            )?;
+            connection.execute(
+                "DELETE FROM message_visualizations WHERE conversation_message_id = ?1",
+                [message_id],
+            )?;
+            connection.execute(
+                "DELETE FROM dashboard_events WHERE event_id = 'conversation-message:' || ?1",
+                [message_id],
+            )?;
+        }
         imported.push((
             &message.record_id,
             &message.parent_record_id,
@@ -1563,7 +1608,7 @@ fn import_conversation_messages(
             "UPDATE conversations
              SET last_message_at = (
                  SELECT created_at FROM conversation_messages
-                 WHERE conversation_id = ?1
+                 WHERE conversation_id = ?1 AND deleted_at IS NULL
                  ORDER BY julianday(created_at) DESC, id DESC
                  LIMIT 1
              )
@@ -1572,6 +1617,22 @@ fn import_conversation_messages(
         )?;
     }
     Ok(())
+}
+
+fn conversation_message_metadata(metadata: &Value) -> Result<(Value, Option<String>)> {
+    let mut metadata = metadata.clone();
+    let object = metadata
+        .as_object_mut()
+        .ok_or_else(|| Error::Sync("Conversation message metadata must be an object".into()))?;
+    let deleted_at = object
+        .remove(CONVERSATION_MESSAGE_DELETED_AT_KEY)
+        .map(|value| {
+            value.as_str().map(str::to_owned).ok_or_else(|| {
+                Error::Sync("Conversation message deletion marker must be a timestamp".into())
+            })
+        })
+        .transpose()?;
+    Ok((metadata, deleted_at))
 }
 
 fn message_import_order<'a>(
@@ -2072,6 +2133,43 @@ mod tests {
         ];
         let order = message_import_order(records.into_iter()).unwrap();
         assert_eq!(order, vec![1, 0]);
+    }
+
+    #[test]
+    fn imported_conversation_message_tombstones_cannot_be_revived() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("xpressclaw.yaml");
+        let db = Database::open_memory().unwrap();
+        insert_project_data(&db);
+        let config = Config {
+            agents: vec![AgentConfig {
+                name: "atlas".into(),
+                backend: "codex".into(),
+                ..AgentConfig::default()
+            }],
+            ..Config::default()
+        };
+        config.save(&config_path).unwrap();
+        let stale = export_snapshot(&db, &config, &manifest()).unwrap();
+        let mut deleted = stale.clone();
+        deleted.conversation_messages[0]
+            .metadata
+            .as_object_mut()
+            .unwrap()
+            .insert(
+                CONVERSATION_MESSAGE_DELETED_AT_KEY.into(),
+                Value::String("2026-01-02 00:00:00".into()),
+            );
+
+        let mut loaded = Config::load(&config_path).unwrap();
+        import_snapshot(&db, &mut loaded, &config_path, directory.path(), &deleted).unwrap();
+        import_snapshot(&db, &mut loaded, &config_path, directory.path(), &stale).unwrap();
+
+        let visible = crate::conversations::ConversationManager::new(std::sync::Arc::new(db))
+            .get_messages("conversation-one", 20, None)
+            .unwrap();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].content, "two");
     }
 
     #[test]

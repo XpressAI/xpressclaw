@@ -6,7 +6,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::Response;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
@@ -46,6 +46,7 @@ pub fn routes() -> Router<AppState> {
             axum::routing::delete(remove_participant),
         )
         .route("/{id}/messages", get(list_messages).post(send_user_message))
+        .route("/{id}/messages/{message_id}", delete(delete_message))
         .route("/{id}/agent-messages", post(send_agent_message))
         .route("/{id}/events", get(conversation_events))
         .route(
@@ -53,6 +54,7 @@ pub fn routes() -> Router<AppState> {
             get(list_linked_tasks).post(create_linked_task),
         )
         .route("/{id}/turns", get(list_turns))
+        .route("/{id}/turns/{turn_id}/cancel", post(cancel_turn))
         .route("/{id}/attachments/{attachment_id}", get(get_attachment))
         .route(
             "/{id}/messages/{message_id}/visualizations/{artifact_id}",
@@ -216,6 +218,26 @@ async fn list_messages(
         })
         .collect::<Vec<_>>();
     Ok(Json(json!(messages)))
+}
+
+async fn delete_message(
+    State(state): State<AppState>,
+    Path((id, message_id)): Path<(String, i64)>,
+) -> Result<StatusCode, ApiError> {
+    let running_turns = ConversationManager::new(state.db.clone())
+        .delete_message(&id, message_id)
+        .map_err(api_error)?;
+    for turn_id in running_turns {
+        state
+            .turn_controls
+            .request_interrupt(&turn_id, AcpInterruptMode::Immediate);
+        state.elicitations.cancel_attempt(&turn_id);
+    }
+    state
+        .event_bus
+        .send(&id, ConversationEvent::MessageDeleted { message_id });
+    state.event_bus.send(&id, ConversationEvent::Done);
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Deserialize)]
@@ -488,6 +510,25 @@ async fn list_turns(State(state): State<AppState>, Path(id): Path<String>) -> Ap
     Ok(Json(json!(turns)))
 }
 
+async fn cancel_turn(
+    State(state): State<AppState>,
+    Path((id, turn_id)): Path<(String, String)>,
+) -> ApiResult {
+    let cancellation = ConversationTurnQueue::new(state.db.clone())
+        .cancel(&id, &turn_id)
+        .map_err(api_error)?;
+    if cancellation.was_running {
+        state
+            .turn_controls
+            .request_interrupt(&turn_id, AcpInterruptMode::Immediate);
+        state.elicitations.cancel_attempt(&turn_id);
+    }
+    if cancellation.changed {
+        state.event_bus.send(&id, ConversationEvent::Done);
+    }
+    Ok(Json(json!(cancellation.turn)))
+}
+
 async fn get_attachment(
     State(state): State<AppState>,
     Path((id, attachment_id)): Path<(String, String)>,
@@ -754,6 +795,91 @@ mod tests {
             response.into_body().collect().await.unwrap().to_bytes(),
             "hello"
         );
+    }
+
+    #[tokio::test]
+    async fn conversation_responses_can_be_cancelled_and_messages_deleted() {
+        let (app, db) = app_with_db();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"project_id":"project","title":"Recoverable","participant_ids":["atlas"]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let conversation = json_body(response).await;
+        let id = conversation["id"].as_str().unwrap();
+        let sent = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/{id}/messages"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"content":"Please answer"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let sent = json_body(sent).await;
+        let message_id = sent["message"]["id"].as_i64().unwrap();
+        let turns = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/{id}/turns"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let turns = json_body(turns).await;
+        let turn_id = turns[0]["id"].as_str().unwrap();
+
+        let cancelled = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/{id}/turns/{turn_id}/cancel"))
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cancelled.status(), StatusCode::OK);
+        assert_eq!(json_body(cancelled).await["status"], "cancelled");
+
+        let deleted = app
+            .clone()
+            .oneshot(
+                Request::delete(format!("/{id}/messages/{message_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+        let listed = app
+            .oneshot(
+                Request::get(format!("/{id}/messages"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(json_body(listed).await, json!([]));
+        let tombstoned = db
+            .with_conn(|connection| {
+                connection.query_row(
+                    "SELECT deleted_at IS NOT NULL FROM conversation_messages WHERE id = ?1",
+                    [message_id],
+                    |row| row.get::<_, bool>(0),
+                )
+            })
+            .unwrap();
+        assert!(tombstoned);
     }
 
     #[tokio::test]

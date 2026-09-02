@@ -32,6 +32,13 @@ pub struct ConversationTurn {
     pub response_started_at: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationTurnCancellation {
+    pub turn: ConversationTurn,
+    pub changed: bool,
+    pub was_running: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct ConversationAgentSession {
     pub native_session_id: Option<String>,
@@ -186,7 +193,7 @@ impl ConversationTurnQueue {
         let trigger_exists = transaction.query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM conversation_messages
-                WHERE id = ?1 AND conversation_id = ?2
+                WHERE id = ?1 AND conversation_id = ?2 AND deleted_at IS NULL
              )",
             rusqlite::params![trigger_message_id, conversation_id],
             |row| row.get::<_, bool>(0),
@@ -227,7 +234,9 @@ impl ConversationTurnQueue {
                      SET response_queued_at = CASE
                             WHEN COALESCE(trigger_message_id, 0) <= ?1
                             THEN (SELECT created_at FROM conversation_messages
-                                  WHERE id = ?1 AND conversation_id = conversation_turns.conversation_id)
+                                  WHERE id = ?1
+                                    AND conversation_id = conversation_turns.conversation_id
+                                    AND deleted_at IS NULL)
                             ELSE response_queued_at END,
                          trigger_message_id = MAX(COALESCE(trigger_message_id, 0), ?1)
                      WHERE id = ?2",
@@ -241,7 +250,8 @@ impl ConversationTurnQueue {
             "INSERT INTO conversation_turns
              (id, conversation_id, agent_id, trigger_message_id, response_queued_at)
              SELECT ?1, ?2, ?3, ?4, created_at
-             FROM conversation_messages WHERE id = ?4 AND conversation_id = ?2",
+             FROM conversation_messages
+             WHERE id = ?4 AND conversation_id = ?2 AND deleted_at IS NULL",
             rusqlite::params![id, conversation_id, agent_id, trigger_message_id],
         )?;
         transaction.execute(
@@ -387,6 +397,58 @@ impl ConversationTurnQueue {
                 |row| row.get(0),
             )
             .map_err(Error::from)
+        })
+    }
+
+    /// Cancel queued or running work, or dismiss a terminal failure. The
+    /// durable transition happens before the caller interrupts a live ACP
+    /// process, so a late response cannot be published after cancellation.
+    pub fn cancel(
+        &self,
+        conversation_id: &str,
+        turn_id: &str,
+    ) -> Result<ConversationTurnCancellation> {
+        self.db.with_conn(|conn| {
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let original = transaction
+                .query_row(
+                    "SELECT * FROM conversation_turns
+                     WHERE id = ?1 AND conversation_id = ?2",
+                    rusqlite::params![turn_id, conversation_id],
+                    row_to_turn,
+                )
+                .optional()?
+                .ok_or_else(|| Error::Conversation(format!("turn {turn_id} not found")))?;
+            let was_running = original.status == "running";
+            let changed = transaction.execute(
+                "UPDATE conversation_turns
+                 SET status = 'cancelled', completed_at = CURRENT_TIMESTAMP,
+                     error_message = NULL
+                 WHERE id = ?1 AND conversation_id = ?2
+                   AND status IN ('queued', 'running', 'failed')",
+                rusqlite::params![turn_id, conversation_id],
+            )? == 1;
+            if changed {
+                refresh_agent_session_state(
+                    &transaction,
+                    &original.conversation_id,
+                    &original.agent_id,
+                )?;
+            }
+            let turn = transaction.query_row(
+                "SELECT * FROM conversation_turns WHERE id = ?1",
+                [turn_id],
+                row_to_turn,
+            )?;
+            transaction.commit()?;
+            Ok(ConversationTurnCancellation {
+                turn,
+                changed,
+                was_running,
+            })
         })
     }
 
@@ -592,7 +654,7 @@ impl ConversationTurnQueue {
             let mut statement = transaction.prepare(
                 "SELECT id, sender_type, sender_id, content, metadata, created_at
                  FROM conversation_messages
-                 WHERE conversation_id = ?1 AND id > ?2
+                 WHERE conversation_id = ?1 AND id > ?2 AND deleted_at IS NULL
                  ORDER BY id DESC",
             )?;
             let messages =
@@ -713,6 +775,85 @@ impl ConversationTurnQueue {
     }
 }
 
+/// Cancel every unfinished or failed response caused by a message. This is
+/// shared by local deletion and synchronized tombstones; server callers use
+/// the returned running IDs to interrupt the corresponding ACP processes.
+pub(crate) fn cancel_message_turns(
+    connection: &rusqlite::Connection,
+    conversation_id: &str,
+    message_id: i64,
+) -> Result<Vec<String>> {
+    let mut running_statement = connection.prepare(
+        "SELECT id FROM conversation_turns
+         WHERE conversation_id = ?1 AND trigger_message_id = ?2 AND status = 'running'",
+    )?;
+    let running_turns = running_statement
+        .query_map(rusqlite::params![conversation_id, message_id], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(running_statement);
+
+    let mut agent_statement = connection.prepare(
+        "SELECT DISTINCT agent_id FROM conversation_turns
+         WHERE conversation_id = ?1 AND trigger_message_id = ?2
+           AND status IN ('queued', 'running', 'failed')",
+    )?;
+    let affected_agents = agent_statement
+        .query_map(rusqlite::params![conversation_id, message_id], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(agent_statement);
+
+    connection.execute(
+        "UPDATE conversation_turns
+         SET status = 'cancelled', completed_at = CURRENT_TIMESTAMP,
+             error_message = NULL
+         WHERE conversation_id = ?1 AND trigger_message_id = ?2
+           AND status IN ('queued', 'running', 'failed')",
+        rusqlite::params![conversation_id, message_id],
+    )?;
+    connection.execute(
+        "UPDATE conversation_turns SET result_message_id = NULL
+         WHERE conversation_id = ?1 AND result_message_id = ?2",
+        rusqlite::params![conversation_id, message_id],
+    )?;
+    for agent_id in affected_agents {
+        refresh_agent_session_state(connection, conversation_id, &agent_id)?;
+    }
+    Ok(running_turns)
+}
+
+fn refresh_agent_session_state(
+    connection: &rusqlite::Connection,
+    conversation_id: &str,
+    agent_id: &str,
+) -> Result<()> {
+    let latest = connection
+        .query_row(
+            "SELECT status, error_message FROM conversation_turns
+             WHERE conversation_id = ?1 AND agent_id = ?2
+             ORDER BY queued_at DESC, rowid DESC LIMIT 1",
+            rusqlite::params![conversation_id, agent_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()?;
+    let (status, last_error) = match latest {
+        Some((status, error)) if matches!(status.as_str(), "queued" | "running" | "failed") => {
+            (status, error)
+        }
+        _ => ("idle".to_string(), None),
+    };
+    connection.execute(
+        "UPDATE conversation_agent_sessions
+         SET status = ?1, last_error = ?2, updated_at = CURRENT_TIMESTAMP
+         WHERE conversation_id = ?3 AND agent_id = ?4",
+        rusqlite::params![status, last_error, conversation_id, agent_id],
+    )?;
+    Ok(())
+}
+
 fn row_to_turn(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConversationTurn> {
     Ok(ConversationTurn {
         id: row.get("id")?,
@@ -817,6 +958,77 @@ mod tests {
                 && turn.response_queued_at.as_deref() == Some(second.created_at.as_str())
                 && turn.response_started_at.is_none()
         }));
+    }
+
+    #[test]
+    fn failed_turn_can_be_dismissed_and_stops_needing_attention() {
+        let (db, manager, queue) = setup();
+        let conversation = manager
+            .create_in_project(
+                Some("p"),
+                &CreateConversation {
+                    title: Some("Failure".into()),
+                    icon: None,
+                    participant_ids: vec!["atlas".into()],
+                },
+            )
+            .unwrap();
+        let message = manager
+            .send_message(
+                &conversation.id,
+                &SendMessage {
+                    sender_type: "user".into(),
+                    sender_id: "local".into(),
+                    sender_name: None,
+                    content: "Please answer".into(),
+                    message_type: None,
+                },
+            )
+            .unwrap();
+        queue
+            .enqueue(&conversation.id, "atlas", message.id)
+            .unwrap();
+        let running = queue.claim_next().unwrap().unwrap();
+        queue.fail(&running, "Harness refused the request").unwrap();
+
+        let before = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT needs_attention FROM dashboard_events
+                     WHERE work_kind = 'conversation_turn' AND work_id = ?1",
+                    [&running.id],
+                    |row| row.get::<_, bool>(0),
+                )
+            })
+            .unwrap();
+        assert!(before);
+
+        let cancellation = queue.cancel(&conversation.id, &running.id).unwrap();
+
+        assert!(cancellation.changed);
+        assert!(!cancellation.was_running);
+        assert_eq!(cancellation.turn.status, "cancelled");
+        let (session_status, still_needs_attention) = db
+            .with_conn(|conn| {
+                Ok::<_, rusqlite::Error>((
+                    conn.query_row(
+                        "SELECT status FROM conversation_agent_sessions
+                         WHERE conversation_id = ?1 AND agent_id = 'atlas'",
+                        [&conversation.id],
+                        |row| row.get::<_, String>(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM dashboard_events
+                         WHERE work_kind = 'conversation_turn' AND work_id = ?1
+                           AND needs_attention = 1",
+                        [&running.id],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                ))
+            })
+            .unwrap();
+        assert_eq!(session_status, "idle");
+        assert_eq!(still_needs_attention, 0);
     }
 
     #[test]

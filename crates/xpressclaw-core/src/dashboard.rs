@@ -167,6 +167,8 @@ pub struct DashboardAttentionItem {
     pub href: String,
     pub summary: String,
     pub updated_at: String,
+    pub work_kind: String,
+    pub work_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -911,7 +913,8 @@ impl DashboardManager {
         self.db.with_conn(|conn| {
             let mut statement = conn.prepare(
                 "SELECT id, kind, project_id, project_name, agent_id, agent_name,
-                        target_type, target_id, target_title, href, summary, updated_at
+                        target_type, target_id, target_title, href, summary, updated_at,
+                        work_kind, work_id
                  FROM (
                     SELECT 'task:' || t.id AS id,
                            CASE WHEN t.status = 'waiting_for_input' THEN 'waiting_for_input'
@@ -921,7 +924,7 @@ impl DashboardManager {
                            '/tasks/' || t.id AS href,
                            CASE WHEN t.status = 'waiting_for_input' THEN 'The Agent needs your input'
                                 ELSE 'Task is blocked' END AS summary,
-                           t.updated_at
+                           t.updated_at, 'task' AS work_kind, t.id AS work_id
                     FROM tasks t
                     LEFT JOIN projects p ON p.id = t.project_id
                     LEFT JOIN agents a ON a.id = t.agent_id
@@ -933,9 +936,16 @@ impl DashboardManager {
                            'conversation', c.id, COALESCE(c.title, 'Untitled conversation'),
                            '/conversations/' || c.id,
                            'Conversation response failed',
-                           cas.updated_at
+                           cas.updated_at, 'conversation_turn', ct.id
                     FROM conversation_agent_sessions cas
                     JOIN conversations c ON c.id = cas.conversation_id
+                    JOIN conversation_turns ct ON ct.rowid = (
+                        SELECT candidate.rowid FROM conversation_turns candidate
+                        WHERE candidate.conversation_id = cas.conversation_id
+                          AND candidate.agent_id = cas.agent_id
+                          AND candidate.status = 'failed'
+                        ORDER BY candidate.queued_at DESC, candidate.rowid DESC LIMIT 1
+                    )
                     LEFT JOIN projects p ON p.id = c.project_id
                     LEFT JOIN agents a ON a.id = cas.agent_id
                     WHERE cas.status = 'failed' AND (?1 IS NULL OR c.project_id = ?1)
@@ -961,6 +971,8 @@ impl DashboardManager {
                         href: row.get(9)?,
                         summary: safe_preview(&row.get::<_, String>(10)?, 240),
                         updated_at: row.get(11)?,
+                        work_kind: row.get(12)?,
+                        work_id: row.get(13)?,
                     })
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -2715,6 +2727,13 @@ mod tests {
             )?;
             for failed_agent in [agent_id.as_str(), reviewer_id] {
                 conn.execute(
+                    "INSERT INTO conversation_turns
+                         (id, conversation_id, agent_id, status, completed_at, error_message)
+                     VALUES ('failed-' || ?1, 'conversation-failed', ?1, 'failed',
+                             CURRENT_TIMESTAMP, 'Harness error')",
+                    [failed_agent],
+                )?;
+                conn.execute(
                     "INSERT INTO conversation_agent_sessions
                          (conversation_id, agent_id, status)
                      VALUES ('conversation-failed', ?1, 'failed')",
@@ -2745,6 +2764,9 @@ mod tests {
             .attention
             .iter()
             .any(|item| item.id == "conversation:conversation-failed:reviewer-agent"));
+        assert!(snapshot.attention.iter().all(|item| {
+            item.work_kind == "conversation_turn" && item.work_id.starts_with("failed-")
+        }));
     }
 
     #[test]

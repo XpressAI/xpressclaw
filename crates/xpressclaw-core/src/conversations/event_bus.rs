@@ -22,6 +22,8 @@ pub enum ConversationEvent {
         #[serde(flatten)]
         message: serde_json::Value,
     },
+    /// A stored message was hidden by the user.
+    MessageDeleted { message_id: i64 },
     /// An error occurred during processing.
     Error {
         agent_id: Option<String>,
