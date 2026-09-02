@@ -33,6 +33,8 @@ pub struct SyncOutcome {
     pub project_id: String,
     pub commit: String,
     pub counts: SnapshotCounts,
+    #[serde(skip_serializing)]
+    pub interrupted_conversation_turn_ids: Vec<String>,
 }
 
 /// Create the portable pointer manifest. This performs no network operation
@@ -108,6 +110,7 @@ pub fn fetch(
                     project_id: manifest.project_id,
                     commit,
                     counts: snapshot.counts(),
+                    interrupted_conversation_turn_ids: Vec::new(),
                 });
             }
             Some(previous)
@@ -130,7 +133,8 @@ pub fn fetch(
         }
     }
 
-    state::import_snapshot(db, config, config_path, project_dir, &snapshot)?;
+    let interrupted_conversation_turn_ids =
+        state::import_snapshot(db, config, config_path, project_dir, &snapshot)?;
     let merged = state::export_snapshot(db, config, &manifest)?;
     let digest = merged.digest()?;
     state::save_sync_state(db, &manifest, &commit, &digest, &remote_digest)?;
@@ -138,6 +142,7 @@ pub fn fetch(
         project_id: manifest.project_id,
         commit,
         counts: snapshot.counts(),
+        interrupted_conversation_turn_ids,
     })
 }
 
@@ -199,6 +204,7 @@ pub fn publish(db: &Database, config: &Config, project_dir: &Path) -> Result<Syn
         project_id: manifest.project_id,
         commit,
         counts: snapshot.counts(),
+        interrupted_conversation_turn_ids: Vec::new(),
     })
 }
 

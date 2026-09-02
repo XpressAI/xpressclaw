@@ -727,7 +727,7 @@ pub(super) fn import_snapshot(
     config_path: &Path,
     project_dir: &Path,
     snapshot: &PortableSnapshot,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     // Reload the file-backed form so values supplied only through environment
     // overrides are never materialized into xpressclaw.yaml by a fetch.
     let mut updated_config = if config_path.exists() {
@@ -738,9 +738,9 @@ pub(super) fn import_snapshot(
     let original_config = fs::read(config_path).ok();
     merge_agent_config(&mut updated_config, snapshot, project_dir)?;
 
-    let transaction_result = db.with_conn(|connection| -> Result<()> {
+    let transaction_result = db.with_conn(|connection| -> Result<Vec<String>> {
         let transaction = Transaction::new_unchecked(connection, TransactionBehavior::Immediate)?;
-        import_transaction(&transaction, snapshot)?;
+        let interrupted_turn_ids = import_transaction(&transaction, snapshot)?;
         if fs::read(config_path).ok().as_deref() != original_config.as_deref() {
             return Err(Error::Sync(
                 "xpressclaw.yaml changed during fetch; no synchronized state was imported".into(),
@@ -751,11 +751,11 @@ pub(super) fn import_snapshot(
             restore_config(config_path, original_config.as_deref());
             return Err(Error::from(error));
         }
-        Ok(())
+        Ok(interrupted_turn_ids)
     });
-    transaction_result?;
+    let interrupted_turn_ids = transaction_result?;
     *config = updated_config;
-    Ok(())
+    Ok(interrupted_turn_ids)
 }
 
 fn restore_config(path: &Path, contents: Option<&[u8]>) {
@@ -900,7 +900,7 @@ fn portable_budget(budget: &PortableBudgetSettings) -> Result<BudgetConfig> {
     })
 }
 
-fn import_transaction(connection: &Connection, snapshot: &PortableSnapshot) -> Result<()> {
+fn import_transaction(connection: &Connection, snapshot: &PortableSnapshot) -> Result<Vec<String>> {
     let project_exists: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
         [&snapshot.project.id],
@@ -938,8 +938,7 @@ fn import_transaction(connection: &Connection, snapshot: &PortableSnapshot) -> R
     import_task_messages(connection, snapshot)?;
     import_workflows(connection, snapshot)?;
     import_memory(connection, snapshot)?;
-    import_conversation_messages(connection, snapshot)?;
-    Ok(())
+    import_conversation_messages(connection, snapshot)
 }
 
 fn validate_local_scopes(connection: &Connection, snapshot: &PortableSnapshot) -> Result<()> {
@@ -1449,7 +1448,7 @@ fn import_memory(connection: &Connection, snapshot: &PortableSnapshot) -> Result
 fn import_conversation_messages(
     connection: &Connection,
     snapshot: &PortableSnapshot,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     struct ExistingMessage {
         id: i64,
         conversation_id: String,
@@ -1464,6 +1463,7 @@ fn import_conversation_messages(
     }
 
     let mut imported = Vec::with_capacity(snapshot.conversation_messages.len());
+    let mut interrupted_turn_ids = BTreeSet::new();
     let order = message_import_order(snapshot.conversation_messages.iter().map(|message| {
         (
             message.record_id.as_str(),
@@ -1580,7 +1580,11 @@ fn import_conversation_messages(
                 )?;
             }
             if became_deleted {
-                reconcile_message_deletion_turns(connection, &message.conversation_id, message_id)?;
+                interrupted_turn_ids.extend(reconcile_message_deletion_turns(
+                    connection,
+                    &message.conversation_id,
+                    message_id,
+                )?);
             }
             connection.execute(
                 "DELETE FROM conversation_message_attachments WHERE message_id = ?1",
@@ -1626,7 +1630,7 @@ fn import_conversation_messages(
             [&conversation.id],
         )?;
     }
-    Ok(())
+    Ok(interrupted_turn_ids.into_iter().collect())
 }
 
 fn conversation_message_metadata(metadata: &Value) -> Result<(Value, Option<String>)> {
@@ -2228,6 +2232,56 @@ mod tests {
             })
             .unwrap();
         assert_eq!(deleted_dashboard_events, 0);
+    }
+
+    #[test]
+    fn imported_tombstones_report_running_conversation_turns() {
+        let db = Database::open_memory().unwrap();
+        insert_project_data(&db);
+        let config = Config {
+            agents: vec![AgentConfig {
+                name: "atlas".into(),
+                backend: "codex".into(),
+                ..AgentConfig::default()
+            }],
+            ..Config::default()
+        };
+        let mut deleted = export_snapshot(&db, &config, &manifest()).unwrap();
+        deleted.conversation_messages[0]
+            .metadata
+            .as_object_mut()
+            .unwrap()
+            .insert(
+                CONVERSATION_MESSAGE_DELETED_AT_KEY.into(),
+                Value::String("2026-01-02 00:00:00".into()),
+            );
+
+        let interrupted = db
+            .with_conn(|connection| {
+                connection.execute_batch(
+                    "INSERT INTO conversation_agent_sessions
+                        (conversation_id, agent_id, native_session_id, status)
+                     VALUES ('conversation-one', 'atlas', 'active-session', 'running');
+                     INSERT INTO conversation_turns
+                        (id, conversation_id, agent_id, trigger_message_id, status)
+                     SELECT 'running-turn', 'conversation-one', 'atlas', id, 'running'
+                     FROM conversation_messages WHERE content = 'one';",
+                )?;
+                import_conversation_messages(connection, &deleted)
+            })
+            .unwrap();
+
+        assert_eq!(interrupted, ["running-turn"]);
+        let status = db
+            .with_conn(|connection| {
+                connection.query_row(
+                    "SELECT status FROM conversation_turns WHERE id = 'running-turn'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(status, "cancelled");
     }
 
     #[test]

@@ -15,6 +15,7 @@ use xpressclaw_core::error::Error;
 use xpressclaw_core::llm::router::LlmRouter;
 use xpressclaw_core::projects::{Project, ProjectManager};
 use xpressclaw_core::sync::{self, ProjectSyncManifest, SnapshotCounts, MANIFEST_FILE};
+use xpressclaw_core::workers::acp::AcpInterruptMode;
 use xpressclaw_core::workers::native::resolved_workspace;
 
 use crate::state::AppState;
@@ -108,6 +109,13 @@ async fn fetch_project(
     .await
     .map_err(join_error)?
     .map_err(core_error)?;
+
+    for turn_id in &outcome.interrupted_conversation_turn_ids {
+        state
+            .turn_controls
+            .request_interrupt(turn_id, AcpInterruptMode::Immediate);
+        state.elicitations.cancel_attempt(turn_id);
+    }
 
     // fetch deliberately reloads the file-backed configuration so environment
     // credentials are never written to disk. Restore those runtime-only
