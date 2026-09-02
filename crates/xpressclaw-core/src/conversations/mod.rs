@@ -1503,6 +1503,11 @@ mod tests {
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].id, first.id);
         assert!(mgr.attachments(deleted.id).unwrap().is_empty());
+        assert!(queue
+            .list_for_conversation(&conv.id, 10)
+            .unwrap()
+            .iter()
+            .any(|turn| turn.status == "queued" && turn.trigger_message_id == Some(first.id)));
         let (deleted_at, turn_status, session_status, last_message_at, dashboard_event_count) = mgr
             .db
             .with_conn(|conn| {
@@ -1539,7 +1544,7 @@ mod tests {
             .unwrap();
         assert!(deleted_at.is_some());
         assert_eq!(turn_status, "cancelled");
-        assert_eq!(session_status, "idle");
+        assert_eq!(session_status, "queued");
         assert_eq!(last_message_at.as_deref(), Some(first.created_at.as_str()));
         assert_eq!(dashboard_event_count, 0);
     }
@@ -1594,6 +1599,112 @@ mod tests {
             Some(first.created_at.as_str())
         );
         assert_eq!(mgr.get_messages(&conv.id, 10, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn deleting_a_running_coalesced_message_requeues_visible_work() {
+        let mgr = test_manager();
+        let conv = mgr
+            .create(&CreateConversation {
+                title: Some("Retain work absorbed by a running turn".into()),
+                icon: None,
+                participant_ids: vec!["atlas".into()],
+            })
+            .unwrap();
+        let first = mgr
+            .send_message(
+                &conv.id,
+                &SendMessage {
+                    sender_type: "user".into(),
+                    sender_id: "local".into(),
+                    sender_name: Some("You".into()),
+                    content: "Keep this request".into(),
+                    message_type: None,
+                },
+            )
+            .unwrap();
+        let deleted = mgr
+            .send_message(
+                &conv.id,
+                &SendMessage {
+                    sender_type: "user".into(),
+                    sender_id: "local".into(),
+                    sender_name: Some("You".into()),
+                    content: "Delete this coalesced follow-up".into(),
+                    message_type: None,
+                },
+            )
+            .unwrap();
+        let queue = runtime::ConversationTurnQueue::new(mgr.db.clone());
+        assert!(queue.enqueue(&conv.id, "atlas", first.id).unwrap());
+        assert!(!queue.enqueue(&conv.id, "atlas", deleted.id).unwrap());
+        let running = queue.claim_next().unwrap().unwrap();
+        assert_eq!(running.trigger_message_id, Some(deleted.id));
+
+        let interrupted = mgr.delete_message(&conv.id, deleted.id).unwrap();
+
+        assert_eq!(interrupted, vec![running.id.clone()]);
+        let turns = queue.list_for_conversation(&conv.id, 10).unwrap();
+        assert_eq!(turns.len(), 2);
+        assert!(turns
+            .iter()
+            .any(|turn| turn.id == running.id && turn.status == "cancelled"));
+        assert!(turns
+            .iter()
+            .any(|turn| { turn.status == "queued" && turn.trigger_message_id == Some(first.id) }));
+    }
+
+    #[test]
+    fn cancelling_a_running_turn_queues_its_deferred_follow_up() {
+        let mgr = test_manager();
+        let conv = mgr
+            .create(&CreateConversation {
+                title: Some("Keep deferred follow-up".into()),
+                icon: None,
+                participant_ids: vec!["atlas".into()],
+            })
+            .unwrap();
+        let first = mgr
+            .send_message(
+                &conv.id,
+                &SendMessage {
+                    sender_type: "user".into(),
+                    sender_id: "local".into(),
+                    sender_name: Some("You".into()),
+                    content: "Stop this response".into(),
+                    message_type: None,
+                },
+            )
+            .unwrap();
+        let queue = runtime::ConversationTurnQueue::new(mgr.db.clone());
+        assert!(queue.enqueue(&conv.id, "atlas", first.id).unwrap());
+        let running = queue.claim_next().unwrap().unwrap();
+        let follow_up = mgr
+            .send_message(
+                &conv.id,
+                &SendMessage {
+                    sender_type: "user".into(),
+                    sender_id: "local".into(),
+                    sender_name: Some("You".into()),
+                    content: "Answer this follow-up instead".into(),
+                    message_type: None,
+                },
+            )
+            .unwrap();
+        assert!(!queue.enqueue(&conv.id, "atlas", follow_up.id).unwrap());
+
+        let cancellation = queue.cancel(&conv.id, &running.id).unwrap();
+
+        assert!(cancellation.changed);
+        assert!(cancellation.was_running);
+        let turns = queue.list_for_conversation(&conv.id, 10).unwrap();
+        assert_eq!(turns.len(), 2);
+        assert!(turns
+            .iter()
+            .any(|turn| turn.id == running.id && turn.status == "cancelled"));
+        assert!(turns.iter().any(|turn| {
+            turn.status == "queued" && turn.trigger_message_id == Some(follow_up.id)
+        }));
     }
 
     #[test]

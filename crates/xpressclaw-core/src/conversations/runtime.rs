@@ -172,7 +172,7 @@ impl ConversationTurnQueue {
     }
 
     fn enqueue_in_transaction(
-        transaction: &rusqlite::Transaction<'_>,
+        transaction: &rusqlite::Connection,
         conversation_id: &str,
         agent_id: &str,
         trigger_message_id: i64,
@@ -431,6 +431,23 @@ impl ConversationTurnQueue {
                    AND status IN ('queued', 'running', 'failed')",
                 rusqlite::params![turn_id, conversation_id],
             )? == 1;
+            if changed && was_running {
+                let after_id = original.trigger_message_id.unwrap_or(0);
+                if let Some((message_id, _)) = latest_addressed_message(
+                    &transaction,
+                    &original.conversation_id,
+                    &original.agent_id,
+                    after_id,
+                    None,
+                )? {
+                    Self::enqueue_in_transaction(
+                        &transaction,
+                        &original.conversation_id,
+                        &original.agent_id,
+                        message_id,
+                    )?;
+                }
+            }
             if changed {
                 refresh_agent_session_state(
                     &transaction,
@@ -769,12 +786,12 @@ pub(crate) fn reconcile_message_deletion_turns(
     }
 
     let mut running_statement = connection.prepare(
-        "SELECT id FROM conversation_turns
+        "SELECT id, agent_id FROM conversation_turns
          WHERE conversation_id = ?1 AND trigger_message_id = ?2 AND status = 'running'",
     )?;
     let running_turns = running_statement
         .query_map(rusqlite::params![conversation_id, message_id], |row| {
-            row.get::<_, String>(0)
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     drop(running_statement);
@@ -799,6 +816,40 @@ pub(crate) fn reconcile_message_deletion_turns(
            AND status IN ('queued', 'running', 'failed')",
         rusqlite::params![conversation_id, message_id],
     )?;
+    for (_, agent_id) in &running_turns {
+        let replacement = match latest_addressed_message(
+            connection,
+            conversation_id,
+            agent_id,
+            message_id,
+            None,
+        )? {
+            Some(message) => Some(message),
+            None => {
+                let last_terminal_trigger = latest_terminal_trigger_before_message(
+                    connection,
+                    conversation_id,
+                    agent_id,
+                    message_id,
+                )?;
+                latest_addressed_message(
+                    connection,
+                    conversation_id,
+                    agent_id,
+                    last_terminal_trigger,
+                    Some(message_id),
+                )?
+            }
+        };
+        if let Some((replacement_message_id, _)) = replacement {
+            ConversationTurnQueue::enqueue_in_transaction(
+                connection,
+                conversation_id,
+                agent_id,
+                replacement_message_id,
+            )?;
+        }
+    }
     connection.execute(
         "UPDATE conversation_turns SET result_message_id = NULL
          WHERE conversation_id = ?1 AND result_message_id = ?2",
@@ -807,7 +858,7 @@ pub(crate) fn reconcile_message_deletion_turns(
     for agent_id in affected_agents {
         refresh_agent_session_state(connection, conversation_id, &agent_id)?;
     }
-    Ok(running_turns)
+    Ok(running_turns.into_iter().map(|(id, _)| id).collect())
 }
 
 /// A queued turn owns a high-water message, not only that message. If its
@@ -820,13 +871,11 @@ fn retarget_queued_turn_before_message(
     agent_id: &str,
     before_message_id: i64,
 ) -> Result<bool> {
-    let last_terminal_trigger = connection.query_row(
-        "SELECT COALESCE(MAX(trigger_message_id), 0) FROM conversation_turns
-         WHERE conversation_id = ?1 AND agent_id = ?2
-           AND status IN ('completed', 'cancelled', 'failed')
-           AND trigger_message_id < ?3",
-        rusqlite::params![conversation_id, agent_id, before_message_id],
-        |row| row.get::<_, i64>(0),
+    let last_terminal_trigger = latest_terminal_trigger_before_message(
+        connection,
+        conversation_id,
+        agent_id,
+        before_message_id,
     )?;
     let candidate = latest_addressed_message(
         connection,
@@ -849,6 +898,24 @@ fn retarget_queued_turn_before_message(
             before_message_id
         ],
     )? == 1)
+}
+
+fn latest_terminal_trigger_before_message(
+    connection: &rusqlite::Connection,
+    conversation_id: &str,
+    agent_id: &str,
+    before_message_id: i64,
+) -> Result<i64> {
+    connection
+        .query_row(
+            "SELECT COALESCE(MAX(trigger_message_id), 0) FROM conversation_turns
+         WHERE conversation_id = ?1 AND agent_id = ?2
+           AND status IN ('completed', 'cancelled', 'failed')
+           AND trigger_message_id < ?3",
+            rusqlite::params![conversation_id, agent_id, before_message_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(Error::from)
 }
 
 fn latest_addressed_message(
