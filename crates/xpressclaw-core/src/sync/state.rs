@@ -1569,6 +1569,16 @@ fn import_conversation_messages(
             params![message.record_id, message_id],
         )?;
         if deleted_at.is_some() {
+            // A tombstone imported before its message ever existed locally has
+            // nothing to evict from dashboard history. Remove the ordinary
+            // activity row created by the message insert trigger; existing
+            // messages keep the durable deletion version emitted on update.
+            if !already_existed {
+                connection.execute(
+                    "DELETE FROM dashboard_events WHERE event_id = 'conversation-message:' || ?1",
+                    [message_id],
+                )?;
+            }
             if became_deleted {
                 reconcile_message_deletion_turns(connection, &message.conversation_id, message_id)?;
             }
@@ -2191,6 +2201,33 @@ mod tests {
             .unwrap();
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].content, "two");
+
+        let fresh_directory = tempfile::tempdir().unwrap();
+        let fresh_config_path = fresh_directory.path().join("xpressclaw.yaml");
+        let fresh_db = Database::open_memory().unwrap();
+        let mut fresh_config = Config::default();
+        fresh_config.save(&fresh_config_path).unwrap();
+        import_snapshot(
+            &fresh_db,
+            &mut fresh_config,
+            &fresh_config_path,
+            fresh_directory.path(),
+            &deleted,
+        )
+        .unwrap();
+        let deleted_dashboard_events = fresh_db
+            .with_conn(|connection| {
+                connection.query_row(
+                    "SELECT COUNT(*) FROM dashboard_events event
+                     JOIN conversation_messages message
+                       ON event.event_id = 'conversation-message:' || message.id
+                     WHERE message.content = 'one'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(deleted_dashboard_events, 0);
     }
 
     #[test]
