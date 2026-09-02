@@ -421,6 +421,7 @@ async function mockApi(
 	};
 	let projectSyncConflictReturned = false;
 	let taskLoadFailed = false;
+	const deletedConversationMessageIds = new Set<number>();
 	const status = options.taskStatus ?? (options.pendingElicitation ? 'waiting_for_input' : options.live ? 'in_progress' : 'completed');
 	const attemptStatus = options.attemptError
 		? 'failed'
@@ -771,6 +772,8 @@ async function mockApi(
 			response = options.conversations ?? [];
 		} else if (path === `/api/conversations/${conversationId}`) {
 			response = options.conversations?.find((conversation) => conversation.id === conversationId) ?? { error: 'Unknown conversation' };
+		} else if (path === `/api/conversations/${conversationId}/message-deletions`) {
+			response = [...deletedConversationMessageIds].sort((left, right) => left - right);
 		} else if (path === `/api/conversations/${conversationId}/messages`) {
 			if (request.method() === 'POST') {
 				const payload = request.postDataJSON() as Record<string, unknown>;
@@ -812,6 +815,7 @@ async function mockApi(
 					: conversationMessages.filter((message) => Number(message.id) < before);
 				response = eligible.slice(-limit);
 				if (before !== null && options.deleteConversationMessageAfterHistoryLoad !== undefined) {
+					deletedConversationMessageIds.add(options.deleteConversationMessageAfterHistoryLoad);
 					conversationMessages = conversationMessages.filter(
 						(message) => Number(message.id) !== options.deleteConversationMessageAfterHistoryLoad,
 					);
@@ -820,6 +824,7 @@ async function mockApi(
 		} else if (path.startsWith(`/api/conversations/${conversationId}/messages/`) && request.method() === 'DELETE') {
 			const messageId = Number(path.slice(path.lastIndexOf('/') + 1));
 			options.conversationMessageDeleteRequests?.push(messageId);
+			deletedConversationMessageIds.add(messageId);
 			conversationMessages = conversationMessages.filter((message) => message.id !== messageId);
 			await route.fulfill({ status: 204, body: '' });
 			return;
@@ -1836,7 +1841,7 @@ test('conversation failures, active responses, and messages all have clear actio
 	await expect(page.getByText('This message can be removed')).toHaveCount(0);
 });
 
-test('conversation refresh removes a deleted recent message after older history was loaded', async ({ page }) => {
+test('conversation refresh removes a deleted message from older loaded history', async ({ page }) => {
 	const conversation = {
 		id: conversationId,
 		project_id: projectId,
@@ -1850,13 +1855,13 @@ test('conversation refresh removes a deleted recent message after older history 
 			{ participant_type: 'agent', participant_id: agentId, joined_at: timestamp(2) },
 		],
 	};
-	const conversationMessages = Array.from({ length: 81 }, (_, index) => {
+	const conversationMessages = Array.from({ length: 121 }, (_, index) => {
 		const id = index + 1;
 		return {
 			id,
 			conversation_id: conversationId,
 			sender_type: 'user', sender_id: 'local', sender_name: 'You',
-			content: id === 70 ? 'Deleted while disconnected' : `Retained message ${id}`,
+			content: id === 20 ? 'Deleted while disconnected' : `Retained message ${id}`,
 			message_type: 'message', linked_task_id: null, metadata: {}, attachments: [],
 			created_at: timestamp(id),
 		};
@@ -1864,15 +1869,15 @@ test('conversation refresh removes a deleted recent message after older history 
 	await mockApi(page, {
 		conversations: [conversation],
 		conversationMessages,
-		deleteConversationMessageAfterHistoryLoad: 70,
+		deleteConversationMessageAfterHistoryLoad: 20,
 	});
 	await page.goto(`/conversations/${conversationId}`);
-	await expect(page.getByText('Deleted while disconnected')).toBeVisible();
 
 	await page.getByRole('button', { name: 'Load earlier messages' }).click();
 
 	await expect(page.getByText('Retained message 1', { exact: true })).toBeVisible();
-	await expect(page.getByText('Retained message 71', { exact: true })).toBeVisible();
+	await expect(page.getByText('Retained message 81', { exact: true })).toBeVisible();
+	await expect(page.getByText('Deleted while disconnected')).toBeVisible();
 	await expect(page.getByText('Deleted while disconnected')).toHaveCount(0, { timeout: 5_000 });
 });
 

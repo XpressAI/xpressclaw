@@ -1006,6 +1006,22 @@ impl ConversationManager {
         })
     }
 
+    /// Return durable message tombstones so clients can reconcile deletions
+    /// that happened while their live event stream was disconnected.
+    pub fn deleted_message_ids(&self, conv_id: &str) -> Result<Vec<i64>> {
+        self.db.with_conn(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT id FROM conversation_messages
+                 WHERE conversation_id = ?1 AND deleted_at IS NOT NULL
+                 ORDER BY id ASC",
+            )?;
+            let ids = statement
+                .query_map([conv_id], |row| row.get::<_, i64>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(ids)
+        })
+    }
+
     /// Hide a message, remove its local artifacts, and cancel every response
     /// that the message caused. The row itself remains as a synchronized
     /// tombstone so an older Project checkout cannot make it reappear.
@@ -1547,6 +1563,7 @@ mod tests {
         assert_eq!(session_status, "queued");
         assert_eq!(last_message_at.as_deref(), Some(first.created_at.as_str()));
         assert_eq!(dashboard_event_count, 0);
+        assert_eq!(mgr.deleted_message_ids(&conv.id).unwrap(), vec![deleted.id]);
     }
 
     #[test]
@@ -1667,6 +1684,121 @@ mod tests {
                 .unwrap(),
             None
         );
+        assert!(queue
+            .session(&conv.id, "atlas")
+            .unwrap()
+            .native_session_id
+            .is_none());
+    }
+
+    #[test]
+    fn deleting_an_earlier_message_cancels_a_running_coalesced_turn() {
+        let mgr = test_manager();
+        let conv = mgr
+            .create(&CreateConversation {
+                title: Some("Remove an earlier coalesced prompt".into()),
+                icon: None,
+                participant_ids: vec!["atlas".into()],
+            })
+            .unwrap();
+        let deleted = mgr
+            .send_message(
+                &conv.id,
+                &SendMessage {
+                    sender_type: "user".into(),
+                    sender_id: "local".into(),
+                    sender_name: Some("You".into()),
+                    content: "Delete this first request".into(),
+                    message_type: None,
+                },
+            )
+            .unwrap();
+        let retained = mgr
+            .send_message(
+                &conv.id,
+                &SendMessage {
+                    sender_type: "user".into(),
+                    sender_id: "local".into(),
+                    sender_name: Some("You".into()),
+                    content: "Keep this coalesced follow-up".into(),
+                    message_type: None,
+                },
+            )
+            .unwrap();
+        let queue = runtime::ConversationTurnQueue::new(mgr.db.clone());
+        assert!(queue.enqueue(&conv.id, "atlas", deleted.id).unwrap());
+        assert!(!queue.enqueue(&conv.id, "atlas", retained.id).unwrap());
+        let running = queue.claim_next().unwrap().unwrap();
+        assert_eq!(running.trigger_message_id, Some(retained.id));
+
+        let interrupted = mgr.delete_message(&conv.id, deleted.id).unwrap();
+
+        assert_eq!(interrupted, vec![running.id.clone()]);
+        let turns = queue.list_for_conversation(&conv.id, 10).unwrap();
+        assert!(turns
+            .iter()
+            .any(|turn| turn.id == running.id && turn.status == "cancelled"));
+        assert!(turns.iter().any(|turn| {
+            turn.status == "queued" && turn.trigger_message_id == Some(retained.id)
+        }));
+        assert_eq!(
+            mgr.get_messages(&conv.id, 10, None).unwrap()[0].id,
+            retained.id
+        );
+    }
+
+    #[test]
+    fn deleting_a_completed_prompt_resets_the_resumable_session() {
+        let mgr = test_manager();
+        let conv = mgr
+            .create(&CreateConversation {
+                title: Some("Reset completed prompt history".into()),
+                icon: None,
+                participant_ids: vec!["atlas".into()],
+            })
+            .unwrap();
+        let prompt = mgr
+            .send_message(
+                &conv.id,
+                &SendMessage {
+                    sender_type: "user".into(),
+                    sender_id: "local".into(),
+                    sender_name: Some("You".into()),
+                    content: "Remove this completed prompt".into(),
+                    message_type: None,
+                },
+            )
+            .unwrap();
+        let queue = runtime::ConversationTurnQueue::new(mgr.db.clone());
+        assert!(queue.enqueue(&conv.id, "atlas", prompt.id).unwrap());
+        let running = queue.claim_next().unwrap().unwrap();
+        let result = mgr
+            .send_message(
+                &conv.id,
+                &SendMessage {
+                    sender_type: "agent".into(),
+                    sender_id: "atlas".into(),
+                    sender_name: Some("Atlas".into()),
+                    content: "Completed response".into(),
+                    message_type: None,
+                },
+            )
+            .unwrap();
+        queue
+            .complete(&running, "completed-session", result.id)
+            .unwrap();
+        assert_eq!(
+            queue
+                .session(&conv.id, "atlas")
+                .unwrap()
+                .native_session_id
+                .as_deref(),
+            Some("completed-session")
+        );
+
+        let interrupted = mgr.delete_message(&conv.id, prompt.id).unwrap();
+
+        assert!(interrupted.is_empty());
         assert!(queue
             .session(&conv.id, "atlas")
             .unwrap()

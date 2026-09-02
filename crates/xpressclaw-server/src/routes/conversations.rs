@@ -46,6 +46,7 @@ pub fn routes() -> Router<AppState> {
             axum::routing::delete(remove_participant),
         )
         .route("/{id}/messages", get(list_messages).post(send_user_message))
+        .route("/{id}/message-deletions", get(list_message_deletions))
         .route("/{id}/messages/{message_id}", delete(delete_message))
         .route("/{id}/agent-messages", post(send_agent_message))
         .route("/{id}/events", get(conversation_events))
@@ -218,6 +219,16 @@ async fn list_messages(
         })
         .collect::<Vec<_>>();
     Ok(Json(json!(messages)))
+}
+
+async fn list_message_deletions(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult {
+    let message_ids = ConversationManager::new(state.db.clone())
+        .deleted_message_ids(&id)
+        .map_err(api_error)?;
+    Ok(Json(json!(message_ids)))
 }
 
 async fn delete_message(
@@ -862,6 +873,7 @@ mod tests {
             .unwrap();
         assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
         let listed = app
+            .clone()
             .oneshot(
                 Request::get(format!("/{id}/messages"))
                     .body(Body::empty())
@@ -870,6 +882,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(json_body(listed).await, json!([]));
+        let deletions = app
+            .oneshot(
+                Request::get(format!("/{id}/message-deletions"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(json_body(deletions).await, json!([message_id]));
         let tombstoned = db
             .with_conn(|connection| {
                 connection.query_row(

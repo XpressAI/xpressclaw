@@ -185,14 +185,16 @@
 
 	async function refreshActivity() {
 		const latestMessageIdAtRequest = messages.at(-1)?.id ?? 0;
+		const reconcileLoadedHistory = olderMessagesLoaded;
 		try {
-			const [nextMessages, nextTurns, nextTasks] = await Promise.all([
+			const [nextMessages, nextTurns, nextTasks, deletedMessageIds] = await Promise.all([
 				conversations.messages(conversationId, MESSAGE_PAGE_SIZE),
 				conversations.turns(conversationId),
 				conversations.tasks(conversationId),
+				reconcileLoadedHistory ? conversations.messageDeletions(conversationId) : Promise.resolve([]),
 			]);
-			if (olderMessagesLoaded) {
-				messages = reconcileRecentMessages(messages, nextMessages, latestMessageIdAtRequest);
+			if (reconcileLoadedHistory) {
+				messages = reconcileRecentMessages(messages, nextMessages, latestMessageIdAtRequest, deletedMessageIds);
 			}
 			else {
 				messages = nextMessages;
@@ -209,13 +211,15 @@
 		return [...byId.values()].sort((left, right) => left.id - right.id);
 	}
 
-	function reconcileRecentMessages(existing: ConversationMessage[], incoming: ConversationMessage[], latestIdAtRequest: number): ConversationMessage[] {
+	function reconcileRecentMessages(existing: ConversationMessage[], incoming: ConversationMessage[], latestIdAtRequest: number, deletedMessageIds: number[]): ConversationMessage[] {
 		const oldestIncomingId = incoming[0]?.id;
+		const deleted = new Set(deletedMessageIds);
 		const outsideSnapshot = existing.filter((message) =>
-			(oldestIncomingId !== undefined && message.id < oldestIncomingId)
-			|| message.id > latestIdAtRequest
+			!deleted.has(message.id)
+			&& ((oldestIncomingId !== undefined && message.id < oldestIncomingId)
+				|| message.id > latestIdAtRequest)
 		);
-		return mergeMessages(outsideSnapshot, incoming);
+		return mergeMessages(outsideSnapshot, incoming.filter((message) => !deleted.has(message.id)));
 	}
 
 	function afterRender(): Promise<void> {

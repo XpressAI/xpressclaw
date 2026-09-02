@@ -273,6 +273,8 @@ export const conversations = {
 		if (beforeId !== undefined) params.set('before_id', String(beforeId));
 		return request<ConversationMessage[]>(`/api/conversations/${encodeURIComponent(id)}/messages?${params}`);
 	},
+	messageDeletions: (id: string) =>
+		request<number[]>(`/api/conversations/${encodeURIComponent(id)}/message-deletions`),
 	sendMessage: (id: string, content: string, attachments: ConversationMessageUpload[] = []) =>
 		request<{ message: ConversationMessage; queued_agents: string[] }>(`/api/conversations/${encodeURIComponent(id)}/messages`, {
 			method: 'POST',

@@ -758,8 +758,9 @@ impl ConversationTurnQueue {
 
 /// Reconcile responses when a message is deleted. Coalesced queued turns are
 /// retargeted when earlier visible work remains; all other unfinished or
-/// failed responses caused by the message are cancelled. Server callers use
-/// the returned running IDs to interrupt the corresponding ACP processes.
+/// failed responses that may have consumed the message are cancelled. Server
+/// callers use the returned running IDs to interrupt the corresponding ACP
+/// processes.
 pub(crate) fn reconcile_message_deletion_turns(
     connection: &rusqlite::Connection,
     conversation_id: &str,
@@ -785,9 +786,19 @@ pub(crate) fn reconcile_message_deletion_turns(
         )?;
     }
 
+    // A native session may retain any completed prompt in its own history.
+    // Once a message is hidden, no Agent in this conversation may resume a
+    // session that could still contain it.
+    connection.execute(
+        "UPDATE conversation_agent_sessions
+         SET native_session_id = NULL, updated_at = CURRENT_TIMESTAMP
+         WHERE conversation_id = ?1",
+        [conversation_id],
+    )?;
+
     let mut running_statement = connection.prepare(
         "SELECT id, agent_id FROM conversation_turns
-         WHERE conversation_id = ?1 AND trigger_message_id = ?2 AND status = 'running'",
+         WHERE conversation_id = ?1 AND trigger_message_id >= ?2 AND status = 'running'",
     )?;
     let running_turns = running_statement
         .query_map(rusqlite::params![conversation_id, message_id], |row| {
@@ -798,8 +809,9 @@ pub(crate) fn reconcile_message_deletion_turns(
 
     let mut agent_statement = connection.prepare(
         "SELECT DISTINCT agent_id FROM conversation_turns
-         WHERE conversation_id = ?1 AND trigger_message_id = ?2
-           AND status IN ('queued', 'running', 'failed')",
+         WHERE conversation_id = ?1
+           AND ((trigger_message_id = ?2 AND status IN ('queued', 'failed'))
+                OR (trigger_message_id >= ?2 AND status = 'running'))",
     )?;
     let affected_agents = agent_statement
         .query_map(rusqlite::params![conversation_id, message_id], |row| {
@@ -812,17 +824,12 @@ pub(crate) fn reconcile_message_deletion_turns(
         "UPDATE conversation_turns
          SET status = 'cancelled', completed_at = CURRENT_TIMESTAMP,
              error_message = NULL
-         WHERE conversation_id = ?1 AND trigger_message_id = ?2
-           AND status IN ('queued', 'running', 'failed')",
+         WHERE conversation_id = ?1
+           AND ((trigger_message_id = ?2 AND status IN ('queued', 'failed'))
+                OR (trigger_message_id >= ?2 AND status = 'running'))",
         rusqlite::params![conversation_id, message_id],
     )?;
     for (_, agent_id) in &running_turns {
-        connection.execute(
-            "UPDATE conversation_agent_sessions
-             SET native_session_id = NULL, updated_at = CURRENT_TIMESTAMP
-             WHERE conversation_id = ?1 AND agent_id = ?2",
-            rusqlite::params![conversation_id, agent_id],
-        )?;
         let replacement = match latest_addressed_message(
             connection,
             conversation_id,
