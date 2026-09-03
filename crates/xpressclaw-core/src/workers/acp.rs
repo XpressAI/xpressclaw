@@ -1522,9 +1522,13 @@ async fn run_connected_turn(
             continue;
         }
 
-        return Err(agent_client_protocol::util::internal_error(format!(
-            "ACP agent does not advertise session configuration '{config_id}'"
-        )));
+        // Session controls can change with the selected model. Treat stored
+        // values as preferences and let the ACP agent's current advertisement
+        // decide which ones apply instead of failing the entire turn.
+        warn!(
+            config_id = %config_id,
+            "skipping ACP session configuration not advertised for this session"
+        );
     }
 
     sessions.insert(
@@ -2115,6 +2119,9 @@ mod tests {
             AcpTurnOptions {
                 model: Some("Test Model".into()),
                 session_config: [
+                    // A stale model-specific preference must not block the
+                    // turn when this session does not advertise it.
+                    ("effort".into(), json!("low")),
                     ("mode".into(), json!("build")),
                     ("use_fast_tools".into(), json!(true)),
                 ]
