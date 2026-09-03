@@ -297,6 +297,10 @@ pub enum AcpSessionStart {
 pub struct AcpTurnOptions {
     pub model: Option<String>,
     pub session_config: HashMap<String, Value>,
+    /// Stored preferences may be unavailable for the model selected in this
+    /// session. Explicit workflow and message controls are intentionally not
+    /// included here so unsupported required configuration still fails.
+    pub optional_session_config_ids: HashSet<String>,
     pub mcp_servers: Vec<McpServer>,
     /// Extra workspace roots advertised through ACP. Codex ACP maps a root's
     /// `.agents/skills` directory into its session-scoped skill discovery.
@@ -1232,6 +1236,7 @@ async fn run_connected_turn(
     let AcpTurnOptions {
         model,
         session_config: requested_config,
+        optional_session_config_ids,
         mcp_servers,
         mcp_signature,
         additional_directories,
@@ -1522,13 +1527,20 @@ async fn run_connected_turn(
             continue;
         }
 
-        // Session controls can change with the selected model. Treat stored
-        // values as preferences and let the ACP agent's current advertisement
-        // decide which ones apply instead of failing the entire turn.
-        warn!(
-            config_id = %config_id,
-            "skipping ACP session configuration not advertised for this session"
-        );
+        if optional_session_config_ids.contains(&config_id) {
+            // Session controls can change with the selected model. Stored
+            // preferences should not block a turn when the current model no
+            // longer advertises them.
+            warn!(
+                config_id = %config_id,
+                "skipping stored ACP session preference not advertised for this session"
+            );
+            continue;
+        }
+
+        return Err(agent_client_protocol::util::internal_error(format!(
+            "ACP agent does not advertise session configuration '{config_id}'"
+        )));
     }
 
     sessions.insert(
@@ -2127,6 +2139,7 @@ mod tests {
                 ]
                 .into_iter()
                 .collect(),
+                optional_session_config_ids: ["effort".into()].into_iter().collect(),
                 mcp_servers: vec![McpServer::Stdio(
                     McpServerStdio::new("github", "/opt/xpressclaw/mcp-github.mjs")
                         .env(vec![EnvVariable::new("GH_REPO", "owner/repo")]),
