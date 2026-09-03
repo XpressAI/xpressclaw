@@ -2760,8 +2760,15 @@ fn requested_session_config(
         .and_then(Value::as_object)
     {
         for (key, value) in overrides {
+            // TaskView sends its full selected control map on every message.
+            // Preserve preference provenance when that merely echoes the
+            // untouched runner value; changed values remain requirements.
+            let unchanged_preference =
+                optional_ids.contains(key) && requested.get(key) == Some(value);
             requested.insert(key.clone(), value.clone());
-            optional_ids.remove(key);
+            if !unchanged_preference {
+                optional_ids.remove(key);
+            }
         }
     }
     Ok(RequestedSessionConfig {
@@ -5473,6 +5480,8 @@ flows:
                     payload: json!({
                         "config_options": {
                             "mode": "build",
+                            "model": "fast",
+                            "effort": "low",
                             "approval_policy": true
                         }
                     }),
@@ -5485,6 +5494,7 @@ flows:
                 session_config: [
                     ("mode".into(), json!("default")),
                     ("model".into(), json!("fast")),
+                    ("effort".into(), json!("low")),
                     ("approval_policy".into(), json!(false)),
                 ]
                 .into_iter()
@@ -5495,15 +5505,19 @@ flows:
         };
         let requested = requested_session_config(&db, &agent, &task.id).unwrap();
         assert_eq!(requested.values.get("model"), Some(&json!("fast")));
+        assert_eq!(requested.values.get("effort"), Some(&json!("low")));
         assert_eq!(
             requested.values.get("thought_level"),
             Some(&json!("medium"))
         );
         assert_eq!(requested.values.get("mode"), Some(&json!("build")));
         assert_eq!(requested.values.get("approval_policy"), Some(&json!(true)));
-        // Only the untouched harness preference is optional. Workflow and
-        // message controls are requirements even when they override defaults.
-        assert_eq!(requested.optional_ids, HashSet::from(["model".into()]));
+        // UI-echoed harness preferences stay optional. Workflow controls and
+        // changed message controls remain requirements.
+        assert_eq!(
+            requested.optional_ids,
+            HashSet::from(["effort".into(), "model".into()])
+        );
     }
 
     #[test]
