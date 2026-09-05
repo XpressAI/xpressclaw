@@ -13,6 +13,7 @@ const manifestUrl = new URL('../harnesses/runner-versions.json', import.meta.url
 const harnessWorkflowUrl = new URL('../.github/workflows/harnesses.yml', import.meta.url);
 const releaseWorkflowUrl = new URL('../.github/workflows/release.yml', import.meta.url);
 const nativeHarnessUrl = new URL('../harnesses/native/', import.meta.url);
+const dockerBakeUrl = new URL('../harnesses/docker-bake.hcl', import.meta.url);
 
 const expectedAcpCommands = {
   codex: ['codex-acp'],
@@ -74,6 +75,9 @@ test('convenience native builds retain usable ACP smoke defaults', async () => {
       expectedAcpCommands[id],
     );
   }
+
+  const dockerBake = await readFile(dockerBakeUrl, 'utf8');
+  assert.doesNotMatch(dockerBake, /target "native-deepseek-harness(?:-docker)?"/);
 });
 
 test('image and release workflows resolve the same immutable runner revision', async () => {
