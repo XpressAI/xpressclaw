@@ -50,8 +50,7 @@ Write-Host "    Copied to $binDir\xpressclaw-$triple.exe"
 
 if (-not $SkipTest) {
     Write-Host "==> Running tests..."
-    node --test harnesses/native/common/*.test.mjs scripts/runner-versions.test.mjs
-    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    # Linux-container MCP and runner tests run in build.sh and Linux CI.
     cargo test -p xpressclaw-core -p xpressclaw-server
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
