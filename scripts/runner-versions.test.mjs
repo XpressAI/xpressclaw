@@ -50,7 +50,11 @@ test('the checked-in runner manifest is complete and produces exact build argume
       runner.build_args.split('\n').map((line) => line.split(/=(.*)/s, 2)),
     );
     assert.match(runner.build_args, new RegExp(`(^|\\n)RUNNER_VERSION=${runner.version}$`));
-    assert.deepEqual(JSON.parse(buildArgs.ACP_SMOKE_COMMAND), expectedAcpCommands[runner.id]);
+    assert.match(buildArgs.ACP_SMOKE_COMMAND_B64, /^[A-Za-z0-9+/]+={0,2}$/);
+    assert.deepEqual(
+      JSON.parse(Buffer.from(buildArgs.ACP_SMOKE_COMMAND_B64, 'base64').toString('utf8')),
+      expectedAcpCommands[runner.id],
+    );
     assert.doesNotMatch(runner.build_args, /(^|[=@])latest($|\n)/);
   }
   assert.deepEqual(

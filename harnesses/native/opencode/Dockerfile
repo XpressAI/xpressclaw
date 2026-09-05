@@ -27,11 +27,11 @@ RUN opencode --version \
     && node --check /opt/xpressclaw/mcp-xpressclaw.mjs
 
 USER node
-ARG ACP_SMOKE_COMMAND
+ARG ACP_SMOKE_COMMAND_B64
 ENV HOME=/home/node \
     CI=1 \
     NO_COLOR=1
-RUN node /opt/xpressclaw/verify-acp-initialize.mjs "${ACP_SMOKE_COMMAND}"
+RUN node /opt/xpressclaw/verify-acp-initialize.mjs "${ACP_SMOKE_COMMAND_B64}"
 WORKDIR /workspace
 ENTRYPOINT []
 

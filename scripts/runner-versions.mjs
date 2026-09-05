@@ -103,8 +103,10 @@ export function validateRunnerVersions(manifest) {
     if ('RUNNER_VERSION' in runner.build_args) {
       fail(`${id}.build_args must not define the generated RUNNER_VERSION argument`);
     }
-    if ('ACP_SMOKE_COMMAND' in runner.build_args) {
-      fail(`${id}.build_args must not define the generated ACP_SMOKE_COMMAND argument`);
+    for (const name of ['ACP_SMOKE_COMMAND', 'ACP_SMOKE_COMMAND_B64']) {
+      if (name in runner.build_args) {
+        fail(`${id}.build_args must not define the generated ${name} argument`);
+      }
     }
 
     for (const [name, value] of Object.entries(runner.build_args)) {
@@ -285,7 +287,7 @@ export function runnerMatrix(manifest) {
     dockerfile: runner.dockerfile,
     build_args: Object.entries({
       ...runner.build_args,
-      ACP_SMOKE_COMMAND: JSON.stringify(runner.acp_command),
+      ACP_SMOKE_COMMAND_B64: Buffer.from(JSON.stringify(runner.acp_command)).toString('base64'),
       RUNNER_VERSION: runner.version,
     })
       .map(([name, value]) => `${name}=${value}`)

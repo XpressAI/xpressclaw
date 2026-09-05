@@ -54,7 +54,7 @@ RUN /opt/xpressclaw/libexec/gh --version \
     && test -x /opt/xpressclaw/pi-with-mcp
 
 USER node
-ARG ACP_SMOKE_COMMAND
+ARG ACP_SMOKE_COMMAND_B64
 ENV HOME=/home/node \
     CI=1 \
     NO_COLOR=1 \
@@ -64,7 +64,7 @@ ENV HOME=/home/node \
 RUN if [ "${AGENT_DSH_RUNTIME}" = "1" ]; then \
       test "${DSH_SESSION_ROOT}" = "/home/node/.dsh/acp-sessions"; \
     fi \
-    && node /opt/xpressclaw/verify-acp-initialize.mjs "${ACP_SMOKE_COMMAND}" \
+    && node /opt/xpressclaw/verify-acp-initialize.mjs "${ACP_SMOKE_COMMAND_B64}" \
     && if [ "${AGENT_ACP_SMOKE}" = "1" ]; then \
       node /opt/xpressclaw/verify-acp-stdio.mjs "${AGENT_BINARY}"; \
     fi

@@ -4,7 +4,8 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import readline from 'node:readline';
 
-const command = JSON.parse(process.argv[2] ?? 'null');
+const encodedCommand = process.argv[2] ?? '';
+const command = JSON.parse(Buffer.from(encodedCommand, 'base64').toString('utf8') || 'null');
 assert.ok(Array.isArray(command) && command.length > 0, 'ACP command must be a non-empty JSON array');
 assert.ok(command.every((part) => typeof part === 'string' && part.length > 0), 'ACP command arguments must be non-empty strings');
 
@@ -19,10 +20,7 @@ child.stderr.on('data', (chunk) => {
   stderr = `${stderr}${chunk}`.slice(-16 * 1024);
 });
 
-// Cross-architecture image builds execute the target binary through QEMU. A
-// cold Qwen or Grok startup can exceed 30 seconds on a busy hosted runner even
-// though the same initialize exchange completes normally once scheduled.
-const timeout = setTimeout(() => child.kill('SIGKILL'), 120_000);
+const timeout = setTimeout(() => child.kill('SIGKILL'), 30_000);
 try {
   child.stdin.write(`${JSON.stringify({
     jsonrpc: '2.0',
