@@ -27,7 +27,7 @@ RUN opencode --version \
     && node --check /opt/xpressclaw/mcp-xpressclaw.mjs
 
 USER node
-ARG ACP_SMOKE_COMMAND_B64
+ARG ACP_SMOKE_COMMAND_B64=WyJvcGVuY29kZSIsImFjcCJd
 ENV HOME=/home/node \
     CI=1 \
     NO_COLOR=1

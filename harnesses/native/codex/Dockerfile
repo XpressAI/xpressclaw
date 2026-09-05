@@ -54,7 +54,7 @@ RUN codex-acp --version \
     && chmod -R a-w /opt/xpressclaw/presentation-runtime
 
 USER node
-ARG ACP_SMOKE_COMMAND_B64
+ARG ACP_SMOKE_COMMAND_B64=WyJjb2RleC1hY3AiXQ==
 ENV HOME=/home/node \
     CI=1 \
     NO_COLOR=1

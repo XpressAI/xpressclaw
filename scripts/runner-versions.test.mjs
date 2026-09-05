@@ -12,6 +12,7 @@ import {
 const manifestUrl = new URL('../harnesses/runner-versions.json', import.meta.url);
 const harnessWorkflowUrl = new URL('../.github/workflows/harnesses.yml', import.meta.url);
 const releaseWorkflowUrl = new URL('../.github/workflows/release.yml', import.meta.url);
+const nativeHarnessUrl = new URL('../harnesses/native/', import.meta.url);
 
 const expectedAcpCommands = {
   codex: ['codex-acp'],
@@ -61,6 +62,18 @@ test('the checked-in runner manifest is complete and produces exact build argume
     Object.fromEntries(Object.entries(input.runners).map(([id, runner]) => [id, runner.acp_command])),
     expectedAcpCommands,
   );
+});
+
+test('convenience native builds retain usable ACP smoke defaults', async () => {
+  for (const id of ['codex', 'claude', 'opencode']) {
+    const dockerfile = await readFile(new URL(`${id}/Dockerfile`, nativeHarnessUrl), 'utf8');
+    const encoded = dockerfile.match(/^ARG ACP_SMOKE_COMMAND_B64=(\S+)$/m)?.[1];
+    assert.ok(encoded, `${id} Dockerfile must provide a direct-build smoke command`);
+    assert.deepEqual(
+      JSON.parse(Buffer.from(encoded, 'base64').toString('utf8')),
+      expectedAcpCommands[id],
+    );
+  }
 });
 
 test('image and release workflows resolve the same immutable runner revision', async () => {
