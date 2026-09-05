@@ -1,4 +1,6 @@
-// Docker Bake file for building all harness images.
+// Legacy convenience targets for a small native-runner subset.
+// Product builds use scripts/build-runner-images.sh and the exact versions in
+// harnesses/runner-versions.json.
 // Usage: docker buildx bake -f harnesses/docker-bake.hcl
 
 variable "REGISTRY" {
@@ -39,7 +41,7 @@ target "native-deepseek-harness" {
   target     = "runner"
   args = {
     AGENT_KIND        = "deepseek-harness"
-    AGENT_PACKAGE     = "@openma/deepseek-harness-acp@0.4.24"
+    AGENT_PACKAGE     = "@openma/deepseek-harness-acp@latest"
     AGENT_BINARY      = "dsh-acp"
     AGENT_ACP_SMOKE   = "1"
     AGENT_DSH_RUNTIME = "1"

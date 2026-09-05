@@ -8,6 +8,10 @@ use serde::Serialize;
 
 use crate::config::ContainerEngineAccess;
 
+/// Release builds set this to the immutable runner-image commit they tested.
+/// Developer builds retain the convenient `latest` default.
+pub const RUNNER_IMAGE_TAG: &str = env!("XPRESSCLAW_RUNNER_TAG");
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct AcpAuthMount {
     /// Path relative to the host user's home directory.
@@ -162,11 +166,17 @@ macro_rules! agent {
             host_executables: $host_executables,
             login_command: $login_command,
             install_url: $install_url,
-            minimal_image: concat!("ghcr.io/xpressai/xpressclaw-runner-", $kind, ":latest"),
+            minimal_image: concat!(
+                "ghcr.io/xpressai/xpressclaw-runner-",
+                $kind,
+                ":",
+                env!("XPRESSCLAW_RUNNER_TAG")
+            ),
             host_image: concat!(
                 "ghcr.io/xpressai/xpressclaw-runner-",
                 $kind,
-                "-docker:latest"
+                "-docker:",
+                env!("XPRESSCLAW_RUNNER_TAG")
             ),
             local_minimal_image: concat!("xpressclaw-runner-", $kind, ":latest"),
             local_host_image: concat!("xpressclaw-runner-", $kind, "-docker:latest"),
@@ -400,9 +410,9 @@ pub fn default_runner_image(
 
 pub fn local_runner_image(image: &str) -> Option<&'static str> {
     ACP_AGENTS.iter().find_map(|agent| {
-        if image == agent.minimal_image {
+        if managed_image_matches(image, agent.minimal_image) {
             Some(agent.local_minimal_image)
-        } else if image == agent.host_image {
+        } else if managed_image_matches(image, agent.host_image) {
             Some(agent.local_host_image)
         } else {
             None
@@ -412,17 +422,53 @@ pub fn local_runner_image(image: &str) -> Option<&'static str> {
 
 pub fn is_builtin_runner_image(image: &str) -> bool {
     ACP_AGENTS.iter().any(|agent| {
-        image == agent.minimal_image
-            || image == agent.host_image
-            || image == agent.local_minimal_image
-            || image == agent.local_host_image
+        managed_image_matches(image, agent.minimal_image)
+            || managed_image_matches(image, agent.host_image)
+            || managed_image_matches(image, agent.local_minimal_image)
+            || managed_image_matches(image, agent.local_host_image)
     })
 }
 
 pub fn is_host_runner_image(image: &str) -> bool {
-    ACP_AGENTS
-        .iter()
-        .any(|agent| image == agent.host_image || image == agent.local_host_image)
+    ACP_AGENTS.iter().any(|agent| {
+        managed_image_matches(image, agent.host_image)
+            || managed_image_matches(image, agent.local_host_image)
+    })
+}
+
+/// Whether an image is one of the managed images for a particular product.
+///
+/// Full commit tags from older releases and the legacy `latest` tag are
+/// treated as defaults, so upgrading XpressClaw advances existing Agents to
+/// the runner revision tested with the new release. Other tags and digests
+/// remain explicit user pins.
+pub fn is_managed_runner_image_for_kind(image: &str, kind: &str) -> bool {
+    agent_definition(kind).is_some_and(|agent| {
+        managed_image_matches(image, agent.minimal_image)
+            || managed_image_matches(image, agent.host_image)
+            || managed_image_matches(image, agent.local_minimal_image)
+            || managed_image_matches(image, agent.local_host_image)
+    })
+}
+
+fn managed_image_matches(candidate: &str, current: &str) -> bool {
+    if candidate == current {
+        return true;
+    }
+    let (candidate_repository, candidate_tag) = match candidate.rsplit_once(':') {
+        Some(parts) => parts,
+        None => return false,
+    };
+    let (current_repository, _) = match current.rsplit_once(':') {
+        Some(parts) => parts,
+        None => return false,
+    };
+    candidate_repository == current_repository
+        && (candidate_tag == "latest"
+            || (candidate_tag.len() == 40
+                && candidate_tag
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())))
 }
 
 #[cfg(test)]
@@ -447,6 +493,7 @@ mod tests {
     #[test]
     fn resolves_published_and_local_images() {
         let codex = agent_definition("codex").unwrap();
+        assert!(codex.minimal_image.ends_with(RUNNER_IMAGE_TAG));
         assert_eq!(
             default_runner_image("codex", ContainerEngineAccess::Host),
             Some(codex.host_image)
@@ -458,6 +505,18 @@ mod tests {
         assert!(is_builtin_runner_image(codex.local_host_image));
         assert!(is_host_runner_image(codex.host_image));
         assert!(!is_host_runner_image(codex.minimal_image));
+        assert!(is_managed_runner_image_for_kind(
+            "ghcr.io/xpressai/xpressclaw-runner-codex:0123456789abcdef0123456789abcdef01234567",
+            "codex"
+        ));
+        assert!(is_managed_runner_image_for_kind(
+            "ghcr.io/xpressai/xpressclaw-runner-codex:latest",
+            "codex"
+        ));
+        assert!(!is_managed_runner_image_for_kind(
+            "ghcr.io/xpressai/xpressclaw-runner-codex:manually-pinned",
+            "codex"
+        ));
     }
 
     #[test]
@@ -480,15 +539,15 @@ mod tests {
         );
         assert_eq!(
             default_runner_image("deepseek-harness", ContainerEngineAccess::None),
-            Some("ghcr.io/xpressai/xpressclaw-runner-deepseek-harness:latest")
+            Some(dsh.minimal_image)
         );
         assert_eq!(
             default_runner_image("deepseek-harness", ContainerEngineAccess::Host),
-            Some("ghcr.io/xpressai/xpressclaw-runner-deepseek-harness-docker:latest")
+            Some(dsh.host_image)
         );
         assert_eq!(
             local_runner_image(dsh.minimal_image),
-            Some("xpressclaw-runner-deepseek-harness:latest")
+            Some(dsh.local_minimal_image)
         );
         assert!(is_host_runner_image(dsh.local_host_image));
     }

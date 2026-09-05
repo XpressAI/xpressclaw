@@ -26,6 +26,7 @@ jobs:
       build: ${{ steps.meta.outputs.build }}
       tag: ${{ steps.meta.outputs.tag }}
       sha: ${{ steps.meta.outputs.sha }}
+      runner_tag: ${{ steps.meta.outputs.runner_tag }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -50,11 +51,22 @@ jobs:
           NEXT_BUILD=$((${LAST_BUILD:-0} + 1))
           VERSION=$(node scripts/release-metadata.mjs --release-version "$NEXT_BUILD")
           TAG="v${VERSION}"
+          # `-m` keeps a merge commit whose first-parent diff changed a runner
+          # input. That is the SHA used by the main-branch image workflow.
+          RUNNER_TAG=$(git log --first-parent -m -1 --format=%H -- \
+            harnesses \
+            scripts/build-runner-images.sh \
+            scripts/runner-versions.mjs \
+            scripts/runner-versions.test.mjs \
+            scripts/verify-runner-images.sh \
+            .github/workflows/harnesses.yml)
+          test -n "$RUNNER_TAG"
 
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "build=$NEXT_BUILD" >> "$GITHUB_OUTPUT"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+          echo "runner_tag=$RUNNER_TAG" >> "$GITHUB_OUTPUT"
           echo "Release: XpressClaw $VERSION ($SHORT_SHA)"
 
   build-tauri:
@@ -77,6 +89,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       XPRESSCLAW_BUILD_NUMBER: ${{ needs.release-metadata.outputs.build }}
+      # Keep a promoted stable release on the images tested by its prerelease.
+      XPRESSCLAW_RUNNER_TAG: ${{ needs.release-metadata.outputs.runner_tag }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -268,7 +282,7 @@ jobs:
       - uses: docker/setup-buildx-action@v3
 
       - name: Require public runner images
-        run: bash scripts/verify-runner-images.sh 300
+        run: bash scripts/verify-runner-images.sh 3600 "${{ needs.release-metadata.outputs.runner_tag }}"
 
       - uses: actions/download-artifact@v4
         with:
@@ -303,6 +317,7 @@ jobs:
             XpressClaw `${{ needs.release-metadata.outputs.version }}`.
 
             Built from `main` at `${{ github.sha }}` (`${{ needs.release-metadata.outputs.sha }}`).
+            Runner images are pinned to `${{ needs.release-metadata.outputs.runner_tag }}`.
 
             **Desktop downloads:**
             - macOS (Apple Silicon): `.dmg` arm64 — signed and notarized

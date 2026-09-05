@@ -22,18 +22,19 @@ XpressClaw publishes one product-specific image for each supported ACP agent:
 
 `codex`, `claude`, and `opencode` retain dedicated Dockerfiles. The `npm` and
 `binary` Dockerfiles are parameterized templates; CI supplies the exact
-package or platform archive pinned by its source project or the ACP Registry. Run
+package or platform archive recorded in
+[`harnesses/runner-versions.json`](../runner-versions.json). Run
 `scripts/build-runner-images.sh` from the repository root to build every local
-tag.
+tag from those same pins.
 
 ## DeepSeek Harness
 
-The `deepseek-harness` images install the stable
-`@openma/deepseek-harness-acp@0.4.24` package and start its standalone
-`dsh-acp` stdio command. The adapter is maintained by openma-ai; it is not an
-official DeepSeek package. Standalone mode is deliberate here: the runner has
-to be reproducible and cannot depend on every host having an ACP profile under
-`$DSH_HOME/profiles`.
+The `deepseek-harness` images install the exact
+`@openma/deepseek-harness-acp` version in the runner manifest and start its
+standalone `dsh-acp` stdio command. The adapter is maintained by openma-ai; it
+is not an official DeepSeek package. Standalone mode is deliberate here: the
+runner has to be reproducible and cannot depend on every host having an ACP
+profile under `$DSH_HOME/profiles`.
 
 The adapter package carries an exact, lockfile-built DeepSeek Harness runtime.
 At image build time XpressClaw validates the archive against its independently
@@ -86,12 +87,30 @@ there. See [`docs/presentations.md`](../../docs/presentations.md).
 
 ## Publishing
 
-`Build & Push Runner Images` publishes all multi-architecture tags on a
-push to `main` or a manual workflow dispatch. It then verifies every tag from
-an unauthenticated job. GitHub creates a container package as private on its
-first publication, so an XpressAI organization owner must change each new
-package to **Public** once in its package settings. The release workflow will
-not publish a desktop beta until all runner tags pass the anonymous check.
+`Update Runner Versions` checks the ACP Registry and the few additional npm
+dependencies each day. It writes exact versions, archive URLs, and available
+checksums to `harnesses/runner-versions.json` and opens or refreshes one pull
+request. The update is never installed directly from a mutable `latest` tag:
+the pull request builds and smoke-tests the exact proposed inputs first.
+The workflow uses the repository's `PRIVATE_REPOS_TOKEN` so GitHub runs CI on
+the generated pull request; the built-in workflow token suppresses those runs.
+
+To hold a broken upstream release, restore that runner's last known-good
+`version` and `build_args` in the manifest and set its `auto_update` field to
+`false`, with a short `pin_reason`. Scheduled updates will leave that entire
+runner entry unchanged while continuing to update the others. Set it back to
+`true` and remove `pin_reason` when the pin is no longer needed.
+
+`Build & Push Runner Images` publishes all multi-architecture tags on a push
+to `main` or a manual workflow dispatch. Each build receives both `latest` and
+the source commit SHA. It then verifies every tag from an unauthenticated job.
+GitHub creates a container package as private on its first publication, so an
+XpressAI organization owner must change each new package to **Public** once in
+its package settings. The release workflow resolves the most recent runner
+source commit and will not publish a desktop prerelease until every image with
+that exact tag is public. Release binaries use that immutable tag rather than
+`latest`; development builds continue to use `latest`. Promoting that existing
+prerelease does not rebuild or update its runner set.
 
 For a `github.com` origin, Xpressclaw discovers the host's existing `gh`
 login and supplies Git credentials through `credential.helper`. The worker

@@ -4,6 +4,8 @@ import { readFile } from 'node:fs/promises';
 import readline from 'node:readline';
 
 const adapter = '/usr/local/lib/node_modules/@agentclientprotocol/codex-acp/dist/index.js';
+const expectedVersion = process.env.EXPECTED_CODEX_ACP_VERSION;
+assert.ok(expectedVersion, 'EXPECTED_CODEX_ACP_VERSION is required');
 const source = await readFile(adapter, 'utf8');
 assert.match(source, /\.join\(root, "\.agents", "skills"\)/);
 assert.match(source, /skillsExtraRootsSet\(\{ extraRoots: skillExtraRoots \}\)/);
@@ -39,7 +41,11 @@ try {
       break;
     }
   }
-  assert.equal(response?.result?.agentInfo?.version, '1.1.7');
+  if (expectedVersion === 'latest') {
+    assert.match(response?.result?.agentInfo?.version ?? '', /^\d+\.\d+\.\d+/);
+  } else {
+    assert.equal(response?.result?.agentInfo?.version, expectedVersion);
+  }
   assert.deepEqual(
     response?.result?.agentCapabilities?.sessionCapabilities?.additionalDirectories,
     {},

@@ -5,6 +5,7 @@ FROM node:24-bookworm-slim AS runner-base
 ARG AGENT_KIND
 ARG AGENT_PACKAGE
 ARG AGENT_BINARY
+ARG RUNNER_VERSION=development
 # Companion agent for bridge packages (e.g. pi-acp needs pi); binary verified on PATH.
 ARG AGENT_EXTRA_PACKAGES=""
 ARG AGENT_EXTRA_BINARY=""
@@ -13,9 +14,10 @@ ARG AGENT_DSH_RUNTIME=""
 ARG AGENT_DSH_PATH=""
 ARG AGENT_NODE_PATH=""
 ARG AGENT_DSH_SESSION_ROOT=""
-ARG PI_MCP_PACKAGE="pi-mcp-adapter@2.21.0"
+ARG PI_MCP_PACKAGE="pi-mcp-adapter@latest"
 LABEL io.xpressclaw.protocol="acp-xpressclaw-v2" \
     io.xpressclaw.agent="${AGENT_KIND}" \
+    io.xpressclaw.runner.version="${RUNNER_VERSION}" \
     io.xpressclaw.pi-mcp="${AGENT_KIND}-config-v1"
 
 RUN test -n "${AGENT_KIND}" \

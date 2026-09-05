@@ -72,9 +72,18 @@
 
 	function isBuiltInImage(candidate: string): boolean {
 		return agentOptions.some((agent) => {
-			const localImage = agent.image.replace('ghcr.io/xpressai/', '');
-			const localHostImage = agent.host_image.replace('ghcr.io/xpressai/', '');
-			return [agent.image, agent.host_image, localImage, localHostImage].includes(candidate);
+			return [agent.image, agent.host_image].some((published) => {
+				const variants = [published, published.replace('ghcr.io/xpressai/', '')];
+				return variants.some((current) => {
+					if (candidate === current) return true;
+					const currentSeparator = current.lastIndexOf(':');
+					const candidateSeparator = candidate.lastIndexOf(':');
+					if (currentSeparator < 0 || candidateSeparator < 0) return false;
+					const sameRepository = candidate.slice(0, candidateSeparator) === current.slice(0, currentSeparator);
+					const tag = candidate.slice(candidateSeparator + 1);
+					return sameRepository && (tag === 'latest' || /^[0-9a-f]{40}$/.test(tag));
+				});
+			});
 		});
 	}
 

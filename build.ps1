@@ -50,6 +50,8 @@ Write-Host "    Copied to $binDir\xpressclaw-$triple.exe"
 
 if (-not $SkipTest) {
     Write-Host "==> Running tests..."
+    node --test harnesses/native/common/*.test.mjs scripts/runner-versions.test.mjs
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     cargo test -p xpressclaw-core -p xpressclaw-server
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
@@ -88,34 +90,26 @@ if ($ContainerRuntime) {
         }
     }
     Write-Host "==> Building native ACP runner images with $ContainerRuntime $($BuildArgs -join ' ')..."
-    foreach ($runner in @("codex", "claude", "opencode")) {
-        & $ContainerRuntime @BuildArgs --file "harnesses/native/$runner/Dockerfile" --target runner `
+    $Runners = @(node scripts/runner-versions.mjs list)
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    foreach ($runner in $Runners) {
+        $Dockerfile = (node scripts/runner-versions.mjs dockerfile $runner).Trim()
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        $ResolvedBuildArgs = @(node scripts/runner-versions.mjs build-args $runner)
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        $RunnerBuildArgs = @()
+        foreach ($BuildArg in $ResolvedBuildArgs) {
+            $RunnerBuildArgs += "--build-arg", $BuildArg
+        }
+        & $ContainerRuntime @BuildArgs --file "harnesses/native/$Dockerfile/Dockerfile" --target runner @RunnerBuildArgs `
             --tag "xpressclaw-runner-${runner}:latest" `
             --tag "localhost/xpressclaw-runner-${runner}:latest" harnesses/native
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-        & $ContainerRuntime @BuildArgs --file "harnesses/native/$runner/Dockerfile" --target runner-host `
+        & $ContainerRuntime @BuildArgs --file "harnesses/native/$Dockerfile/Dockerfile" --target runner-host @RunnerBuildArgs `
             --tag "xpressclaw-runner-${runner}-docker:latest" `
             --tag "localhost/xpressclaw-runner-${runner}-docker:latest" harnesses/native
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     }
-    $DeepSeekArgs = @(
-        "--build-arg", "AGENT_KIND=deepseek-harness",
-        "--build-arg", "AGENT_PACKAGE=@openma/deepseek-harness-acp@0.4.24",
-        "--build-arg", "AGENT_BINARY=dsh-acp",
-        "--build-arg", "AGENT_ACP_SMOKE=1",
-        "--build-arg", "AGENT_DSH_RUNTIME=1",
-        "--build-arg", "AGENT_DSH_PATH=/opt/xpressclaw/deepseek-harness-runtime/node_modules/@deepseek-ai/dsh",
-        "--build-arg", "AGENT_NODE_PATH=/opt/xpressclaw/deepseek-harness-runtime/node_modules",
-        "--build-arg", "AGENT_DSH_SESSION_ROOT=/home/node/.dsh/acp-sessions"
-    )
-    & $ContainerRuntime @BuildArgs --file "harnesses/native/npm/Dockerfile" --target runner @DeepSeekArgs `
-        --tag "xpressclaw-runner-deepseek-harness:latest" `
-        --tag "localhost/xpressclaw-runner-deepseek-harness:latest" harnesses/native
-    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-    & $ContainerRuntime @BuildArgs --file "harnesses/native/npm/Dockerfile" --target runner-host @DeepSeekArgs `
-        --tag "xpressclaw-runner-deepseek-harness-docker:latest" `
-        --tag "localhost/xpressclaw-runner-deepseek-harness-docker:latest" harnesses/native
-    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 } elseif (-not $BuildRunners) {
     Write-Host "==> Skipping runner builds (use --with-runners)"
 } else {

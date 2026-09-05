@@ -6,6 +6,7 @@ on:
     paths:
       - 'harnesses/**'
       - 'scripts/build-runner-images.sh'
+      - 'scripts/runner-versions*.mjs'
       - 'scripts/verify-runner-images.sh'
       - '.github/workflows/harnesses.yml'
   pull_request:
@@ -13,145 +14,55 @@ on:
     paths:
       - 'harnesses/**'
       - 'scripts/build-runner-images.sh'
+      - 'scripts/runner-versions*.mjs'
       - 'scripts/verify-runner-images.sh'
       - '.github/workflows/harnesses.yml'
   workflow_dispatch:
 
 concurrency:
   group: harness-images-${{ github.ref }}
-  cancel-in-progress: true
+  queue: max
+  # Release jobs wait for immutable commit tags, so main builds must finish.
+  # Superseded pull-request builds can still be cancelled.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   REGISTRY: ghcr.io/xpressai
 
 jobs:
+  runner-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      runners: ${{ steps.versions.outputs.runners }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Validate pinned runner versions
+        run: node --test scripts/runner-versions.test.mjs
+
+      - name: Generate runner matrix
+        id: versions
+        run: echo "runners=$(node scripts/runner-versions.mjs matrix)" >> "$GITHUB_OUTPUT"
+
   build-native-runners:
+    needs: runner-matrix
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     strategy:
+      fail-fast: false
       matrix:
-        runner:
-          - codex
-          - claude
-          - deepseek-harness
-          - github-copilot
-          - junie
-          - kimi
-          - opencode
-          - pi
-          - qwen
-          - cline
-          - cursor
-          - glm
-          - grok
-          - kilo
-          - mistral-vibe
+        runner: ${{ fromJSON(needs.runner-matrix.outputs.runners) }}
         variant:
           - target: runner
             suffix: ''
           - target: runner-host
             suffix: '-docker'
-        include:
-          - runner: codex
-            dockerfile: codex
-            build_args: ''
-          - runner: claude
-            dockerfile: claude
-            build_args: ''
-          - runner: opencode
-            dockerfile: opencode
-            build_args: ''
-          - runner: deepseek-harness
-            dockerfile: npm
-            build_args: |
-              AGENT_KIND=deepseek-harness
-              AGENT_PACKAGE=@openma/deepseek-harness-acp@0.4.24
-              AGENT_BINARY=dsh-acp
-              AGENT_ACP_SMOKE=1
-              AGENT_DSH_RUNTIME=1
-              AGENT_DSH_PATH=/opt/xpressclaw/deepseek-harness-runtime/node_modules/@deepseek-ai/dsh
-              AGENT_NODE_PATH=/opt/xpressclaw/deepseek-harness-runtime/node_modules
-              AGENT_DSH_SESSION_ROOT=/home/node/.dsh/acp-sessions
-          - runner: github-copilot
-            dockerfile: npm
-            build_args: |
-              AGENT_KIND=github-copilot
-              AGENT_PACKAGE=@github/copilot@1.0.71
-              AGENT_BINARY=copilot
-          - runner: cline
-            dockerfile: npm
-            build_args: |
-              AGENT_KIND=cline
-              AGENT_PACKAGE=cline@3.0.38
-              AGENT_BINARY=cline
-          - runner: glm
-            dockerfile: npm
-            build_args: |
-              AGENT_KIND=glm
-              AGENT_PACKAGE=glm-acp-agent@1.1.4
-              AGENT_BINARY=glm-acp-agent
-          - runner: grok
-            dockerfile: npm
-            build_args: |
-              AGENT_KIND=grok
-              AGENT_PACKAGE=@xai-official/grok@0.2.97
-              AGENT_BINARY=grok
-          - runner: kilo
-            dockerfile: npm
-            build_args: |
-              AGENT_KIND=kilo
-              AGENT_PACKAGE=@kilocode/cli@7.3.54
-              AGENT_BINARY=kilo
-          - runner: pi
-            dockerfile: npm
-            build_args: |
-              AGENT_KIND=pi
-              AGENT_PACKAGE=pi-acp@0.0.31
-              AGENT_BINARY=pi-acp
-              AGENT_EXTRA_PACKAGES=@earendil-works/pi-coding-agent@0.82.0
-              AGENT_EXTRA_BINARY=pi
-          - runner: qwen
-            dockerfile: npm
-            build_args: |
-              AGENT_KIND=qwen
-              AGENT_PACKAGE=@qwen-code/qwen-code@0.19.10
-              AGENT_BINARY=qwen
-          - runner: cursor
-            dockerfile: binary
-            build_args: |
-              AGENT_KIND=cursor
-              AGENT_BINARY=cursor-agent
-              AGENT_PATH=dist-package/cursor-agent
-              AGENT_ARCHIVE_AMD64=https://downloads.cursor.com/lab/2026.07.20-8cc9c0b/linux/x64/agent-cli-package.tar.gz
-              AGENT_ARCHIVE_ARM64=https://downloads.cursor.com/lab/2026.07.20-8cc9c0b/linux/arm64/agent-cli-package.tar.gz
-          - runner: junie
-            dockerfile: binary
-            build_args: |
-              AGENT_KIND=junie
-              AGENT_BINARY=junie
-              AGENT_PATH=junie-app/bin/junie
-              AGENT_ARCHIVE_AMD64=https://github.com/JetBrains/junie/releases/download/1966.57/junie-release-1966.57-linux-amd64.zip
-              AGENT_ARCHIVE_ARM64=https://github.com/JetBrains/junie/releases/download/1966.57/junie-release-1966.57-linux-aarch64.zip
-          - runner: kimi
-            dockerfile: binary
-            build_args: |
-              AGENT_KIND=kimi
-              AGENT_BINARY=kimi
-              AGENT_PATH=kimi
-              AGENT_ARCHIVE_AMD64=https://github.com/MoonshotAI/kimi-cli/releases/download/1.49.0/kimi-1.49.0-x86_64-unknown-linux-gnu.tar.gz
-              AGENT_ARCHIVE_ARM64=https://github.com/MoonshotAI/kimi-cli/releases/download/1.49.0/kimi-1.49.0-aarch64-unknown-linux-gnu.tar.gz
-              AGENT_SHA256_AMD64=6ce0b83f583c45a64cc9f51ffe7e1a8e03ee79acda69945fcf8c23341b9d892f
-              AGENT_SHA256_ARM64=5ac54cabce16ede27b9d2069b9b88edee25528646e7bb5befa9980a1ca71febb
-          - runner: mistral-vibe
-            dockerfile: binary
-            build_args: |
-              AGENT_KIND=mistral-vibe
-              AGENT_BINARY=vibe-acp
-              AGENT_PATH=vibe-acp
-              AGENT_ARCHIVE_AMD64=https://github.com/mistralai/mistral-vibe/releases/download/v2.17.1/vibe-acp-linux-x86_64-2.17.1.zip
-              AGENT_ARCHIVE_ARM64=https://github.com/mistralai/mistral-vibe/releases/download/v2.17.1/vibe-acp-linux-aarch64-2.17.1.zip
     steps:
       - uses: actions/checkout@v4
 
@@ -169,18 +80,19 @@ jobs:
       - uses: docker/build-push-action@v6
         with:
           context: harnesses/native
-          file: harnesses/native/${{ matrix.dockerfile }}/Dockerfile
+          file: harnesses/native/${{ matrix.runner.dockerfile }}/Dockerfile
           target: ${{ matrix.variant.target }}
-          build-args: ${{ matrix.build_args }}
+          build-args: ${{ matrix.runner.build_args }}
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
           tags: |
-            ${{ env.REGISTRY }}/xpressclaw-runner-${{ matrix.runner }}${{ matrix.variant.suffix }}:latest
-            ${{ env.REGISTRY }}/xpressclaw-runner-${{ matrix.runner }}${{ matrix.variant.suffix }}:${{ github.sha }}
+            ${{ env.REGISTRY }}/xpressclaw-runner-${{ matrix.runner.id }}${{ matrix.variant.suffix }}:latest
+            ${{ env.REGISTRY }}/xpressclaw-runner-${{ matrix.runner.id }}${{ matrix.variant.suffix }}:${{ github.sha }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.licenses=Apache-2.0
+            io.xpressclaw.runner.version=${{ matrix.runner.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 

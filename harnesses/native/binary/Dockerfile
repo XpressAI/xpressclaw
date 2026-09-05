@@ -10,8 +10,10 @@ ARG AGENT_ARCHIVE_AMD64
 ARG AGENT_ARCHIVE_ARM64
 ARG AGENT_SHA256_AMD64
 ARG AGENT_SHA256_ARM64
+ARG RUNNER_VERSION=development
 LABEL io.xpressclaw.protocol="acp-xpressclaw-v2" \
-    io.xpressclaw.agent="${AGENT_KIND}"
+    io.xpressclaw.agent="${AGENT_KIND}" \
+    io.xpressclaw.runner.version="${RUNNER_VERSION}"
 
 RUN test -n "${AGENT_KIND}" \
     && test -n "${AGENT_BINARY}" \

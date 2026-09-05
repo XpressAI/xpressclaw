@@ -85,7 +85,7 @@ echo "    Copied to binaries/xpressclaw-${TARGET_TRIPLE}"
 
 if [ "$SKIP_TEST" = false ]; then
     echo "==> Running tests..."
-    node --test harnesses/native/common/*.test.mjs
+    node --test harnesses/native/common/*.test.mjs scripts/runner-versions.test.mjs
     cargo test -p xpressclaw-core -p xpressclaw-server
 fi
 

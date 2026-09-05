@@ -1086,7 +1086,7 @@ agents:
         assert_eq!(config.agents[0].runner.kind, "codex");
         assert_eq!(
             config.agents[0].runner.image,
-            "ghcr.io/xpressai/xpressclaw-runner-codex:latest"
+            default_native_runner_image("codex", ContainerEngineAccess::None).unwrap()
         );
     }
 
@@ -1105,7 +1105,7 @@ agents:
         assert_eq!(config.agents[0].runner.kind, "deepseek-harness");
         assert_eq!(
             config.agents[0].runner.image,
-            "ghcr.io/xpressai/xpressclaw-runner-deepseek-harness:latest"
+            default_native_runner_image("deepseek-harness", ContainerEngineAccess::None).unwrap()
         );
     }
 
@@ -1150,10 +1150,11 @@ agents:
         assert_eq!(loaded.agents[0].runner.kind, "claude");
         assert_eq!(
             loaded.agents[0].runner.image,
-            "ghcr.io/xpressai/xpressclaw-runner-claude:latest"
+            default_native_runner_image("claude", ContainerEngineAccess::None).unwrap()
         );
         let saved = std::fs::read_to_string(path).unwrap();
-        assert!(saved.contains("xpressclaw-runner-claude:latest"));
+        assert!(saved
+            .contains(default_native_runner_image("claude", ContainerEngineAccess::None).unwrap()));
         assert!(!saved.contains("xpressclaw-native-runner:latest"));
     }
 

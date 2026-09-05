@@ -2,9 +2,11 @@ FROM docker:29.6.1-cli AS docker-cli
 
 FROM node:22-bookworm-slim AS runner-base
 
-ARG CLAUDE_ACP_VERSION=0.61.0
+ARG CLAUDE_ACP_VERSION=latest
+ARG RUNNER_VERSION=development
 LABEL io.xpressclaw.protocol="acp-xpressclaw-v2" \
-    io.xpressclaw.agent="claude"
+    io.xpressclaw.agent="claude" \
+    io.xpressclaw.runner.version="${RUNNER_VERSION}"
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates gh git openssh-client ripgrep \

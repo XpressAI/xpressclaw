@@ -21,7 +21,8 @@ use tokio::sync::{
 use tracing::{error, info, warn};
 
 use crate::acp::{
-    agent_definition, canonical_agent_kind, infer_agent_kind_from_backend, local_runner_image,
+    agent_definition, canonical_agent_kind, infer_agent_kind_from_backend,
+    is_managed_runner_image_for_kind, local_runner_image,
 };
 use crate::agents::registry::AgentRegistry;
 use crate::collaboration::{network_name as collaboration_network_name, CollaborationSecrets};
@@ -3138,18 +3139,8 @@ fn visualization_source_roots(
 
 pub fn resolved_runner_image(config: &NativeRunnerConfig, kind: &str) -> Result<String> {
     let desired_default = default_native_runner_image(kind, config.container_engine);
-    let alternate_mode = match config.container_engine {
-        ContainerEngineAccess::None => ContainerEngineAccess::Host,
-        ContainerEngineAccess::Host => ContainerEngineAccess::None,
-    };
-    let alternate_default = default_native_runner_image(kind, alternate_mode);
     let configured_image = config.image.trim();
-    let built_in_image = [desired_default, alternate_default]
-        .into_iter()
-        .flatten()
-        .any(|image| {
-            configured_image == image || local_runner_image_alias(image) == Some(configured_image)
-        });
+    let built_in_image = is_managed_runner_image_for_kind(configured_image, kind);
     if configured_image.is_empty() || built_in_image {
         return desired_default.map(str::to_owned).ok_or_else(|| {
             Error::Backend(format!(
@@ -6457,22 +6448,12 @@ flows:
 
     #[test]
     fn selects_a_minimal_image_for_each_native_runner() {
-        assert_eq!(
-            default_native_runner_image("codex", ContainerEngineAccess::None),
-            Some("ghcr.io/xpressai/xpressclaw-runner-codex:latest")
-        );
-        assert_eq!(
-            default_native_runner_image("claude", ContainerEngineAccess::None),
-            Some("ghcr.io/xpressai/xpressclaw-runner-claude:latest")
-        );
-        assert_eq!(
-            default_native_runner_image("opencode", ContainerEngineAccess::None),
-            Some("ghcr.io/xpressai/xpressclaw-runner-opencode:latest")
-        );
-        assert_eq!(
-            default_native_runner_image("deepseek-harness", ContainerEngineAccess::None),
-            Some("ghcr.io/xpressai/xpressclaw-runner-deepseek-harness:latest")
-        );
+        for kind in ["codex", "claude", "opencode", "deepseek-harness"] {
+            assert_eq!(
+                default_native_runner_image(kind, ContainerEngineAccess::None),
+                agent_definition(kind).map(|agent| agent.minimal_image)
+            );
+        }
         assert_eq!(
             default_native_runner_image("custom", ContainerEngineAccess::None),
             None
@@ -6489,7 +6470,7 @@ flows:
         };
         assert_eq!(
             resolved_runner_image(&config, "codex").unwrap(),
-            "ghcr.io/xpressai/xpressclaw-runner-codex-docker:latest"
+            default_native_runner_image("codex", ContainerEngineAccess::Host).unwrap()
         );
         let workspace = Path::new("/home/me/project");
         assert_eq!(
@@ -6512,7 +6493,24 @@ flows:
         };
         assert_eq!(
             resolved_runner_image(&config, "codex").unwrap(),
-            "ghcr.io/xpressai/xpressclaw-runner-codex-docker:latest"
+            default_native_runner_image("codex", ContainerEngineAccess::Host).unwrap()
+        );
+    }
+
+    #[test]
+    fn managed_commit_image_moves_to_the_current_release_default() {
+        let config = NativeRunnerConfig {
+            kind: "codex".into(),
+            image: concat!(
+                "ghcr.io/xpressai/xpressclaw-runner-codex:",
+                "0123456789abcdef0123456789abcdef01234567"
+            )
+            .into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolved_runner_image(&config, "codex").unwrap(),
+            default_native_runner_image("codex", ContainerEngineAccess::None).unwrap()
         );
     }
 
