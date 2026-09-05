@@ -90,7 +90,7 @@ const BUNDLED_CONTROL_MCP_SOURCE: &str = concat!(
 
 struct NativeAttemptRuntime {
     db: Arc<Database>,
-    config: Arc<Config>,
+    config: Arc<RwLock<Arc<Config>>>,
     docker: Arc<DockerManager>,
     event_bus: Arc<ConversationEventBus>,
     elicitation_broker: Arc<AcpElicitationBroker>,
@@ -523,7 +523,7 @@ pub async fn start_dispatcher(
                     );
                 }
                 let db = db.clone();
-                let config = config.read().unwrap().clone();
+                let config = config.clone();
                 let event_bus = event_bus.clone();
                 let elicitation_broker = elicitation_broker.clone();
                 let turn_controls = turn_controls.clone();
@@ -627,7 +627,7 @@ async fn start_conversation_dispatcher(
             Ok(Some(turn)) => {
                 let runtime = ConversationAttemptRuntime {
                     db: db.clone(),
-                    config: config.read().unwrap().clone(),
+                    config: config.clone(),
                     docker,
                     event_bus: event_bus.clone(),
                     elicitation_broker: elicitation_broker.clone(),
@@ -677,7 +677,7 @@ async fn start_conversation_dispatcher(
 
 struct ConversationAttemptRuntime {
     db: Arc<Database>,
-    config: Arc<Config>,
+    config: Arc<RwLock<Arc<Config>>>,
     docker: Arc<DockerManager>,
     event_bus: Arc<ConversationEventBus>,
     elicitation_broker: Arc<AcpElicitationBroker>,
@@ -712,6 +712,16 @@ async fn execute_conversation_turn(
     }
     let manager = ConversationManager::new(db.clone());
     let conversation = manager.get(&turn.conversation_id)?;
+    let (_runtime_lifecycle_guard, config, repository) = prepare_repository_for_turn(
+        &db,
+        &config,
+        &turn.agent_id,
+        &docker,
+        &project_processes,
+        &conversation_processes,
+        &runtime_lifecycle,
+    )
+    .await?;
     let agent = config
         .agents
         .iter()
@@ -720,16 +730,6 @@ async fn execute_conversation_turn(
             name: turn.agent_id.clone(),
         })?;
     let kind = resolve_runner_kind(agent)?;
-    let (_runtime_lifecycle_guard, repository) = prepare_repository_for_turn(
-        &db,
-        &config,
-        agent,
-        &docker,
-        &project_processes,
-        &conversation_processes,
-        &runtime_lifecycle,
-    )
-    .await?;
     if !queue.is_running(&turn.id)? {
         return Ok(());
     }
@@ -1067,26 +1067,44 @@ impl RuntimeRepository {
     }
 }
 
+async fn enter_agent_runtime_config(
+    config: &Arc<RwLock<Arc<Config>>>,
+    runtime_lifecycle: &NativeRuntimeLifecycle,
+    agent_id: &str,
+) -> (OwnedRwLockReadGuard<()>, Arc<Config>) {
+    let guard = runtime_lifecycle.enter(agent_id).await;
+    let config_snapshot = config.read().unwrap().clone();
+    (guard, config_snapshot)
+}
+
 async fn prepare_repository_for_turn(
     db: &Arc<Database>,
-    config: &Config,
-    agent: &AgentConfig,
+    config: &Arc<RwLock<Arc<Config>>>,
+    agent_id: &str,
     docker: &DockerManager,
     project_processes: &ProjectAcpProcesses,
     conversation_processes: &ConversationAcpProcesses,
     runtime_lifecycle: &NativeRuntimeLifecycle,
-) -> Result<(OwnedRwLockReadGuard<()>, RuntimeRepository)> {
-    let bootstrap_root = resolved_workspace(config, agent);
-    let lifecycle = runtime_lifecycle.slot(&agent.name);
+) -> Result<(OwnedRwLockReadGuard<()>, Arc<Config>, RuntimeRepository)> {
     // Stable repositories retain the ordinary shared runtime path, so Task
     // and Conversation lanes for one Agent can continue concurrently.
-    let read_guard = lifecycle.clone().read_owned().await;
-    let inspection = inspect_repository_for_turn(db, &agent.name, &bootstrap_root).await?;
+    // Snapshot configuration only after entering the runtime boundary. An
+    // update may commit while a dispatcher has claimed work, and that claimed
+    // work must observe the new image after the update releases this lock.
+    let (read_guard, config_snapshot) =
+        enter_agent_runtime_config(config, runtime_lifecycle, agent_id).await;
+    let agent = config_snapshot
+        .agents
+        .iter()
+        .find(|agent| agent.name == agent_id)
+        .ok_or_else(|| Error::AgentNotFound {
+            name: agent_id.to_string(),
+        })?;
+    let bootstrap_root = resolved_workspace(&config_snapshot, agent);
+    let inspection = inspect_repository_for_turn(db, agent_id, &bootstrap_root).await?;
     if !inspection.requires_boundary_change() {
-        return Ok((
-            read_guard,
-            RuntimeRepository::from_inspection(inspection, agent),
-        ));
+        let repository = RuntimeRepository::from_inspection(inspection, agent);
+        return Ok((read_guard, config_snapshot, repository));
     }
 
     // Repository reconciliation and destructive Project cleanup share the
@@ -1095,24 +1113,35 @@ async fn prepare_repository_for_turn(
     // released. Downgrading atomically then prevents deletion from entering
     // between repository cleanup and the new turn.
     drop(read_guard);
+    let lifecycle = runtime_lifecycle.slot(agent_id);
     let write_guard = lifecycle.write_owned().await;
-    AgentRegistry::new(db.clone()).get(&agent.name)?;
-    let inspection = inspect_repository_for_turn(db, &agent.name, &bootstrap_root).await?;
+    AgentRegistry::new(db.clone()).get(agent_id)?;
+    let config_snapshot = config.read().unwrap().clone();
+    let agent = config_snapshot
+        .agents
+        .iter()
+        .find(|agent| agent.name == agent_id)
+        .ok_or_else(|| Error::AgentNotFound {
+            name: agent_id.to_string(),
+        })?;
+    let bootstrap_root = resolved_workspace(&config_snapshot, agent);
+    let inspection = inspect_repository_for_turn(db, agent_id, &bootstrap_root).await?;
     let inspection = if inspection.requires_boundary_change() {
-        let boundary = apply_repository_boundary_for_turn(db, &agent.name, &bootstrap_root).await?;
+        let boundary = apply_repository_boundary_for_turn(db, agent_id, &bootstrap_root).await?;
         if boundary.changed {
             conversation_processes
-                .retire_agent_everywhere(&agent.name)
+                .retire_agent_everywhere(agent_id)
                 .await;
-            project_processes.retire_agent(&agent.name).await;
-            let _ = docker.stop_preserving(&agent.name).await;
+            project_processes.retire_agent(agent_id).await;
+            let _ = docker.stop_preserving(agent_id).await;
         }
         boundary.inspection
     } else {
         inspection
     };
     let guard = OwnedRwLockWriteGuard::downgrade(write_guard);
-    Ok((guard, RuntimeRepository::from_inspection(inspection, agent)))
+    let repository = RuntimeRepository::from_inspection(inspection, agent);
+    Ok((guard, config_snapshot, repository))
 }
 
 async fn inspect_repository_for_turn(
@@ -1161,6 +1190,16 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
         .attempt_id
         .as_deref()
         .ok_or_else(|| Error::Task(format!("queue item {} has no work attempt", item.id)))?;
+    let (_runtime_lifecycle_guard, config, repository) = prepare_repository_for_turn(
+        &db,
+        &config,
+        &item.agent_id,
+        &docker,
+        &processes,
+        &conversation_processes,
+        &runtime_lifecycle,
+    )
+    .await?;
     let agent = config
         .agents
         .iter()
@@ -1169,16 +1208,6 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
             name: item.agent_id.clone(),
         })?;
     let kind = resolve_runner_kind(agent)?;
-    let (_runtime_lifecycle_guard, repository) = prepare_repository_for_turn(
-        &db,
-        &config,
-        agent,
-        &docker,
-        &processes,
-        &conversation_processes,
-        &runtime_lifecycle,
-    )
-    .await?;
     let session_start = session_start(&db, &item, &kind)?;
     let requested_session_config = requested_session_config(&db, agent, &item.task_id)?;
     let mut prompt = build_prompt(&db, &item, attempt_id)?;
@@ -4279,6 +4308,50 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), lifecycle.enter("atlas"))
             .await
             .expect("new work should resume after cleanup releases the barrier");
+    }
+
+    #[tokio::test]
+    async fn claimed_work_snapshots_config_after_runtime_maintenance() {
+        let lifecycle = Arc::new(NativeRuntimeLifecycle::default());
+        let initial = Config {
+            agents: vec![AgentConfig {
+                name: "atlas".to_string(),
+                runner: NativeRunnerConfig {
+                    image: "ghcr.io/xpressai/xpressclaw-runner-codex@sha256:old".to_string(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let config = Arc::new(RwLock::new(Arc::new(initial)));
+        let maintenance = lifecycle
+            .try_quiesce_agent("atlas")
+            .expect("idle Agent should enter maintenance");
+
+        let worker_config = config.clone();
+        let worker_lifecycle = lifecycle.clone();
+        let worker = tokio::spawn(async move {
+            let (_guard, snapshot) =
+                enter_agent_runtime_config(&worker_config, &worker_lifecycle, "atlas").await;
+            snapshot.agents[0].runner.image.clone()
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !worker.is_finished(),
+            "claimed work must wait at the runtime boundary"
+        );
+
+        let mut updated = config.read().unwrap().as_ref().clone();
+        updated.agents[0].runner.image =
+            "ghcr.io/xpressai/xpressclaw-runner-codex@sha256:new".to_string();
+        *config.write().unwrap() = Arc::new(updated);
+        drop(maintenance);
+
+        assert_eq!(
+            worker.await.unwrap(),
+            "ghcr.io/xpressai/xpressclaw-runner-codex@sha256:new"
+        );
     }
 
     #[test]

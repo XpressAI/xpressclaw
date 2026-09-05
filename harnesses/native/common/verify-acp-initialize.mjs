@@ -19,7 +19,10 @@ child.stderr.on('data', (chunk) => {
   stderr = `${stderr}${chunk}`.slice(-16 * 1024);
 });
 
-const timeout = setTimeout(() => child.kill('SIGKILL'), 30_000);
+// Cross-architecture image builds execute the target binary through QEMU. A
+// cold Qwen or Grok startup can exceed 30 seconds on a busy hosted runner even
+// though the same initialize exchange completes normally once scheduled.
+const timeout = setTimeout(() => child.kill('SIGKILL'), 120_000);
 try {
   child.stdin.write(`${JSON.stringify({
     jsonrpc: '2.0',
