@@ -1,0 +1,10 @@
+{
+  "crates/xpressclaw-tauri/icons/macos/XpressClaw.icon/Assets/teal-network.svg": "020a3a8e6f323824fcaa03ce489750d6992ac15454093ce1c217e3672c9d2e34",
+  "crates/xpressclaw-tauri/icons/macos/XpressClaw.icon/Assets/white-network.svg": "cfd7470307f75c8109a960078e0a46dfcb625c8edf7589a54911ffea469fc346",
+  "crates/xpressclaw-tauri/icons/macos/XpressClaw.icon/icon.json": "d9d9fb1d524a5153f993e4c3bc5bc9a5385568ae9f766f78c757cd8486fdf8c3",
+  "crates/xpressclaw-tauri/icons/macos/background.svg": "c716a596c5707c9bc5811067dcf89dcd28958ca9be97466e48872afd67b8d860",
+  "crates/xpressclaw-tauri/icons/macos/compiled/Assets.car": "d07ee7e7d7f027b6fdc109d785634ae979c20ddb163956ec9428b34d5173fd72",
+  "crates/xpressclaw-tauri/icons/macos/compiled/XpressClaw.icns": "1e4d184ce8b721b8f200539e41255b5c761d09eb999c694e2724f3e09411394f",
+  "crates/xpressclaw-tauri/icons/macos/compiled/partial-info.plist": "e7760f203de2453a39122c0d6322f3fefa33bb952e44fed7542aeeaba0708d9a",
+  "scripts/build-app-icon.py": "bf8c9f9da91f647b9f4bb185f8d9e8b5f0071b02d4f7294e581099419f95c13d"
+}

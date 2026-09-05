@@ -165,6 +165,12 @@ jobs:
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY_ID }}
         run: bash build.sh --skip-test --skip-docker --skip-check --target=${{ matrix.target }}
 
+      - name: Verify macOS app icon bundle
+        if: runner.os == 'macOS'
+        run: >-
+          python3 scripts/verify-app-icon.py
+          --app target/${{ matrix.target }}/release/bundle/macos/xpressclaw.app
+
       # Windows
       - name: Build (Windows)
         if: runner.os == 'Windows'

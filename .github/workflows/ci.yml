@@ -24,6 +24,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check macOS app icon assets
+        run: python3 scripts/build-app-icon.py --check
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
