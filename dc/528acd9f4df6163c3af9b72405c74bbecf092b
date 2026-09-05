@@ -1,0 +1,1 @@
+Fixed wizard agent creation: was inheriting per-agent base_url from other agents, not setting default MCP servers (tasks/memory/skills/apps), and not assigning any skills. New agents now get default skills (memory-system, task-management, build-app), all default MCP servers, and correct global LLM config. Added Skills page to Workflows tab.

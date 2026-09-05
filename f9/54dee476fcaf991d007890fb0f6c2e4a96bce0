@@ -1,0 +1,1 @@
+Root cause of agents only seeing 2 MCP tools: allowed_tools=['Read','Write','Edit','Bash','Glob','Grep'] was a WHITELIST. MCP tools have names like mcp__tasks__create_task — they weren't in the whitelist so the CLI filtered them out. The MCP servers were starting fine (all 7 in env, all parsed correctly) but their tools were hidden. Removing allowed_tools lets all tools through.

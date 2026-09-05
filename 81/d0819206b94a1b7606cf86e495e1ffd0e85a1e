@@ -1,0 +1,12 @@
+Root cause CONFIRMED: rules_rust sets CARGO_MANIFEST_DIR to bazel-out/.../bin/
+not the exec root. rust-embed resolves ../../frontend/build/ from there.
+The genrule created build/ in the exec root (via pwd -P symlink), but
+bazel-out/.../bin/frontend/build/ never existed.
+
+Evidence: include_bytes! probe on CI printed:
+  couldn't read bazel-out/darwin_arm64-fastbuild/bin/crates/xpressclaw-server/
+  src/../../../frontend/build/index.html: No such file or directory
+
+Fix: cp -r build to dirname of the stamp file in bazel-out/.
+Verified locally: clean build (no cache, no pre-existing frontend/build/)
+now embeds the frontend correctly.

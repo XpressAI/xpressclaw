@@ -1,0 +1,1 @@
+CI was duplicating build.sh steps and diverging. Now both release.yml and ci.yml call build.sh directly with skip flags.

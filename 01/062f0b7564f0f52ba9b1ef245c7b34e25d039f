@@ -1,0 +1,1 @@
+Added 9 Anthropic skills from github.com/anthropics/skills: frontend-design, mcp-builder, webapp-testing, skill-creator, doc-coauthoring, pdf, docx, xlsx, pptx. Base harness image updated with poppler-utils, libreoffice, and Python deps (pypdf, pdfplumber, pdf2image, Pillow, openpyxl, python-pptx). Agents need skill names in their YAML skills: [] list to see them.

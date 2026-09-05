@@ -1,0 +1,59 @@
+Why PiHarness is intentionally small:
+
+The temptation when writing a "pi harness" is to put a lot of
+pi-knowledge on the host side — "pi agents need tmux, so we provision
+tmux; pi agents use these tools, so we preinstall them." Resisted that.
+Everything pi-specific that can live in the guest image SHOULD live in
+the guest image, because (a) it ships as a versioned artifact we can
+sign/vet later via the hub, (b) it keeps the host side generic so
+adding new harnesses doesn't grow the xpressclaw binary, and (c) it
+matches how other harness vendors (codex, opencode) will be added —
+they can't realistically patch the xpressclaw host.
+
+The pi-specific bits that had to be on the host: workspace mount
+(filesystem is a host resource), env seeding for endpoints that ARE
+host resources (sidecar, xclaw socket), and image resolution (the
+host owns the image cache). That's it.
+
+Why OCI pull stubbed vs. done:
+
+The real OCI pull is non-trivial: parse ghcr.io/foo/bar:tag, fetch
+manifest, handle multi-platform manifests, pull blob(s), verify
+digest, cache. The oci-client crate does most of it but integrating
+adds ~200 lines + a new workspace dep. Pushed to task 4b as its own
+unit of work. The stub interface is designed so the real impl drops
+in without changing PiHarness or callers — resolve() returns
+Result<PathBuf> either way.
+
+Decision tracked in task 4b: OCI artifact (single blob with custom
+media type) vs OCI image (multi-layer that needs flattening) vs raw
+GH Release asset. Leaning artifact — it's what tools like `oras`
+push WASM as, it's what the ecosystem is converging on, and it's a
+single HTTP GET after the manifest fetch.
+
+Environment variable naming:
+
+OPENAI_API_BASE is used because it's the de-facto standard any
+shell-native agent respects (most libraries read it). When we add a
+codex harness or opencode harness they'll pick it up for free. Custom
+xpressclaw-specific names would force each harness vendor to add
+explicit support; standard names piggyback on existing conventions.
+XCLAW_SOCKET is xpressclaw-specific because the xclaw CLI doesn't
+exist outside our world.
+
+Placeholder values:
+
+OPENAI_API_BASE=http://127.0.0.1:8935/v1 and XCLAW_SOCKET=/run/xclaw.sock
+are both fictional endpoints today. Task 5 makes the socket real;
+task 6 makes the LLM endpoint real. Pi harness images can be built
+with these values baked in as expectations; when the real
+infrastructure lands the values don't change.
+
+Why container_id stays c2w-namespaced when launched via PiHarness:
+
+PiHarness delegates launch() to C2wHarness which formats container_id
+as "c2w-{agent_id}". That's semantically correct — the underlying
+isolation IS a c2w container; the pi-ness is a configuration choice
+layered on top. A user who lists agents and sees "c2w-piggy" is
+seeing what the isolation actually is. If we wanted a pi-prefixed ID
+we'd have to invent a separate registry. Not worth the bookkeeping.

@@ -1,0 +1,7 @@
+Comment trim across the five branch-owned android files, prompted by fahreza noticing our comments run far longer than the repo's voice. Measured: old core files sit at 3-8% comment lines (board.rs 4.3%, telegram.rs 4.1%, zettelkasten 4.9%); the android files were 20-33% (emulator.rs 32.7%). Policy applied: keep <=2-line comments that state a constraint the code can't show (blocking adb_client -> spawn_blocking, resize-would-upscale, injection charsets, long-clickable substring trap, %s-inside-quotes); delete history, justification, and narration — that material lives in the git notes and ADR-024, where it's pinned to the commit that made it true.
+
+Two of the deleted blocks were STALE AND WRONG, which is the point: emulator.rs still explained the `cmd /c start` cmd.exe re-parsing risk (that spawn layer was removed in f2e1fa0 — the charset check is now defense-in-depth, comment rewritten to say so), and sdk.rs referenced the "device-link connector" deleted earlier today (b7e8159).
+
+After: mod.rs 16%, emulator.rs 19%, sdk.rs 10.6%, routes 6.4%, cli 11.6%. The residual above the old-code band is structural, not prose: these files are many 3-6-line functions each carrying a single /// one-liner, and the CLI's doc-comments ARE the clap --help text (functional, don't cut). Verified: 361 core tests pass, cli+server check clean — comments only, zero behavior.
+
+Lesson for future sessions: when writing a NEW module with no surrounding style to match, calibrate against the repo's oldest files first; rationale goes in the git note, not the source.

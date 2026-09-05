@@ -1,0 +1,9 @@
+All ADR-018 implementation complete:
+- DB migration v14 (desired_status, restart_count, last_attempt_at)
+- DesiredStatus/ObservedStatus enums (observed never persisted)
+- Reconciler: 10s loop, images/agents/tasks, exponential backoff
+- API: start/stop set desired only, list/get query Docker live
+- Frontend: desired_status for buttons, auto-refresh 5s, restart count
+- Removed startup agent loop from up.rs
+- stop is idempotent (200 not 409)
+- All 264 tests pass, clippy clean

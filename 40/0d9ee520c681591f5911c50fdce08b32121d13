@@ -1,0 +1,28 @@
+Per-agent android toggle: agent_mcp_servers() in images.rs composes defaults+extras
+then removes OPTIONAL_MCP_SERVERS (just "android") not named in agent.tools. Rollout
+is reconciler drift: MCP_SERVERS is baked into the container env at start, so the
+running-branch compares the env's key set (container_env_var + parse, keys only —
+never log the full value, the github entry can carry a PAT) against the desired set
+and stops the container; next cycle restarts it with the new toolset. Same pattern
+as the image-freshness check on purpose.
+
+UI decision (fahreza, after three iterations): the toggle is the tool's ONLY
+representation. Rejected (a) write-on-toggle a la the wizard's git/github checkboxes
+— a global mcp_servers row can't track a per-agent toggle (agent B's untoggle would
+delete the row agent A relies on, or never-delete makes it permanent), and it IS the
+double-storage bug in tools-tier2-TODO.md; (b) a derived appears-when-toggled row —
+second representation of the same fact on one screen. So ToolsTab filters android
+from the MCP Servers list unconditionally. The setup-seeded android entry in existing
+yamls is harmless dead config: containers compose from code defaults and the host
+spawner (server.rs) skips /app/ paths — verified before touching this, since that
+spawner DOES launch config servers on the host.
+
+Known limitation, documented in ADR-024 + tools-tier2-TODO.md: this gates the
+toolbox, not the network — /v1/android/* carries no per-agent authz, like every
+host endpoint. Hard enforcement = per-agent credentials + middleware, own project.
+
+Future direction on record (tools-tier2-TODO.md): one catalog of server defs + one
+per-agent enable list; per-agent android device targets become per-agent overrides
+on the catalog entry. Also filed: secure-screen (FLAG_SECURE) black frames on
+lock/login — emulator-level capture is the only bypass, real devices unfixable by
+design (android-liveview-TODO.md).

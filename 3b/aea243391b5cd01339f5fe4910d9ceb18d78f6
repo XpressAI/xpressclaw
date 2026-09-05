@@ -1,0 +1,7 @@
+Root cause: docker/manager.rs is_named_volume heuristic only treated a leading '/' or '~' as a host path, so Windows sources like C:\Users\...\documents were misclassified as named volumes -> Docker 400 "invalid characters for a local volume name". Chat still worked because it doesn't use the documents bind.
+
+Fix: a Docker volume name can never contain a path separator or the drive-letter colon, so treat any source containing / \ : (or a leading ~) as a bind mount. Covers Unix, C:\, C:/, and \\UNC.
+
+Rejected: a Windows drive-letter regex (^[A-Za-z]:[\/]) -- more brittle and misses UNC; the inverse "cannot be a volume name" check is simpler and total.
+
+Branched from main (f8341ab) to isolate this from fahreza/android-support WIP (that branch's Cargo.toml edit is stashed in stash@{0}). Built NSIS/MSI from this branch; server boots healthy. The white screen seen during testing was unrelated: VS Code auto port-forward was squatting 127.0.0.1:8935 and intercepting the webview; the server answered 200 on its 0.0.0.0 binding.

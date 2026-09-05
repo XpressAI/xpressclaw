@@ -1,0 +1,7 @@
+Phase 4 (collaborative live view) + Phase 3 foundation (control endpoints). KEY ARCHITECTURE: agent and human share ONE device via the SAME /v1/android/* endpoints — an agent MCP tool call and a human's browser click both hit e.g. /v1/android/tap. So 'human steps in' needs no special handoff.
+
+Endpoints (crates/xpressclaw-server/src/routes/android.rs, feature-gated, nested at /v1/android in server.rs): status, screenshot (image/png), dump, tap, tap-text, swipe, input-text, key. Each resolves the device target from the configured 'android' connector record (serial/tcp), default emulator-5554, then runs AndroidDevice (adb_client) inside spawn_blocking (adb_client is sync). Core AndroidDevice gained swipe/input_text/key_event (thin shell() wrappers).
+
+Live view (frontend/src/routes/android/+page.svelte, sidebar link in +layout.svelte): polls /v1/android/screenshot ~1.4fps into an <img>, maps clicks to device coords via naturalWidth/Height -> /v1/android/tap, Back/Home/Recents -> /key, text input -> /input-text. MVP polling (no scrcpy); upgrade to scrcpy/WebRTC later if fps matters.
+
+STILL TODO for full Phase 3 (agent): the Python MCP shim (harnesses/base/mcp_android.py or a separate MCP server) that exposes these as MCP tools and proxies to /v1/android/* — must NOT put adb in the container (that was the scrcpy trap); it just HTTP-proxies to the host server like mcp_xpressclaw.py does. Then wire an android-capable agent + rebuild harness image. Phase 5 (emulator lifecycle: android up/down provisioning via DEFAULT_SYSTEM_IMAGE) also remains. Not pushed.

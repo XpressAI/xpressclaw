@@ -1,0 +1,56 @@
+Non-obvious things discovered while writing Task 3:
+
+**Epoch deadline is absolute, not relative.** I assumed `set_epoch_deadline(n)`
+meant "trap after n ticks from now." It actually means "trap when the
+engine's global counter reaches n." Since the runtime's background tick
+driver starts advancing the counter from construction, by the time any
+guest instantiates the counter is already > 0; a store-default deadline of
+0 therefore traps the instant the first epoch tick fires after
+instantiation — basically immediately. Fix was u64::MAX/2 as "effectively
+no deadline." Caller-specified deadlines need to be converted to absolute
+once wasmtime exposes `current_epoch()` publicly (it doesn't today).
+Proper per-step budget accounting for snapshot/rollback (task 8) will
+need to work around this.
+
+**Inherited stdio means logs() returns empty.** I deferred MemoryOutputPipe
+wiring because it requires touching the C2wInstance API, which would have
+bloated this commit. stdout/stderr fields exist on RunningAgent but are
+never populated. The smoke test passes because it doesn't assert on log
+content — but if someone else tries to rely on Harness::logs() with a
+C2wHarness they'll get empty strings, and that's not documented in the
+trait. This is task 3b debt.
+
+**Host port is None for every c2w agent right now.** Endpoint exposure
+from guest to host requires wasi-sockets plumbing, which I punted to
+task 4 because it's genuinely non-trivial — you need a host-side
+listener that forwards to a wasi-poll-driven guest-side acceptor, and
+the wasmtime-wasi p1 vs p2 story differs here. Pairing it with the first
+real HTTP-serving harness image makes sense.
+
+**spec.image interpreted as filesystem path.** In task 3 it's a path
+directly; in task 4 it becomes a GHCR OCI ref that gets pulled and
+converted. Call sites don't need to know — the signature is stable.
+
+**Driver task abort doesn't surface guest errors.** stop() calls
+abort() and drains the JoinError, discarding any trap/panic the guest
+may have hit before abort arrived. Acceptable for stop semantics but
+means tracing-level visibility into what went wrong is weaker than
+Docker's (which returns container exit codes). Revisit if debugging
+pi harness startup proves painful.
+
+**Why the smoke test subcommand exists.** User said "keeping an eye on
+the code, will let you know if I see something strange" and I'd
+previously promised something runnable before diving into task 4. The
+subcommand is 95 lines of cost for proving the runtime works on a real
+machine before committing to GHCR / OCI / pi harness plumbing. It's
+explicitly marked as temporary (module doc + commit body) and will be
+removed when task 4's `xpressclaw harness add/run` lands a real
+workload smoke.
+
+**First hand-crafted WAT hello-world trapped at offset 0x5d.** I wrote a
+string-printing module with fd_write and got an opaque trap. After
+fixing the epoch bug the same module still trapped — haven't diagnosed
+further because the smoke's job is to prove the lifecycle, not WAT
+authoring. Simplified to a noop `_start`. If later work needs complex
+guest authoring, use AssemblyScript or compile a small Rust cdylib
+rather than hand-writing WAT.

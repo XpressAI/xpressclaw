@@ -1,0 +1,1 @@
+fix: serde(skip) on HooksConfig broke the test_update_config_wake_on_and_hooks test because it excluded hooks from JSON serialization (API response returned null). Changed to skip_deserializing + default functions so hooks are always defaulted when reading YAML but included in JSON for the API. All 49 tests pass.

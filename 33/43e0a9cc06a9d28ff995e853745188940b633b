@@ -1,0 +1,1 @@
+Pure cargo fmt output, zero hand edits — the android files drifted from rustfmt during the hand-edited refactors (CI lint job runs cargo fmt --check and was red). Reproduced the exact CI command locally, applied, re-checked: PASS. test.yaml left dirty as always (pre-existing, holds local config).

@@ -1,0 +1,67 @@
+Non-obvious decisions for task 6:
+
+**Why extend the existing /v1/chat/completions handler vs. write a new one.**
+The old handler already had 70% of what ADR-023 §6 requires: agent_id
+extraction, degraded-model swap, routing to LlmRouter. Creating a second
+endpoint would've duplicated most of that. The risk was that "extending"
+quietly changes semantics for existing callers — so I kept the behavior
+for non-auth'd requests (no agent_id → pass through unchanged, no
+usage recorded) as a compatibility guarantee. Anthropic /v1/messages is
+untouched; it's got its own complex proxy path.
+
+**Why `Authorization: Bearer sk-{agent}` not a custom header.**
+Harnesses expect an OpenAI-style endpoint. `Authorization: Bearer sk-...`
+is what OpenAI's SDK sends. Making agents use a custom `X-Agent-Id`
+header would force each harness vendor to special-case xpressclaw; the
+`sk-{agent}` trick piggybacks on convention. Real provider keys never
+reach this endpoint (ADR-023 §6 forbids harnesses holding them), so the
+ambiguity never arises in practice.
+
+**The `.filter(|s| !s.contains("xpressclaw"))` heuristic.**
+Kept from the pre-existing code — it guards against a real provider key
+that happens to start with `sk-` accidentally being treated as an agent
+name. The word "xpressclaw" appears in one specific real key pattern
+the codebase has encountered. Fragile, but removing it is a separate
+bug-risk and outside this task's scope. If/when we move to first-class
+agent auth (JWT? OAuth?) this goes away.
+
+**Budget check semantics: three return states of check_budget()**
+- `Ok(true)`  — under budget, allow.
+- `Ok(false)` — over budget but `on_exceeded: alert` — log and allow.
+- `Err(_)`    — paused, OR `on_exceeded: stop` over limit. Refuse with 429.
+
+Mapping `Err` to 429 (not 402 / 403) because "Too Many Requests" is the
+closest HTTP semantic to "budget exhausted for now, try later." OpenAI
+clients tend to retry on 429 with backoff, which is the right behavior
+when the daily limit auto-resets at midnight.
+
+**Why the streaming path counts chars/4, not tokens.**
+`ChatCompletionChunk` has no usage field — the router trait doesn't
+expose terminal usage on streams. Getting accurate per-provider usage
+requires either extending the chunk type or writing a per-provider
+post-stream hook. Both are bigger than this task's scope. chars/4 is a
+known-bad approximation but it's non-zero and directional — an agent
+that streams twice as much gets charged twice as much. When task 11
+lands this becomes real.
+
+**Why record_usage is fire-and-forget.**
+A failed usage write shouldn't fail the request — the user already got
+their completion, penalizing them by returning an error would be rude.
+Worst case we lose a row of spending data; the next request with real
+usage will re-assert the budget state. Logged at warn level for
+observability.
+
+**Canned provider test pattern.**
+I built a minimal `CannedProvider` implementing LlmProvider directly in
+the test module rather than mocking at the HTTP layer. Tests the real
+routing path (LlmRouter → provider) end-to-end. Much faster than
+spinning up a mock HTTP server, and the provider trait boundary is
+exactly where the ADR-023 sidecar lives.
+
+**Seeding `degraded_model` via raw SQL in the test.**
+The BudgetManager doesn't expose a public "set degraded_model for test"
+method, so I insert into the `budget_state` table directly. This is
+acceptable in a test but would be a smell in real code — it bypasses
+the on_exceeded workflow that would normally set degraded_model in
+production. If BudgetManager grows a test seam later, migrate this
+test off the raw SQL.

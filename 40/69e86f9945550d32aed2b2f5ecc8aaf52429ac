@@ -1,0 +1,1 @@
+Documents now per-agent at ~/.xpressclaw/{agent_id}/documents/. Agent uses file names only (e.g. 'report.docx'), server resolves full path. $DOCUMENTS_DIR variable auto-injected into scripts. Added list_documents MCP tool and GET /api/office/documents download endpoint with proper MIME types. This prevents agents from writing to arbitrary host paths.

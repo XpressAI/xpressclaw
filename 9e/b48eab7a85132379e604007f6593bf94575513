@@ -1,0 +1,1 @@
+Agent API key was wiped on every save because the UI sent null for empty api_key field. Backend now merges incoming LLM config with existing — null means keep. Also killed model-name-based provider routing (gpt→openai, qwen→local). All models go through the configured default provider; the YAML controls routing.

@@ -1,0 +1,11 @@
+Tray right-click bug on Windows: right-clicking the tray icon flashed its context menu and dismissed it instantly, so Quit (the only way to exit) was unreachable.
+
+Root cause (evidence: read tray.rs + confirmed TrayIconEvent enum in cargo registry src tauri-2.10.3/src/tray/mod.rs): on_tray_icon_event matched TrayIconEvent::Click { .. } — that variant carries button: MouseButton and button_state: MouseButtonState, so it fires for ALL buttons. On right-click the handler called window.show()+set_focus(), stealing focus from the OS-opened context menu and closing it.
+
+Fix: match only { button: MouseButton::Left, button_state: MouseButtonState::Up, .. }. Chose Up over Down to avoid popping the window on the press half of a click. Right/middle fall through so the native menu stays open.
+
+Branched fresh off main (NOT off fahreza/android-device-control) because the tray code is unrelated to android and the bug exists on main. The android WIP (uncommitted local settings + desktop-schema.json) was stashed under stash labeled 'android-device-control wip' before switching — pop it back on that branch when resuming android work. Untracked artifacts (image.png, test_openai.sh, gen/schemas/windows-schema.json, build logs, PR.md) rode along into this worktree but are NOT part of this commit; only tray.rs is staged.
+
+Verified: cargo check -p xpressclaw-tauri green; built NSIS installer (target/x86_64-pc-windows-msvc/release/bundle/nsis/xpressclaw_0.1.0_x64-setup.exe, 10.5MB). Not yet manually clicked to confirm — recommend installing and right-clicking the tray to verify menu stays open.
+
+PR body drafted at PR.md (project root, scratch — keeps gitmoji title per PR convention; commit messages stay emoji-free).

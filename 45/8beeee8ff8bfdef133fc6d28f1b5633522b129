@@ -1,0 +1,18 @@
+Root cause of frontend not built: rust-embed in Bazel exec root.
+
+The genrule creates frontend/build/ in the real filesystem (pwd -P follows symlinks),
+but the server compilation resolves ../../frontend/build/ through the exec root.
+On CI, the exec root may not use directory symlinks for packages with BUILD.bazel,
+so the side-effect build/ directory is invisible to the compiler.
+
+Key evidence:
+- Empty frontend/build/ compiles OK but embeds zero files (confirmed)
+- Local clean build works because exec root uses dir symlinks locally
+- CI release DMG binary returns "frontend not built" (confirmed via curl on x64 DMG)
+- strings check was initially misleading (doctype is lowercase in SvelteKit)
+
+Fix approach: build frontend before Bazel in CI, add filegroup to glob build/**
+as compile_data so Bazel makes the files available as proper inputs.
+
+Rejected: changing tauri.conf.json beforeBuildCommand paths (red herring — Tauri
+window loads from localhost, not frontendDist).

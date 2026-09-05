@@ -1,0 +1,1 @@
+Added container logs capability. GET /api/agents/{id}/logs and /api/apps/{id}/logs endpoints call DockerManager::logs(). MCP tools get_agent_logs and get_app_logs let agents read container output to diagnose failures (e.g. app in error state). Uses existing bollard docker.logs() with tail parameter.

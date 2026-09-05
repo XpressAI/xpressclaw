@@ -1,0 +1,1 @@
+Bazel build system merged (PR #36). CI fixes required: sudo for bazelisk on Linux, cmake install on both platforms, --action_env=PATH to pass host PATH into sandbox for build scripts (llama-cpp-sys needs cmake), skip frontend rebuild when pre-built artifact exists, async_trait lifetime fix in procedure_runner.rs. Build times: ~15min macOS, ~28min Ubuntu on CI.

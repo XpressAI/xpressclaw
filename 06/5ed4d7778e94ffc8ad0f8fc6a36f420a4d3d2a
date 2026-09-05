@@ -1,0 +1,16 @@
+Three fixes for the Word document creation workflow reported by user.
+
+1. office_run activate: run_applescript only added activate when wrapping
+   scripts. Agent scripts include tell application but omit activate, so
+   Word never launches. Fix: inject activate after the first tell line
+   when missing.
+
+2. Documents directory: container /workspace/Documents was mounted from
+   workspace_dir, not from the per-agent documents dir that office.rs
+   resolves. Agent creates files in the wrong location. Fix: bind-mount
+   data_dir/{agent_id}/documents/ at /workspace/Documents.
+
+3. XML tool calls: Qwen3.5-27b degrades to <parameter=...> format in
+   long conversations. System silently ignored this, ending the turn.
+   Fix: detect_malformed_tool_call() checks for the pattern after each
+   response and injects a system hint message so the model retries.

@@ -1,0 +1,10 @@
+Diagnosis: The release.yml workflow runs 'npx @tauri-apps/cli build' which triggers beforeBuildCommand in tauri.conf.json. The beforeBuildCommand had 'cd ../frontend && npm run build' but from crates/xpressclaw-tauri/, ../frontend resolves to crates/frontend/ which doesn't exist. The frontend is at project root frontend/, which is ../../frontend from the tauri directory.
+
+Evidence:
+1. cd crates/xpressclaw-tauri && ls ../frontend → 'No such file or directory'
+2. cd crates/xpressclaw-tauri && ls ../../frontend → Shows frontend directory with build/ subdirectory
+3. frontendDist path '../../frontend/build' was already correct (two levels up), confirming the inconsistency
+
+Impact: The beforeBuildCommand failed silently, so npm run build never executed. The frontend was never built during Tauri packaging, causing 'Frontend not found' errors with white windows.
+
+Fix: Changed both beforeDevCommand (line 9) and beforeBuildCommand (line 10) from 'cd ../frontend' to 'cd ../../frontend'.

@@ -1,0 +1,13 @@
+Why the loop does non-streaming for tool-use turns and only streams the terminal turn: streaming+tool_calls is fiddly — OpenAI returns tool call deltas across chunks (id in one, name in another, arguments in pieces), so you have to accumulate. Non-streaming gives you the complete tool_calls array in one hit. For tool-use turns the user doesn't see the output anyway (they're internal), so the latency cost is zero-perceived. For the terminal turn the user IS watching, so we re-run in streaming mode.
+
+Why re-run the terminal turn in streaming mode instead of trying to stream the last non-streaming response: the first non-streaming call already hit the LLM and we know it's terminal (no tool_calls). Re-running costs one extra API call. Alternative would be to fake a stream from the non-streaming response by splitting the content into chunks — but that defeats the purpose (token-by-token rendering is better UX than fake-chunked all-at-once).
+
+Why iterate up to 20 turns: the docker-era claude-agent-sdk default was ~10 for simple tasks, ~25 for complex ones. 20 is the midpoint that handles most tasks without letting pathological loops burn money. Model-driven loops where the LLM calls the same tool forever are the failure case — they'll hit 20 and fail loudly.
+
+Why append the assistant message with tool_calls before appending the tool results: OpenAI / Anthropic require it. A tool-role message must follow an assistant message that contains the corresponding tool_call_id. If we skip the assistant turn, the LLM gets a tool result out of nowhere and errors.
+
+Why format_tool_result flattens images as '[image: <mime>]' instead of passing through: passing raw image bytes as a tool result requires the LLM provider to accept them in subsequent user messages, which is vision-specific and has its own message-content-part structure. Flattening is the lossy but universally-supported path. Real image-returning tools (e.g. 'take_screenshot') can be revisited when a vision workflow warrants it.
+
+Why caller-provided tools are preserved: a future harness that DOES speak its own tool protocol (like pi-as-c2w eventually) may still come through this endpoint. We shouldn't overwrite their tools list. Empty-or-none tools on the incoming request signals 'I want the harness to pick' — that's when we inject from MCP.
+
+Regression risk: if MCP tool schemas are malformed or the LLM provider rejects the tools field, every request fails instead of silently falling back to the no-tools behavior. Mitigation: if schemas.is_empty() we don't inject. Beyond that, a bad tool definition is a user config bug that surfaces loudly — which is correct behavior for a dev setup.

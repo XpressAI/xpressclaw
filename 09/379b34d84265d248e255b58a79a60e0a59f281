@@ -1,0 +1,1 @@
+ADR-016: Restructure bottom tabs to Agents/Tasks/Workflows/Settings. Agents tab holds apps+conversations+agents+knowledge. Tasks tab holds tasks+schedules. Workflows tab holds procedures+future agent-to-agent workflows. Settings tab becomes a proper config hub: profile, server, LLM providers, pricing, budgets, connectors.
