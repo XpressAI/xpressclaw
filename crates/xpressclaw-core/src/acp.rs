@@ -409,6 +409,13 @@ pub fn default_runner_image(
 }
 
 pub fn local_runner_image(image: &str) -> Option<&'static str> {
+    local_runner_image_for_tag(image, RUNNER_IMAGE_TAG)
+}
+
+fn local_runner_image_for_tag(image: &str, runner_image_tag: &str) -> Option<&'static str> {
+    if runner_image_tag != "latest" {
+        return None;
+    }
     ACP_AGENTS.iter().find_map(|agent| {
         if managed_image_matches(image, agent.minimal_image) {
             Some(agent.local_minimal_image)
@@ -499,8 +506,15 @@ mod tests {
             Some(codex.host_image)
         );
         assert_eq!(
-            local_runner_image(codex.minimal_image),
+            local_runner_image_for_tag(codex.minimal_image, "latest"),
             Some(codex.local_minimal_image)
+        );
+        assert_eq!(
+            local_runner_image_for_tag(
+                codex.minimal_image,
+                "0123456789abcdef0123456789abcdef01234567"
+            ),
+            None
         );
         assert!(is_builtin_runner_image(codex.local_host_image));
         assert!(is_host_runner_image(codex.host_image));
@@ -546,7 +560,7 @@ mod tests {
             Some(dsh.host_image)
         );
         assert_eq!(
-            local_runner_image(dsh.minimal_image),
+            local_runner_image_for_tag(dsh.minimal_image, "latest"),
             Some(dsh.local_minimal_image)
         );
         assert!(is_host_runner_image(dsh.local_host_image));

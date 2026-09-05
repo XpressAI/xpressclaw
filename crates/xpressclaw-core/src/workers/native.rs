@@ -3151,9 +3151,9 @@ pub fn resolved_runner_image(config: &NativeRunnerConfig, kind: &str) -> Result<
     Ok(configured_image.to_string())
 }
 
-/// Local tags used by the ACP runner images. A published image is the
-/// default, but retaining these aliases lets existing developer builds run
-/// without a forced retag or registry pull.
+/// Local tags used by development builds of the ACP runner images.
+/// Release builds use an immutable published tag and never fall back to a
+/// mutable local alias.
 pub fn local_runner_image_alias(image: &str) -> Option<&'static str> {
     local_runner_image(image)
 }
@@ -6563,14 +6563,18 @@ flows:
     }
 
     #[test]
-    fn published_images_keep_the_prototype_local_aliases() {
+    fn development_builds_keep_the_prototype_local_aliases() {
+        let expected_minimal =
+            (crate::acp::RUNNER_IMAGE_TAG == "latest").then_some("xpressclaw-runner-codex:latest");
+        let expected_host = (crate::acp::RUNNER_IMAGE_TAG == "latest")
+            .then_some("xpressclaw-runner-codex-docker:latest");
         assert_eq!(
             local_runner_image_alias("ghcr.io/xpressai/xpressclaw-runner-codex:latest"),
-            Some("xpressclaw-runner-codex:latest")
+            expected_minimal
         );
         assert_eq!(
             local_runner_image_alias("ghcr.io/xpressai/xpressclaw-runner-codex-docker:latest"),
-            Some("xpressclaw-runner-codex-docker:latest")
+            expected_host
         );
         assert_eq!(local_runner_image_alias("example/custom:latest"), None);
     }
