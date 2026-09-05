@@ -22,9 +22,9 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: harness-images-${{ github.ref }}
-  # Release jobs wait for immutable commit tags, so main builds must finish.
-  # Superseded pull-request builds can still be cancelled.
+  # Keep one cancelable lane per PR, but never let a later main push replace an
+  # intermediate revision whose immutable image tag a release may require.
+  group: harness-images-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:

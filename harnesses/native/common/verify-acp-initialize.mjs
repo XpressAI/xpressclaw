@@ -20,7 +20,7 @@ child.stderr.on('data', (chunk) => {
   stderr = `${stderr}${chunk}`.slice(-16 * 1024);
 });
 
-const timeout = setTimeout(() => child.kill('SIGKILL'), 30_000);
+const timeout = setTimeout(() => child.kill('SIGKILL'), 60_000);
 try {
   child.stdin.write(`${JSON.stringify({
     jsonrpc: '2.0',

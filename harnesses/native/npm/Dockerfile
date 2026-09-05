@@ -65,6 +65,12 @@ RUN if [ "${AGENT_DSH_RUNTIME}" = "1" ]; then \
       test "${DSH_SESSION_ROOT}" = "/home/node/.dsh/acp-sessions"; \
     fi \
     && node /opt/xpressclaw/verify-acp-initialize.mjs "${ACP_SMOKE_COMMAND_B64}" \
+    && if [ "${AGENT_KIND}" = "pi" ]; then \
+      printf '%s' '{"mcpServers":{}}' > /tmp/pi-mcp-smoke.json; \
+      XPRESSCLAW_PI_MCP_CONFIG=/tmp/pi-mcp-smoke.json \
+        timeout 30 /opt/xpressclaw/pi-with-mcp --mode rpc --offline --no-session </dev/null; \
+      rm /tmp/pi-mcp-smoke.json; \
+    fi \
     && if [ "${AGENT_ACP_SMOKE}" = "1" ]; then \
       node /opt/xpressclaw/verify-acp-stdio.mjs "${AGENT_BINARY}"; \
     fi

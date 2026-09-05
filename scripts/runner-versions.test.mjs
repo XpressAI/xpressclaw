@@ -80,6 +80,15 @@ test('convenience native builds retain usable ACP smoke defaults', async () => {
   assert.doesNotMatch(dockerBake, /target "native-deepseek-harness(?:-docker)?"/);
 });
 
+test('Pi image startup exercises the production MCP wrapper', async () => {
+  const dockerfile = await readFile(new URL('npm/Dockerfile', nativeHarnessUrl), 'utf8');
+  assert.match(dockerfile, /if \[ "\$\{AGENT_KIND\}" = "pi" \]; then/);
+  assert.match(
+    dockerfile,
+    /XPRESSCLAW_PI_MCP_CONFIG=\/tmp\/pi-mcp-smoke\.json \\\n\s+timeout 30 \/opt\/xpressclaw\/pi-with-mcp --mode rpc --offline --no-session/,
+  );
+});
+
 test('image and release workflows resolve the same immutable runner revision', async () => {
   const [harnessWorkflow, releaseWorkflow] = await Promise.all([
     readFile(harnessWorkflowUrl, 'utf8'),
@@ -87,6 +96,14 @@ test('image and release workflows resolve the same immutable runner revision', a
   ]);
 
   assert.match(harnessWorkflow, /runner_tag=\$\(bash scripts\/runner-revision\.sh\)/);
+  assert.match(
+    harnessWorkflow,
+    /group: harness-images-\$\{\{ github\.event_name == 'pull_request' && github\.ref \|\| github\.sha \}\}/,
+  );
+  assert.match(
+    harnessWorkflow,
+    /cancel-in-progress: \$\{\{ github\.event_name == 'pull_request' \}\}/,
+  );
   assert.match(
     harnessWorkflow,
     /xpressclaw-runner-\$\{\{ matrix\.runner\.id \}\}\$\{\{ matrix\.variant\.suffix \}\}:\$\{\{ needs\.runner-matrix\.outputs\.runner_tag \}\}/,
