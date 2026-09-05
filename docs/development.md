@@ -98,11 +98,18 @@ Use a separate shared target directory for container builds or a different
 toolchain. Do not apply this override to `build.sh`/`build.ps1`: those packaging
 scripts expect binaries in the current checkout's normal `target/` paths.
 
-After stopping builds, `cargo clean --profile dev` clears local debug/test
-artifacts while retaining release output. When using a shared target, pass the
-same `CARGO_TARGET_DIR` for cleanup. Check `git worktree list` first: older
-checkouts may contain source worktrees under `target/`, so deleting the entire
-directory or using unrestricted `cargo clean` would delete that source too.
+Before cleanup, stop builds and check for programs running from the selected
+target directory, including `target/debug/xpressclaw`. `cargo clean --profile dev`
+removes debug/test executables as well as compiler caches, while retaining release
+output. Stop those programs first and preserve any executable needed for restart
+outside the target directory. If a program must remain running, skip profile-wide
+cleanup and remove only inspected cache directories that contain neither active
+executables nor source worktrees.
+
+When using a shared target, pass the same `CARGO_TARGET_DIR` for cleanup. Check
+`git worktree list` first: older checkouts may contain source worktrees under
+`target/`, so deleting the entire directory or using unrestricted `cargo clean`
+would delete that source too.
 
 ## Repository architecture
 
