@@ -21,7 +21,6 @@ on:
 
 concurrency:
   group: harness-images-${{ github.ref }}
-  queue: max
   # Release jobs wait for immutable commit tags, so main builds must finish.
   # Superseded pull-request builds can still be cancelled.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
