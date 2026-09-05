@@ -112,6 +112,12 @@ that exact tag is public. Release binaries use that immutable tag rather than
 `latest`; development builds continue to use `latest`. Promoting that existing
 prerelease does not rebuild or update its runner set.
 
+An installed release can opt into a newer published harness independently of
+the application release. While an Agent is idle, use **Update harness** beside
+its container image. XpressClaw pulls that runner's `latest` tag, verifies the
+built-in image contract, and saves the repository digest it actually received.
+The digest remains fixed until the user explicitly updates the harness again.
+
 For a `github.com` origin, Xpressclaw discovers the host's existing `gh`
 login and supplies Git credentials through `credential.helper`. The worker
 still has the complete Git CLI. GitHub PR, review, check, and Actions

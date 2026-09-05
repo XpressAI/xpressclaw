@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { mcpServers, sessions, setup } from '$lib/api';
+	import { agents, mcpServers, sessions, setup } from '$lib/api';
 	import { canonicalHarnessKind, harnessName, inferHarnessKindFromBackend, openExternal } from '$lib/utils';
 	import DirectoryPicker from '$lib/components/DirectoryPicker.svelte';
 	import type { AcpAgentCatalogEntry, AcpConfigOption, AcpModeState, LiveConfig, McpServerDefinition, McpVerificationResult, NativeRunnerConfig } from '$lib/api';
@@ -43,6 +43,10 @@
 	let mcpError = $state('');
 	let verifyingMcp = $state<string | null>(null);
 	let mcpVerification = $state<Record<string, McpVerificationResult>>({});
+	let updatingRunnerImage = $state(false);
+	let runnerImageUpdate = $state<{ message: string; error: boolean } | null>(null);
+	let savedKind = $state('');
+	let savedContainerEngine = $state<'none' | 'host'>('none');
 	let modelOptions = $derived(selectChoices(configOptions.find((option) => option.category === 'model' || option.id === 'model')));
 	const mcpRegistryUrl = 'https://registry.modelcontextprotocol.io/';
 	const skillsDocumentation: Record<string, string> = {
@@ -70,7 +74,7 @@
 		return containerEngine === 'host' ? agent.host_image : agent.image;
 	}
 
-	function isBuiltInImage(candidate: string): boolean {
+	function isManagedDefaultImage(candidate: string): boolean {
 		return agentOptions.some((agent) => {
 			return [agent.image, agent.host_image].some((published) => {
 				const variants = [published, published.replace('ghcr.io/xpressai/', '')];
@@ -87,6 +91,26 @@
 		});
 	}
 
+	function imageRepository(candidate: string): string {
+		const digestSeparator = candidate.indexOf('@sha256:');
+		if (digestSeparator >= 0) return candidate.slice(0, digestSeparator);
+		const tagSeparator = candidate.lastIndexOf(':');
+		return tagSeparator >= 0 ? candidate.slice(0, tagSeparator) : candidate;
+	}
+
+	function isPublishedDigest(candidate: string): boolean {
+		if (!/@sha256:[0-9a-f]{64}$/.test(candidate)) return false;
+		return agentOptions.some((agent) => {
+			return [agent.image, agent.host_image]
+				.map(imageRepository)
+				.includes(imageRepository(candidate));
+		});
+	}
+
+	let canUpdateRunnerImage = $derived(Boolean(selectedAgent && kind !== 'custom'
+		&& kind === savedKind && containerEngine === savedContainerEngine
+		&& (!image.trim() || isManagedDefaultImage(image.trim()) || isPublishedDigest(image.trim()))));
+
 	function selectChoices(option: AcpConfigOption | undefined): { value: string; name: string; description?: string | null }[] {
 		if (!option || !Array.isArray(option.options)) return [];
 		return option.options.flatMap((entry) => 'options' in entry ? entry.options : [entry]);
@@ -98,9 +122,33 @@
 	}
 
 	function setContainerEngine(enabled: boolean) {
-		const replaceImage = !image.trim() || isBuiltInImage(image.trim());
+		const replaceImage = !image.trim() || isManagedDefaultImage(image.trim()) || canUpdateRunnerImage;
 		containerEngine = enabled ? 'host' : 'none';
 		if (kind !== 'custom' && replaceImage) image = defaultImage();
+	}
+
+	async function updateRunnerImage() {
+		if (updatingRunnerImage) return;
+		updatingRunnerImage = true;
+		runnerImageUpdate = null;
+		try {
+			const result = await agents.updateRunnerImage(agentId);
+			image = result.image;
+			const version = result.version ? ` ${result.version}` : '';
+			runnerImageUpdate = {
+				message: result.changed
+					? `Updated to the latest published harness${version}. New work will use it.`
+					: `This Agent already uses the latest published harness${version}.`,
+				error: false
+			};
+		} catch (cause) {
+			runnerImageUpdate = {
+				message: cause instanceof Error ? cause.message : 'Could not update the harness image.',
+				error: true
+			};
+		} finally {
+			updatingRunnerImage = false;
+		}
 	}
 
 	function validConfigOptions(value: unknown): AcpConfigOption[] {
@@ -163,7 +211,9 @@
 			? inferHarnessKindFromBackend(config.backend)
 			: canonicalHarnessKind(configuredKind);
 		containerEngine = config.runner.container_engine ?? 'none';
-		image = isBuiltInImage(config.runner.image) ? defaultImage() : config.runner.image;
+		savedKind = kind;
+		savedContainerEngine = containerEngine;
+		image = isManagedDefaultImage(config.runner.image) ? defaultImage() : config.runner.image;
 		workspace = config.runner.workspace ?? '';
 		projectName = config.runner.project_name ?? '';
 		model = config.runner.model ?? '';
@@ -382,8 +432,21 @@
 
 		<div class="mt-4">
 			<label for="runner-image" class="mb-1 block text-xs font-medium text-muted-foreground">Container image</label>
-			<input id="runner-image" bind:value={image} class="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-sm outline-none focus:ring-1 focus:ring-ring" />
-			<p class="mt-1 text-[11px] text-muted-foreground">Published images are pulled on demand. Extend one or provide a custom image whose command starts an ACP server over stdio.</p>
+			<div class="flex gap-2">
+				<input id="runner-image" bind:value={image} class="min-w-0 flex-1 rounded-md border border-input bg-background px-3 py-2 font-mono text-sm outline-none focus:ring-1 focus:ring-ring" />
+				{#if canUpdateRunnerImage}
+					<button type="button" onclick={updateRunnerImage} disabled={updatingRunnerImage} class="shrink-0 rounded-md border border-border px-3 py-2 text-xs hover:bg-accent disabled:opacity-50">
+						{updatingRunnerImage ? 'Updating…' : 'Update harness'}
+					</button>
+				{/if}
+			</div>
+			<p class="mt-1 text-[11px] text-muted-foreground">Published images are pulled on demand. While this Agent is idle, Update harness downloads the newest XpressClaw image and pins its exact digest. Extend one or provide a custom image whose command starts an ACP server over stdio.</p>
+			{#if runnerImageUpdate}
+				<div role={runnerImageUpdate.error ? 'alert' : 'status'} class="mt-2 flex items-start justify-between gap-2 rounded-md border px-3 py-2 text-xs {runnerImageUpdate.error ? 'border-destructive/30 bg-destructive/5 text-destructive' : 'border-emerald-500/25 bg-emerald-500/10 text-emerald-600'}">
+					<span>{runnerImageUpdate.message}</span>
+					<button type="button" aria-label="Dismiss harness update message" onclick={() => (runnerImageUpdate = null)} class="shrink-0 opacity-70 hover:opacity-100">×</button>
+				</div>
+			{/if}
 		</div>
 	</div>
 

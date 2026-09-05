@@ -388,6 +388,22 @@ impl SessionManager {
         })
     }
 
+    /// Whether a session has work that has not reached a terminal state.
+    pub fn has_active_attempts(&self, session_id: &str) -> Result<bool> {
+        self.db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM work_attempts
+                    WHERE session_id = ?1
+                      AND status NOT IN ('completed', 'failed', 'cancelled', 'interrupted')
+                )",
+                [session_id],
+                |row| row.get(0),
+            )
+            .map_err(Error::from)
+        })
+    }
+
     pub fn task_activity(
         &self,
         task_id: &str,
@@ -1234,6 +1250,7 @@ mod tests {
         assert_eq!(attempt.status, "queued");
         assert!(attempt.response_queued_at.is_some());
         assert!(attempt.response_started_at.is_none());
+        assert!(manager.has_active_attempts("builder").unwrap());
 
         let running = manager
             .transition_attempt(&attempt.id, "running", "Codex is working", None, None)
@@ -1258,6 +1275,7 @@ mod tests {
                 None,
             )
             .unwrap();
+        assert!(!manager.has_active_attempts("builder").unwrap());
 
         let overview = manager.overview("builder").unwrap();
         assert_eq!(overview.session.status, "idle");

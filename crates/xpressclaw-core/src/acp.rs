@@ -408,6 +408,15 @@ pub fn default_runner_image(
     })
 }
 
+/// Mutable publication tag used only when an operator explicitly asks to
+/// update a built-in runner. Release defaults remain on the immutable tag
+/// compiled into the application.
+pub fn latest_runner_image(kind: &str, container_engine: ContainerEngineAccess) -> Option<String> {
+    let image = default_runner_image(kind, container_engine)?;
+    let (repository, _) = image.rsplit_once(':')?;
+    Some(format!("{repository}:latest"))
+}
+
 pub fn local_runner_image(image: &str) -> Option<&'static str> {
     local_runner_image_for_tag(image, RUNNER_IMAGE_TAG)
 }
@@ -431,6 +440,22 @@ pub fn is_builtin_runner_image(image: &str) -> bool {
     ACP_AGENTS.iter().any(|agent| {
         managed_image_matches(image, agent.minimal_image)
             || managed_image_matches(image, agent.host_image)
+            || published_digest_matches(image, agent.minimal_image)
+            || published_digest_matches(image, agent.host_image)
+            || managed_image_matches(image, agent.local_minimal_image)
+            || managed_image_matches(image, agent.local_host_image)
+    })
+}
+
+/// Whether an image belongs to the built-in product's published repositories.
+/// Explicit digest pins count as built-in for compatibility enforcement, but
+/// are not managed defaults and therefore are not rewritten on app upgrades.
+pub fn is_builtin_runner_image_for_kind(image: &str, kind: &str) -> bool {
+    agent_definition(kind).is_some_and(|agent| {
+        managed_image_matches(image, agent.minimal_image)
+            || managed_image_matches(image, agent.host_image)
+            || published_digest_matches(image, agent.minimal_image)
+            || published_digest_matches(image, agent.host_image)
             || managed_image_matches(image, agent.local_minimal_image)
             || managed_image_matches(image, agent.local_host_image)
     })
@@ -439,6 +464,7 @@ pub fn is_builtin_runner_image(image: &str) -> bool {
 pub fn is_host_runner_image(image: &str) -> bool {
     ACP_AGENTS.iter().any(|agent| {
         managed_image_matches(image, agent.host_image)
+            || published_digest_matches(image, agent.host_image)
             || managed_image_matches(image, agent.local_host_image)
     })
 }
@@ -476,6 +502,22 @@ fn managed_image_matches(candidate: &str, current: &str) -> bool {
                 && candidate_tag
                     .bytes()
                     .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())))
+}
+
+fn published_digest_matches(candidate: &str, current: &str) -> bool {
+    let (candidate_repository, digest) = match candidate.rsplit_once("@sha256:") {
+        Some(parts) => parts,
+        None => return false,
+    };
+    let (current_repository, _) = match current.rsplit_once(':') {
+        Some(parts) => parts,
+        None => return false,
+    };
+    candidate_repository == current_repository
+        && digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 #[cfg(test)]
@@ -519,6 +561,18 @@ mod tests {
         assert!(is_builtin_runner_image(codex.local_host_image));
         assert!(is_host_runner_image(codex.host_image));
         assert!(!is_host_runner_image(codex.minimal_image));
+        assert_eq!(
+            latest_runner_image("codex", ContainerEngineAccess::Host).as_deref(),
+            Some("ghcr.io/xpressai/xpressclaw-runner-codex-docker:latest")
+        );
+        let digest = format!(
+            "ghcr.io/xpressai/xpressclaw-runner-codex@sha256:{}",
+            "a".repeat(64)
+        );
+        assert!(is_builtin_runner_image(&digest));
+        assert!(is_builtin_runner_image_for_kind(&digest, "codex"));
+        assert!(!is_builtin_runner_image_for_kind(&digest, "claude"));
+        assert!(!is_managed_runner_image_for_kind(&digest, "codex"));
         assert!(is_managed_runner_image_for_kind(
             "ghcr.io/xpressai/xpressclaw-runner-codex:0123456789abcdef0123456789abcdef01234567",
             "codex"

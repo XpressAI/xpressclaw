@@ -390,6 +390,21 @@ impl ConversationTurnQueue {
         })
     }
 
+    /// Whether an Agent has a Conversation response queued or running.
+    pub fn has_active_for_agent(&self, agent_id: &str) -> Result<bool> {
+        self.db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM conversation_turns
+                    WHERE agent_id = ?1 AND status IN ('queued', 'running')
+                )",
+                [agent_id],
+                |row| row.get(0),
+            )
+            .map_err(Error::from)
+        })
+    }
+
     /// Store an Agent response and its copied artifacts, then finish the turn
     /// in the same transaction. A participant removed while the prompt is
     /// running cannot publish a late response: cancellation wins before any
@@ -812,6 +827,8 @@ mod tests {
             .unwrap();
         let turns = queue.list_for_conversation(&conversation.id, 10).unwrap();
         assert_eq!(turns.len(), 2);
+        assert!(queue.has_active_for_agent("atlas").unwrap());
+        assert!(queue.has_active_for_agent("reviewer").unwrap());
         assert!(turns.iter().all(|turn| {
             turn.trigger_message_id == Some(second.id)
                 && turn.response_queued_at.as_deref() == Some(second.created_at.as_str())
@@ -854,6 +871,7 @@ mod tests {
             )
             .unwrap();
         let running = queue.claim_next().unwrap().unwrap();
+        assert!(queue.has_active_for_agent("atlas").unwrap());
         db.with_conn(|conn| {
             conn.execute(
                 "INSERT INTO dashboard_git_baselines
@@ -1285,6 +1303,7 @@ mod tests {
             vec![running.id.clone()]
         );
         assert!(!queue.is_running(&running.id).unwrap());
+        assert!(!queue.has_active_for_agent("atlas").unwrap());
         assert!(!queue
             .enqueue(&conversation.id, "atlas", request.id)
             .unwrap());

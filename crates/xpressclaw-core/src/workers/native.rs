@@ -22,7 +22,7 @@ use tracing::{error, info, warn};
 
 use crate::acp::{
     agent_definition, canonical_agent_kind, infer_agent_kind_from_backend,
-    is_managed_runner_image_for_kind, local_runner_image,
+    is_builtin_runner_image_for_kind, is_managed_runner_image_for_kind, local_runner_image,
 };
 use crate::agents::registry::AgentRegistry;
 use crate::collaboration::{network_name as collaboration_network_name, CollaborationSecrets};
@@ -176,6 +176,13 @@ impl NativeRuntimeLifecycle {
             guards.push(slot.write_owned().await);
         }
         guards
+    }
+
+    /// Enter an exclusive Agent runtime boundary only when no turn is using
+    /// it. User-initiated maintenance should fail fast instead of waiting for
+    /// an arbitrarily long coding turn to finish.
+    pub fn try_quiesce_agent(&self, agent_id: &str) -> Option<OwnedRwLockWriteGuard<()>> {
+        self.slot(agent_id).try_write_owned().ok()
     }
 }
 
@@ -743,8 +750,7 @@ async fn execute_conversation_turn(
         &repository.container_bootstrap,
         agent,
     );
-    let built_in_image = default_native_runner_image(&kind, agent.runner.container_engine)
-        == Some(spec.image.as_str());
+    let built_in_image = is_builtin_runner_image_for_kind(&spec.image, &kind);
     if !runner_image_ready(&docker, &spec.image, built_in_image, agent).await {
         let local_fallback = match local_runner_image_alias(&spec.image) {
             Some(image) if runner_image_ready(&docker, image, built_in_image, agent).await => {
@@ -1235,8 +1241,7 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
         &repository.container_bootstrap,
         agent,
     );
-    let built_in_image = default_native_runner_image(&kind, agent.runner.container_engine)
-        == Some(spec.image.as_str());
+    let built_in_image = is_builtin_runner_image_for_kind(&spec.image, &kind);
     let image_ready = runner_image_ready(&docker, &spec.image, built_in_image, agent).await;
     if !image_ready {
         let local_fallback = match local_runner_image_alias(&spec.image) {
