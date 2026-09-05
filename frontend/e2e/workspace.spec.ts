@@ -390,6 +390,7 @@ async function mockApi(
 		sharedProjectState?: SharedProjectState;
 		preserveWorkspace?: boolean;
 		agentRunnerKind?: string;
+		runnerImageUpdateRequests?: string[];
 		runnerReadiness?: Record<string, unknown>;
 		visualizationDocuments?: Record<string, string>;
 		visualizationRequests?: { path: string; token: string | undefined }[];
@@ -814,6 +815,14 @@ async function mockApi(
 			response = {};
 		} else if (path === '/api/agents') {
 			response = availableAgents;
+		} else if (path === `/api/agents/${agentId}/runner-image/update`) {
+			options.runnerImageUpdateRequests?.push(agentId);
+			response = {
+				image: `ghcr.io/xpressai/xpressclaw-runner-${agentRunnerKind}@sha256:${'a'.repeat(64)}`,
+				version: '9.9.9',
+				changed: true,
+				environment_stopped: true,
+			};
 		} else if (path === `/api/agents/${agentId}`) {
 			response = options.agentKind ? {
 				...agent,
@@ -3833,6 +3842,22 @@ test('DeepSeek Harness is preserved in Agent runner settings', async ({ page }) 
 	);
 });
 
+test('built-in harness images can be updated to the latest published digest', async ({ page }) => {
+	const runnerImageUpdateRequests: string[] = [];
+	await mockApi(page, { runnerImageUpdateRequests });
+	await page.goto(`/agents/${agentId}?tab=runner`);
+
+	await page.getByRole('button', { name: 'Update harness' }).click();
+	await expect.poll(() => runnerImageUpdateRequests).toEqual([agentId]);
+	await expect(page.locator('#runner-image')).toHaveValue(
+		`ghcr.io/xpressai/xpressclaw-runner-codex@sha256:${'a'.repeat(64)}`,
+	);
+	const status = page.getByRole('status');
+	await expect(status).toContainText('Updated to the latest published harness 9.9.9');
+	await status.getByRole('button', { name: 'Dismiss harness update message' }).click();
+	await expect(status).toHaveCount(0);
+});
+
 test('custom runner kinds containing a built-in name stay custom in Agent settings', async ({ page }) => {
 	await mockApi(page, { agentRunnerKind: 'codex-proxy' });
 	await page.goto(`/agents/${agentId}?tab=runner`);
@@ -3843,6 +3868,7 @@ test('custom runner kinds containing a built-in name stay custom in Agent settin
 		'Other ACP harness (codex-proxy)',
 	);
 	await expect(page.locator('#runner-image')).toHaveValue('xpressclaw-runner-codex-proxy:latest');
+	await expect(page.getByRole('button', { name: 'Update harness' })).toHaveCount(0);
 });
 
 test('mobile connection recovery stays non-blocking and does not reload the workspace', async ({ page }) => {

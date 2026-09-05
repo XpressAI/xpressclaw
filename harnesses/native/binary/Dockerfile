@@ -10,8 +10,10 @@ ARG AGENT_ARCHIVE_AMD64
 ARG AGENT_ARCHIVE_ARM64
 ARG AGENT_SHA256_AMD64
 ARG AGENT_SHA256_ARM64
+ARG RUNNER_VERSION=development
 LABEL io.xpressclaw.protocol="acp-xpressclaw-v2" \
-    io.xpressclaw.agent="${AGENT_KIND}"
+    io.xpressclaw.agent="${AGENT_KIND}" \
+    io.xpressclaw.runner.version="${RUNNER_VERSION}"
 
 RUN test -n "${AGENT_KIND}" \
     && test -n "${AGENT_BINARY}" \
@@ -42,6 +44,7 @@ RUN test -n "${AGENT_KIND}" \
 
 COPY --chmod=0755 common/mcp-github.mjs /opt/xpressclaw/mcp-github.mjs
 COPY --chmod=0755 common/mcp-xpressclaw.mjs /opt/xpressclaw/mcp-xpressclaw.mjs
+COPY --chmod=0755 common/verify-acp-initialize.mjs /opt/xpressclaw/verify-acp-initialize.mjs
 COPY --chmod=0755 common/git-credential-xpressclaw /usr/local/bin/git-credential-xpressclaw
 
 RUN /opt/xpressclaw/libexec/gh --version \
@@ -49,9 +52,11 @@ RUN /opt/xpressclaw/libexec/gh --version \
     && node --check /opt/xpressclaw/mcp-xpressclaw.mjs
 
 USER node
+ARG ACP_SMOKE_COMMAND_B64
 ENV HOME=/home/node \
     CI=1 \
     NO_COLOR=1
+RUN node /opt/xpressclaw/verify-acp-initialize.mjs "${ACP_SMOKE_COMMAND_B64}"
 WORKDIR /workspace
 ENTRYPOINT []
 

@@ -1,0 +1,320 @@
+{
+  "schema_version": 1,
+  "registry_url": "https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json",
+  "runners": {
+    "codex": {
+      "auto_update": true,
+      "version": "1.10.0",
+      "acp_command": ["codex-acp"],
+      "dockerfile": "codex",
+      "sources": [
+        {
+          "kind": "acp-registry",
+          "id": "codex-acp",
+          "target": "version",
+          "arg": "CODEX_ACP_VERSION"
+        }
+      ],
+      "build_args": {
+        "CODEX_ACP_VERSION": "1.10.0"
+      }
+    },
+    "claude": {
+      "auto_update": true,
+      "version": "0.74.0",
+      "acp_command": ["claude-agent-acp"],
+      "dockerfile": "claude",
+      "sources": [
+        {
+          "kind": "acp-registry",
+          "id": "claude-acp",
+          "target": "version",
+          "arg": "CLAUDE_ACP_VERSION"
+        }
+      ],
+      "build_args": {
+        "CLAUDE_ACP_VERSION": "0.74.0"
+      }
+    },
+    "deepseek-harness": {
+      "auto_update": false,
+      "pin_reason": "0.4.28 fails the runner's ACP protocol smoke test with an internal error",
+      "version": "0.4.24",
+      "acp_command": ["dsh-acp"],
+      "dockerfile": "npm",
+      "sources": [
+        {
+          "kind": "npm",
+          "package": "@openma/deepseek-harness-acp",
+          "target": "package",
+          "arg": "AGENT_PACKAGE"
+        }
+      ],
+      "build_args": {
+        "AGENT_KIND": "deepseek-harness",
+        "AGENT_PACKAGE": "@openma/deepseek-harness-acp@0.4.24",
+        "AGENT_BINARY": "dsh-acp",
+        "AGENT_ACP_SMOKE": "1",
+        "AGENT_DSH_RUNTIME": "1",
+        "AGENT_DSH_PATH": "/opt/xpressclaw/deepseek-harness-runtime/node_modules/@deepseek-ai/dsh",
+        "AGENT_NODE_PATH": "/opt/xpressclaw/deepseek-harness-runtime/node_modules",
+        "AGENT_DSH_SESSION_ROOT": "/home/node/.dsh/acp-sessions"
+      }
+    },
+    "github-copilot": {
+      "auto_update": true,
+      "version": "1.0.83",
+      "acp_command": ["copilot", "--acp"],
+      "dockerfile": "npm",
+      "sources": [
+        {
+          "kind": "acp-registry",
+          "id": "github-copilot-cli",
+          "target": "package",
+          "arg": "AGENT_PACKAGE"
+        }
+      ],
+      "build_args": {
+        "AGENT_KIND": "github-copilot",
+        "AGENT_PACKAGE": "@github/copilot@1.0.83",
+        "AGENT_BINARY": "copilot"
+      }
+    },
+    "junie": {
+      "auto_update": true,
+      "version": "3123.7.0",
+      "acp_command": ["junie", "--acp=true"],
+      "dockerfile": "binary",
+      "sources": [
+        {
+          "kind": "acp-registry",
+          "id": "junie",
+          "target": "binary"
+        }
+      ],
+      "build_args": {
+        "AGENT_KIND": "junie",
+        "AGENT_BINARY": "junie",
+        "AGENT_PATH": "junie-app/bin/junie",
+        "AGENT_ARCHIVE_AMD64": "https://github.com/JetBrains/junie-acp-release/releases/download/3123.7/junie-release-3123.7-linux-amd64.zip",
+        "AGENT_ARCHIVE_ARM64": "https://github.com/JetBrains/junie-acp-release/releases/download/3123.7/junie-release-3123.7-linux-aarch64.zip",
+        "AGENT_SHA256_AMD64": "",
+        "AGENT_SHA256_ARM64": ""
+      }
+    },
+    "kimi": {
+      "auto_update": true,
+      "version": "1.50.0",
+      "acp_command": ["kimi", "acp"],
+      "dockerfile": "binary",
+      "sources": [
+        {
+          "kind": "acp-registry",
+          "id": "kimi",
+          "target": "binary"
+        }
+      ],
+      "build_args": {
+        "AGENT_KIND": "kimi",
+        "AGENT_BINARY": "kimi",
+        "AGENT_PATH": "kimi",
+        "AGENT_ARCHIVE_AMD64": "https://github.com/MoonshotAI/kimi-cli/releases/download/1.50.0/kimi-1.50.0-x86_64-unknown-linux-gnu.tar.gz",
+        "AGENT_ARCHIVE_ARM64": "https://github.com/MoonshotAI/kimi-cli/releases/download/1.50.0/kimi-1.50.0-aarch64-unknown-linux-gnu.tar.gz",
+        "AGENT_SHA256_AMD64": "10ccaa26ee7f5bb43f7c05baf808c11cd0160710b07ac422382d1d1923f3dab6",
+        "AGENT_SHA256_ARM64": "de235322f48abe63e7a8d737f39f0c00fecf724f1dfaa1ae02491bb773ae8070"
+      }
+    },
+    "opencode": {
+      "auto_update": true,
+      "version": "1.18.29",
+      "acp_command": ["opencode", "acp"],
+      "dockerfile": "opencode",
+      "sources": [
+        {
+          "kind": "acp-registry",
+          "id": "opencode",
+          "target": "version",
+          "arg": "OPENCODE_VERSION"
+        }
+      ],
+      "build_args": {
+        "OPENCODE_VERSION": "1.18.29"
+      }
+    },
+    "pi": {
+      "auto_update": true,
+      "version": "0.0.33",
+      "acp_command": ["pi-acp"],
+      "dockerfile": "npm",
+      "sources": [
+        {
+          "kind": "acp-registry",
+          "id": "pi-acp",
+          "target": "package",
+          "arg": "AGENT_PACKAGE"
+        },
+        {
+          "kind": "npm",
+          "package": "@earendil-works/pi-coding-agent",
+          "target": "package",
+          "arg": "AGENT_EXTRA_PACKAGES",
+          "primary": false
+        },
+        {
+          "kind": "npm",
+          "package": "pi-mcp-adapter",
+          "target": "package",
+          "arg": "PI_MCP_PACKAGE",
+          "primary": false
+        }
+      ],
+      "build_args": {
+        "AGENT_KIND": "pi",
+        "AGENT_PACKAGE": "pi-acp@0.0.33",
+        "AGENT_BINARY": "pi-acp",
+        "AGENT_EXTRA_PACKAGES": "@earendil-works/pi-coding-agent@0.85.0",
+        "AGENT_EXTRA_BINARY": "pi",
+        "PI_MCP_PACKAGE": "pi-mcp-adapter@2.32.1"
+      }
+    },
+    "qwen": {
+      "auto_update": true,
+      "version": "0.23.0",
+      "acp_command": ["qwen", "--acp", "--experimental-skills"],
+      "dockerfile": "npm",
+      "sources": [
+        {
+          "kind": "acp-registry",
+          "id": "qwen-code",
+          "target": "package",
+          "arg": "AGENT_PACKAGE"
+        }
+      ],
+      "build_args": {
+        "AGENT_KIND": "qwen",
+        "AGENT_PACKAGE": "@qwen-code/qwen-code@0.23.0",
+        "AGENT_BINARY": "qwen"
+      }
+    },
+    "cline": {
+      "auto_update": true,
+      "version": "3.0.61",
+      "acp_command": ["cline", "--acp"],
+      "dockerfile": "npm",
+      "sources": [
+        {
+          "kind": "acp-registry",
+          "id": "cline",
+          "target": "package",
+          "arg": "AGENT_PACKAGE"
+        }
+      ],
+      "build_args": {
+        "AGENT_KIND": "cline",
+        "AGENT_PACKAGE": "cline@3.0.61",
+        "AGENT_BINARY": "cline"
+      }
+    },
+    "cursor": {
+      "auto_update": true,
+      "version": "2026.09.02",
+      "acp_command": ["cursor-agent", "acp"],
+      "dockerfile": "binary",
+      "sources": [
+        {
+          "kind": "acp-registry",
+          "id": "cursor",
+          "target": "binary"
+        }
+      ],
+      "build_args": {
+        "AGENT_KIND": "cursor",
+        "AGENT_BINARY": "cursor-agent",
+        "AGENT_PATH": "dist-package/cursor-agent",
+        "AGENT_ARCHIVE_AMD64": "https://downloads.cursor.com/lab/2026.09.02-c22c1a3/linux/x64/agent-cli-package.tar.gz",
+        "AGENT_ARCHIVE_ARM64": "https://downloads.cursor.com/lab/2026.09.02-c22c1a3/linux/arm64/agent-cli-package.tar.gz",
+        "AGENT_SHA256_AMD64": "",
+        "AGENT_SHA256_ARM64": ""
+      }
+    },
+    "glm": {
+      "auto_update": true,
+      "version": "1.8.0",
+      "acp_command": ["glm-acp-agent"],
+      "dockerfile": "npm",
+      "sources": [
+        {
+          "kind": "acp-registry",
+          "id": "glm-acp-agent",
+          "target": "package",
+          "arg": "AGENT_PACKAGE"
+        }
+      ],
+      "build_args": {
+        "AGENT_KIND": "glm",
+        "AGENT_PACKAGE": "glm-acp-agent@1.8.0",
+        "AGENT_BINARY": "glm-acp-agent"
+      }
+    },
+    "grok": {
+      "auto_update": true,
+      "version": "1.0.21",
+      "acp_command": ["grok", "agent", "stdio"],
+      "dockerfile": "npm",
+      "sources": [
+        {
+          "kind": "acp-registry",
+          "id": "grok-build",
+          "target": "package",
+          "arg": "AGENT_PACKAGE"
+        }
+      ],
+      "build_args": {
+        "AGENT_KIND": "grok",
+        "AGENT_PACKAGE": "@xai-official/grok@1.0.21",
+        "AGENT_BINARY": "grok"
+      }
+    },
+    "kilo": {
+      "auto_update": true,
+      "version": "7.5.14",
+      "acp_command": ["kilo", "acp"],
+      "dockerfile": "npm",
+      "sources": [
+        {
+          "kind": "acp-registry",
+          "id": "kilo",
+          "target": "package",
+          "arg": "AGENT_PACKAGE"
+        }
+      ],
+      "build_args": {
+        "AGENT_KIND": "kilo",
+        "AGENT_PACKAGE": "@kilocode/cli@7.5.14",
+        "AGENT_BINARY": "kilo"
+      }
+    },
+    "mistral-vibe": {
+      "auto_update": true,
+      "version": "2.24.1",
+      "acp_command": ["vibe-acp"],
+      "dockerfile": "binary",
+      "sources": [
+        {
+          "kind": "acp-registry",
+          "id": "mistral-vibe",
+          "target": "binary"
+        }
+      ],
+      "build_args": {
+        "AGENT_KIND": "mistral-vibe",
+        "AGENT_BINARY": "vibe-acp",
+        "AGENT_PATH": "vibe-acp",
+        "AGENT_ARCHIVE_AMD64": "https://github.com/mistralai/mistral-vibe/releases/download/v2.24.1/vibe-acp-linux-x86_64-2.24.1.tar.gz",
+        "AGENT_ARCHIVE_ARM64": "https://github.com/mistralai/mistral-vibe/releases/download/v2.24.1/vibe-acp-linux-aarch64-2.24.1.tar.gz",
+        "AGENT_SHA256_AMD64": "8e87f581e7c292fbeab7377178e947ddc4e83753c409f1db0760631f11d7083c",
+        "AGENT_SHA256_ARM64": "e43913b43f0666df2a42060cd3bd410805b0ca1218843b0c242edf874a78c31a"
+      }
+    }
+  }
+}
