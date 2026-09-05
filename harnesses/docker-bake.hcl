@@ -12,7 +12,7 @@ variable "TAG" {
 }
 
 group "default" {
-  targets = ["native-codex", "native-claude", "native-deepseek-harness", "native-opencode", "native-codex-docker", "native-claude-docker", "native-deepseek-harness-docker", "native-opencode-docker"]
+  targets = ["native-codex", "native-claude", "native-opencode", "native-codex-docker", "native-claude-docker", "native-opencode-docker"]
 }
 
 // Retained only for developers maintaining the pre-ACP compatibility images.
