@@ -84,6 +84,15 @@ export function validateRunnerVersions(manifest) {
     if (!isExactVersion(runner.version)) {
       fail(`${id}.version must be an exact version`);
     }
+    if (
+      !Array.isArray(runner.acp_command) ||
+      runner.acp_command.length === 0 ||
+      runner.acp_command.some(
+        (part) => typeof part !== 'string' || !part || part.includes('\n') || part.includes('\r'),
+      )
+    ) {
+      fail(`${id}.acp_command must be a non-empty array of single-line strings`);
+    }
     if (!['codex', 'claude', 'opencode', 'npm', 'binary'].includes(runner.dockerfile)) {
       fail(`${id}.dockerfile is unsupported`);
     }
@@ -93,6 +102,9 @@ export function validateRunnerVersions(manifest) {
     if (!isRecord(runner.build_args)) fail(`${id}.build_args must be an object`);
     if ('RUNNER_VERSION' in runner.build_args) {
       fail(`${id}.build_args must not define the generated RUNNER_VERSION argument`);
+    }
+    if ('ACP_SMOKE_COMMAND' in runner.build_args) {
+      fail(`${id}.build_args must not define the generated ACP_SMOKE_COMMAND argument`);
     }
 
     for (const [name, value] of Object.entries(runner.build_args)) {
@@ -271,7 +283,11 @@ export function runnerMatrix(manifest) {
     id,
     version: runner.version,
     dockerfile: runner.dockerfile,
-    build_args: Object.entries({ ...runner.build_args, RUNNER_VERSION: runner.version })
+    build_args: Object.entries({
+      ...runner.build_args,
+      ACP_SMOKE_COMMAND: JSON.stringify(runner.acp_command),
+      RUNNER_VERSION: runner.version,
+    })
       .map(([name, value]) => `${name}=${value}`)
       .join('\n'),
   }));

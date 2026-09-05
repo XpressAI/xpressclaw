@@ -41,6 +41,7 @@ COPY --chmod=0755 common/mcp-xpressclaw.mjs /opt/xpressclaw/mcp-xpressclaw.mjs
 COPY --chmod=0755 common/pi-with-mcp /opt/xpressclaw/pi-with-mcp
 COPY --chmod=0755 common/prepare-deepseek-harness.mjs /opt/xpressclaw/prepare-deepseek-harness.mjs
 COPY --chmod=0755 common/verify-acp-stdio.mjs /opt/xpressclaw/verify-acp-stdio.mjs
+COPY --chmod=0755 common/verify-acp-initialize.mjs /opt/xpressclaw/verify-acp-initialize.mjs
 COPY --chmod=0755 common/git-credential-xpressclaw /usr/local/bin/git-credential-xpressclaw
 
 RUN /opt/xpressclaw/libexec/gh --version \
@@ -53,6 +54,7 @@ RUN /opt/xpressclaw/libexec/gh --version \
     && test -x /opt/xpressclaw/pi-with-mcp
 
 USER node
+ARG ACP_SMOKE_COMMAND
 ENV HOME=/home/node \
     CI=1 \
     NO_COLOR=1 \
@@ -62,6 +64,7 @@ ENV HOME=/home/node \
 RUN if [ "${AGENT_DSH_RUNTIME}" = "1" ]; then \
       test "${DSH_SESSION_ROOT}" = "/home/node/.dsh/acp-sessions"; \
     fi \
+    && node /opt/xpressclaw/verify-acp-initialize.mjs "${ACP_SMOKE_COMMAND}" \
     && if [ "${AGENT_ACP_SMOKE}" = "1" ]; then \
       node /opt/xpressclaw/verify-acp-stdio.mjs "${AGENT_BINARY}"; \
     fi

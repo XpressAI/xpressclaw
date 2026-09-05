@@ -5,6 +5,7 @@
     "codex": {
       "auto_update": true,
       "version": "1.10.0",
+      "acp_command": ["codex-acp"],
       "dockerfile": "codex",
       "sources": [
         {
@@ -21,6 +22,7 @@
     "claude": {
       "auto_update": true,
       "version": "0.74.0",
+      "acp_command": ["claude-agent-acp"],
       "dockerfile": "claude",
       "sources": [
         {
@@ -38,6 +40,7 @@
       "auto_update": false,
       "pin_reason": "0.4.28 fails the runner's ACP protocol smoke test with an internal error",
       "version": "0.4.24",
+      "acp_command": ["dsh-acp"],
       "dockerfile": "npm",
       "sources": [
         {
@@ -61,6 +64,7 @@
     "github-copilot": {
       "auto_update": true,
       "version": "1.0.83",
+      "acp_command": ["copilot", "--acp"],
       "dockerfile": "npm",
       "sources": [
         {
@@ -79,6 +83,7 @@
     "junie": {
       "auto_update": true,
       "version": "3123.7.0",
+      "acp_command": ["junie", "--acp=true"],
       "dockerfile": "binary",
       "sources": [
         {
@@ -100,6 +105,7 @@
     "kimi": {
       "auto_update": true,
       "version": "1.50.0",
+      "acp_command": ["kimi", "acp"],
       "dockerfile": "binary",
       "sources": [
         {
@@ -121,6 +127,7 @@
     "opencode": {
       "auto_update": true,
       "version": "1.18.29",
+      "acp_command": ["opencode", "acp"],
       "dockerfile": "opencode",
       "sources": [
         {
@@ -137,6 +144,7 @@
     "pi": {
       "auto_update": true,
       "version": "0.0.33",
+      "acp_command": ["pi-acp"],
       "dockerfile": "npm",
       "sources": [
         {
@@ -172,6 +180,7 @@
     "qwen": {
       "auto_update": true,
       "version": "0.23.0",
+      "acp_command": ["qwen", "--acp", "--experimental-skills"],
       "dockerfile": "npm",
       "sources": [
         {
@@ -190,6 +199,7 @@
     "cline": {
       "auto_update": true,
       "version": "3.0.61",
+      "acp_command": ["cline", "--acp"],
       "dockerfile": "npm",
       "sources": [
         {
@@ -208,6 +218,7 @@
     "cursor": {
       "auto_update": true,
       "version": "2026.09.02",
+      "acp_command": ["cursor-agent", "acp"],
       "dockerfile": "binary",
       "sources": [
         {
@@ -229,6 +240,7 @@
     "glm": {
       "auto_update": true,
       "version": "1.8.0",
+      "acp_command": ["glm-acp-agent"],
       "dockerfile": "npm",
       "sources": [
         {
@@ -247,6 +259,7 @@
     "grok": {
       "auto_update": true,
       "version": "1.0.21",
+      "acp_command": ["grok", "agent", "stdio"],
       "dockerfile": "npm",
       "sources": [
         {
@@ -265,6 +278,7 @@
     "kilo": {
       "auto_update": true,
       "version": "7.5.14",
+      "acp_command": ["kilo", "acp"],
       "dockerfile": "npm",
       "sources": [
         {
@@ -283,6 +297,7 @@
     "mistral-vibe": {
       "auto_update": true,
       "version": "2.24.1",
+      "acp_command": ["vibe-acp"],
       "dockerfile": "binary",
       "sources": [
         {

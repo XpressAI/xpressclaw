@@ -44,6 +44,7 @@ RUN test -n "${AGENT_KIND}" \
 
 COPY --chmod=0755 common/mcp-github.mjs /opt/xpressclaw/mcp-github.mjs
 COPY --chmod=0755 common/mcp-xpressclaw.mjs /opt/xpressclaw/mcp-xpressclaw.mjs
+COPY --chmod=0755 common/verify-acp-initialize.mjs /opt/xpressclaw/verify-acp-initialize.mjs
 COPY --chmod=0755 common/git-credential-xpressclaw /usr/local/bin/git-credential-xpressclaw
 
 RUN /opt/xpressclaw/libexec/gh --version \
@@ -51,9 +52,11 @@ RUN /opt/xpressclaw/libexec/gh --version \
     && node --check /opt/xpressclaw/mcp-xpressclaw.mjs
 
 USER node
+ARG ACP_SMOKE_COMMAND
 ENV HOME=/home/node \
     CI=1 \
     NO_COLOR=1
+RUN node /opt/xpressclaw/verify-acp-initialize.mjs "${ACP_SMOKE_COMMAND}"
 WORKDIR /workspace
 ENTRYPOINT []
 

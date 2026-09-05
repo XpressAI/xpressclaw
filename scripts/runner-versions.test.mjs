@@ -13,6 +13,24 @@ const manifestUrl = new URL('../harnesses/runner-versions.json', import.meta.url
 const harnessWorkflowUrl = new URL('../.github/workflows/harnesses.yml', import.meta.url);
 const releaseWorkflowUrl = new URL('../.github/workflows/release.yml', import.meta.url);
 
+const expectedAcpCommands = {
+  codex: ['codex-acp'],
+  claude: ['claude-agent-acp'],
+  'deepseek-harness': ['dsh-acp'],
+  'github-copilot': ['copilot', '--acp'],
+  junie: ['junie', '--acp=true'],
+  kimi: ['kimi', 'acp'],
+  opencode: ['opencode', 'acp'],
+  pi: ['pi-acp'],
+  qwen: ['qwen', '--acp', '--experimental-skills'],
+  cline: ['cline', '--acp'],
+  cursor: ['cursor-agent', 'acp'],
+  glm: ['glm-acp-agent'],
+  grok: ['grok', 'agent', 'stdio'],
+  kilo: ['kilo', 'acp'],
+  'mistral-vibe': ['vibe-acp'],
+};
+
 async function manifest() {
   return JSON.parse(await readFile(manifestUrl, 'utf8'));
 }
@@ -28,9 +46,17 @@ test('the checked-in runner manifest is complete and produces exact build argume
 
   assert.deepEqual(matrix.map((runner) => runner.id), expectedRunnerIds);
   for (const runner of matrix) {
+    const buildArgs = Object.fromEntries(
+      runner.build_args.split('\n').map((line) => line.split(/=(.*)/s, 2)),
+    );
     assert.match(runner.build_args, new RegExp(`(^|\\n)RUNNER_VERSION=${runner.version}$`));
+    assert.deepEqual(JSON.parse(buildArgs.ACP_SMOKE_COMMAND), expectedAcpCommands[runner.id]);
     assert.doesNotMatch(runner.build_args, /(^|[=@])latest($|\n)/);
   }
+  assert.deepEqual(
+    Object.fromEntries(Object.entries(input.runners).map(([id, runner]) => [id, runner.acp_command])),
+    expectedAcpCommands,
+  );
 });
 
 test('image and release workflows resolve the same immutable runner revision', async () => {
