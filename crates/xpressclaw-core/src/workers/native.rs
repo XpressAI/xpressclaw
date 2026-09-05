@@ -910,6 +910,7 @@ async fn execute_conversation_turn(
             AcpTurnOptions {
                 model: agent.runner.model.clone(),
                 session_config: agent.runner.session_config.clone(),
+                optional_session_config_ids: agent.runner.session_config.keys().cloned().collect(),
                 mcp_servers,
                 mcp_signature,
                 additional_directories: presentation_support.additional_directories,
@@ -1410,7 +1411,8 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
             &prompt.content,
             AcpTurnOptions {
                 model: agent.runner.model.clone(),
-                session_config: requested_session_config,
+                session_config: requested_session_config.values,
+                optional_session_config_ids: requested_session_config.optional_ids,
                 mcp_servers,
                 mcp_signature,
                 additional_directories: presentation_support.additional_directories,
@@ -2711,6 +2713,11 @@ fn mcp_server_from_config(name: &str, config: &McpServerConfig) -> Result<McpSer
     }
 }
 
+struct RequestedSessionConfig {
+    values: HashMap<String, Value>,
+    optional_ids: HashSet<String>,
+}
+
 /// Merge harness defaults, workflow/task overrides, and the controls chosen
 /// alongside the latest user message. Values stay keyed by opaque ACP option
 /// IDs; the adapter remains the source of truth for what each option means.
@@ -2718,8 +2725,9 @@ fn requested_session_config(
     db: &Arc<Database>,
     agent: &AgentConfig,
     task_id: &str,
-) -> Result<std::collections::HashMap<String, Value>> {
+) -> Result<RequestedSessionConfig> {
     let mut requested = agent.runner.session_config.clone();
+    let mut optional_ids = requested.keys().cloned().collect::<HashSet<_>>();
     let task = TaskBoard::new(db.clone()).get(task_id)?;
     if let Some(overrides) = task
         .context
@@ -2727,11 +2735,10 @@ fn requested_session_config(
         .and_then(|context| context.get("session_config"))
         .and_then(Value::as_object)
     {
-        requested.extend(
-            overrides
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone())),
-        );
+        for (key, value) in overrides {
+            requested.insert(key.clone(), value.clone());
+            optional_ids.remove(key);
+        }
     }
 
     let latest_message_payload: Option<String> = db.with_conn(|conn| {
@@ -2752,13 +2759,22 @@ fn requested_session_config(
         .and_then(|payload| payload.get("config_options"))
         .and_then(Value::as_object)
     {
-        requested.extend(
-            overrides
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone())),
-        );
+        for (key, value) in overrides {
+            // TaskView sends its full selected control map on every message.
+            // Preserve preference provenance when that merely echoes the
+            // untouched runner value; changed values remain requirements.
+            let unchanged_preference =
+                optional_ids.contains(key) && requested.get(key) == Some(value);
+            requested.insert(key.clone(), value.clone());
+            if !unchanged_preference {
+                optional_ids.remove(key);
+            }
+        }
     }
-    Ok(requested)
+    Ok(RequestedSessionConfig {
+        values: requested,
+        optional_ids,
+    })
 }
 
 fn repository_volume_mounts(
@@ -5464,6 +5480,8 @@ flows:
                     payload: json!({
                         "config_options": {
                             "mode": "build",
+                            "model": "fast",
+                            "effort": "low",
                             "approval_policy": true
                         }
                     }),
@@ -5476,6 +5494,7 @@ flows:
                 session_config: [
                     ("mode".into(), json!("default")),
                     ("model".into(), json!("fast")),
+                    ("effort".into(), json!("low")),
                     ("approval_policy".into(), json!(false)),
                 ]
                 .into_iter()
@@ -5485,10 +5504,20 @@ flows:
             ..Default::default()
         };
         let requested = requested_session_config(&db, &agent, &task.id).unwrap();
-        assert_eq!(requested.get("model"), Some(&json!("fast")));
-        assert_eq!(requested.get("thought_level"), Some(&json!("medium")));
-        assert_eq!(requested.get("mode"), Some(&json!("build")));
-        assert_eq!(requested.get("approval_policy"), Some(&json!(true)));
+        assert_eq!(requested.values.get("model"), Some(&json!("fast")));
+        assert_eq!(requested.values.get("effort"), Some(&json!("low")));
+        assert_eq!(
+            requested.values.get("thought_level"),
+            Some(&json!("medium"))
+        );
+        assert_eq!(requested.values.get("mode"), Some(&json!("build")));
+        assert_eq!(requested.values.get("approval_policy"), Some(&json!(true)));
+        // UI-echoed harness preferences stay optional. Workflow controls and
+        // changed message controls remain requirements.
+        assert_eq!(
+            requested.optional_ids,
+            HashSet::from(["effort".into(), "model".into()])
+        );
     }
 
     #[test]

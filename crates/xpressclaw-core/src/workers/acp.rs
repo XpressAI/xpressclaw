@@ -297,6 +297,10 @@ pub enum AcpSessionStart {
 pub struct AcpTurnOptions {
     pub model: Option<String>,
     pub session_config: HashMap<String, Value>,
+    /// Stored preferences may be unavailable for the model selected in this
+    /// session. Explicit workflow and message controls are intentionally not
+    /// included here so unsupported required configuration still fails.
+    pub optional_session_config_ids: HashSet<String>,
     pub mcp_servers: Vec<McpServer>,
     /// Extra workspace roots advertised through ACP. Codex ACP maps a root's
     /// `.agents/skills` directory into its session-scoped skill discovery.
@@ -1232,6 +1236,7 @@ async fn run_connected_turn(
     let AcpTurnOptions {
         model,
         session_config: requested_config,
+        optional_session_config_ids,
         mcp_servers,
         mcp_signature,
         additional_directories,
@@ -1448,77 +1453,103 @@ async fn run_connected_turn(
 
     let mut requested_config = requested_config.into_iter().collect::<Vec<_>>();
     requested_config.sort_by(|left, right| left.0.cmp(&right.0));
-    for (config_id, value) in requested_config {
-        if let Some(option) = config_options
-            .iter()
-            .find(|option| option.id.to_string() == config_id)
-        {
-            let option_name = option.name.clone();
-            let value = resolve_config_value(option, &value)
-                .map_err(agent_client_protocol::util::internal_error)?;
-            let display_value = match &value {
-                SessionConfigOptionValue::Boolean { value } => value.to_string(),
-                SessionConfigOptionValue::ValueId { value } => value.to_string(),
-                _ => "updated".to_string(),
-            };
-            let response = connection
-                .send_request(SetSessionConfigOptionRequest::new(
-                    session_id.clone(),
-                    config_id.clone(),
-                    value.clone(),
-                ))
-                .block_task()
-                .await?;
-            if !response.config_options.is_empty() {
-                config_options = response.config_options;
+    loop {
+        let mut deferred_config = Vec::new();
+        let mut made_progress = false;
+        for (config_id, value) in std::mem::take(&mut requested_config) {
+            if let Some(option) = config_options
+                .iter()
+                .find(|option| option.id.to_string() == config_id)
+            {
+                let option_name = option.name.clone();
+                let value = resolve_config_value(option, &value)
+                    .map_err(agent_client_protocol::util::internal_error)?;
+                let display_value = match &value {
+                    SessionConfigOptionValue::Boolean { value } => value.to_string(),
+                    SessionConfigOptionValue::ValueId { value } => value.to_string(),
+                    _ => "updated".to_string(),
+                };
+                let response = connection
+                    .send_request(SetSessionConfigOptionRequest::new(
+                        session_id.clone(),
+                        config_id.clone(),
+                        value.clone(),
+                    ))
+                    .block_task()
+                    .await?;
+                if !response.config_options.is_empty() {
+                    config_options = response.config_options;
+                }
+                recorder
+                    .append_event(
+                        "session_config",
+                        &format!("Set {option_name} to {display_value}"),
+                        json!({ "config_id": config_id, "value": value }),
+                    )
+                    .map_err(agent_client_protocol::Error::into_internal_error)?;
+                made_progress = true;
+                continue;
             }
-            recorder
-                .append_event(
-                    "session_config",
-                    &format!("Set {option_name} to {display_value}"),
-                    json!({ "config_id": config_id, "value": value }),
-                )
-                .map_err(agent_client_protocol::Error::into_internal_error)?;
-            continue;
+
+            if config_id == "mode" {
+                let requested_mode = value.as_str().ok_or_else(|| {
+                    agent_client_protocol::util::internal_error(
+                        "legacy ACP mode values must be strings",
+                    )
+                })?;
+                let available = modes.as_ref().ok_or_else(|| {
+                    agent_client_protocol::util::internal_error(format!(
+                        "ACP agent does not advertise a session config option or legacy mode named '{config_id}'"
+                    ))
+                })?;
+                if !available
+                    .available_modes
+                    .iter()
+                    .any(|mode| mode.id.to_string() == requested_mode)
+                {
+                    return Err(agent_client_protocol::util::internal_error(format!(
+                        "ACP agent does not offer mode '{requested_mode}'"
+                    )));
+                }
+                connection
+                    .send_request(SetSessionModeRequest::new(
+                        session_id.clone(),
+                        requested_mode.to_string(),
+                    ))
+                    .block_task()
+                    .await?;
+                if let Some(modes) = modes.as_mut() {
+                    modes.current_mode_id = requested_mode.to_string().into();
+                }
+                recorder
+                    .append_event(
+                        "session_mode",
+                        &format!("Switched to {requested_mode} mode"),
+                        json!({ "mode_id": requested_mode }),
+                    )
+                    .map_err(agent_client_protocol::Error::into_internal_error)?;
+                made_progress = true;
+                continue;
+            }
+
+            deferred_config.push((config_id, value));
         }
 
-        if config_id == "mode" {
-            let requested_mode = value.as_str().ok_or_else(|| {
-                agent_client_protocol::util::internal_error(
-                    "legacy ACP mode values must be strings",
-                )
-            })?;
-            let available = modes.as_ref().ok_or_else(|| {
-                agent_client_protocol::util::internal_error(format!(
-                    "ACP agent does not advertise a session config option or legacy mode named '{config_id}'"
-                ))
-            })?;
-            if !available
-                .available_modes
-                .iter()
-                .any(|mode| mode.id.to_string() == requested_mode)
-            {
-                return Err(agent_client_protocol::util::internal_error(format!(
-                    "ACP agent does not offer mode '{requested_mode}'"
-                )));
-            }
-            connection
-                .send_request(SetSessionModeRequest::new(
-                    session_id.clone(),
-                    requested_mode.to_string(),
-                ))
-                .block_task()
-                .await?;
-            if let Some(modes) = modes.as_mut() {
-                modes.current_mode_id = requested_mode.to_string().into();
-            }
-            recorder
-                .append_event(
-                    "session_mode",
-                    &format!("Switched to {requested_mode} mode"),
-                    json!({ "mode_id": requested_mode }),
-                )
-                .map_err(agent_client_protocol::Error::into_internal_error)?;
+        requested_config = deferred_config;
+        if requested_config.is_empty() || !made_progress {
+            break;
+        }
+    }
+
+    for (config_id, _) in requested_config {
+        if optional_session_config_ids.contains(&config_id) {
+            // Session controls can change with the selected model. Stored
+            // preferences should not block a turn when no requested model or
+            // config mutation makes them available.
+            warn!(
+                config_id = %config_id,
+                "skipping stored ACP session preference not advertised for this session"
+            );
             continue;
         }
 
@@ -2019,18 +2050,41 @@ mod tests {
                     }
                     "session/set_config_option" => {
                         assert_eq!(request["params"]["sessionId"], "acp-session-1");
-                        match request["params"]["configId"].as_str().unwrap() {
-                            "model" => assert_eq!(request["params"]["value"], "model-test"),
+                        let config_options = match request["params"]["configId"].as_str().unwrap() {
+                            "model" => {
+                                assert_eq!(request["params"]["value"], "model-test");
+                                vec![
+                                    SessionConfigOption::select(
+                                        "analysis_depth",
+                                        "Analysis depth",
+                                        "shallow",
+                                        vec![
+                                            SessionConfigSelectOption::new("shallow", "Shallow"),
+                                            SessionConfigSelectOption::new("deep", "Deep"),
+                                        ],
+                                    ),
+                                    SessionConfigOption::boolean(
+                                        "use_fast_tools",
+                                        "Use fast tools",
+                                        false,
+                                    ),
+                                ]
+                            }
+                            "analysis_depth" => {
+                                assert_eq!(request["params"]["value"], "deep");
+                                vec![]
+                            }
                             "use_fast_tools" => {
                                 assert_eq!(request["params"]["type"], "boolean");
                                 assert_eq!(request["params"]["value"], true);
+                                vec![]
                             }
                             other => panic!("unexpected config option: {other}"),
-                        }
+                        };
                         json!({
                             "jsonrpc": "2.0",
                             "id": id,
-                            "result": SetSessionConfigOptionResponse::new(vec![]),
+                            "result": SetSessionConfigOptionResponse::new(config_options),
                         })
                     }
                     "session/set_mode" => {
@@ -2113,10 +2167,23 @@ mod tests {
             Path::new("/workspace"),
             "Do the work",
             AcpTurnOptions {
-                model: Some("Test Model".into()),
+                model: None,
                 session_config: [
+                    // The current model does not expose analysis depth, but
+                    // choosing the stored model does. It must be retried,
+                    // while stale effort remains safe to skip.
+                    ("analysis_depth".into(), json!("deep")),
+                    ("effort".into(), json!("low")),
+                    ("model".into(), json!("Test Model")),
                     ("mode".into(), json!("build")),
                     ("use_fast_tools".into(), json!(true)),
+                ]
+                .into_iter()
+                .collect(),
+                optional_session_config_ids: [
+                    "analysis_depth".into(),
+                    "effort".into(),
+                    "model".into(),
                 ]
                 .into_iter()
                 .collect(),
@@ -2147,7 +2214,13 @@ mod tests {
             .any(|event| event.event_type == "session_config_options"));
         assert!(events
             .iter()
-            .any(|event| event.summary == "Using model model-test"));
+            .any(|event| event.summary == "Set Model to model-test"));
+        assert!(events
+            .iter()
+            .any(|event| event.summary == "Set Analysis depth to deep"));
+        assert!(!events
+            .iter()
+            .any(|event| event.summary.starts_with("Set Effort")));
         assert!(events
             .iter()
             .any(|event| event.summary == "Set Use fast tools to true"));
