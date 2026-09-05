@@ -51,16 +51,7 @@ jobs:
           NEXT_BUILD=$((${LAST_BUILD:-0} + 1))
           VERSION=$(node scripts/release-metadata.mjs --release-version "$NEXT_BUILD")
           TAG="v${VERSION}"
-          # `-m` keeps a merge commit whose first-parent diff changed a runner
-          # input. That is the SHA used by the main-branch image workflow.
-          RUNNER_TAG=$(git log --first-parent -m -1 --format=%H -- \
-            harnesses \
-            scripts/build-runner-images.sh \
-            scripts/runner-versions.mjs \
-            scripts/runner-versions.test.mjs \
-            scripts/verify-runner-images.sh \
-            .github/workflows/harnesses.yml)
-          test -n "$RUNNER_TAG"
+          RUNNER_TAG=$(bash scripts/runner-revision.sh)
 
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "build=$NEXT_BUILD" >> "$GITHUB_OUTPUT"

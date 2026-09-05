@@ -10,6 +10,8 @@ import {
 } from './runner-versions.mjs';
 
 const manifestUrl = new URL('../harnesses/runner-versions.json', import.meta.url);
+const harnessWorkflowUrl = new URL('../.github/workflows/harnesses.yml', import.meta.url);
+const releaseWorkflowUrl = new URL('../.github/workflows/release.yml', import.meta.url);
 
 async function manifest() {
   return JSON.parse(await readFile(manifestUrl, 'utf8'));
@@ -29,6 +31,21 @@ test('the checked-in runner manifest is complete and produces exact build argume
     assert.match(runner.build_args, new RegExp(`(^|\\n)RUNNER_VERSION=${runner.version}$`));
     assert.doesNotMatch(runner.build_args, /(^|[=@])latest($|\n)/);
   }
+});
+
+test('image and release workflows resolve the same immutable runner revision', async () => {
+  const [harnessWorkflow, releaseWorkflow] = await Promise.all([
+    readFile(harnessWorkflowUrl, 'utf8'),
+    readFile(releaseWorkflowUrl, 'utf8'),
+  ]);
+
+  assert.match(harnessWorkflow, /runner_tag=\$\(bash scripts\/runner-revision\.sh\)/);
+  assert.match(
+    harnessWorkflow,
+    /xpressclaw-runner-\$\{\{ matrix\.runner\.id \}\}\$\{\{ matrix\.variant\.suffix \}\}:\$\{\{ needs\.runner-matrix\.outputs\.runner_tag \}\}/,
+  );
+  assert.doesNotMatch(harnessWorkflow, /xpressclaw-runner-.*:\$\{\{ github\.sha \}\}/);
+  assert.match(releaseWorkflow, /RUNNER_TAG=\$\(bash scripts\/runner-revision\.sh\)/);
 });
 
 test('updates tracked registry and npm sources while leaving a pinned runner unchanged', async () => {

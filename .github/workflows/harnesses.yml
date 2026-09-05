@@ -6,6 +6,7 @@ on:
     paths:
       - 'harnesses/**'
       - 'scripts/build-runner-images.sh'
+      - 'scripts/runner-revision.sh'
       - 'scripts/runner-versions*.mjs'
       - 'scripts/verify-runner-images.sh'
       - '.github/workflows/harnesses.yml'
@@ -14,6 +15,7 @@ on:
     paths:
       - 'harnesses/**'
       - 'scripts/build-runner-images.sh'
+      - 'scripts/runner-revision.sh'
       - 'scripts/runner-versions*.mjs'
       - 'scripts/verify-runner-images.sh'
       - '.github/workflows/harnesses.yml'
@@ -33,8 +35,11 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       runners: ${{ steps.versions.outputs.runners }}
+      runner_tag: ${{ steps.versions.outputs.runner_tag }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:
@@ -45,7 +50,9 @@ jobs:
 
       - name: Generate runner matrix
         id: versions
-        run: echo "runners=$(node scripts/runner-versions.mjs matrix)" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "runners=$(node scripts/runner-versions.mjs matrix)" >> "$GITHUB_OUTPUT"
+          echo "runner_tag=$(bash scripts/runner-revision.sh)" >> "$GITHUB_OUTPUT"
 
   build-native-runners:
     needs: runner-matrix
@@ -86,10 +93,10 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: |
             ${{ env.REGISTRY }}/xpressclaw-runner-${{ matrix.runner.id }}${{ matrix.variant.suffix }}:latest
-            ${{ env.REGISTRY }}/xpressclaw-runner-${{ matrix.runner.id }}${{ matrix.variant.suffix }}:${{ github.sha }}
+            ${{ env.REGISTRY }}/xpressclaw-runner-${{ matrix.runner.id }}${{ matrix.variant.suffix }}:${{ needs.runner-matrix.outputs.runner_tag }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.revision=${{ needs.runner-matrix.outputs.runner_tag }}
             org.opencontainers.image.licenses=Apache-2.0
             io.xpressclaw.runner.version=${{ matrix.runner.version }}
           cache-from: type=gha
@@ -97,7 +104,7 @@ jobs:
 
   verify-public-runners:
     if: github.event_name != 'pull_request'
-    needs: build-native-runners
+    needs: [runner-matrix, build-native-runners]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -105,4 +112,4 @@ jobs:
       - uses: docker/setup-buildx-action@v3
 
       - name: Verify anonymous runner access
-        run: bash scripts/verify-runner-images.sh 120
+        run: bash scripts/verify-runner-images.sh 120 "${{ needs.runner-matrix.outputs.runner_tag }}"
