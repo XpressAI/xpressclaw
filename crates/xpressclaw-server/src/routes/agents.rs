@@ -5,13 +5,17 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use xpressclaw_core::acp::{is_builtin_runner_image_for_kind, latest_runner_image};
 use xpressclaw_core::agents::registry::{AgentRecord, AgentRegistry};
 use xpressclaw_core::config::{
     AgentConfig, AgentLlmConfig, BudgetConfig, HooksConfig, NativeRunnerConfig, RateLimitConfig,
     WakeOnConfig,
 };
+use xpressclaw_core::conversations::runtime::ConversationTurnQueue;
 use xpressclaw_core::sessions::LogicalSession;
+use xpressclaw_core::sessions::SessionManager;
 use xpressclaw_core::workers::acp::AcpInterruptMode;
+use xpressclaw_core::workers::native::{resolve_runner_kind, runner_image_compatible};
 
 use crate::state::AppState;
 
@@ -25,6 +29,10 @@ pub fn routes() -> Router<AppState> {
         .route("/", get(list_agents))
         .route("/{id}", get(get_agent).delete(delete_agent))
         .route("/{id}/config", axum::routing::patch(update_agent_config))
+        .route(
+            "/{id}/runner-image/update",
+            axum::routing::post(update_runner_image),
+        )
         .route("/{id}/start", axum::routing::post(start_agent))
         .route("/{id}/stop", axum::routing::post(stop_agent))
         .route("/{id}/logs", get(raw_logs_removed))
@@ -218,6 +226,135 @@ async fn stop_agent(
         .ensure(&record.id, Some(&record.name))
         .ok();
     Ok(Json(agent_json(&record, &config, session.as_ref())))
+}
+
+/// Pull the newest published image for a built-in ACP harness and pin this
+/// Agent to the immutable digest that was actually received. Existing work is
+/// never interrupted; the update is accepted only at an idle runtime boundary.
+async fn update_runner_image(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let registry = AgentRegistry::new(state.db.clone());
+    let record = registry.get(&id).map_err(|error| match &error {
+        xpressclaw_core::error::Error::AgentNotFound { .. } => not_found(&error),
+        _ => internal_error(error),
+    })?;
+    let docker = state.docker().await.ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "Docker or Podman is not available" })),
+        )
+    })?;
+
+    // Match Project deletion's config-then-runtime lock order. The try-lock
+    // makes this explicit maintenance action return immediately during work.
+    let _config_guard = state.config_write_lock.lock().await;
+    let current_config = state.config();
+    let current_agent = current_config
+        .agents
+        .iter()
+        .find(|agent| agent.name == record.name)
+        .ok_or_else(|| not_found(format!("Agent configuration not found: {}", record.name)))?;
+    let kind = resolve_runner_kind(current_agent).map_err(bad_request)?;
+    if !is_builtin_runner_image_for_kind(&current_agent.runner.image, &kind)
+        && !current_agent.runner.image.trim().is_empty()
+    {
+        return Err(bad_request(
+            "Only built-in XpressClaw harness images can be updated from the published registry",
+        ));
+    }
+    let latest_image = latest_runner_image(&kind, current_agent.runner.container_engine)
+        .ok_or_else(|| bad_request("The selected harness has no published XpressClaw image"))?;
+    let _runtime_guard = state
+        .native_runtime_lifecycle
+        .try_quiesce_agent(&record.name)
+        .ok_or_else(agent_busy)?;
+    ensure_agent_has_no_active_work(&state, &record.name)?;
+
+    docker
+        .pull_image(&latest_image)
+        .await
+        .map_err(internal_error)?;
+    let host_image = current_agent.runner.container_engine
+        == xpressclaw_core::config::ContainerEngineAccess::Host;
+    if !runner_image_compatible(&docker, &latest_image, true, host_image, kind == "pi").await {
+        return Err(internal_error(format!(
+            "The newest published {kind} image is incompatible with this XpressClaw version"
+        )));
+    }
+    let image = docker
+        .image_repo_digest(&latest_image)
+        .await
+        .map_err(internal_error)?;
+    let version = docker
+        .image_label(&latest_image, "io.xpressclaw.runner.version")
+        .await;
+
+    // A dispatcher may claim durable work before it reaches the runtime
+    // barrier. Recheck after the network pull so that work keeps its original
+    // image and the user can retry when it finishes.
+    ensure_agent_has_no_active_work(&state, &record.name)?;
+
+    let changed = current_agent.runner.image != image;
+    let environment_stopped = if changed {
+        let mut new_config = (*current_config).clone();
+        let agent = new_config
+            .agents
+            .iter_mut()
+            .find(|agent| agent.name == record.name)
+            .ok_or_else(|| not_found(format!("Agent configuration not found: {}", record.name)))?;
+        agent.runner.image = image.clone();
+        new_config
+            .save(&state.config_path)
+            .map_err(internal_error)?;
+        let new_config = std::sync::Arc::new(new_config);
+        let new_router = std::sync::Arc::new(
+            xpressclaw_core::llm::router::LlmRouter::build_from_config(&new_config),
+        );
+        state.apply_config(new_config, Some(new_router));
+
+        state
+            .conversation_processes
+            .retire_agent_everywhere(&record.name)
+            .await;
+        docker.stop_preserving(&record.name).await.is_ok()
+    } else {
+        false
+    };
+
+    Ok(Json(json!({
+        "image": image,
+        "version": version,
+        "changed": changed,
+        "environment_stopped": environment_stopped,
+    })))
+}
+
+fn ensure_agent_has_no_active_work(
+    state: &AppState,
+    agent_id: &str,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    let attempts = SessionManager::new(state.db.clone())
+        .has_active_attempts(agent_id)
+        .map_err(internal_error)?;
+    let conversation_turns = ConversationTurnQueue::new(state.db.clone())
+        .has_active_for_agent(agent_id)
+        .map_err(internal_error)?;
+    if attempts || conversation_turns {
+        Err(agent_busy())
+    } else {
+        Ok(())
+    }
+}
+
+fn agent_busy() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "error": "Finish or cancel this Agent's active work, then update its harness"
+        })),
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -415,6 +552,13 @@ fn internal_error(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
 fn not_found(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
     (
         StatusCode::NOT_FOUND,
+        Json(json!({ "error": e.to_string() })),
+    )
+}
+
+fn bad_request(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::BAD_REQUEST,
         Json(json!({ "error": e.to_string() })),
     )
 }

@@ -24,6 +24,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check macOS app icon assets
+        run: python3 scripts/build-app-icon.py --check
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -73,7 +76,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: true
-          token: ${{ secrets.PRIVATE_REPOS_TOKEN }}
 
       - uses: actions/setup-node@v4
         with:
@@ -112,7 +114,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: true
-          token: ${{ secrets.PRIVATE_REPOS_TOKEN }}
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -133,7 +134,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: true
-          token: ${{ secrets.PRIVATE_REPOS_TOKEN }}
 
       - uses: actions/setup-node@v4
         with:

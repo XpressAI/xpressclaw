@@ -790,7 +790,7 @@ mod tests {
         assert_eq!(value["kind"], "codex");
         assert_eq!(
             value["image"],
-            "ghcr.io/xpressai/xpressclaw-runner-codex:latest"
+            default_native_runner_image("codex", ContainerEngineAccess::None).unwrap()
         );
         assert!(value["workspace_present"].as_bool().is_some());
         assert_eq!(value["presentation_artifacts"]["supported"], true);

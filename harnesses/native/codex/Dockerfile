@@ -2,10 +2,12 @@ FROM docker:29.6.1-cli AS docker-cli
 
 FROM node:22-bookworm-slim AS runner-base
 
-ARG CODEX_ACP_VERSION=1.1.7
+ARG CODEX_ACP_VERSION=latest
+ARG RUNNER_VERSION=development
 ARG PPTXGENJS_VERSION=4.0.1
 LABEL io.xpressclaw.protocol="acp-xpressclaw-v2" \
     io.xpressclaw.agent="codex" \
+    io.xpressclaw.runner.version="${RUNNER_VERSION}" \
     io.xpressclaw.presentations="xpressclaw-pptx-v1" \
     io.xpressclaw.presentations.pptxgenjs="4.0.1"
 
@@ -39,6 +41,7 @@ COPY --chmod=0444 codex/presentation-runtime/verify-codex-acp.mjs /opt/xpresscla
 
 COPY --chmod=0755 common/mcp-github.mjs /opt/xpressclaw/mcp-github.mjs
 COPY --chmod=0755 common/mcp-xpressclaw.mjs /opt/xpressclaw/mcp-xpressclaw.mjs
+COPY --chmod=0755 common/verify-acp-initialize.mjs /opt/xpressclaw/verify-acp-initialize.mjs
 COPY --chmod=0755 common/git-credential-xpressclaw /usr/local/bin/git-credential-xpressclaw
 
 RUN codex-acp --version \
@@ -46,14 +49,16 @@ RUN codex-acp --version \
     && node --check /opt/xpressclaw/mcp-github.mjs \
     && node --check /opt/xpressclaw/mcp-xpressclaw.mjs \
     && /opt/xpressclaw/presentation-runtime/bin/xpressclaw-presentation-runtime \
-    && node /opt/xpressclaw/presentation-runtime/verify-codex-acp.mjs \
+    && EXPECTED_CODEX_ACP_VERSION="${CODEX_ACP_VERSION}" node /opt/xpressclaw/presentation-runtime/verify-codex-acp.mjs \
     && node /opt/xpressclaw/presentation-runtime/verify-runtime.mjs \
     && chmod -R a-w /opt/xpressclaw/presentation-runtime
 
 USER node
+ARG ACP_SMOKE_COMMAND_B64=WyJjb2RleC1hY3AiXQ==
 ENV HOME=/home/node \
     CI=1 \
     NO_COLOR=1
+RUN node /opt/xpressclaw/verify-acp-initialize.mjs "${ACP_SMOKE_COMMAND_B64}"
 WORKDIR /workspace
 ENTRYPOINT []
 

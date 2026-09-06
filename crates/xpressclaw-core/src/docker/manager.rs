@@ -1327,6 +1327,13 @@ impl DockerManager {
     /// images carry this label so stale pre-ACP local tags are not reported as
     /// ready and then fail immediately with a missing server executable.
     pub async fn image_has_label(&self, image: &str, key: &str, value: &str) -> bool {
+        self.image_label(image, key)
+            .await
+            .is_some_and(|label| label == value)
+    }
+
+    /// Read one image label from the local runtime cache.
+    pub async fn image_label(&self, image: &str, key: &str) -> Option<String> {
         self.docker
             .inspect_image(image)
             .await
@@ -1334,7 +1341,29 @@ impl DockerManager {
             .and_then(|image| image.config)
             .and_then(|config| config.labels)
             .and_then(|labels| labels.get(key).cloned())
-            .is_some_and(|label| label == value)
+    }
+
+    /// Resolve a pulled tag to the immutable repository digest reported by
+    /// Docker or Podman. Persisting this reference prevents an explicit user
+    /// update from changing again without another update action.
+    pub async fn image_repo_digest(&self, image: &str) -> Result<String> {
+        let repository = image
+            .rsplit_once(':')
+            .map(|(name, _)| name)
+            .ok_or_else(|| Error::Docker(format!("image reference has no tag: {image}")))?;
+        let inspect = self.docker.inspect_image(image).await.map_err(|error| {
+            Error::Docker(format!("failed to inspect pulled image {image}: {error}"))
+        })?;
+        inspect
+            .repo_digests
+            .unwrap_or_default()
+            .into_iter()
+            .find(|digest| digest.starts_with(&format!("{repository}@sha256:")))
+            .ok_or_else(|| {
+                Error::Docker(format!(
+                    "container runtime did not report an immutable repository digest for {image}"
+                ))
+            })
     }
 
     /// Check if a container's image matches the latest local image.

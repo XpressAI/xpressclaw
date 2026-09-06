@@ -131,6 +131,12 @@ export const agents = {
 	}) => request<{ agent: LiveConfig['agents'][0]; needs_restart: boolean }>(
 		`/api/agents/${id}/config`, { method: 'PATCH', body: JSON.stringify(data) }
 	),
+	updateRunnerImage: (id: string) => request<{
+		image: string;
+		version: string | null;
+		changed: boolean;
+		environment_stopped: boolean;
+	}>(`/api/agents/${id}/runner-image/update`, { method: 'POST', body: '{}' }),
 	logs: (id: string, tail = 100) =>
 		request<{ logs: string }>(`/api/agents/${id}/logs?tail=${tail}`)
 };

@@ -1,4 +1,6 @@
-// Docker Bake file for building all harness images.
+// Legacy convenience targets for a small native-runner subset.
+// Product builds use scripts/build-runner-images.sh and the exact versions in
+// harnesses/runner-versions.json.
 // Usage: docker buildx bake -f harnesses/docker-bake.hcl
 
 variable "REGISTRY" {
@@ -10,7 +12,7 @@ variable "TAG" {
 }
 
 group "default" {
-  targets = ["native-codex", "native-claude", "native-deepseek-harness", "native-opencode", "native-codex-docker", "native-claude-docker", "native-deepseek-harness-docker", "native-opencode-docker"]
+  targets = ["native-codex", "native-claude", "native-opencode", "native-codex-docker", "native-claude-docker", "native-opencode-docker"]
 }
 
 // Retained only for developers maintaining the pre-ACP compatibility images.
@@ -33,23 +35,6 @@ target "native-claude" {
   tags       = ["xpressclaw-runner-claude:${TAG}", "localhost/xpressclaw-runner-claude:${TAG}", "${REGISTRY}/xpressclaw-runner-claude:${TAG}"]
 }
 
-target "native-deepseek-harness" {
-  context    = "./native"
-  dockerfile = "npm/Dockerfile"
-  target     = "runner"
-  args = {
-    AGENT_KIND        = "deepseek-harness"
-    AGENT_PACKAGE     = "@openma/deepseek-harness-acp@0.4.24"
-    AGENT_BINARY      = "dsh-acp"
-    AGENT_ACP_SMOKE   = "1"
-    AGENT_DSH_RUNTIME = "1"
-    AGENT_DSH_PATH    = "/opt/xpressclaw/deepseek-harness-runtime/node_modules/@deepseek-ai/dsh"
-    AGENT_NODE_PATH   = "/opt/xpressclaw/deepseek-harness-runtime/node_modules"
-    AGENT_DSH_SESSION_ROOT = "/home/node/.dsh/acp-sessions"
-  }
-  tags = ["xpressclaw-runner-deepseek-harness:${TAG}", "localhost/xpressclaw-runner-deepseek-harness:${TAG}", "${REGISTRY}/xpressclaw-runner-deepseek-harness:${TAG}"]
-}
-
 target "native-opencode" {
   context    = "./native"
   dockerfile = "opencode/Dockerfile"
@@ -69,12 +54,6 @@ target "native-claude-docker" {
   dockerfile = "claude/Dockerfile"
   target     = "runner-host"
   tags       = ["xpressclaw-runner-claude-docker:${TAG}", "localhost/xpressclaw-runner-claude-docker:${TAG}", "${REGISTRY}/xpressclaw-runner-claude-docker:${TAG}"]
-}
-
-target "native-deepseek-harness-docker" {
-  inherits = ["native-deepseek-harness"]
-  target   = "runner-host"
-  tags     = ["xpressclaw-runner-deepseek-harness-docker:${TAG}", "localhost/xpressclaw-runner-deepseek-harness-docker:${TAG}", "${REGISTRY}/xpressclaw-runner-deepseek-harness-docker:${TAG}"]
 }
 
 target "native-opencode-docker" {

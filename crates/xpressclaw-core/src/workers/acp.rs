@@ -297,6 +297,10 @@ pub enum AcpSessionStart {
 pub struct AcpTurnOptions {
     pub model: Option<String>,
     pub session_config: HashMap<String, Value>,
+    /// Stored preferences may be unavailable for the model selected in this
+    /// session. Explicit workflow and message controls are intentionally not
+    /// included here so unsupported required configuration still fails.
+    pub optional_session_config_ids: HashSet<String>,
     pub mcp_servers: Vec<McpServer>,
     /// Extra workspace roots advertised through ACP. Codex ACP maps a root's
     /// `.agents/skills` directory into its session-scoped skill discovery.
@@ -1232,6 +1236,7 @@ async fn run_connected_turn(
     let AcpTurnOptions {
         model,
         session_config: requested_config,
+        optional_session_config_ids,
         mcp_servers,
         mcp_signature,
         additional_directories,
@@ -1315,6 +1320,9 @@ async fn run_connected_turn(
                     Ok(response) => {
                         let forked_session_id = response.session_id.to_string();
                         recorder
+                            .persist_native_session(&forked_session_id)
+                            .map_err(agent_client_protocol::Error::into_internal_error)?;
+                        recorder
                             .append_event(
                                 "session_fork",
                                 "Forked the inherited agent conversation for this task",
@@ -1324,14 +1332,29 @@ async fn run_connected_turn(
                                 }),
                             )
                             .map_err(agent_client_protocol::Error::into_internal_error)?;
-                        (
-                            Some((
-                                forked_session_id,
-                                response.config_options.unwrap_or_default(),
-                                response.modes,
-                            )),
-                            None,
-                        )
+                        if initialized
+                            .agent_capabilities
+                            .session_capabilities
+                            .resume
+                            .is_some()
+                            || initialized.agent_capabilities.load_session
+                        {
+                            // A fork can be detached: Codex ACP unsubscribes it
+                            // before returning. Activate it before configuration
+                            // requests or the first prompt, using the controls
+                            // returned by resume/load rather than fork metadata.
+                            (None, Some(forked_session_id))
+                        } else {
+                            // Older agents without resume/load return a live fork.
+                            (
+                                Some((
+                                    forked_session_id,
+                                    response.config_options.unwrap_or_default(),
+                                    response.modes,
+                                )),
+                                None,
+                            )
+                        }
                     }
                     Err(error) => {
                         warn!(
@@ -1448,77 +1471,103 @@ async fn run_connected_turn(
 
     let mut requested_config = requested_config.into_iter().collect::<Vec<_>>();
     requested_config.sort_by(|left, right| left.0.cmp(&right.0));
-    for (config_id, value) in requested_config {
-        if let Some(option) = config_options
-            .iter()
-            .find(|option| option.id.to_string() == config_id)
-        {
-            let option_name = option.name.clone();
-            let value = resolve_config_value(option, &value)
-                .map_err(agent_client_protocol::util::internal_error)?;
-            let display_value = match &value {
-                SessionConfigOptionValue::Boolean { value } => value.to_string(),
-                SessionConfigOptionValue::ValueId { value } => value.to_string(),
-                _ => "updated".to_string(),
-            };
-            let response = connection
-                .send_request(SetSessionConfigOptionRequest::new(
-                    session_id.clone(),
-                    config_id.clone(),
-                    value.clone(),
-                ))
-                .block_task()
-                .await?;
-            if !response.config_options.is_empty() {
-                config_options = response.config_options;
+    loop {
+        let mut deferred_config = Vec::new();
+        let mut made_progress = false;
+        for (config_id, value) in std::mem::take(&mut requested_config) {
+            if let Some(option) = config_options
+                .iter()
+                .find(|option| option.id.to_string() == config_id)
+            {
+                let option_name = option.name.clone();
+                let value = resolve_config_value(option, &value)
+                    .map_err(agent_client_protocol::util::internal_error)?;
+                let display_value = match &value {
+                    SessionConfigOptionValue::Boolean { value } => value.to_string(),
+                    SessionConfigOptionValue::ValueId { value } => value.to_string(),
+                    _ => "updated".to_string(),
+                };
+                let response = connection
+                    .send_request(SetSessionConfigOptionRequest::new(
+                        session_id.clone(),
+                        config_id.clone(),
+                        value.clone(),
+                    ))
+                    .block_task()
+                    .await?;
+                if !response.config_options.is_empty() {
+                    config_options = response.config_options;
+                }
+                recorder
+                    .append_event(
+                        "session_config",
+                        &format!("Set {option_name} to {display_value}"),
+                        json!({ "config_id": config_id, "value": value }),
+                    )
+                    .map_err(agent_client_protocol::Error::into_internal_error)?;
+                made_progress = true;
+                continue;
             }
-            recorder
-                .append_event(
-                    "session_config",
-                    &format!("Set {option_name} to {display_value}"),
-                    json!({ "config_id": config_id, "value": value }),
-                )
-                .map_err(agent_client_protocol::Error::into_internal_error)?;
-            continue;
+
+            if config_id == "mode" {
+                let requested_mode = value.as_str().ok_or_else(|| {
+                    agent_client_protocol::util::internal_error(
+                        "legacy ACP mode values must be strings",
+                    )
+                })?;
+                let available = modes.as_ref().ok_or_else(|| {
+                    agent_client_protocol::util::internal_error(format!(
+                        "ACP agent does not advertise a session config option or legacy mode named '{config_id}'"
+                    ))
+                })?;
+                if !available
+                    .available_modes
+                    .iter()
+                    .any(|mode| mode.id.to_string() == requested_mode)
+                {
+                    return Err(agent_client_protocol::util::internal_error(format!(
+                        "ACP agent does not offer mode '{requested_mode}'"
+                    )));
+                }
+                connection
+                    .send_request(SetSessionModeRequest::new(
+                        session_id.clone(),
+                        requested_mode.to_string(),
+                    ))
+                    .block_task()
+                    .await?;
+                if let Some(modes) = modes.as_mut() {
+                    modes.current_mode_id = requested_mode.to_string().into();
+                }
+                recorder
+                    .append_event(
+                        "session_mode",
+                        &format!("Switched to {requested_mode} mode"),
+                        json!({ "mode_id": requested_mode }),
+                    )
+                    .map_err(agent_client_protocol::Error::into_internal_error)?;
+                made_progress = true;
+                continue;
+            }
+
+            deferred_config.push((config_id, value));
         }
 
-        if config_id == "mode" {
-            let requested_mode = value.as_str().ok_or_else(|| {
-                agent_client_protocol::util::internal_error(
-                    "legacy ACP mode values must be strings",
-                )
-            })?;
-            let available = modes.as_ref().ok_or_else(|| {
-                agent_client_protocol::util::internal_error(format!(
-                    "ACP agent does not advertise a session config option or legacy mode named '{config_id}'"
-                ))
-            })?;
-            if !available
-                .available_modes
-                .iter()
-                .any(|mode| mode.id.to_string() == requested_mode)
-            {
-                return Err(agent_client_protocol::util::internal_error(format!(
-                    "ACP agent does not offer mode '{requested_mode}'"
-                )));
-            }
-            connection
-                .send_request(SetSessionModeRequest::new(
-                    session_id.clone(),
-                    requested_mode.to_string(),
-                ))
-                .block_task()
-                .await?;
-            if let Some(modes) = modes.as_mut() {
-                modes.current_mode_id = requested_mode.to_string().into();
-            }
-            recorder
-                .append_event(
-                    "session_mode",
-                    &format!("Switched to {requested_mode} mode"),
-                    json!({ "mode_id": requested_mode }),
-                )
-                .map_err(agent_client_protocol::Error::into_internal_error)?;
+        requested_config = deferred_config;
+        if requested_config.is_empty() || !made_progress {
+            break;
+        }
+    }
+
+    for (config_id, _) in requested_config {
+        if optional_session_config_ids.contains(&config_id) {
+            // Session controls can change with the selected model. Stored
+            // preferences should not block a turn when no requested model or
+            // config mutation makes them available.
+            warn!(
+                config_id = %config_id,
+                "skipping stored ACP session preference not advertised for this session"
+            );
             continue;
         }
 
@@ -2019,18 +2068,41 @@ mod tests {
                     }
                     "session/set_config_option" => {
                         assert_eq!(request["params"]["sessionId"], "acp-session-1");
-                        match request["params"]["configId"].as_str().unwrap() {
-                            "model" => assert_eq!(request["params"]["value"], "model-test"),
+                        let config_options = match request["params"]["configId"].as_str().unwrap() {
+                            "model" => {
+                                assert_eq!(request["params"]["value"], "model-test");
+                                vec![
+                                    SessionConfigOption::select(
+                                        "analysis_depth",
+                                        "Analysis depth",
+                                        "shallow",
+                                        vec![
+                                            SessionConfigSelectOption::new("shallow", "Shallow"),
+                                            SessionConfigSelectOption::new("deep", "Deep"),
+                                        ],
+                                    ),
+                                    SessionConfigOption::boolean(
+                                        "use_fast_tools",
+                                        "Use fast tools",
+                                        false,
+                                    ),
+                                ]
+                            }
+                            "analysis_depth" => {
+                                assert_eq!(request["params"]["value"], "deep");
+                                vec![]
+                            }
                             "use_fast_tools" => {
                                 assert_eq!(request["params"]["type"], "boolean");
                                 assert_eq!(request["params"]["value"], true);
+                                vec![]
                             }
                             other => panic!("unexpected config option: {other}"),
-                        }
+                        };
                         json!({
                             "jsonrpc": "2.0",
                             "id": id,
-                            "result": SetSessionConfigOptionResponse::new(vec![]),
+                            "result": SetSessionConfigOptionResponse::new(config_options),
                         })
                     }
                     "session/set_mode" => {
@@ -2113,10 +2185,23 @@ mod tests {
             Path::new("/workspace"),
             "Do the work",
             AcpTurnOptions {
-                model: Some("Test Model".into()),
+                model: None,
                 session_config: [
+                    // The current model does not expose analysis depth, but
+                    // choosing the stored model does. It must be retried,
+                    // while stale effort remains safe to skip.
+                    ("analysis_depth".into(), json!("deep")),
+                    ("effort".into(), json!("low")),
+                    ("model".into(), json!("Test Model")),
                     ("mode".into(), json!("build")),
                     ("use_fast_tools".into(), json!(true)),
+                ]
+                .into_iter()
+                .collect(),
+                optional_session_config_ids: [
+                    "analysis_depth".into(),
+                    "effort".into(),
+                    "model".into(),
                 ]
                 .into_iter()
                 .collect(),
@@ -2147,7 +2232,13 @@ mod tests {
             .any(|event| event.event_type == "session_config_options"));
         assert!(events
             .iter()
-            .any(|event| event.summary == "Using model model-test"));
+            .any(|event| event.summary == "Set Model to model-test"));
+        assert!(events
+            .iter()
+            .any(|event| event.summary == "Set Analysis depth to deep"));
+        assert!(!events
+            .iter()
+            .any(|event| event.summary.starts_with("Set Effort")));
         assert!(events
             .iter()
             .any(|event| event.summary == "Set Use fast tools to true"));
@@ -2511,6 +2602,200 @@ mod tests {
         assert!(!events
             .iter()
             .any(|event| event.event_type == "session_fork_fallback"));
+        mock_agent.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn acp_turn_resumes_a_fork_before_configuring_and_prompting() {
+        assert_fork_is_activated_before_prompt("session/resume").await;
+    }
+
+    #[tokio::test]
+    async fn acp_turn_loads_a_fork_when_resume_is_unavailable() {
+        assert_fork_is_activated_before_prompt("session/load").await;
+    }
+
+    async fn assert_fork_is_activated_before_prompt(activation_method: &'static str) {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let (first_recorder, _) = test_recorder(db.clone());
+        let (second_recorder, _) = test_recorder(db.clone());
+        let first_attempt_id = first_recorder.attempt_id.clone();
+        let (client_input, agent_input) = tokio::io::duplex(64 * 1024);
+        let (output_tx, output_rx) = tokio::sync::mpsc::channel(8);
+        let db_for_agent = db.clone();
+
+        let mock_agent = tokio::spawn(async move {
+            let mut requests = BufReader::new(agent_input).lines();
+            // A fork is initially detached, as in recent Codex ACP versions.
+            // The second turn must reuse the activated fork without reopening it.
+            for expected_method in [
+                "initialize",
+                "session/fork",
+                activation_method,
+                "session/set_config_option",
+                "session/set_config_option",
+                "session/prompt",
+                "session/prompt",
+            ] {
+                let line = requests.next_line().await.unwrap().unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["method"], expected_method);
+                let result = match expected_method {
+                    "initialize" => {
+                        let mut result =
+                            serde_json::to_value(InitializeResponse::new(ProtocolVersion::V1))
+                                .unwrap();
+                        result["agentCapabilities"] = json!({
+                            "loadSession": true,
+                            "sessionCapabilities": { "fork": {} },
+                        });
+                        if activation_method == "session/resume" {
+                            result["agentCapabilities"]["sessionCapabilities"]["resume"] =
+                                json!({});
+                        }
+                        result
+                    }
+                    "session/fork" | "session/resume" | "session/load" => {
+                        let is_fork = expected_method == "session/fork";
+                        assert_eq!(
+                            request["params"]["sessionId"],
+                            if is_fork {
+                                "source-session"
+                            } else {
+                                "forked-session"
+                            }
+                        );
+                        assert_eq!(request["params"]["cwd"], "/workspace");
+                        assert_eq!(request["params"]["mcpServers"][0]["name"], "test-mcp");
+                        assert_eq!(
+                            request["params"]["additionalDirectories"],
+                            json!(["/extra-workspace"])
+                        );
+                        if is_fork {
+                            // Controls returned by the fork may differ from those
+                            // returned when it is actually activated.
+                            serde_json::to_value(ForkSessionResponse::new("forked-session"))
+                                .unwrap()
+                        } else {
+                            assert_eq!(
+                                SessionManager::new(db_for_agent.clone())
+                                    .get_attempt(&first_attempt_id)
+                                    .unwrap()
+                                    .native_session_id
+                                    .as_deref(),
+                                Some("forked-session")
+                            );
+                            let config_options = vec![
+                                SessionConfigOption::select(
+                                    "model",
+                                    "Model",
+                                    "model-test",
+                                    vec![SessionConfigSelectOption::new(
+                                        "model-test",
+                                        "Test Model",
+                                    )],
+                                )
+                                .category(SessionConfigOptionCategory::Model),
+                                SessionConfigOption::select(
+                                    "collaboration_mode",
+                                    "Collaboration mode",
+                                    "default",
+                                    vec![SessionConfigSelectOption::new("default", "Default")],
+                                ),
+                            ];
+                            serde_json::to_value(
+                                ResumeSessionResponse::new().config_options(config_options),
+                            )
+                            .unwrap()
+                        }
+                    }
+                    "session/set_config_option" => {
+                        assert_eq!(request["params"]["sessionId"], "forked-session");
+                        match request["params"]["configId"].as_str().unwrap() {
+                            "model" => assert_eq!(request["params"]["value"], "model-test"),
+                            "collaboration_mode" => {
+                                assert_eq!(request["params"]["value"], "default")
+                            }
+                            other => panic!("unexpected session option: {other}"),
+                        }
+                        serde_json::to_value(SetSessionConfigOptionResponse::new(vec![])).unwrap()
+                    }
+                    "session/prompt" => {
+                        assert_eq!(request["params"]["sessionId"], "forked-session");
+                        assert_eq!(
+                            request["params"]["prompt"][0]["text"],
+                            "Continue the old task"
+                        );
+                        serde_json::to_value(PromptResponse::new(StopReason::EndTurn)).unwrap()
+                    }
+                    other => panic!("unexpected ACP method: {other}"),
+                };
+                send_json(
+                    &output_tx,
+                    json!({ "jsonrpc": "2.0", "id": request["id"], "result": result }),
+                )
+                .await;
+            }
+        });
+
+        let process = AcpProcess::start(AttachedContainer {
+            info: ContainerInfo {
+                container_id: "test-container".to_string(),
+                agent_id: "test-attempt".to_string(),
+                status: "running".to_string(),
+                host_port: None,
+            },
+            input: Box::pin(client_input),
+            output: Box::pin(ReceiverStream::new(output_rx)),
+        })
+        .await
+        .unwrap();
+        let mut options = AcpTurnOptions {
+            model: Some("Test Model".to_string()),
+            session_config: [("collaboration_mode".to_string(), json!("default"))].into(),
+            mcp_servers: vec![McpServer::Stdio(McpServerStdio::new(
+                "test-mcp",
+                "/test-mcp",
+            ))],
+            additional_directories: vec![PathBuf::from("/extra-workspace")],
+            ..Default::default()
+        };
+        for (recorder, session_start) in [
+            (
+                first_recorder,
+                AcpSessionStart::Fork("source-session".into()),
+            ),
+            (
+                second_recorder,
+                AcpSessionStart::Resume("forked-session".into()),
+            ),
+        ] {
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                process.run_turn(
+                    AcpTurnRuntime::new(
+                        recorder,
+                        Arc::new(AcpElicitationBroker::new()),
+                        Arc::new(AcpTurnControlBroker::new()),
+                    ),
+                    session_start,
+                    Path::new("/workspace"),
+                    "Continue the old task",
+                    AcpTurnOptions {
+                        model: options.model.take(),
+                        session_config: std::mem::take(&mut options.session_config),
+                        mcp_servers: options.mcp_servers.clone(),
+                        additional_directories: options.additional_directories.clone(),
+                        ..Default::default()
+                    },
+                ),
+            )
+            .await
+            .expect("the continuation must start without an interrupt or a second message")
+            .unwrap();
+            assert_eq!(result.session_id, "forked-session");
+            assert!(!result.interrupted);
+        }
         mock_agent.await.unwrap();
     }
 

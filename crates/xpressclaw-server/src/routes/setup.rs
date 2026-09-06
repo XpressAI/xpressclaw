@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use tracing::{info, warn};
-use xpressclaw_core::acp::{canonical_agent_kind, infer_agent_kind_from_backend, ACP_AGENTS};
+use xpressclaw_core::acp::{
+    canonical_agent_kind, infer_agent_kind_from_backend, is_managed_runner_image_for_kind,
+    ACP_AGENTS,
+};
 use xpressclaw_core::agents::registry::AgentRegistry;
 use xpressclaw_core::config::{
     context_label, default_native_runner_image, unique_session_id, AgentConfig, Config,
@@ -815,11 +818,8 @@ fn runner_from_setup(setup: &AgentSetup) -> NativeRunnerConfig {
         .map(str::trim)
         .filter(|image| !image.is_empty())
         .unwrap_or_default();
-    let minimal_image = default_native_runner_image(&kind, ContainerEngineAccess::None);
-    let host_image = default_native_runner_image(&kind, ContainerEngineAccess::Host);
     let image = if configured_image.is_empty()
-        || minimal_image == Some(configured_image)
-        || host_image == Some(configured_image)
+        || is_managed_runner_image_for_kind(configured_image, &kind)
     {
         default_native_runner_image(&kind, container_engine)
             .unwrap_or_default()
@@ -2445,7 +2445,7 @@ mod tests {
         assert_eq!(runner.kind, "claude");
         assert_eq!(
             runner.image,
-            "ghcr.io/xpressai/xpressclaw-runner-claude:latest"
+            default_native_runner_image("claude", ContainerEngineAccess::None).unwrap()
         );
     }
 
@@ -2461,7 +2461,7 @@ mod tests {
         assert_eq!(runner.container_engine, ContainerEngineAccess::Host);
         assert_eq!(
             runner.image,
-            "ghcr.io/xpressai/xpressclaw-runner-codex-docker:latest"
+            default_native_runner_image("codex", ContainerEngineAccess::Host).unwrap()
         );
     }
 
@@ -2504,7 +2504,7 @@ mod tests {
         let runner = runner_from_setup(&setup);
         assert_eq!(
             runner.image,
-            "ghcr.io/xpressai/xpressclaw-runner-qwen:latest"
+            default_native_runner_image("qwen", ContainerEngineAccess::None).unwrap()
         );
     }
 
@@ -2519,7 +2519,8 @@ mod tests {
             assert_eq!(runner.kind, "deepseek-harness");
             assert_eq!(
                 runner.image,
-                "ghcr.io/xpressai/xpressclaw-runner-deepseek-harness:latest"
+                default_native_runner_image("deepseek-harness", ContainerEngineAccess::None)
+                    .unwrap()
             );
         }
     }

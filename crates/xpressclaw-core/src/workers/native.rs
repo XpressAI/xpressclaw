@@ -21,7 +21,8 @@ use tokio::sync::{
 use tracing::{error, info, warn};
 
 use crate::acp::{
-    agent_definition, canonical_agent_kind, infer_agent_kind_from_backend, local_runner_image,
+    agent_definition, canonical_agent_kind, infer_agent_kind_from_backend,
+    is_builtin_runner_image_for_kind, is_managed_runner_image_for_kind, local_runner_image,
 };
 use crate::agents::registry::AgentRegistry;
 use crate::collaboration::{network_name as collaboration_network_name, CollaborationSecrets};
@@ -89,7 +90,7 @@ const BUNDLED_CONTROL_MCP_SOURCE: &str = concat!(
 
 struct NativeAttemptRuntime {
     db: Arc<Database>,
-    config: Arc<Config>,
+    config: Arc<RwLock<Arc<Config>>>,
     docker: Arc<DockerManager>,
     event_bus: Arc<ConversationEventBus>,
     elicitation_broker: Arc<AcpElicitationBroker>,
@@ -175,6 +176,13 @@ impl NativeRuntimeLifecycle {
             guards.push(slot.write_owned().await);
         }
         guards
+    }
+
+    /// Enter an exclusive Agent runtime boundary only when no turn is using
+    /// it. User-initiated maintenance should fail fast instead of waiting for
+    /// an arbitrarily long coding turn to finish.
+    pub fn try_quiesce_agent(&self, agent_id: &str) -> Option<OwnedRwLockWriteGuard<()>> {
+        self.slot(agent_id).try_write_owned().ok()
     }
 }
 
@@ -515,7 +523,7 @@ pub async fn start_dispatcher(
                     );
                 }
                 let db = db.clone();
-                let config = config.read().unwrap().clone();
+                let config = config.clone();
                 let event_bus = event_bus.clone();
                 let elicitation_broker = elicitation_broker.clone();
                 let turn_controls = turn_controls.clone();
@@ -619,7 +627,7 @@ async fn start_conversation_dispatcher(
             Ok(Some(turn)) => {
                 let runtime = ConversationAttemptRuntime {
                     db: db.clone(),
-                    config: config.read().unwrap().clone(),
+                    config: config.clone(),
                     docker,
                     event_bus: event_bus.clone(),
                     elicitation_broker: elicitation_broker.clone(),
@@ -669,7 +677,7 @@ async fn start_conversation_dispatcher(
 
 struct ConversationAttemptRuntime {
     db: Arc<Database>,
-    config: Arc<Config>,
+    config: Arc<RwLock<Arc<Config>>>,
     docker: Arc<DockerManager>,
     event_bus: Arc<ConversationEventBus>,
     elicitation_broker: Arc<AcpElicitationBroker>,
@@ -704,6 +712,16 @@ async fn execute_conversation_turn(
     }
     let manager = ConversationManager::new(db.clone());
     let conversation = manager.get(&turn.conversation_id)?;
+    let (_runtime_lifecycle_guard, config, repository) = prepare_repository_for_turn(
+        &db,
+        &config,
+        &turn.agent_id,
+        &docker,
+        &project_processes,
+        &conversation_processes,
+        &runtime_lifecycle,
+    )
+    .await?;
     let agent = config
         .agents
         .iter()
@@ -712,16 +730,6 @@ async fn execute_conversation_turn(
             name: turn.agent_id.clone(),
         })?;
     let kind = resolve_runner_kind(agent)?;
-    let (_runtime_lifecycle_guard, repository) = prepare_repository_for_turn(
-        &db,
-        &config,
-        agent,
-        &docker,
-        &project_processes,
-        &conversation_processes,
-        &runtime_lifecycle,
-    )
-    .await?;
     if !queue.is_running(&turn.id)? {
         return Ok(());
     }
@@ -742,8 +750,7 @@ async fn execute_conversation_turn(
         &repository.container_bootstrap,
         agent,
     );
-    let built_in_image = default_native_runner_image(&kind, agent.runner.container_engine)
-        == Some(spec.image.as_str());
+    let built_in_image = is_builtin_runner_image_for_kind(&spec.image, &kind);
     if !runner_image_ready(&docker, &spec.image, built_in_image, agent).await {
         let local_fallback = match local_runner_image_alias(&spec.image) {
             Some(image) if runner_image_ready(&docker, image, built_in_image, agent).await => {
@@ -907,6 +914,7 @@ async fn execute_conversation_turn(
             AcpTurnOptions {
                 model: agent.runner.model.clone(),
                 session_config: agent.runner.session_config.clone(),
+                optional_session_config_ids: agent.runner.session_config.keys().cloned().collect(),
                 mcp_servers,
                 mcp_signature,
                 additional_directories: presentation_support.additional_directories,
@@ -1088,26 +1096,44 @@ impl RuntimeRepository {
     }
 }
 
+async fn enter_agent_runtime_config(
+    config: &Arc<RwLock<Arc<Config>>>,
+    runtime_lifecycle: &NativeRuntimeLifecycle,
+    agent_id: &str,
+) -> (OwnedRwLockReadGuard<()>, Arc<Config>) {
+    let guard = runtime_lifecycle.enter(agent_id).await;
+    let config_snapshot = config.read().unwrap().clone();
+    (guard, config_snapshot)
+}
+
 async fn prepare_repository_for_turn(
     db: &Arc<Database>,
-    config: &Config,
-    agent: &AgentConfig,
+    config: &Arc<RwLock<Arc<Config>>>,
+    agent_id: &str,
     docker: &DockerManager,
     project_processes: &ProjectAcpProcesses,
     conversation_processes: &ConversationAcpProcesses,
     runtime_lifecycle: &NativeRuntimeLifecycle,
-) -> Result<(OwnedRwLockReadGuard<()>, RuntimeRepository)> {
-    let bootstrap_root = resolved_workspace(config, agent);
-    let lifecycle = runtime_lifecycle.slot(&agent.name);
+) -> Result<(OwnedRwLockReadGuard<()>, Arc<Config>, RuntimeRepository)> {
     // Stable repositories retain the ordinary shared runtime path, so Task
     // and Conversation lanes for one Agent can continue concurrently.
-    let read_guard = lifecycle.clone().read_owned().await;
-    let inspection = inspect_repository_for_turn(db, &agent.name, &bootstrap_root).await?;
+    // Snapshot configuration only after entering the runtime boundary. An
+    // update may commit while a dispatcher has claimed work, and that claimed
+    // work must observe the new image after the update releases this lock.
+    let (read_guard, config_snapshot) =
+        enter_agent_runtime_config(config, runtime_lifecycle, agent_id).await;
+    let agent = config_snapshot
+        .agents
+        .iter()
+        .find(|agent| agent.name == agent_id)
+        .ok_or_else(|| Error::AgentNotFound {
+            name: agent_id.to_string(),
+        })?;
+    let bootstrap_root = resolved_workspace(&config_snapshot, agent);
+    let inspection = inspect_repository_for_turn(db, agent_id, &bootstrap_root).await?;
     if !inspection.requires_boundary_change() {
-        return Ok((
-            read_guard,
-            RuntimeRepository::from_inspection(inspection, agent),
-        ));
+        let repository = RuntimeRepository::from_inspection(inspection, agent);
+        return Ok((read_guard, config_snapshot, repository));
     }
 
     // Repository reconciliation and destructive Project cleanup share the
@@ -1116,24 +1142,35 @@ async fn prepare_repository_for_turn(
     // released. Downgrading atomically then prevents deletion from entering
     // between repository cleanup and the new turn.
     drop(read_guard);
+    let lifecycle = runtime_lifecycle.slot(agent_id);
     let write_guard = lifecycle.write_owned().await;
-    AgentRegistry::new(db.clone()).get(&agent.name)?;
-    let inspection = inspect_repository_for_turn(db, &agent.name, &bootstrap_root).await?;
+    AgentRegistry::new(db.clone()).get(agent_id)?;
+    let config_snapshot = config.read().unwrap().clone();
+    let agent = config_snapshot
+        .agents
+        .iter()
+        .find(|agent| agent.name == agent_id)
+        .ok_or_else(|| Error::AgentNotFound {
+            name: agent_id.to_string(),
+        })?;
+    let bootstrap_root = resolved_workspace(&config_snapshot, agent);
+    let inspection = inspect_repository_for_turn(db, agent_id, &bootstrap_root).await?;
     let inspection = if inspection.requires_boundary_change() {
-        let boundary = apply_repository_boundary_for_turn(db, &agent.name, &bootstrap_root).await?;
+        let boundary = apply_repository_boundary_for_turn(db, agent_id, &bootstrap_root).await?;
         if boundary.changed {
             conversation_processes
-                .retire_agent_everywhere(&agent.name)
+                .retire_agent_everywhere(agent_id)
                 .await;
-            project_processes.retire_agent(&agent.name).await;
-            let _ = docker.stop_preserving(&agent.name).await;
+            project_processes.retire_agent(agent_id).await;
+            let _ = docker.stop_preserving(agent_id).await;
         }
         boundary.inspection
     } else {
         inspection
     };
     let guard = OwnedRwLockWriteGuard::downgrade(write_guard);
-    Ok((guard, RuntimeRepository::from_inspection(inspection, agent)))
+    let repository = RuntimeRepository::from_inspection(inspection, agent);
+    Ok((guard, config_snapshot, repository))
 }
 
 async fn inspect_repository_for_turn(
@@ -1182,6 +1219,16 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
         .attempt_id
         .as_deref()
         .ok_or_else(|| Error::Task(format!("queue item {} has no work attempt", item.id)))?;
+    let (_runtime_lifecycle_guard, config, repository) = prepare_repository_for_turn(
+        &db,
+        &config,
+        &item.agent_id,
+        &docker,
+        &processes,
+        &conversation_processes,
+        &runtime_lifecycle,
+    )
+    .await?;
     let agent = config
         .agents
         .iter()
@@ -1190,16 +1237,6 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
             name: item.agent_id.clone(),
         })?;
     let kind = resolve_runner_kind(agent)?;
-    let (_runtime_lifecycle_guard, repository) = prepare_repository_for_turn(
-        &db,
-        &config,
-        agent,
-        &docker,
-        &processes,
-        &conversation_processes,
-        &runtime_lifecycle,
-    )
-    .await?;
     let session_start = session_start(&db, &item, &kind)?;
     let requested_session_config = requested_session_config(&db, agent, &item.task_id)?;
     let mut prompt = build_prompt(&db, &item, attempt_id)?;
@@ -1262,8 +1299,7 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
         &repository.container_bootstrap,
         agent,
     );
-    let built_in_image = default_native_runner_image(&kind, agent.runner.container_engine)
-        == Some(spec.image.as_str());
+    let built_in_image = is_builtin_runner_image_for_kind(&spec.image, &kind);
     let image_ready = runner_image_ready(&docker, &spec.image, built_in_image, agent).await;
     if !image_ready {
         let local_fallback = match local_runner_image_alias(&spec.image) {
@@ -1438,7 +1474,8 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
             &prompt.content,
             AcpTurnOptions {
                 model: agent.runner.model.clone(),
-                session_config: requested_session_config,
+                session_config: requested_session_config.values,
+                optional_session_config_ids: requested_session_config.optional_ids,
                 mcp_servers,
                 mcp_signature,
                 additional_directories: presentation_support.additional_directories,
@@ -2739,6 +2776,11 @@ fn mcp_server_from_config(name: &str, config: &McpServerConfig) -> Result<McpSer
     }
 }
 
+struct RequestedSessionConfig {
+    values: HashMap<String, Value>,
+    optional_ids: HashSet<String>,
+}
+
 /// Merge harness defaults, workflow/task overrides, and the controls chosen
 /// alongside the latest user message. Values stay keyed by opaque ACP option
 /// IDs; the adapter remains the source of truth for what each option means.
@@ -2746,8 +2788,9 @@ fn requested_session_config(
     db: &Arc<Database>,
     agent: &AgentConfig,
     task_id: &str,
-) -> Result<std::collections::HashMap<String, Value>> {
+) -> Result<RequestedSessionConfig> {
     let mut requested = agent.runner.session_config.clone();
+    let mut optional_ids = requested.keys().cloned().collect::<HashSet<_>>();
     let task = TaskBoard::new(db.clone()).get(task_id)?;
     if let Some(overrides) = task
         .context
@@ -2755,11 +2798,10 @@ fn requested_session_config(
         .and_then(|context| context.get("session_config"))
         .and_then(Value::as_object)
     {
-        requested.extend(
-            overrides
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone())),
-        );
+        for (key, value) in overrides {
+            requested.insert(key.clone(), value.clone());
+            optional_ids.remove(key);
+        }
     }
 
     let latest_message_payload: Option<String> = db.with_conn(|conn| {
@@ -2780,13 +2822,22 @@ fn requested_session_config(
         .and_then(|payload| payload.get("config_options"))
         .and_then(Value::as_object)
     {
-        requested.extend(
-            overrides
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone())),
-        );
+        for (key, value) in overrides {
+            // TaskView sends its full selected control map on every message.
+            // Preserve preference provenance when that merely echoes the
+            // untouched runner value; changed values remain requirements.
+            let unchanged_preference =
+                optional_ids.contains(key) && requested.get(key) == Some(value);
+            requested.insert(key.clone(), value.clone());
+            if !unchanged_preference {
+                optional_ids.remove(key);
+            }
+        }
     }
-    Ok(requested)
+    Ok(RequestedSessionConfig {
+        values: requested,
+        optional_ids,
+    })
 }
 
 fn repository_volume_mounts(
@@ -3166,18 +3217,8 @@ fn visualization_source_roots(
 
 pub fn resolved_runner_image(config: &NativeRunnerConfig, kind: &str) -> Result<String> {
     let desired_default = default_native_runner_image(kind, config.container_engine);
-    let alternate_mode = match config.container_engine {
-        ContainerEngineAccess::None => ContainerEngineAccess::Host,
-        ContainerEngineAccess::Host => ContainerEngineAccess::None,
-    };
-    let alternate_default = default_native_runner_image(kind, alternate_mode);
     let configured_image = config.image.trim();
-    let built_in_image = [desired_default, alternate_default]
-        .into_iter()
-        .flatten()
-        .any(|image| {
-            configured_image == image || local_runner_image_alias(image) == Some(configured_image)
-        });
+    let built_in_image = is_managed_runner_image_for_kind(configured_image, kind);
     if configured_image.is_empty() || built_in_image {
         return desired_default.map(str::to_owned).ok_or_else(|| {
             Error::Backend(format!(
@@ -3188,9 +3229,9 @@ pub fn resolved_runner_image(config: &NativeRunnerConfig, kind: &str) -> Result<
     Ok(configured_image.to_string())
 }
 
-/// Local tags used by the ACP runner images. A published image is the
-/// default, but retaining these aliases lets existing developer builds run
-/// without a forced retag or registry pull.
+/// Local tags used by development builds of the ACP runner images.
+/// Release builds use an immutable published tag and never fall back to a
+/// mutable local alias.
 pub fn local_runner_image_alias(image: &str) -> Option<&'static str> {
     local_runner_image(image)
 }
@@ -4311,6 +4352,50 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), lifecycle.enter("atlas"))
             .await
             .expect("new work should resume after cleanup releases the barrier");
+    }
+
+    #[tokio::test]
+    async fn claimed_work_snapshots_config_after_runtime_maintenance() {
+        let lifecycle = Arc::new(NativeRuntimeLifecycle::default());
+        let initial = Config {
+            agents: vec![AgentConfig {
+                name: "atlas".to_string(),
+                runner: NativeRunnerConfig {
+                    image: "ghcr.io/xpressai/xpressclaw-runner-codex@sha256:old".to_string(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let config = Arc::new(RwLock::new(Arc::new(initial)));
+        let maintenance = lifecycle
+            .try_quiesce_agent("atlas")
+            .expect("idle Agent should enter maintenance");
+
+        let worker_config = config.clone();
+        let worker_lifecycle = lifecycle.clone();
+        let worker = tokio::spawn(async move {
+            let (_guard, snapshot) =
+                enter_agent_runtime_config(&worker_config, &worker_lifecycle, "atlas").await;
+            snapshot.agents[0].runner.image.clone()
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !worker.is_finished(),
+            "claimed work must wait at the runtime boundary"
+        );
+
+        let mut updated = config.read().unwrap().as_ref().clone();
+        updated.agents[0].runner.image =
+            "ghcr.io/xpressai/xpressclaw-runner-codex@sha256:new".to_string();
+        *config.write().unwrap() = Arc::new(updated);
+        drop(maintenance);
+
+        assert_eq!(
+            worker.await.unwrap(),
+            "ghcr.io/xpressai/xpressclaw-runner-codex@sha256:new"
+        );
     }
 
     #[test]
@@ -5686,6 +5771,8 @@ flows:
                     payload: json!({
                         "config_options": {
                             "mode": "build",
+                            "model": "fast",
+                            "effort": "low",
                             "approval_policy": true
                         }
                     }),
@@ -5698,6 +5785,7 @@ flows:
                 session_config: [
                     ("mode".into(), json!("default")),
                     ("model".into(), json!("fast")),
+                    ("effort".into(), json!("low")),
                     ("approval_policy".into(), json!(false)),
                 ]
                 .into_iter()
@@ -5707,10 +5795,20 @@ flows:
             ..Default::default()
         };
         let requested = requested_session_config(&db, &agent, &task.id).unwrap();
-        assert_eq!(requested.get("model"), Some(&json!("fast")));
-        assert_eq!(requested.get("thought_level"), Some(&json!("medium")));
-        assert_eq!(requested.get("mode"), Some(&json!("build")));
-        assert_eq!(requested.get("approval_policy"), Some(&json!(true)));
+        assert_eq!(requested.values.get("model"), Some(&json!("fast")));
+        assert_eq!(requested.values.get("effort"), Some(&json!("low")));
+        assert_eq!(
+            requested.values.get("thought_level"),
+            Some(&json!("medium"))
+        );
+        assert_eq!(requested.values.get("mode"), Some(&json!("build")));
+        assert_eq!(requested.values.get("approval_policy"), Some(&json!(true)));
+        // UI-echoed harness preferences stay optional. Workflow controls and
+        // changed message controls remain requirements.
+        assert_eq!(
+            requested.optional_ids,
+            HashSet::from(["effort".into(), "model".into()])
+        );
     }
 
     #[test]
@@ -6679,22 +6777,12 @@ flows:
 
     #[test]
     fn selects_a_minimal_image_for_each_native_runner() {
-        assert_eq!(
-            default_native_runner_image("codex", ContainerEngineAccess::None),
-            Some("ghcr.io/xpressai/xpressclaw-runner-codex:latest")
-        );
-        assert_eq!(
-            default_native_runner_image("claude", ContainerEngineAccess::None),
-            Some("ghcr.io/xpressai/xpressclaw-runner-claude:latest")
-        );
-        assert_eq!(
-            default_native_runner_image("opencode", ContainerEngineAccess::None),
-            Some("ghcr.io/xpressai/xpressclaw-runner-opencode:latest")
-        );
-        assert_eq!(
-            default_native_runner_image("deepseek-harness", ContainerEngineAccess::None),
-            Some("ghcr.io/xpressai/xpressclaw-runner-deepseek-harness:latest")
-        );
+        for kind in ["codex", "claude", "opencode", "deepseek-harness"] {
+            assert_eq!(
+                default_native_runner_image(kind, ContainerEngineAccess::None),
+                agent_definition(kind).map(|agent| agent.minimal_image)
+            );
+        }
         assert_eq!(
             default_native_runner_image("custom", ContainerEngineAccess::None),
             None
@@ -6711,7 +6799,7 @@ flows:
         };
         assert_eq!(
             resolved_runner_image(&config, "codex").unwrap(),
-            "ghcr.io/xpressai/xpressclaw-runner-codex-docker:latest"
+            default_native_runner_image("codex", ContainerEngineAccess::Host).unwrap()
         );
         let workspace = Path::new("/home/me/project");
         assert_eq!(
@@ -6734,7 +6822,24 @@ flows:
         };
         assert_eq!(
             resolved_runner_image(&config, "codex").unwrap(),
-            "ghcr.io/xpressai/xpressclaw-runner-codex-docker:latest"
+            default_native_runner_image("codex", ContainerEngineAccess::Host).unwrap()
+        );
+    }
+
+    #[test]
+    fn managed_commit_image_moves_to_the_current_release_default() {
+        let config = NativeRunnerConfig {
+            kind: "codex".into(),
+            image: concat!(
+                "ghcr.io/xpressai/xpressclaw-runner-codex:",
+                "0123456789abcdef0123456789abcdef01234567"
+            )
+            .into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolved_runner_image(&config, "codex").unwrap(),
+            default_native_runner_image("codex", ContainerEngineAccess::None).unwrap()
         );
     }
 
@@ -6787,14 +6892,18 @@ flows:
     }
 
     #[test]
-    fn published_images_keep_the_prototype_local_aliases() {
+    fn development_builds_keep_the_prototype_local_aliases() {
+        let expected_minimal =
+            (crate::acp::RUNNER_IMAGE_TAG == "latest").then_some("xpressclaw-runner-codex:latest");
+        let expected_host = (crate::acp::RUNNER_IMAGE_TAG == "latest")
+            .then_some("xpressclaw-runner-codex-docker:latest");
         assert_eq!(
             local_runner_image_alias("ghcr.io/xpressai/xpressclaw-runner-codex:latest"),
-            Some("xpressclaw-runner-codex:latest")
+            expected_minimal
         );
         assert_eq!(
             local_runner_image_alias("ghcr.io/xpressai/xpressclaw-runner-codex-docker:latest"),
-            Some("xpressclaw-runner-codex-docker:latest")
+            expected_host
         );
         assert_eq!(local_runner_image_alias("example/custom:latest"), None);
     }
