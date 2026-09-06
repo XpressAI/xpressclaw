@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify XpressClaw's compiled icon resources in a macOS app bundle."""
+"""Verify XpressClaw's compiled icon catalog or a macOS app bundle."""
 import argparse
 import hashlib
 import json
@@ -26,12 +26,29 @@ def catalog_appearances(car):
     return {entry['Appearance'] for entry in json.loads(dump)
             if entry.get('AssetType') == 'IconImageStack' and 'Appearance' in entry}
 
+
+def verify_catalog(car):
+    appearances = catalog_appearances(car)
+    missing = REQUIRED_APPEARANCES - appearances
+    if missing:
+        raise RuntimeError(f'Asset catalog inspection did not report appearance variants: {sorted(missing)}. '
+                           'Use macOS 26 or later to inspect adaptive icon stacks.')
+    return appearances
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--app', required=True, type=Path)
+    target = parser.add_mutually_exclusive_group(required=True)
+    target.add_argument('--app', type=Path)
+    target.add_argument('--catalog-only', action='store_true',
+                        help='Verify the committed catalog with Apple tools, without building an app')
     parser.add_argument('--skip-signature', action='store_true')
     args = parser.parse_args()
     subprocess.run(['python3', str(ROOT / 'scripts/build-app-icon.py'), '--check'], check=True)
+    if args.catalog_only:
+        appearances = verify_catalog(COMPILED / 'Assets.car')
+        print(f"CATALOG    OK   appearance stacks present: {', '.join(sorted(appearances))}")
+        return
     contents = args.app.resolve() / 'Contents'
     info = plistlib.loads((contents / 'Info.plist').read_bytes())
     if info.get('CFBundleIconName') != 'XpressClaw':
@@ -42,11 +59,7 @@ def main():
         bundled = contents / 'Resources' / name
         if digest(bundled) != digest(COMPILED / name):
             raise RuntimeError(f'Bundled {name} does not match the committed compiled asset')
-    appearances = catalog_appearances(contents / 'Resources' / 'Assets.car')
-    missing = REQUIRED_APPEARANCES - appearances
-    if missing:
-        raise RuntimeError(f'Asset catalog is missing appearance variants: {sorted(missing)}. '
-                           'The icon would render but could not follow the system appearance.')
+    appearances = verify_catalog(contents / 'Resources' / 'Assets.car')
     executable = contents / 'MacOS' / info['CFBundleExecutable']
     if not executable.is_file():
         raise RuntimeError(f'Missing bundle executable: {executable}')
