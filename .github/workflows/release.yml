@@ -159,6 +159,8 @@ jobs:
       - name: Build (macOS)
         if: runner.os == 'macOS'
         env:
+          # Retain the app bundle for icon verification after DMG packaging.
+          TAURI_BUNDLES: "app,dmg"
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY_ID }}
