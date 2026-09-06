@@ -65,10 +65,11 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: macos-latest
+          # Adaptive icon inspection needs the macOS 26 assetutil on both architectures.
+          - os: macos-26
             target: aarch64-apple-darwin
             label: macOS-arm64
-          - os: macos-15-intel
+          - os: macos-26-intel
             target: x86_64-apple-darwin
             label: macOS-x64
           - os: windows-latest
