@@ -66,6 +66,51 @@ The frontend proxies API calls to `localhost:8935`. `--instance .`
 deliberately selects this checkout's development `xpressclaw.yaml`; omit it
 when exercising normal `~/.xpressclaw` discovery.
 
+## Build storage
+
+`target/` contains compiler intermediates, dependency libraries, test binaries,
+and caches from previous builds. It can be much larger than the compressed
+application installer. Cargo does not automatically remove every artifact left
+by changed features, dependencies, toolchains, or old source worktrees.
+
+The checked-in `.cargo/config.toml` disables incremental compilation and uses
+line-table debug information for development builds and tests. Backtraces retain
+file names and line numbers. Recompiling a changed crate can take longer, and
+inspecting variables in a debugger requires opting into full debug information:
+
+```bash
+CARGO_INCREMENTAL=1 CARGO_PROFILE_DEV_DEBUG=2 cargo build -p xpressclaw-cli
+CARGO_INCREMENTAL=1 CARGO_PROFILE_TEST_DEBUG=2 cargo test -p xpressclaw-core
+```
+
+These are standard [Cargo profile overrides](https://doc.rust-lang.org/cargo/reference/profiles.html).
+Release builds keep their existing profile.
+
+Put task worktrees under `.worktrees/<task>` instead of inside `target/`. For
+direct Cargo checks/tests across worktrees, reuse the main checkout's cache:
+
+```bash
+CARGO_TARGET_DIR="$(git rev-parse --path-format=absolute --git-common-dir)/../target" \
+  cargo test -p xpressclaw-core
+```
+
+Use a separate shared target directory for container builds or a different
+toolchain. Do not apply this override to `build.sh`/`build.ps1`: those packaging
+scripts expect binaries in the current checkout's normal `target/` paths.
+
+Before cleanup, stop builds and check for programs running from the selected
+target directory, including `target/debug/xpressclaw`. `cargo clean --profile dev`
+removes debug/test executables as well as compiler caches, while retaining release
+output. Stop those programs first and preserve any executable needed for restart
+outside the target directory. If a program must remain running, skip profile-wide
+cleanup and remove only inspected cache directories that contain neither active
+executables nor source worktrees.
+
+When using a shared target, pass the same `CARGO_TARGET_DIR` for cleanup. Check
+`git worktree list` first: older checkouts may contain source worktrees under
+`target/`, so deleting the entire directory or using unrestricted `cargo clean`
+would delete that source too.
+
 ## Repository architecture
 
 XpressClaw is a Cargo workspace with four crates:

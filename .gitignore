@@ -1,5 +1,6 @@
 # Rust
 /target/
+/.worktrees/
 **/*.rs.bk
 
 # Python (harness containers)
