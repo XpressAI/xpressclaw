@@ -858,16 +858,13 @@ async fn execute_conversation_turn(
         .native_session_id
         .map(AcpSessionStart::Resume)
         .unwrap_or(AcpSessionStart::New);
-    let previous_trigger_message_id = if matches!(&session_start, AcpSessionStart::Resume(_)) {
-        queue.last_completed_trigger(&turn.conversation_id, &turn.agent_id)?
-    } else {
-        None
-    };
+    let previous_trigger_message_id = conversation_prompt_boundary(&queue, &turn, &session_start)?;
     let prompt = build_conversation_prompt(
         &manager,
         &conversation,
         &turn,
         agent,
+        &session_start,
         previous_trigger_message_id,
     )?;
     turn_controls.begin_attempt(&turn.id);
@@ -981,6 +978,7 @@ fn build_conversation_prompt(
     conversation: &crate::conversations::Conversation,
     turn: &ConversationTurn,
     agent: &AgentConfig,
+    session_start: &AcpSessionStart,
     previous_trigger_message_id: Option<i64>,
 ) -> Result<String> {
     let messages = match (previous_trigger_message_id, turn.trigger_message_id) {
@@ -993,7 +991,11 @@ fn build_conversation_prompt(
         (_, None) => manager.get_messages(&turn.conversation_id, 80, None)?,
     }
     .into_iter()
-    .filter(|message| message.sender_type != "agent" || message.sender_id != turn.agent_id)
+    .filter(|message| {
+        matches!(session_start, AcpSessionStart::New)
+            || message.sender_type != "agent"
+            || message.sender_id != turn.agent_id
+    })
     .collect::<Vec<_>>();
     let mut history = String::new();
     for message in messages {
@@ -1019,6 +1021,32 @@ fn build_conversation_prompt(
         conversation.project_id.as_deref().unwrap_or("unassigned"),
         history,
     ))
+}
+
+/// Resumed sessions already retain completed history, while a fresh session
+/// must reconstruct it. Cancelled and failed work remains a boundary in both
+/// cases so rotating a session cannot put stopped work back into a prompt.
+fn conversation_prompt_boundary(
+    queue: &ConversationTurnQueue,
+    turn: &ConversationTurn,
+    session_start: &AcpSessionStart,
+) -> Result<Option<i64>> {
+    match turn.trigger_message_id {
+        Some(trigger_message_id) => match session_start {
+            AcpSessionStart::New => queue.last_interrupted_trigger_before(
+                &turn.conversation_id,
+                &turn.agent_id,
+                trigger_message_id,
+            ),
+            AcpSessionStart::Resume(_) | AcpSessionStart::Fork(_) => queue
+                .last_terminal_trigger_before(
+                    &turn.conversation_id,
+                    &turn.agent_id,
+                    trigger_message_id,
+                ),
+        },
+        None => Ok(None),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -4386,7 +4414,7 @@ mod tests {
             Ok::<_, rusqlite::Error>(())
         })
         .unwrap();
-        let manager = ConversationManager::new(db);
+        let manager = ConversationManager::new(db.clone());
         let conversation = manager
             .create_in_project(
                 Some("p"),
@@ -4397,7 +4425,7 @@ mod tests {
                 },
             )
             .unwrap();
-        manager
+        let first = manager
             .send_message(
                 &conversation.id,
                 &SendMessage {
@@ -4458,8 +4486,15 @@ mod tests {
             ..Default::default()
         };
 
-        let prompt =
-            build_conversation_prompt(&manager, &conversation, &turn, &agent, None).unwrap();
+        let prompt = build_conversation_prompt(
+            &manager,
+            &conversation,
+            &turn,
+            &agent,
+            &AcpSessionStart::New,
+            None,
+        )
+        .unwrap();
         assert!(prompt.contains("First context"));
         assert!(prompt.contains("Claimed request"));
         assert!(!prompt.contains("Arrived after claim"));
@@ -4470,6 +4505,193 @@ mod tests {
             "Reserve send_conversation_message for genuine interim updates or publishing workspace files while you continue working."
         ));
         assert!(prompt.contains("Never use the tool to duplicate your final response."));
+
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO conversation_agent_sessions
+                 (conversation_id, agent_id, status)
+                 VALUES (?1, 'atlas', 'queued')",
+                [&conversation.id],
+            )?;
+            conn.execute(
+                "INSERT INTO conversation_turns
+                 (id, conversation_id, agent_id, trigger_message_id, status)
+                 VALUES ('cancelled-turn', ?1, 'atlas', ?2, 'cancelled')",
+                rusqlite::params![conversation.id, first.id],
+            )?;
+            Ok::<_, rusqlite::Error>(())
+        })
+        .unwrap();
+        let queue = ConversationTurnQueue::new(db);
+        assert!(queue
+            .session(&conversation.id, "atlas")
+            .unwrap()
+            .native_session_id
+            .is_none());
+        let boundary = conversation_prompt_boundary(&queue, &turn, &AcpSessionStart::New).unwrap();
+        assert_eq!(boundary, Some(first.id));
+        let incremental_prompt = build_conversation_prompt(
+            &manager,
+            &conversation,
+            &turn,
+            &agent,
+            &AcpSessionStart::New,
+            boundary,
+        )
+        .unwrap();
+        assert!(!incremental_prompt.contains("First context"));
+        assert!(incremental_prompt.contains("Claimed request"));
+        assert!(!incremental_prompt.contains("Arrived after claim"));
+    }
+
+    #[test]
+    fn fresh_conversation_session_rebuilds_visible_completed_history_after_deletion() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO projects (id, name) VALUES ('p', 'Project')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO agents (id, name, backend, config, project_id)
+                 VALUES ('atlas', 'Atlas', 'native', '{}', 'p')",
+                [],
+            )?;
+            Ok::<_, rusqlite::Error>(())
+        })
+        .unwrap();
+        let manager = ConversationManager::new(db.clone());
+        let conversation = manager
+            .create_in_project(
+                Some("p"),
+                &crate::conversations::CreateConversation {
+                    title: Some("Rebuild history".into()),
+                    icon: None,
+                    participant_ids: vec!["atlas".into()],
+                },
+            )
+            .unwrap();
+        let deleted = manager
+            .send_message(
+                &conversation.id,
+                &SendMessage {
+                    sender_type: "user".into(),
+                    sender_id: "local".into(),
+                    sender_name: Some("You".into()),
+                    content: "Remove obsolete context".into(),
+                    message_type: None,
+                },
+            )
+            .unwrap();
+        let retained = manager
+            .send_message(
+                &conversation.id,
+                &SendMessage {
+                    sender_type: "user".into(),
+                    sender_id: "local".into(),
+                    sender_name: Some("You".into()),
+                    content: "Retain completed request".into(),
+                    message_type: None,
+                },
+            )
+            .unwrap();
+        let queue = ConversationTurnQueue::new(db);
+        assert!(queue
+            .enqueue(&conversation.id, "atlas", retained.id)
+            .unwrap());
+        let completed = queue.claim_next().unwrap().unwrap();
+        let response = manager
+            .send_message(
+                &conversation.id,
+                &SendMessage {
+                    sender_type: "agent".into(),
+                    sender_id: "atlas".into(),
+                    sender_name: Some("Atlas".into()),
+                    content: "Retained completed response".into(),
+                    message_type: None,
+                },
+            )
+            .unwrap();
+        queue
+            .complete(&completed, "completed-session", response.id)
+            .unwrap();
+
+        manager
+            .delete_message(&conversation.id, deleted.id)
+            .unwrap();
+        assert!(queue
+            .session(&conversation.id, "atlas")
+            .unwrap()
+            .native_session_id
+            .is_none());
+        let newest = manager
+            .send_message(
+                &conversation.id,
+                &SendMessage {
+                    sender_type: "user".into(),
+                    sender_id: "local".into(),
+                    sender_name: Some("You".into()),
+                    content: "Newest request".into(),
+                    message_type: None,
+                },
+            )
+            .unwrap();
+        let turn = ConversationTurn {
+            id: "fresh-turn".into(),
+            conversation_id: conversation.id.clone(),
+            agent_id: "atlas".into(),
+            trigger_message_id: Some(newest.id),
+            status: "running".into(),
+            result_message_id: None,
+            error_message: None,
+            context_used: None,
+            context_size: None,
+            queued_at: "now".into(),
+            started_at: None,
+            completed_at: None,
+            response_queued_at: None,
+            response_started_at: None,
+        };
+        let agent = AgentConfig {
+            name: "atlas".into(),
+            runner: NativeRunnerConfig {
+                project_name: Some("Atlas".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let session_start = AcpSessionStart::New;
+        let boundary = conversation_prompt_boundary(&queue, &turn, &session_start).unwrap();
+        assert_eq!(boundary, None);
+        let prompt = build_conversation_prompt(
+            &manager,
+            &conversation,
+            &turn,
+            &agent,
+            &session_start,
+            boundary,
+        )
+        .unwrap();
+        assert!(!prompt.contains("Remove obsolete context"));
+        assert!(prompt.contains("Retain completed request"));
+        assert!(prompt.contains("Retained completed response"));
+        assert!(prompt.contains("Newest request"));
+
+        let resumed = AcpSessionStart::Resume("completed-session".into());
+        let resumed_boundary = conversation_prompt_boundary(&queue, &turn, &resumed).unwrap();
+        assert_eq!(resumed_boundary, Some(retained.id));
+        let resumed_prompt = build_conversation_prompt(
+            &manager,
+            &conversation,
+            &turn,
+            &agent,
+            &resumed,
+            resumed_boundary,
+        )
+        .unwrap();
+        assert!(!resumed_prompt.contains("Retain completed request"));
+        assert!(!resumed_prompt.contains("Retained completed response"));
+        assert!(resumed_prompt.contains("Newest request"));
     }
 
     #[test]

@@ -13,6 +13,7 @@ use crate::sync::manifest::validate_identifier;
 use crate::workflows::definition::WorkflowDefinition;
 
 pub const STORE_VERSION: u32 = 1;
+pub(super) const CONVERSATION_MESSAGE_DELETED_AT_KEY: &str = "xpressclaw_deleted_at";
 const STORE_DESCRIPTOR: &str = ".xpressclaw-store.yml";
 const PROJECT_FILE: &str = "project.yml";
 const MAX_RECORD_BYTES: u64 = 2 * 1024 * 1024;
@@ -735,6 +736,22 @@ impl PortableSnapshot {
                 )));
             }
             validate_timestamp("Conversation message created_at", &message.created_at)?;
+            if let Some(deleted_at) = message
+                .metadata
+                .get(CONVERSATION_MESSAGE_DELETED_AT_KEY)
+                .and_then(Value::as_str)
+            {
+                validate_timestamp("Conversation message deleted_at", deleted_at)?;
+            } else if message
+                .metadata
+                .get(CONVERSATION_MESSAGE_DELETED_AT_KEY)
+                .is_some()
+            {
+                return Err(Error::Sync(format!(
+                    "Conversation message '{}' deletion marker must be a timestamp",
+                    message.record_id
+                )));
+            }
         }
 
         validate_message_graph(

@@ -15,6 +15,7 @@ use xpressclaw_core::error::Error;
 use xpressclaw_core::llm::router::LlmRouter;
 use xpressclaw_core::projects::{Project, ProjectManager};
 use xpressclaw_core::sync::{self, ProjectSyncManifest, SnapshotCounts, MANIFEST_FILE};
+use xpressclaw_core::workers::acp::AcpInterruptMode;
 use xpressclaw_core::workers::native::resolved_workspace;
 
 use crate::state::AppState;
@@ -100,9 +101,23 @@ async fn fetch_project(
     let config_path = state.config_path.clone();
     let mut runtime_config = state.config().as_ref().clone();
     let force = request.map(|Json(request)| request.force).unwrap_or(false);
+    let turn_controls = state.turn_controls.clone();
+    let elicitations = state.elicitations.clone();
 
     let (outcome, mut updated_config) = tokio::task::spawn_blocking(move || {
-        let outcome = sync::fetch(&db, &mut runtime_config, &config_path, &project_dir, force)?;
+        let outcome = sync::fetch_with_interrupt_handler(
+            &db,
+            &mut runtime_config,
+            &config_path,
+            &project_dir,
+            force,
+            |turn_ids| {
+                for turn_id in turn_ids {
+                    turn_controls.request_interrupt(turn_id, AcpInterruptMode::Immediate);
+                    elicitations.cancel_attempt(turn_id);
+                }
+            },
+        )?;
         Ok::<_, Error>((outcome, runtime_config))
     })
     .await

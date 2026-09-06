@@ -82,6 +82,8 @@ function snapshot(empty = false, cursorBase = 40) {
 			href: '/tasks/task-attention',
 			summary: 'The Agent needs your input',
 			updated_at: iso(1),
+			work_kind: 'task',
+			work_id: 'task-attention',
 		}],
 		feed: {
 			events: empty ? [] : [event({ cursor: cursorBase }), event({
@@ -112,12 +114,15 @@ async function mockDashboard(page: Page, options: {
 	delayDeletedSnapshot?: boolean;
 	refreshProjects?: boolean;
 	rollingWindow?: boolean;
+	deleteRecentEventOnRefresh?: boolean;
+	deleteOlderEventOnRefresh?: boolean;
 	stream?: boolean;
 } = {}) {
 	const scopes: string[] = [];
 	let snapshotRequests = 0;
 	let feedRequests = 0;
 	let selectedProjectDeleted = false;
+	const attentionActions: string[] = [];
 	let releaseFirstRefresh = () => {};
 	let releaseDeletedSnapshot = () => {};
 	const firstRefreshGate = new Promise<void>((resolve) => {
@@ -180,6 +185,17 @@ async function mockDashboard(page: Page, options: {
 					{ id: 'project-new', name: 'New Project' },
 				];
 			}
+			if (options.deleteRecentEventOnRefresh && requestNumber > 1) {
+				response.feed.events = response.feed.events.filter((item) => item.event_id !== 'evt-existing');
+			}
+			if (options.deleteOlderEventOnRefresh && requestNumber > 1) {
+				response.feed.events = [event({
+					cursor: 50,
+					event_id: 'evt-older',
+					event_kind: 'conversation_message_deleted',
+					preview: '',
+				}), ...response.feed.events];
+			}
 			return route.fulfill({ json: response });
 		}
 		if (url.pathname === '/api/dashboard/feed') {
@@ -215,6 +231,10 @@ async function mockDashboard(page: Page, options: {
 			});
 		}
 		if (url.pathname === '/api/health') return route.fulfill({ json: { status: 'ok' } });
+		if (url.pathname === '/api/tasks/task-attention/status' && route.request().method() === 'PATCH') {
+			attentionActions.push('task-attention');
+			return route.fulfill({ json: { id: 'task-attention', status: 'cancelled' } });
+		}
 		if (url.pathname === '/api/setup/check-docker') return route.fulfill({ json: { available: true, installed: true, can_start: false } });
 		if (url.pathname === '/api/projects') return route.fulfill({ json: [] });
 		if (url.pathname === '/api/conversations') return route.fulfill({ json: [] });
@@ -229,6 +249,7 @@ async function mockDashboard(page: Page, options: {
 		snapshotRequestCount: () => snapshotRequests,
 		releaseFirstRefresh,
 		releaseDeletedSnapshot,
+		attentionActions,
 		deleteSelectedProject: () => (selectedProjectDeleted = true),
 	};
 }
@@ -379,7 +400,7 @@ function contrast(foreground: string, background: string) {
 
 test('brand opens the real-time Control center with deduplicated live navigation', async ({ page }, testInfo) => {
 	await page.setViewportSize({ width: 1440, height: 1050 });
-	const { scopes } = await mockDashboard(page);
+	const { scopes, attentionActions } = await mockDashboard(page);
 	await page.goto('/projects');
 	await page.locator('a[aria-label="Open Control center"]').first().click();
 	await expect(page).toHaveURL(/\/dashboard$/);
@@ -398,6 +419,10 @@ test('brand opens the real-time Control center with deduplicated live navigation
 	await expect(stableEvent.locator('img')).toHaveCount(0);
 	expect(await page.evaluate(() => (window as unknown as { dashboardPwned?: number }).dashboardPwned)).toBeUndefined();
 	await expect(page.locator('[data-live-feed] [data-feed-event="evt-existing"]')).toHaveCount(1);
+	page.once('dialog', (dialog) => dialog.accept());
+	await page.getByRole('button', { name: 'Cancel task' }).click();
+	await expect.poll(() => attentionActions).toEqual(['task-attention']);
+	await expect(page.getByRole('heading', { name: 'Needs your attention' })).toHaveCount(0);
 	await page.getByRole('button', { name: 'Load earlier activity' }).click();
 	await expect(page.locator('[data-feed-event="evt-older"]')).toContainText('Earlier bounded activity');
 
@@ -496,6 +521,31 @@ test('live activity during a slow summary refresh queues one trailing refresh', 
 	mocked.releaseFirstRefresh();
 	await expect.poll(mocked.snapshotRequestCount).toBe(3);
 	await expect(page.locator('[data-kpi="working-agents"]')).toContainText('9');
+});
+
+test('a refreshed snapshot removes deleted recent activity without dropping newer live events', async ({ page }) => {
+	await installMockEventSource(page);
+	const mocked = await mockDashboard(page, { deleteRecentEventOnRefresh: true });
+	await page.goto('/dashboard');
+	await expect(page.locator('[data-feed-event="evt-existing"]')).toBeVisible();
+
+	await emitDashboardEvent(page, event({ cursor: 51, event_id: 'evt-after-delete' }));
+	await expect.poll(mocked.snapshotRequestCount).toBeGreaterThan(1);
+	await expect(page.locator('[data-feed-event="evt-existing"]')).toHaveCount(0);
+	await expect(page.locator('[data-feed-event="evt-after-delete"]')).toBeVisible();
+});
+
+test('a durable deletion removes activity from loaded older dashboard history', async ({ page }) => {
+	await installMockEventSource(page);
+	const mocked = await mockDashboard(page, { deleteOlderEventOnRefresh: true });
+	await page.goto('/dashboard');
+	await page.getByRole('button', { name: 'Load earlier activity' }).click();
+	await expect(page.locator('[data-feed-event="evt-older"]')).toBeVisible();
+
+	await emitDashboardEvent(page, event({ cursor: 51, event_id: 'evt-after-older-delete' }));
+	await expect.poll(mocked.snapshotRequestCount).toBeGreaterThan(1);
+	await expect(page.locator('[data-feed-event="evt-older"]')).toHaveCount(0);
+	await expect(page.locator('[data-feed-event="evt-after-older-delete"]')).toBeVisible();
 });
 
 test('live activity coalesced into a failed summary refresh receives one retry', async ({ page }) => {

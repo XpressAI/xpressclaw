@@ -223,7 +223,9 @@ export interface ConversationTurn {
 	id: string;
 	conversation_id: string;
 	agent_id: string;
+	trigger_message_id: number | null;
 	status: string;
+	result_message_id: number | null;
 	error_message: string | null;
 	context_used: number | null;
 	context_size: number | null;
@@ -277,10 +279,16 @@ export const conversations = {
 		if (beforeId !== undefined) params.set('before_id', String(beforeId));
 		return request<ConversationMessage[]>(`/api/conversations/${encodeURIComponent(id)}/messages?${params}`);
 	},
+	messageDeletions: (id: string) =>
+		request<number[]>(`/api/conversations/${encodeURIComponent(id)}/message-deletions`),
 	sendMessage: (id: string, content: string, attachments: ConversationMessageUpload[] = []) =>
 		request<{ message: ConversationMessage; queued_agents: string[] }>(`/api/conversations/${encodeURIComponent(id)}/messages`, {
 			method: 'POST',
 			body: JSON.stringify({ content, attachments }),
+		}),
+	deleteMessage: (id: string, messageId: number) =>
+		request<void>(`/api/conversations/${encodeURIComponent(id)}/messages/${messageId}`, {
+			method: 'DELETE',
 		}),
 	tasks: (id: string) => request<Task[]>(`/api/conversations/${encodeURIComponent(id)}/tasks`),
 	createTask: (id: string, data: { title: string; description?: string; agent_id?: string; workflow_id?: string; workflow_inputs?: Record<string, unknown>; priority?: number }) =>
@@ -289,6 +297,11 @@ export const conversations = {
 			body: JSON.stringify(data),
 		}),
 	turns: (id: string) => request<ConversationTurn[]>(`/api/conversations/${encodeURIComponent(id)}/turns`),
+	cancelTurn: (id: string, turnId: string) =>
+		request<ConversationTurn>(`/api/conversations/${encodeURIComponent(id)}/turns/${encodeURIComponent(turnId)}/cancel`, {
+			method: 'POST',
+			body: '{}',
+		}),
 	attachmentUrl: (conversationId: string, attachmentId: string) => `/api/conversations/${encodeURIComponent(conversationId)}/attachments/${encodeURIComponent(attachmentId)}`,
 	visualizationUrl: (conversationId: string, messageId: number, artifactId: string) =>
 		`/api/conversations/${encodeURIComponent(conversationId)}/messages/${messageId}/visualizations/${encodeURIComponent(artifactId)}`,
@@ -372,6 +385,8 @@ export interface DashboardAttentionItem {
 	href: string;
 	summary: string;
 	updated_at: string;
+	work_kind: 'task' | 'conversation_turn';
+	work_id: string;
 }
 
 export interface DashboardFeedPage {

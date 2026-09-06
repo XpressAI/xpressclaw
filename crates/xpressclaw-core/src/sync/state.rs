@@ -10,6 +10,7 @@ use zerocopy::IntoBytes;
 use crate::config::{
     AgentConfig, AgentLlmConfig, BudgetConfig, Config, OnExceeded, RateLimitConfig, WakeOnConfig,
 };
+use crate::conversations::runtime::reconcile_message_deletion_turns;
 use crate::db::{task_search_key, Database};
 use crate::error::{Error, Result};
 use crate::memory::vector::simple_embedding;
@@ -22,7 +23,7 @@ use super::model::{
     PortableMemoryLink, PortableMemoryNote, PortableParticipant, PortableProject,
     PortableRateLimitSettings, PortableRunnerSettings, PortableSnapshot, PortableTask,
     PortableTaskDependency, PortableTaskMessage, PortableWakeOnSettings, PortableWorkflow,
-    StoreDescriptor, STORE_VERSION,
+    StoreDescriptor, CONVERSATION_MESSAGE_DELETED_AT_KEY, STORE_VERSION,
 };
 
 #[derive(Debug, Clone)]
@@ -120,14 +121,26 @@ pub(super) fn project_has_portable_data(db: &Database, project_id: &str) -> Resu
 }
 
 pub(super) fn ensure_quiescent(db: &Database, project_id: &str) -> Result<()> {
-    let active = db.with_conn(|connection| project_is_active(connection, project_id))?;
+    let active = db.with_conn(|connection| project_is_active(connection, project_id, true))?;
     if active {
-        return Err(quiescent_error());
+        return Err(quiescent_error(true));
     }
     Ok(())
 }
 
-fn project_is_active(connection: &Connection, project_id: &str) -> Result<bool> {
+pub(super) fn ensure_fetch_ready(db: &Database, project_id: &str) -> Result<()> {
+    let active = db.with_conn(|connection| project_is_active(connection, project_id, false))?;
+    if active {
+        return Err(quiescent_error(false));
+    }
+    Ok(())
+}
+
+fn project_is_active(
+    connection: &Connection,
+    project_id: &str,
+    include_conversation_turns: bool,
+) -> Result<bool> {
     connection
         .query_row(
             "SELECT
@@ -137,28 +150,32 @@ fn project_is_active(connection: &Connection, project_id: &str) -> Result<bool> 
                     WHERE task.project_id = ?1
                       AND attempt.status IN ('queued', 'preparing', 'running', 'waiting_for_input', 'review')
                 )
-                OR EXISTS(
+                OR (?2 AND EXISTS(
                     SELECT 1 FROM conversation_turns turn
                     JOIN conversations conversation ON conversation.id = turn.conversation_id
                     WHERE conversation.project_id = ?1
                       AND turn.status IN ('queued', 'running')
-                )
+                ))
                 OR EXISTS(
                     SELECT 1 FROM workflow_instances instance
                     WHERE instance.project_id = ?1
                       AND instance.status IN ('running', 'waiting')
                 )",
-            [project_id],
+            params![project_id, include_conversation_turns],
             |row| row.get::<_, bool>(0),
         )
         .map_err(Error::from)
 }
 
-fn quiescent_error() -> Error {
-    Error::Sync(
-        "Project synchronization requires a quiescent Project; stop the server or wait for active tasks, Conversations, and workflows"
-            .into(),
-    )
+fn quiescent_error(include_conversation_turns: bool) -> Error {
+    let active_work = if include_conversation_turns {
+        "tasks, Conversations, and workflows"
+    } else {
+        "tasks and workflows"
+    };
+    Error::Sync(format!(
+        "Project synchronization requires a quiescent Project; stop the server or wait for active {active_work}"
+    ))
 }
 
 pub(super) fn export_snapshot(
@@ -166,9 +183,27 @@ pub(super) fn export_snapshot(
     config: &Config,
     manifest: &ProjectSyncManifest,
 ) -> Result<PortableSnapshot> {
+    export_snapshot_with_conversations(db, config, manifest, false)
+}
+
+pub(super) fn export_snapshot_for_fetch(
+    db: &Database,
+    config: &Config,
+    manifest: &ProjectSyncManifest,
+) -> Result<PortableSnapshot> {
+    export_snapshot_with_conversations(db, config, manifest, true)
+}
+
+fn export_snapshot_with_conversations(
+    db: &Database,
+    config: &Config,
+    manifest: &ProjectSyncManifest,
+    allow_active_conversations: bool,
+) -> Result<PortableSnapshot> {
     db.with_conn(|connection| {
         let transaction = Transaction::new_unchecked(connection, TransactionBehavior::Immediate)?;
-        let snapshot = export_transaction(&transaction, config, manifest)?;
+        let snapshot =
+            export_transaction(&transaction, config, manifest, allow_active_conversations)?;
         snapshot.validate_for_sync(&manifest.project_id)?;
         transaction.commit()?;
         Ok(snapshot)
@@ -179,9 +214,11 @@ fn export_transaction(
     connection: &Connection,
     config: &Config,
     manifest: &ProjectSyncManifest,
+    allow_active_conversations: bool,
 ) -> Result<PortableSnapshot> {
-    if project_is_active(connection, &manifest.project_id)? {
-        return Err(quiescent_error());
+    let include_conversation_turns = !allow_active_conversations;
+    if project_is_active(connection, &manifest.project_id, include_conversation_turns)? {
+        return Err(quiescent_error(include_conversation_turns));
     }
     let project = connection
         .query_row(
@@ -581,6 +618,7 @@ fn export_conversation_messages(
         linked_task_id: Option<String>,
         metadata: String,
         created_at: String,
+        deleted_at: Option<String>,
         record_id: Option<String>,
         parent_record_id: Option<String>,
     }
@@ -590,6 +628,7 @@ fn export_conversation_messages(
         "SELECT message.id, message.conversation_id, message.sender_type, message.sender_id,
                 message.sender_name, message.content, message.message_type,
                 message.linked_task_id, message.metadata, message.created_at,
+                message.deleted_at,
                 sync.record_id, sync.parent_record_id
          FROM conversation_messages message
          JOIN conversations conversation ON conversation.id = message.conversation_id
@@ -609,8 +648,9 @@ fn export_conversation_messages(
                 linked_task_id: row.get(7)?,
                 metadata: row.get(8)?,
                 created_at: row.get(9)?,
-                record_id: row.get(10)?,
-                parent_record_id: row.get(11)?,
+                deleted_at: row.get(10)?,
+                record_id: row.get(11)?,
+                parent_record_id: row.get(12)?,
             })
         },
     )?;
@@ -632,6 +672,18 @@ fn export_conversation_messages(
             params![record_id, message.id, parent_record_id],
         )?;
         previous_by_conversation.insert(message.conversation_id.clone(), record_id.clone());
+        let mut metadata = parse_json(message.metadata, "Conversation message metadata")?;
+        if let Some(deleted_at) = message.deleted_at {
+            metadata
+                .as_object_mut()
+                .ok_or_else(|| {
+                    Error::Sync("Conversation message metadata must be an object".into())
+                })?
+                .insert(
+                    CONVERSATION_MESSAGE_DELETED_AT_KEY.into(),
+                    Value::String(deleted_at),
+                );
+        }
         result.push(PortableConversationMessage {
             record_id,
             parent_record_id,
@@ -642,7 +694,7 @@ fn export_conversation_messages(
             content: message.content,
             message_type: message.message_type,
             linked_task_id: message.linked_task_id,
-            metadata: parse_json(message.metadata, "Conversation message metadata")?,
+            metadata,
             created_at: message.created_at,
         });
     }
@@ -711,7 +763,28 @@ pub(super) fn import_snapshot(
     config_path: &Path,
     project_dir: &Path,
     snapshot: &PortableSnapshot,
-) -> Result<()> {
+) -> Result<Vec<String>> {
+    import_snapshot_with_conversations(db, config, config_path, project_dir, snapshot, false)
+}
+
+pub(super) fn import_snapshot_for_fetch(
+    db: &Database,
+    config: &mut Config,
+    config_path: &Path,
+    project_dir: &Path,
+    snapshot: &PortableSnapshot,
+) -> Result<Vec<String>> {
+    import_snapshot_with_conversations(db, config, config_path, project_dir, snapshot, true)
+}
+
+fn import_snapshot_with_conversations(
+    db: &Database,
+    config: &mut Config,
+    config_path: &Path,
+    project_dir: &Path,
+    snapshot: &PortableSnapshot,
+    allow_active_conversations: bool,
+) -> Result<Vec<String>> {
     // Reload the file-backed form so values supplied only through environment
     // overrides are never materialized into xpressclaw.yaml by a fetch.
     let mut updated_config = if config_path.exists() {
@@ -722,9 +795,10 @@ pub(super) fn import_snapshot(
     let original_config = fs::read(config_path).ok();
     merge_agent_config(&mut updated_config, snapshot, project_dir)?;
 
-    let transaction_result = db.with_conn(|connection| -> Result<()> {
+    let transaction_result = db.with_conn(|connection| -> Result<Vec<String>> {
         let transaction = Transaction::new_unchecked(connection, TransactionBehavior::Immediate)?;
-        import_transaction(&transaction, snapshot)?;
+        let interrupted_turn_ids =
+            import_transaction(&transaction, snapshot, allow_active_conversations)?;
         if fs::read(config_path).ok().as_deref() != original_config.as_deref() {
             return Err(Error::Sync(
                 "xpressclaw.yaml changed during fetch; no synchronized state was imported".into(),
@@ -735,11 +809,11 @@ pub(super) fn import_snapshot(
             restore_config(config_path, original_config.as_deref());
             return Err(Error::from(error));
         }
-        Ok(())
+        Ok(interrupted_turn_ids)
     });
-    transaction_result?;
+    let interrupted_turn_ids = transaction_result?;
     *config = updated_config;
-    Ok(())
+    Ok(interrupted_turn_ids)
 }
 
 fn restore_config(path: &Path, contents: Option<&[u8]>) {
@@ -884,7 +958,11 @@ fn portable_budget(budget: &PortableBudgetSettings) -> Result<BudgetConfig> {
     })
 }
 
-fn import_transaction(connection: &Connection, snapshot: &PortableSnapshot) -> Result<()> {
+fn import_transaction(
+    connection: &Connection,
+    snapshot: &PortableSnapshot,
+    allow_active_conversations: bool,
+) -> Result<Vec<String>> {
     let project_exists: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
         [&snapshot.project.id],
@@ -893,8 +971,9 @@ fn import_transaction(connection: &Connection, snapshot: &PortableSnapshot) -> R
     if project_exists {
         ensure_project_accepts_work(connection, &snapshot.project.id)?;
     }
-    if project_is_active(connection, &snapshot.project.id)? {
-        return Err(quiescent_error());
+    let include_conversation_turns = !allow_active_conversations;
+    if project_is_active(connection, &snapshot.project.id, include_conversation_turns)? {
+        return Err(quiescent_error(include_conversation_turns));
     }
     validate_local_scopes(connection, snapshot)?;
     let project = &snapshot.project;
@@ -922,8 +1001,7 @@ fn import_transaction(connection: &Connection, snapshot: &PortableSnapshot) -> R
     import_task_messages(connection, snapshot)?;
     import_workflows(connection, snapshot)?;
     import_memory(connection, snapshot)?;
-    import_conversation_messages(connection, snapshot)?;
-    Ok(())
+    import_conversation_messages(connection, snapshot)
 }
 
 fn validate_local_scopes(connection: &Connection, snapshot: &PortableSnapshot) -> Result<()> {
@@ -1433,7 +1511,7 @@ fn import_memory(connection: &Connection, snapshot: &PortableSnapshot) -> Result
 fn import_conversation_messages(
     connection: &Connection,
     snapshot: &PortableSnapshot,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     struct ExistingMessage {
         id: i64,
         conversation_id: String,
@@ -1444,9 +1522,11 @@ fn import_conversation_messages(
         message_type: String,
         metadata: String,
         created_at: String,
+        deleted_at: Option<String>,
     }
 
     let mut imported = Vec::with_capacity(snapshot.conversation_messages.len());
+    let mut interrupted_turn_ids = BTreeSet::new();
     let order = message_import_order(snapshot.conversation_messages.iter().map(|message| {
         (
             message.record_id.as_str(),
@@ -1456,11 +1536,14 @@ fn import_conversation_messages(
     }))?;
     for index in order {
         let message = &snapshot.conversation_messages[index];
+        let (message_metadata, remote_deleted_at) =
+            conversation_message_metadata(&message.metadata)?;
         let existing: Option<ExistingMessage> = connection
             .query_row(
                 "SELECT message.id, message.conversation_id, message.sender_type,
                         message.sender_id, message.sender_name, message.content,
-                        message.message_type, message.metadata, message.created_at
+                        message.message_type, message.metadata, message.created_at,
+                        message.deleted_at
                  FROM conversation_message_sync sync
                  JOIN conversation_messages message ON message.id = sync.message_id
                  WHERE sync.record_id = ?1",
@@ -1476,12 +1559,13 @@ fn import_conversation_messages(
                         message_type: row.get(6)?,
                         metadata: row.get(7)?,
                         created_at: row.get(8)?,
+                        deleted_at: row.get(9)?,
                     })
                 },
             )
             .optional()?;
         let already_existed = existing.is_some();
-        let message_id = if let Some(existing) = existing {
+        let (message_id, deleted_at, became_deleted) = if let Some(existing) = existing {
             if existing.conversation_id != message.conversation_id
                 || existing.sender_type != message.sender_type
                 || existing.sender_id != message.sender_id
@@ -1489,7 +1573,7 @@ fn import_conversation_messages(
                 || existing.content != message.content
                 || existing.message_type != message.message_type
                 || parse_json(existing.metadata, "Conversation message metadata")?
-                    != message.metadata
+                    != message_metadata
                 || existing.created_at != message.created_at
             {
                 return Err(Error::Sync(format!(
@@ -1500,13 +1584,23 @@ fn import_conversation_messages(
             // The message body and identity are immutable, but this relationship
             // is intentionally mutable: deleting a task clears it via the local
             // foreign key and that cleared association must synchronize.
+            let was_deleted = existing.deleted_at.is_some();
+            let deleted_at = match (existing.deleted_at, remote_deleted_at.clone()) {
+                (Some(local), Some(remote)) => Some(local.max(remote)),
+                (Some(local), None) => Some(local),
+                (None, remote) => remote,
+            };
             connection.execute(
-                "UPDATE conversation_messages SET linked_task_id = ?1 WHERE id = ?2",
-                params![message.linked_task_id, existing.id],
+                "UPDATE conversation_messages
+                 SET linked_task_id = ?1, deleted_at = ?2,
+                     processed = CASE WHEN ?2 IS NULL THEN processed ELSE 1 END
+                 WHERE id = ?3",
+                params![message.linked_task_id, deleted_at, existing.id],
             )?;
-            existing.id
+            let became_deleted = !was_deleted && deleted_at.is_some();
+            (existing.id, deleted_at, became_deleted)
         } else {
-            let metadata = serde_json::to_string(&message.metadata).map_err(|error| {
+            let metadata = serde_json::to_string(&message_metadata).map_err(|error| {
                 Error::Sync(format!(
                     "failed to serialize Conversation message metadata: {error}"
                 ))
@@ -1514,8 +1608,8 @@ fn import_conversation_messages(
             connection.execute(
                 "INSERT INTO conversation_messages
                     (conversation_id, sender_type, sender_id, sender_name, content,
-                     message_type, linked_task_id, metadata, created_at, processed)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1)",
+                     message_type, linked_task_id, metadata, created_at, processed, deleted_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10)",
                 params![
                     message.conversation_id,
                     message.sender_type,
@@ -1525,10 +1619,11 @@ fn import_conversation_messages(
                     message.message_type,
                     message.linked_task_id,
                     metadata,
-                    message.created_at
+                    message.created_at,
+                    remote_deleted_at
                 ],
             )?;
-            connection.last_insert_rowid()
+            (connection.last_insert_rowid(), remote_deleted_at, false)
         };
         connection.execute(
             "INSERT OR IGNORE INTO conversation_message_sync
@@ -1536,6 +1631,33 @@ fn import_conversation_messages(
              VALUES (?1, ?2, NULL)",
             params![message.record_id, message_id],
         )?;
+        if deleted_at.is_some() {
+            // A tombstone imported before its message ever existed locally has
+            // nothing to evict from dashboard history. Remove the ordinary
+            // activity row created by the message insert trigger; existing
+            // messages keep the durable deletion version emitted on update.
+            if !already_existed {
+                connection.execute(
+                    "DELETE FROM dashboard_events WHERE event_id = 'conversation-message:' || ?1",
+                    [message_id],
+                )?;
+            }
+            if became_deleted {
+                interrupted_turn_ids.extend(reconcile_message_deletion_turns(
+                    connection,
+                    &message.conversation_id,
+                    message_id,
+                )?);
+            }
+            connection.execute(
+                "DELETE FROM conversation_message_attachments WHERE message_id = ?1",
+                [message_id],
+            )?;
+            connection.execute(
+                "DELETE FROM message_visualizations WHERE conversation_message_id = ?1",
+                [message_id],
+            )?;
+        }
         imported.push((
             &message.record_id,
             &message.parent_record_id,
@@ -1563,7 +1685,7 @@ fn import_conversation_messages(
             "UPDATE conversations
              SET last_message_at = (
                  SELECT created_at FROM conversation_messages
-                 WHERE conversation_id = ?1
+                 WHERE conversation_id = ?1 AND deleted_at IS NULL
                  ORDER BY julianday(created_at) DESC, id DESC
                  LIMIT 1
              )
@@ -1571,7 +1693,23 @@ fn import_conversation_messages(
             [&conversation.id],
         )?;
     }
-    Ok(())
+    Ok(interrupted_turn_ids.into_iter().collect())
+}
+
+fn conversation_message_metadata(metadata: &Value) -> Result<(Value, Option<String>)> {
+    let mut metadata = metadata.clone();
+    let object = metadata
+        .as_object_mut()
+        .ok_or_else(|| Error::Sync("Conversation message metadata must be an object".into()))?;
+    let deleted_at = object
+        .remove(CONVERSATION_MESSAGE_DELETED_AT_KEY)
+        .map(|value| {
+            value.as_str().map(str::to_owned).ok_or_else(|| {
+                Error::Sync("Conversation message deletion marker must be a timestamp".into())
+            })
+        })
+        .transpose()?;
+    Ok((metadata, deleted_at))
 }
 
 fn message_import_order<'a>(
@@ -1762,7 +1900,7 @@ mod tests {
         target
             .with_conn(|connection| {
                 let transaction = connection.unchecked_transaction()?;
-                import_transaction(&transaction, &snapshot)?;
+                import_transaction(&transaction, &snapshot, false)?;
                 transaction.commit()?;
                 Ok::<_, Error>(())
             })
@@ -2075,6 +2213,151 @@ mod tests {
     }
 
     #[test]
+    fn imported_conversation_message_tombstones_cannot_be_revived() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("xpressclaw.yaml");
+        let db = Database::open_memory().unwrap();
+        insert_project_data(&db);
+        let config = Config {
+            agents: vec![AgentConfig {
+                name: "atlas".into(),
+                backend: "codex".into(),
+                ..AgentConfig::default()
+            }],
+            ..Config::default()
+        };
+        config.save(&config_path).unwrap();
+        let stale = export_snapshot(&db, &config, &manifest()).unwrap();
+        let mut deleted = stale.clone();
+        deleted.conversation_messages[0]
+            .metadata
+            .as_object_mut()
+            .unwrap()
+            .insert(
+                CONVERSATION_MESSAGE_DELETED_AT_KEY.into(),
+                Value::String("2026-01-02 00:00:00".into()),
+            );
+
+        let mut loaded = Config::load(&config_path).unwrap();
+        import_snapshot(&db, &mut loaded, &config_path, directory.path(), &deleted).unwrap();
+        db.with_conn(|connection| {
+            connection.execute(
+                "INSERT INTO conversation_agent_sessions
+                    (conversation_id, agent_id, native_session_id)
+                 VALUES ('conversation-one', 'atlas', 'new-session')",
+                [],
+            )
+        })
+        .unwrap();
+        import_snapshot(&db, &mut loaded, &config_path, directory.path(), &deleted).unwrap();
+        import_snapshot(&db, &mut loaded, &config_path, directory.path(), &stale).unwrap();
+
+        let native_session_id = db
+            .with_conn(|connection| {
+                connection.query_row(
+                    "SELECT native_session_id FROM conversation_agent_sessions
+                     WHERE conversation_id = 'conversation-one' AND agent_id = 'atlas'",
+                    [],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(native_session_id.as_deref(), Some("new-session"));
+        let visible = crate::conversations::ConversationManager::new(std::sync::Arc::new(db))
+            .get_messages("conversation-one", 20, None)
+            .unwrap();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].content, "two");
+
+        let fresh_directory = tempfile::tempdir().unwrap();
+        let fresh_config_path = fresh_directory.path().join("xpressclaw.yaml");
+        let fresh_db = Database::open_memory().unwrap();
+        let mut fresh_config = Config::default();
+        fresh_config.save(&fresh_config_path).unwrap();
+        import_snapshot(
+            &fresh_db,
+            &mut fresh_config,
+            &fresh_config_path,
+            fresh_directory.path(),
+            &deleted,
+        )
+        .unwrap();
+        let deleted_dashboard_events = fresh_db
+            .with_conn(|connection| {
+                connection.query_row(
+                    "SELECT COUNT(*) FROM dashboard_events event
+                     JOIN conversation_messages message
+                       ON event.event_id = 'conversation-message:' || message.id
+                     WHERE message.content = 'one'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(deleted_dashboard_events, 0);
+    }
+
+    #[test]
+    fn imported_tombstones_report_running_conversation_turns() {
+        let db = Database::open_memory().unwrap();
+        insert_project_data(&db);
+        let config = Config {
+            agents: vec![AgentConfig {
+                name: "atlas".into(),
+                backend: "codex".into(),
+                ..AgentConfig::default()
+            }],
+            ..Config::default()
+        };
+        let mut deleted = export_snapshot(&db, &config, &manifest()).unwrap();
+        deleted.conversation_messages[0]
+            .metadata
+            .as_object_mut()
+            .unwrap()
+            .insert(
+                CONVERSATION_MESSAGE_DELETED_AT_KEY.into(),
+                Value::String("2026-01-02 00:00:00".into()),
+            );
+
+        db.with_conn(|connection| {
+            connection.execute_batch(
+                "INSERT INTO conversation_agent_sessions
+                    (conversation_id, agent_id, native_session_id, status)
+                 VALUES ('conversation-one', 'atlas', 'active-session', 'running');
+                 INSERT INTO conversation_turns
+                    (id, conversation_id, agent_id, trigger_message_id, status)
+                 SELECT 'running-turn', 'conversation-one', 'atlas', id, 'running'
+                 FROM conversation_messages WHERE content = 'one';",
+            )
+        })
+        .unwrap();
+
+        assert!(ensure_fetch_ready(&db, "project-one").is_ok());
+        assert!(ensure_quiescent(&db, "project-one").is_err());
+        assert!(export_snapshot_for_fetch(&db, &config, &manifest()).is_ok());
+        let interrupted = db
+            .with_conn(|connection| {
+                let transaction = connection.unchecked_transaction()?;
+                let interrupted = import_transaction(&transaction, &deleted, true)?;
+                transaction.commit()?;
+                Ok::<_, Error>(interrupted)
+            })
+            .unwrap();
+
+        assert_eq!(interrupted, ["running-turn"]);
+        let status = db
+            .with_conn(|connection| {
+                connection.query_row(
+                    "SELECT status FROM conversation_turns WHERE id = 'running-turn'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(status, "cancelled");
+    }
+
+    #[test]
     fn import_allows_a_conversation_message_task_link_to_be_cleared() {
         let directory = tempfile::tempdir().unwrap();
         let config_path = directory.path().join("xpressclaw.yaml");
@@ -2153,7 +2436,7 @@ mod tests {
 
         db.with_conn(|connection| {
             let transaction = connection.unchecked_transaction().unwrap();
-            let error = import_transaction(&transaction, &snapshot).unwrap_err();
+            let error = import_transaction(&transaction, &snapshot, false).unwrap_err();
             assert!(error
                 .to_string()
                 .contains("dependency graph contains a cycle"));

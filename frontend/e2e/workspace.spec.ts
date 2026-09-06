@@ -367,6 +367,9 @@ async function mockApi(
 		conversationMessages?: Record<string, unknown>[];
 		conversationTurns?: Record<string, unknown>[];
 		conversationMessageRequests?: Record<string, unknown>[];
+		conversationMessageDeleteRequests?: number[];
+		deleteConversationMessageAfterHistoryLoad?: number;
+		conversationTurnCancelRequests?: string[];
 		conversationTaskRequests?: Record<string, unknown>[];
 		projectSyncStatuses?: Record<string, unknown>[];
 		projectSyncRequests?: { projectId: string; operation: 'fetch' | 'publish'; force: boolean }[];
@@ -419,6 +422,7 @@ async function mockApi(
 	};
 	let projectSyncConflictReturned = false;
 	let taskLoadFailed = false;
+	const deletedConversationMessageIds = new Set<number>();
 	const status = options.taskStatus ?? (options.pendingElicitation ? 'waiting_for_input' : options.live ? 'in_progress' : 'completed');
 	const attemptStatus = options.attemptError
 		? 'failed'
@@ -580,6 +584,7 @@ async function mockApi(
 		availableProjects = [...availableProjects.slice(1), availableProjects[0]];
 	}
 	let conversationMessages = [...(options.conversationMessages ?? [])];
+	let conversationTurns = [...(options.conversationTurns ?? [])];
 
 	if (!options.preserveWorkspace) {
 		await page.addInitScript(() => localStorage.removeItem('xpressclaw.workspace.v1'));
@@ -768,6 +773,8 @@ async function mockApi(
 			response = options.conversations ?? [];
 		} else if (path === `/api/conversations/${conversationId}`) {
 			response = options.conversations?.find((conversation) => conversation.id === conversationId) ?? { error: 'Unknown conversation' };
+		} else if (path === `/api/conversations/${conversationId}/message-deletions`) {
+			response = [...deletedConversationMessageIds].sort((left, right) => left - right);
 		} else if (path === `/api/conversations/${conversationId}/messages`) {
 			if (request.method() === 'POST') {
 				const payload = request.postDataJSON() as Record<string, unknown>;
@@ -795,7 +802,33 @@ async function mockApi(
 				};
 				conversationMessages.push(sent);
 				response = { message: sent, queued_agents: [agentId] };
-			} else response = conversationMessages;
+			} else {
+				const requestedLimit = Number(url.searchParams.get('limit'));
+				const limit = Number.isFinite(requestedLimit) && requestedLimit > 0
+					? requestedLimit
+					: conversationMessages.length;
+				const requestedBefore = Number(url.searchParams.get('before_id'));
+				const before = Number.isFinite(requestedBefore) && requestedBefore > 0
+					? requestedBefore
+					: null;
+				const eligible = before === null
+					? conversationMessages
+					: conversationMessages.filter((message) => Number(message.id) < before);
+				response = eligible.slice(-limit);
+				if (before !== null && options.deleteConversationMessageAfterHistoryLoad !== undefined) {
+					deletedConversationMessageIds.add(options.deleteConversationMessageAfterHistoryLoad);
+					conversationMessages = conversationMessages.filter(
+						(message) => Number(message.id) !== options.deleteConversationMessageAfterHistoryLoad,
+					);
+				}
+			}
+		} else if (path.startsWith(`/api/conversations/${conversationId}/messages/`) && request.method() === 'DELETE') {
+			const messageId = Number(path.slice(path.lastIndexOf('/') + 1));
+			options.conversationMessageDeleteRequests?.push(messageId);
+			deletedConversationMessageIds.add(messageId);
+			conversationMessages = conversationMessages.filter((message) => message.id !== messageId);
+			await route.fulfill({ status: 204, body: '' });
+			return;
 		} else if (path === `/api/conversations/${conversationId}/tasks`) {
 			if (request.method() === 'POST') {
 				const payload = request.postDataJSON() as Record<string, unknown>;
@@ -805,7 +838,14 @@ async function mockApi(
 					: { ...task, id: 'conversation-task-test', title: payload.title, description: payload.description ?? null, agent_id: payload.agent_id ?? null, conversation_id: conversationId };
 			} else response = listedTasks.filter((listedTask) => listedTask.conversation_id === conversationId);
 		} else if (path === `/api/conversations/${conversationId}/turns`) {
-			response = options.conversationTurns ?? [];
+			response = conversationTurns;
+		} else if (path.startsWith(`/api/conversations/${conversationId}/turns/`) && path.endsWith('/cancel')) {
+			const turnId = decodeURIComponent(path.split('/').at(-2) ?? '');
+			options.conversationTurnCancelRequests?.push(turnId);
+			conversationTurns = conversationTurns.map((turn) => turn.id === turnId
+				? { ...turn, status: 'cancelled', error_message: null, completed_at: timestamp(200) }
+				: turn);
+			response = conversationTurns.find((turn) => turn.id === turnId);
 		} else if (path === `/api/conversations/${conversationId}/events`) {
 			await route.fulfill({ status: 200, contentType: 'text/event-stream', body: ': connected\n\n' });
 			return;
@@ -1744,6 +1784,110 @@ test.describe('current response timing semantics', () => {
 		await expect(page.locator('[data-agent-loading]', { hasText: 'Preparing Secondary browser workspace' })).toHaveAttribute('data-agent-phase', 'preparing');
 		await expect(page.getByText(/Secondary browser workspace is responding/)).toHaveCount(0);
 	});
+});
+
+test('conversation failures, active responses, and messages all have clear actions', async ({ page }) => {
+	const conversation = {
+		id: conversationId,
+		project_id: projectId,
+		title: 'Recoverable collaboration',
+		icon: null,
+		created_at: timestamp(1),
+		updated_at: timestamp(20),
+		last_message_at: timestamp(20),
+		participants: [
+			{ participant_type: 'user', participant_id: 'local', joined_at: timestamp(1) },
+			{ participant_type: 'agent', participant_id: agentId, joined_at: timestamp(2) },
+			{ participant_type: 'agent', participant_id: 'project-secondary-test', joined_at: timestamp(2) },
+		],
+	};
+	const deletedMessages: number[] = [];
+	const cancelledTurns: string[] = [];
+	await mockApi(page, {
+		multipleAgents: true,
+		conversations: [conversation],
+		conversationMessages: [{
+			id: 41,
+			conversation_id: conversationId,
+			sender_type: 'user', sender_id: 'local', sender_name: 'You',
+			content: 'This message can be removed', message_type: 'message',
+			linked_task_id: null, metadata: {}, attachments: [], created_at: timestamp(10),
+		}],
+		conversationTurns: [
+			{
+				id: 'turn-failed', conversation_id: conversationId, agent_id: agentId,
+				trigger_message_id: 41, status: 'failed', result_message_id: null,
+				error_message: 'The harness refused to answer', context_used: null, context_size: null,
+				queued_at: timestamp(18), started_at: timestamp(19), completed_at: timestamp(20),
+				response_queued_at: timestamp(18), response_started_at: timestamp(19),
+			},
+			{
+				id: 'turn-running', conversation_id: conversationId, agent_id: 'project-secondary-test',
+				trigger_message_id: 41, status: 'running', result_message_id: null,
+				error_message: null, context_used: null, context_size: null,
+				queued_at: timestamp(18), started_at: timestamp(19), completed_at: null,
+				response_queued_at: timestamp(18), response_started_at: timestamp(19),
+			},
+		],
+		conversationMessageDeleteRequests: deletedMessages,
+		conversationTurnCancelRequests: cancelledTurns,
+	});
+	await page.goto(`/conversations/${conversationId}`);
+
+	await expect(page.getByText('The harness refused to answer')).toBeVisible();
+	await page.getByRole('button', { name: 'Dismiss' }).click();
+	await expect.poll(() => cancelledTurns).toEqual(['turn-failed']);
+	await expect(page.getByText('The harness refused to answer')).toHaveCount(0);
+
+	page.once('dialog', (dialog) => dialog.accept());
+	await page.getByRole('button', { name: 'Cancel' }).click();
+	await expect.poll(() => cancelledTurns).toEqual(['turn-failed', 'turn-running']);
+
+	page.once('dialog', (dialog) => dialog.accept());
+	await page.locator('[data-message-role="user"]', { hasText: 'This message can be removed' })
+		.getByRole('button', { name: 'Delete message' }).click();
+	await expect.poll(() => deletedMessages).toEqual([41]);
+	await expect(page.getByText('This message can be removed')).toHaveCount(0);
+});
+
+test('conversation refresh removes a deleted message from older loaded history', async ({ page }) => {
+	const conversation = {
+		id: conversationId,
+		project_id: projectId,
+		title: 'Recover missed deletions',
+		icon: null,
+		created_at: timestamp(1),
+		updated_at: timestamp(100),
+		last_message_at: timestamp(100),
+		participants: [
+			{ participant_type: 'user', participant_id: 'local', joined_at: timestamp(1) },
+			{ participant_type: 'agent', participant_id: agentId, joined_at: timestamp(2) },
+		],
+	};
+	const conversationMessages = Array.from({ length: 121 }, (_, index) => {
+		const id = index + 1;
+		return {
+			id,
+			conversation_id: conversationId,
+			sender_type: 'user', sender_id: 'local', sender_name: 'You',
+			content: id === 20 ? 'Deleted while disconnected' : `Retained message ${id}`,
+			message_type: 'message', linked_task_id: null, metadata: {}, attachments: [],
+			created_at: timestamp(id),
+		};
+	});
+	await mockApi(page, {
+		conversations: [conversation],
+		conversationMessages,
+		deleteConversationMessageAfterHistoryLoad: 20,
+	});
+	await page.goto(`/conversations/${conversationId}`);
+
+	await page.getByRole('button', { name: 'Load earlier messages' }).click();
+
+	await expect(page.getByText('Retained message 1', { exact: true })).toBeVisible();
+	await expect(page.getByText('Retained message 81', { exact: true })).toBeVisible();
+	await expect(page.getByText('Deleted while disconnected')).toBeVisible();
+	await expect(page.getByText('Deleted while disconnected')).toHaveCount(0, { timeout: 5_000 });
 });
 
 test('context usage is stateful and tool completion details stay on one row', async ({ page }) => {

@@ -8,7 +8,7 @@ use tracing::info;
 use unicode_casefold::UnicodeCaseFold;
 use unicode_normalization::UnicodeNormalization;
 
-use crate::conversations::runtime::ConversationTurnQueue;
+use crate::conversations::runtime::{reconcile_message_deletion_turns, ConversationTurnQueue};
 use crate::error::{Error, Result};
 use crate::workflows::context;
 use crate::workflows::definition::{WorkflowDefinition, WorkflowInputType};
@@ -185,6 +185,15 @@ impl Database {
 
                 if target == 40 {
                     backfill_workflow_agent_bindings(&transaction).map_err(|error| {
+                        Error::Migration {
+                            version: target,
+                            message: error.to_string(),
+                        }
+                    })?;
+                }
+
+                if target == 46 {
+                    reconcile_adopted_conversation_tombstones(&transaction).map_err(|error| {
                         Error::Migration {
                             version: target,
                             message: error.to_string(),
@@ -434,6 +443,56 @@ fn backfill_pending_conversation_turns(transaction: &rusqlite::Transaction<'_>) 
         "UPDATE conversation_messages
          SET processed = 1
          WHERE sender_type = 'user' AND processed = 0",
+        [],
+    )?;
+    Ok(())
+}
+
+/// Apply the normal deletion reconciliation to tombstones first seen while
+/// upgrading from v45. Preserve a durable dashboard deletion version for any
+/// previously visible message, keep the sync marker until this Rust pass has
+/// located every adopted row, then remove it in the same migration transaction.
+fn reconcile_adopted_conversation_tombstones(transaction: &rusqlite::Connection) -> Result<()> {
+    let adopted = {
+        let mut statement = transaction.prepare(
+            "SELECT id, conversation_id FROM conversation_messages
+             WHERE deleted_at IS NOT NULL
+               AND json_valid(metadata)
+               AND json_type(metadata, '$.xpressclaw_deleted_at') = 'text'
+             ORDER BY id ASC",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+    for (message_id, conversation_id) in adopted {
+        reconcile_message_deletion_turns(transaction, &conversation_id, message_id)?;
+        transaction.execute(
+            "INSERT INTO dashboard_events (
+                event_id, event_kind, occurred_at, project_id, project_name,
+                agent_id, agent_name, source_kind, source_label,
+                target_type, target_id, target_title, href, severity,
+                needs_attention, preview, work_kind, work_id
+             )
+             SELECT event_id, 'conversation_message_deleted',
+                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    project_id, project_name, agent_id, agent_name,
+                    'system', 'XpressClaw', target_type, target_id,
+                    target_title, href, 'info', 0, '', work_kind, work_id
+             FROM dashboard_events
+             WHERE event_id = 'conversation-message:' || ?1
+             ORDER BY cursor DESC LIMIT 1",
+            [message_id],
+        )?;
+    }
+    transaction.execute(
+        "UPDATE conversation_messages
+         SET metadata = json_remove(metadata, '$.xpressclaw_deleted_at')
+         WHERE json_valid(metadata)
+           AND json_type(metadata, '$.xpressclaw_deleted_at') = 'text'",
         [],
     )?;
     Ok(())
@@ -2455,6 +2514,114 @@ ALTER TABLE workflow_step_executions ADD COLUMN continuation_prompt_message_id I
     REFERENCES task_messages(id) ON DELETE SET NULL;
 "#;
 
+const MIGRATION_V46: &str = r#"
+-- Conversation messages are synchronized immutable records. A deletion marker
+-- hides a message everywhere without allowing a later Project fetch to revive
+-- it from an older checkout.
+ALTER TABLE conversation_messages ADD COLUMN deleted_at TIMESTAMP;
+UPDATE conversation_messages
+   SET deleted_at = json_extract(metadata, '$.xpressclaw_deleted_at'),
+       processed = 1
+ WHERE json_valid(metadata)
+   AND json_type(metadata, '$.xpressclaw_deleted_at') = 'text';
+DELETE FROM conversation_message_attachments
+ WHERE message_id IN (
+       SELECT id FROM conversation_messages WHERE deleted_at IS NOT NULL
+ );
+DELETE FROM message_visualizations
+ WHERE conversation_message_id IN (
+       SELECT id FROM conversation_messages WHERE deleted_at IS NOT NULL
+ );
+UPDATE conversations
+   SET last_message_at = (
+       SELECT created_at FROM conversation_messages
+        WHERE conversation_id = conversations.id AND deleted_at IS NULL
+        ORDER BY julianday(created_at) DESC, id DESC LIMIT 1
+   )
+ WHERE EXISTS (
+       SELECT 1 FROM conversation_messages
+        WHERE conversation_id = conversations.id AND deleted_at IS NOT NULL
+ );
+CREATE INDEX idx_conversation_messages_visible
+    ON conversation_messages(conversation_id, id)
+    WHERE deleted_at IS NULL;
+UPDATE conversation_agent_sessions
+   SET status = 'idle', last_error = NULL, updated_at = CURRENT_TIMESTAMP
+ WHERE status = 'failed'
+   AND NOT EXISTS (
+       SELECT 1 FROM conversation_turns turn
+       WHERE turn.conversation_id = conversation_agent_sessions.conversation_id
+         AND turn.agent_id = conversation_agent_sessions.agent_id
+         AND turn.status = 'failed'
+   );
+
+UPDATE dashboard_events
+   SET needs_attention = 0
+ WHERE target_type = 'task'
+   AND needs_attention = 1
+   AND NOT EXISTS (
+       SELECT 1 FROM tasks task
+        WHERE task.id = dashboard_events.target_id
+          AND task.status IN ('waiting_for_input', 'blocked')
+   );
+UPDATE dashboard_events
+   SET needs_attention = 0
+ WHERE target_type = 'conversation'
+   AND needs_attention = 1
+   AND NOT EXISTS (
+       SELECT 1 FROM conversation_agent_sessions session
+        WHERE session.conversation_id = dashboard_events.target_id
+          AND session.agent_id = dashboard_events.agent_id
+          AND session.status = 'failed'
+   );
+
+-- Attention is current state, not permanent history. Keep the activity row as
+-- an audit trail, but stop presenting it as unresolved once the user clears the
+-- underlying task or Conversation failure.
+CREATE TRIGGER dashboard_task_attention_clear
+AFTER UPDATE OF status ON tasks
+WHEN OLD.status IN ('waiting_for_input', 'blocked')
+ AND NEW.status NOT IN ('waiting_for_input', 'blocked')
+BEGIN
+    UPDATE dashboard_events
+       SET needs_attention = 0
+     WHERE target_type = 'task' AND target_id = NEW.id AND needs_attention = 1;
+END;
+
+CREATE TRIGGER dashboard_conversation_attention_clear
+AFTER UPDATE OF status ON conversation_agent_sessions
+WHEN OLD.status = 'failed' AND NEW.status != 'failed'
+BEGIN
+    UPDATE dashboard_events
+       SET needs_attention = 0
+     WHERE target_type = 'conversation'
+       AND target_id = NEW.conversation_id
+       AND agent_id = NEW.agent_id
+       AND needs_attention = 1;
+END;
+
+CREATE TRIGGER dashboard_conversation_message_delete
+AFTER UPDATE OF deleted_at ON conversation_messages
+WHEN OLD.deleted_at IS NULL AND NEW.deleted_at IS NOT NULL
+BEGIN
+    -- Keep a durable, non-displayable version of the stable event ID so live
+    -- replay and refreshed pages can evict a deleted message from previously
+    -- loaded dashboard history.
+    INSERT INTO dashboard_events (
+        event_id, event_kind, occurred_at, project_id, project_name,
+        agent_id, agent_name, source_kind, source_label,
+        target_type, target_id, target_title, href, severity,
+        needs_attention, preview, work_kind, work_id
+    )
+    SELECT event_id, 'conversation_message_deleted', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+           project_id, project_name, agent_id, agent_name, 'system', 'XpressClaw',
+           target_type, target_id, target_title, href, 'info', 0, '', work_kind, work_id
+    FROM dashboard_events
+    WHERE event_id = 'conversation-message:' || NEW.id
+    ORDER BY cursor DESC LIMIT 1;
+END;
+"#;
+
 const MIGRATION_V39: &str = "
 -- Cascading Project deletion is a recoverable two-phase operation. The
 -- durable marker is set before workers and retained runtimes are stopped, so
@@ -2553,6 +2720,7 @@ fn schema_migrations() -> &'static [(u32, &'static str)] {
         (43, MIGRATION_V43),
         (44, MIGRATION_V44),
         (45, MIGRATION_V45),
+        (46, MIGRATION_V46),
     ]
 }
 
@@ -2573,7 +2741,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "45");
+        assert_eq!(version, "46");
         let visualization_table: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -2610,6 +2778,201 @@ mod tests {
             )
             .unwrap();
         assert_eq!(memory_owner, "projects");
+    }
+
+    #[test]
+    fn v46_adopts_synced_message_tombstones_and_removes_local_artifacts() {
+        ensure_sqlite_vec();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        register_sql_functions(&conn).unwrap();
+        for &(target, sql) in schema_migrations() {
+            if target > 45 {
+                break;
+            }
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.execute_batch(
+            r#"INSERT INTO agents (id, name, backend, config)
+               VALUES ('atlas', 'Atlas', 'native', '{}'),
+                      ('beta', 'Beta', 'native', '{}');
+               INSERT INTO conversations (id, title, last_message_at)
+               VALUES ('conversation', 'Upgrade', '2026-01-02 00:00:00');
+               INSERT INTO conversation_participants
+                   (conversation_id, participant_type, participant_id)
+               VALUES ('conversation', 'agent', 'atlas'),
+                      ('conversation', 'agent', 'beta');
+               INSERT INTO conversation_messages
+                   (conversation_id, sender_type, sender_id, content, metadata,
+                    created_at, processed)
+               VALUES
+                   ('conversation', 'user', 'local', 'Keep', '{}',
+                    '2026-01-01 00:00:00', 1),
+                   ('conversation', 'user', 'local', 'Remove',
+                    '{"xpressclaw_deleted_at":"2026-01-03 00:00:00"}',
+                    '2026-01-02 00:00:00', 0),
+                   ('conversation', 'user', 'local', 'Keep this follow-up', '{}',
+                    '2026-01-04 00:00:00', 1);
+               INSERT INTO conversation_agent_sessions
+                   (conversation_id, agent_id, native_session_id, status)
+               VALUES ('conversation', 'atlas', 'tainted-atlas-session', 'running'),
+                      ('conversation', 'beta', 'tainted-beta-session', 'queued');
+               INSERT INTO conversation_turns
+                   (id, conversation_id, agent_id, trigger_message_id, status)
+               VALUES ('running-turn', 'conversation', 'atlas', 3, 'running'),
+                      ('queued-turn', 'conversation', 'beta', 2, 'queued');
+               INSERT INTO conversation_message_attachments
+                   (id, message_id, name, mime_type, data, size)
+               VALUES ('attachment', 2, 'note.txt', 'text/plain', X'78', 1);
+               INSERT INTO message_visualizations
+                   (id, conversation_message_id, reference_index, title, status,
+                    error_code, retrieval_token)
+               VALUES ('visualization', 2, 0, 'Old artifact', 'unavailable',
+                       'missing', 'retrieval-token');"#,
+        )
+        .unwrap();
+
+        conn.execute_batch(MIGRATION_V46).unwrap();
+        reconcile_adopted_conversation_tombstones(&conn).unwrap();
+
+        let adopted: (Option<String>, String, bool) = conn
+            .query_row(
+                "SELECT deleted_at, metadata, processed
+                 FROM conversation_messages WHERE id = 2",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(adopted.0.as_deref(), Some("2026-01-03 00:00:00"));
+        assert_eq!(adopted.1, "{}");
+        assert!(adopted.2);
+        let cleanup: (i64, i64, i64, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM conversation_message_attachments),
+                    (SELECT COUNT(*) FROM message_visualizations),
+                    (SELECT COUNT(*) FROM dashboard_events
+                      WHERE event_id = 'conversation-message:2'),
+                    (SELECT event_kind FROM dashboard_events
+                      WHERE event_id = 'conversation-message:2'
+                      ORDER BY cursor DESC LIMIT 1),
+                    (SELECT last_message_at FROM conversations WHERE id = 'conversation')",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            cleanup,
+            (
+                0,
+                0,
+                2,
+                Some("conversation_message_deleted".into()),
+                Some("2026-01-04 00:00:00".into())
+            )
+        );
+
+        let reconciliation: (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM conversation_agent_sessions
+                      WHERE native_session_id IS NULL AND status = 'queued'),
+                    (SELECT COUNT(*) FROM conversation_turns
+                      WHERE agent_id = 'atlas' AND trigger_message_id = 3
+                        AND status = 'cancelled'),
+                    (SELECT COUNT(*) FROM conversation_turns
+                      WHERE agent_id = 'atlas' AND trigger_message_id = 3
+                        AND status = 'queued'),
+                    (SELECT COUNT(*) FROM conversation_turns
+                      WHERE agent_id = 'beta' AND trigger_message_id = 1
+                        AND status = 'queued')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            reconciliation,
+            (2, 1, 1, 1),
+            "migration should clear both sessions, requeue later running work, and retarget queued work"
+        );
+    }
+
+    #[test]
+    fn v46_backfills_resolved_dashboard_attention() {
+        ensure_sqlite_vec();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        register_sql_functions(&conn).unwrap();
+        for &(target, sql) in schema_migrations() {
+            if target > 45 {
+                break;
+            }
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.execute_batch(
+            r#"INSERT INTO projects (id, name) VALUES ('project', 'Project');
+               INSERT INTO agents (id, name, backend, config, project_id)
+               VALUES ('atlas', 'Atlas', 'native', '{}', 'project');
+               INSERT INTO tasks (id, title, status, agent_id, project_id)
+               VALUES ('resolved-task', 'Resolved task', 'completed', 'atlas', 'project'),
+                      ('active-task', 'Active task', 'blocked', 'atlas', 'project');
+               INSERT INTO conversations (id, project_id, title)
+               VALUES ('resolved-conversation', 'project', 'Resolved conversation'),
+                      ('active-conversation', 'project', 'Active conversation');
+               INSERT INTO conversation_agent_sessions
+                   (conversation_id, agent_id, status, last_error)
+               VALUES ('resolved-conversation', 'atlas', 'failed', 'Old failure'),
+                      ('active-conversation', 'atlas', 'failed', 'Current failure');
+               INSERT INTO conversation_turns
+                   (id, conversation_id, agent_id, status, error_message)
+               VALUES ('active-turn', 'active-conversation', 'atlas', 'failed', 'Current failure');
+               INSERT INTO dashboard_events
+                   (event_id, event_kind, target_type, target_id, target_title,
+                    href, agent_id, needs_attention)
+               VALUES ('resolved-task-event', 'failure', 'task', 'resolved-task',
+                       'Resolved task', '/tasks/resolved-task', 'atlas', 1),
+                      ('active-task-event', 'failure', 'task', 'active-task',
+                       'Active task', '/tasks/active-task', 'atlas', 1),
+                      ('resolved-conversation-event', 'failure', 'conversation',
+                       'resolved-conversation', 'Resolved conversation',
+                       '/conversations/resolved-conversation', 'atlas', 1),
+                      ('active-conversation-event', 'failure', 'conversation',
+                       'active-conversation', 'Active conversation',
+                       '/conversations/active-conversation', 'atlas', 1);"#,
+        )
+        .unwrap();
+
+        conn.execute_batch(MIGRATION_V46).unwrap();
+
+        let attention = conn
+            .prepare(
+                "SELECT event_id, needs_attention FROM dashboard_events
+                 WHERE event_id LIKE '%-event' ORDER BY event_id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            attention,
+            vec![
+                ("active-conversation-event".into(), true),
+                ("active-task-event".into(), true),
+                ("resolved-conversation-event".into(), false),
+                ("resolved-task-event".into(), false),
+            ]
+        );
     }
 
     #[test]
