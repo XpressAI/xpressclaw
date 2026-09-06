@@ -54,7 +54,11 @@ session, or uses `session/fork` to branch an older task, dependency, or the
 project's active context. Forking is capability-gated because it is an unstable
 ACP extension. If unavailable or rejected, XpressClaw continues the selected
 source with `session/resume` when advertised and `session/load` otherwise. The
-returned ACP session ID is stored on the attempt and selected using the
+forked session is also activated with `session/resume` or `session/load` before
+applying controls or prompting: a successful fork can return a detached session.
+Agents without either activation method retain the legacy live-fork behavior.
+The returned fork ID is stored on the attempt before activation so interrupted
+setup can recover the same branch. ACP session IDs are selected using the
 precedence from ADR-025: earlier turn on the same task, dependency, explicit
 fresh conversation, then the project's latest conversation.
 
