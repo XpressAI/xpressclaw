@@ -39,6 +39,20 @@ jobs:
           sh -n install.sh
           bash scripts/test-install.sh
 
+  # Exercise Apple's catalog reader before a release, without compiling the app.
+  macos-icons:
+    name: macOS Icon Assets (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-26, macos-26-intel]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify adaptive icon catalog
+        run: python3 scripts/verify-app-icon.py --catalog-only
+
   # Frontend type checking (independent of Rust)
   frontend:
     name: Frontend
@@ -67,7 +81,7 @@ jobs:
       - run: npx playwright install --with-deps chromium
       - run: npm run test:e2e
 
-  # Build + test + clippy (only ubuntu — macOS is only needed for release)
+  # Build + test + clippy on Ubuntu
   build:
     name: Build & Test
     needs: lint

@@ -22,6 +22,14 @@ python3 scripts/build-app-icon.py --check
 
 The macOS Tauri configuration runs the same check before bundling. CI also verifies the legacy ICNS structure, the resulting application’s catalog, the fallback icon, the expected Info.plist keys, and all required appearance stacks.
 
+Inspect the committed catalog with Apple's tools on macOS 26 or later, without building the app:
+
+```sh
+python3 scripts/verify-app-icon.py --catalog-only
+```
+
+Pull requests run this check on both Intel and Apple Silicon macOS 26 runners. Release builds use the same runner versions and also verify the signed app bundle.
+
 Verify a built bundle with:
 
 ```sh
