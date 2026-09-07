@@ -31,6 +31,20 @@ pub fn setup_tray(app: &App, local_url: &str) -> Result<(), Box<dyn std::error::
             }
         }
 
+        // Windows does not recolor template tray icons. Use the full-color
+        // white-and-blue app artwork instead of the monochrome template.
+        #[cfg(target_os = "windows")]
+        {
+            let icon_bytes = include_bytes!("../icons/tray-icon-windows.png");
+            match tauri::image::Image::from_bytes(icon_bytes) {
+                Ok(img) => {
+                    let _ = tray.set_icon(Some(img));
+                    info!("tray icon set to full-color Windows variant");
+                }
+                Err(e) => warn!(error = %e, "failed to set Windows tray icon"),
+            }
+        }
+
         let handle = app.handle().clone();
         let local_url = local_url.to_string();
         tray.on_menu_event(move |_app, event| {
