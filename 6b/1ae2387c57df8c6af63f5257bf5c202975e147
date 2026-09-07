@@ -1,0 +1,1 @@
+Office automation was returning 500 when osascript had non-zero exit, even if the script partially succeeded (Word opened, wrote file, but failed on a later command). Fixed: return 200 with success:false so agent gets error details. Also handle partial success — if stdout has content but exit code is non-zero, return output with warning.

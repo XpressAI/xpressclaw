@@ -1,0 +1,1 @@
+Critical fix: MCP_SERVERS env var was never injected into agent containers. build_container_spec now merges default_mcp_servers() with config.mcp_servers and sets MCP_SERVERS as JSON env var. Without this, agents had no access to tasks, apps, memory, or filesystem MCP tools.

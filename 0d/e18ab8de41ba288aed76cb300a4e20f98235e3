@@ -1,0 +1,1 @@
+Added COPY mcp_apps.py to base harness Dockerfile. Without this, agents can't call publish_app.

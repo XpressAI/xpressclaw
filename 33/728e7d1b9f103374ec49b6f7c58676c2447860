@@ -1,0 +1,44 @@
+Why a shared Engine (not per-agent) with per-instance Store:
+
+wasmtime's intended pattern is Engine-per-process, Store-per-isolated-unit.
+Engine holds compiled code + config (expensive to build). Store holds guest
+state (cheap). Agents need isolation between each other — that's the Store
+boundary. But they all share the same compiled module code and runtime
+config, so Engine can be shared. This matches the wasmer/wasmedge
+alternatives too and is the pattern c2w's own examples use.
+
+Why epoch interruption specifically (vs. fuel or async yield):
+
+All three are cancellation primitives. Fuel is deterministic but expensive
+per-instruction. Async yield requires guest cooperation. Epoch interruption
+is a global atomic counter check at loop back-edges — cheapest of the three
+for guests that mostly run and rarely get interrupted, which matches our
+agent workload pattern (long steady execution + occasional step-boundary
+interruption for snapshot/restore). The background Tokio task ticking the
+epoch every 50ms means worst-case interruption latency is 50ms regardless
+of how deep the guest is; good enough for our rollback guarantee.
+
+Why preview 1 (not preview 2):
+
+c2w emits preview-1 modules today. When c2w adopts preview 2 we switch in
+place. The `build_p1()` call in `run_to_completion` is the single line
+that'd flip. I considered abstracting over both but it's premature — we
+don't yet have a preview-2 consumer, and wasmtime's two WASI context types
+(WasiP1Ctx vs WasiCtx) have different linker setups, so the abstraction
+would mostly be a match statement in one place.
+
+Sticking points discovered while writing this:
+
+- `wasmtime_wasi::I32Exit` is the type the exit trap downcasts to, not
+  `wasmtime::I32Exit` — the latter doesn't exist. Took a minute to find.
+- `inherit_stdout()` and friends return `&mut Self`, not `Self`, so the
+  builder chain breaks if you try to assign back. Just call them in
+  sequence without reassigning.
+- `preopened_dir` now takes DirPerms + FilePerms parameters (separate
+  from the directory capability); they weren't in older wasmtime APIs.
+
+Unit test is intentionally trivial. An end-to-end test with an actual
+c2w-compiled image lands in task 3 when we have a test image to run.
+Committing a test-image as a checked-in binary blob now would block this
+commit on decisions we haven't made yet (which harness image, what size
+budget, where it's built).

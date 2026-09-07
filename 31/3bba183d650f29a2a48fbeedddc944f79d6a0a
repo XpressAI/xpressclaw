@@ -1,0 +1,1 @@
+Added prime directive #4: read documentation before guessing. WebFetch docs pages for any external SDK/API/library before attempting integration. Training data is stale. This would have prevented: the allowed_tools whitelist issue, the MCP stdio connection failure, the titleBarStyle casing, and numerous other bugs this session.

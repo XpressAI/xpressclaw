@@ -1,0 +1,10 @@
+ADR-020 task dependencies implemented:
+- DB migration v17: task_dependencies table
+- TaskBoard: add_dependency (cycle detection via DFS), get_dependencies,
+  get_dependents, is_ready, get_blockers, create_batch (ref→UUID mapping)
+- Dispatcher: checks is_ready() before dispatch, re-queues if unmet,
+  includes completed dependency outputs in agent prompt
+- API: POST /tasks/batch, POST /tasks/{id}/dependencies, enriched GET
+- MCP: create_tasks (batch with refs), add_dependency
+- Tests: simple chain, cycle detection, batch diamond deps
+- 267 tests pass, clippy clean

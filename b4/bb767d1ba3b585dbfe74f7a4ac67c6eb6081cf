@@ -1,0 +1,17 @@
+Senior requirement (via fahreza): android must be a TOOL any agent can use, NOT a dedicated agent, and NOT enabled by default; connectors were fahreza's intended opt-in surface.
+
+EVIDENCE THAT DROVE THE DESIGN:
+1. The android-pilot preset was pure prompt-convenience — its agent.yaml had no default_mcp_servers; the actual wiring was default_mcp_servers() -> MCP_SERVERS env for EVERY agent container (gated only by the cargo feature). So 'android support in Add Agent' was cosmetically an agent but architecturally already a global tool.
+2. The per-agent ToolsTab toggles (fetch/git/github/websearch) are COSMETIC: agent.tools goes into AGENT_CONFIG env, which harnesses/base/server.py:31 reads into a constant and never uses; those tool names appear nowhere in the Rust runtime. Pre-existing gap, flagged to fahreza, NOT fixed here — needs its own decision (gating all default servers per-agent).
+
+THE CHANGE: android removed from default_mcp_servers(); new android::opt_in_mcp_servers(db) returns {android: mcp_server_config()} only while an enabled 'android' connector exists (ConnectorManager::first_enabled_of_type — also reused by routes/android.rs resolve_target, which already read the same record for the device address; connector = one switch for 'which device' AND 'do agents get tools'). Both container-launch paths compose it (reconciler + runtime.rs start_agent) via build_container_spec_with_mcp — comprehensive-changes rule; miss one and behavior forks.
+
+LIVE TOGGLE: reconciler's running-branch compares the container's actual MCP_SERVERS env (new DockerManager::container_env_var; marker substring 'mcp_android.py') against the desired opt-in and stops the container on mismatch — next cycle restarts it with the right toolset. Same stop-and-let-next-cycle-restart pattern as the image-freshness check right above it. Cost: session reset on flip (accepted — identical to image updates; history reconstruction covers chat context).
+
+PILOT'S KNOWLEDGE MOVED INTO THE TOOL LAYER: mcp_android.py descriptions now carry FLAG_SECURE (black screenshot -> use screen_map) and re-verify-after-acting. Rejected the MCP initialize 'instructions' field — could not verify the claude CLI surfaces it without doc-diving; descriptions are the guaranteed channel.
+
+REJECTED: per-agent tool gating (scope: all default servers, senior decision needed); auto-creating the connector from the live-view emulator flow (violates explicit opt-in).
+
+GOTCHAS FOUND: load_presets_from_dir/install_builtin_templates are dead code — presets come ONLY from builtin_presets(), so no stale android-pilot on user machines. Non-feature builds never compile the opt-in path; frontend hides android surfaces via the json content-type probe. crates/xpressclaw-server/test.yaml was already dirty before this work — deliberately NOT committed.
+
+Verified: 362 core tests incl new android_tools_are_connector_opt_in (opt-in on create, withdrawn on disable), cargo check workspace with AND without the feature, svelte-check 0 errors, full build.ps1 --android run (installer + harness images).

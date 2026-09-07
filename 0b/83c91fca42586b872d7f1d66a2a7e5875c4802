@@ -1,0 +1,84 @@
+Why the design uses agent_id as the logical model name (and the rejected
+alternatives):
+
+The user's earlier diagnostic agent identified three real bugs (server
+LlmRouter was global-only; AgentLlmConfig had no model field; add_agent
+copied the global config). The user then asked for a model-name-as-
+indirection approach: harness uses {agent_id} as its model name; server
+resolves to real (provider, model). I considered three layouts:
+
+1. {agent_id}_model{num} (the user's literal suggestion). Reserves room
+   for multiple models per agent. Skipped — every code path has exactly
+   one current model per agent today; the {num} suffix would be dead
+   structure. Trivial to add later by changing one bind_agent() call.
+
+2. {agent_id}-real-model passthrough — set LLM_MODEL to a real model name
+   and have the router only resolve real names. Skipped because it
+   requires restarting the container to swap the model (e.g. budget
+   degradation), defeating the indirection's main reason to exist. The
+   existing budget code already intercepts request.model in the proxy,
+   but the indirection in the router lets us also serve callers that
+   don't go through the budget path.
+
+3. {agent_id} (chosen). Single hop: harness sends body.model=atlas, the
+   router has bind atlas->("openai|key|", "gpt-4o"), chat() rewrites
+   the request and dispatches. Both /v1/chat/completions and /v1/messages
+   resolve through the same map.
+
+Critical tripwire: the Claude SDK harness has the line
+  use_model = model if model != AGENT_NAME else LLM_MODEL
+at harnesses/claude-sdk/harness.py:265. Setting LLM_MODEL=AGENT_NAME
+makes both branches yield AGENT_NAME, which is fine — the server
+resolves at the end. But it means any change to that substitution rule
+needs to keep ANTHROPIC_BASE_URL pointed at the xpressclaw server (not
+api.anthropic.com), or the SDK will send the unrecognized agent_id
+straight to Anthropic and get a 400.
+
+Provider-instance dedup key is provider_type|api_key|base_url. Two
+agents on the same OpenAI key share one OpenAiProvider; two on different
+keys get separate ones. This was the previous PR's silent bug — it
+generated unique instance names per agent then prefix-matched on
+HashMap iteration order, so requests routed non-deterministically.
+
+provider=local (embedded llama.cpp) is back. The previous PR removed
+the registration path entirely; this one re-adds it, gated on
+#[cfg(feature = "local-llm")] and requires model_path. The
+post-GGUF-download flow now patches llm.model_path into every
+provider=local agent rather than touching a removed global field.
+
+Container env scrubbed of real cloud keys. The previous code passed
+ANTHROPIC_API_KEY/OPENAI_API_KEY into the container if the agent or
+global config had them. Now the container only ever sees placeholder
+sk-ant-<agent_id> / sk-xpressclaw-<agent_id> keys. The proxy uses these
+placeholders to identify the agent and pulls the real key from server-
+side config. test_build_container_spec_no_real_keys_in_container locks
+this in — if a future change leaks the key, the test fails.
+
+env_overrides now per-agent. ANTHROPIC_API_KEY env applies only to
+agents with provider=anthropic; OPENAI_API_KEY/OPENAI_BASE_URL only to
+provider=openai. Previously these clobbered global fields that no longer
+exist.
+
+Backward compat: old YAMLs with top-level agent.model still load —
+Config::migrate_legacy_fields() moves it into llm.model. Old YAMLs with
+the dropped global llm fields (default_provider, openai_api_key, etc.)
+load fine because serde ignores unknown fields when there's no
+deny_unknown_fields. The DEFAULT_CONFIG_TEMPLATE now writes the new
+shape.
+
+Routes that mutate agents (add_agent, update_agent_config) now rebuild
+the router via LlmRouter::build_from_config. Reusing the old router on a
+config edit was a latent bug — the new agent's binding wouldn't exist
+until next server restart.
+
+Tests cover six scenarios:
+- migrate_legacy_top_level_model + does_not_overwrite_explicit_llm_model
+- effective_model fallback ordering
+- router resolves logical agent name
+- router resolves real model name (for direct callers)
+- two agents share one provider instance when keys+url match
+- set_agent_model re-points an existing binding
+- container spec doesn't leak real api_key into env
+
+Not included in this PR: deleting the unrelated buck-out/ tree and
+external/ submodule drift; those weren't introduced here.

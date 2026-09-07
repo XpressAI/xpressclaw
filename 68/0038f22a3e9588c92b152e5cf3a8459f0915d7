@@ -1,0 +1,1 @@
+Removed API key masking. The masked '********' value was causing a cascade of bugs: frontend loaded empty, sent null on save, backend merge logic tried to preserve but had edge cases that wiped base_url too. Simpler approach: return real values, load them, save them back. This is a local app — the API isn't exposed to the internet.

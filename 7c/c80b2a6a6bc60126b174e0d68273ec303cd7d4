@@ -1,0 +1,5 @@
+ADR-020: task dependencies.
+Key: task_dependencies table (task_id, depends_on), cycle detection via DFS,
+dispatcher skips tasks with unmet deps, cascade cancel on dep cancelled,
+dependency output forwarded as context in prompts, blocked_by field in
+API response so small models see WHY a task isn't running.

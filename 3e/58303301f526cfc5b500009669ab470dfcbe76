@@ -1,0 +1,1 @@
+Simplified shutdown: removed overlay+background thread+AtomicBool, back to synchronous ExitRequested handler. Polls try_wait() every 250ms up to 5s instead of unconditional 5s sleep. Also switched Docker::connect_with_local_defaults to connect_with_defaults so DOCKER_HOST env var is honored for all schemes (needed for rootless podman on Linux).

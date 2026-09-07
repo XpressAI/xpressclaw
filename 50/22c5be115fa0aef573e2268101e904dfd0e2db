@@ -1,0 +1,5 @@
+Why the trait exists on DockerManager directly (not via a wrapper struct): DockerManager already has the right lifecycle surface, constructor patterns are harness-specific anyway (each impl has its own connect/bootstrap), and a wrapper would just add an Arc layer with no payload. When the c2w harness lands it gets its own struct (C2wHarness) with its own state; they don't need to share a parent.
+
+Method identifier choice: the trait takes agent_id consistently; the Docker impl maps agent_id -> 'xpressclaw-{agent_id}' container name internally, matching what the reconciler already does via format!() at call sites today. This lets future harnesses use whatever naming they want.
+
+Dual accessor on AppState (both docker() and harness()) is temporary scaffolding. The harness() accessor is backed by the same DockerManager; there's no new connection. Subsequent commits migrate callers, and the final cleanup commit removes the docker() accessor + docker field when nothing references them.

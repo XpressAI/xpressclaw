@@ -1,0 +1,69 @@
+Why this task is smaller than it looks:
+
+The real "tmux attach + downgrade indicator" feature has three layers:
+1. Backend: surface the state (budget degraded_model, harness tmux
+   availability)
+2. Frontend: render an affordance
+3. Frontend: when clicked, stream a terminal
+
+This commit lands layers 1 and 2 fully. Layer 3 (the xterm.js +
+WebSocket terminal stream) is honest deferred work — it requires a
+harness that actually exposes a tmux session over a socket we can
+bridge to the browser, and no harness does today. Shipping the button
+without layer 3 would leave a non-functional UI element in the app;
+hiding the button until `available: true` means the UI surface only
+appears when it will work.
+
+**Why extend /api/budget/:id instead of adding a new endpoint.**
+The frontend already fetches budget for the agent detail pages. Adding
+`degraded_model` + `is_paused` to the existing response means one
+HTTP call for the UI, not two. The BudgetSummary stays unchanged for
+other callers (budget table, history), and the new fields are
+additive. Future-proofing: if we want a full BudgetState on the API,
+upgrade this endpoint rather than adding more.
+
+**Why `agentHarness.tmux` is a separate helper, not on `agents.*`.**
+The `agents` object in the API client is about agent CRUD. Tmux
+availability is a harness-capability query that happens to be keyed
+by agent id — the reasoning flows through the harness, not the agent
+record. Grouping by `agentHarness` leaves room for other capability
+queries (`.snapshot(id)`, `.restore(id, snap)`) without overloading
+the agents namespace.
+
+**The `untrack()` around budget/tmux fetches inside the $effect.**
+Without untrack, every time a fetch resolves and sets `primaryBudget`,
+Svelte's reactive system sees that as a dependency of the effect and
+re-runs it, causing an infinite fetch loop. Untracking the actual
+fetch body (and double-checking `primaryAgentId === id` inside the
+`.then` in case the user navigated away mid-flight) keeps it correct.
+
+**Why the tmux button alerts instead of opening a real view.**
+xterm.js hasn't been pulled in as a dep yet; if I added it now I'd
+also have to build the WebSocket streaming endpoint server-side. That
+work is meaningful and belongs with a harness that has an actual tmux
+session to show — doing it now against nothing would be plumbing for
+plumbing's sake. The alert() is a visible "not wired yet" marker that
+makes it obvious which piece is still missing when someone eventually
+clicks it.
+
+**The DockerUnavailable enum variant still leaks through in agents.rs
+fallbacks.**
+When `state.harness()` returns None we report `ObservedStatus::
+DockerUnavailable`. The name is stale (Docker is gone) but the
+serialized string is what frontend callers see, and renaming it would
+ripple through their type checks. Follow-up task 7 phase C (the setup
+wizard cleanup) is a natural place to also rename the enum once the
+UI churn is already happening.
+
+**Why `budget.agent(id)` uses encodeURIComponent even though agent ids
+are currently plain strings.**
+Defensive — agent ids could contain `/` or other URL-significant
+characters in the future (e.g. namespaced ids like `team-a/atlas`).
+The cost is zero and the correctness win is real.
+
+**What a real user will see today if they run this.**
+The downgrade chip will ONLY show if something manually seeds
+`degraded_model` in the agent's budget_state row (no real degrade flow
+runs to completion in the spike — agents don't launch). A manual test:
+insert the row and refresh the conversation page, chip appears. The
+tmux button never shows because no harness implements `attach_tmux`.

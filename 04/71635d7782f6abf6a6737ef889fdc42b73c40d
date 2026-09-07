@@ -1,0 +1,1 @@
+UI redesign: navy/indigo dark theme, 32 avatar images for agents (deterministic by name hash), purple user bubbles, dark agent bubbles. Sidebar restructured: Apps section replaces triple branding, conversations use emoji not faces, agents show status via ring color (green/amber/red). User profile stored server-side in config table as data URI.

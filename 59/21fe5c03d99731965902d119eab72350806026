@@ -1,0 +1,1 @@
+Chrome CDP rejects hostname-based Host headers — only accepts localhost or IP addresses. host.docker.internal was returning '500 Host header is not an IP address'. Fix: resolve hostname to IP via socket.gethostbyname() before connecting. Verified: Playwright in container successfully connects to Chrome on host, loads pages, extracts content.

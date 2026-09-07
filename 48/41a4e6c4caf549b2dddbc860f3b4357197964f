@@ -1,0 +1,1 @@
+Critical bug: build.rs unconditionally copied target/release/xpressclaw over the Bazel-built sidecar. Fixed by only copying when no sidecar exists. This was causing every build to ship the stale Cargo binary instead of the Bazel one.

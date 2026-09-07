@@ -1,0 +1,62 @@
+Why an in-process LLM was load-bearing in the first place — and the
+specific things that made removing it land cleanly:
+
+The embedded path existed because llama.cpp was the easiest way to ship
+"zero-config local inference" before Ollama was as polished as it is
+now. It has paid for itself in pain: invariant-violation crashes inside
+`llama-cpp-2` (KV-cache type mismatches and sampler lifetime issues
+were the recurring two) brought down the whole server process, and
+releasing the desktop bundle required cross-compiling with the right
+combination of `metal`/`cuda`/CPU per platform. CUDA in particular
+needed bespoke `CUDA_PATH`/`RUSTFLAGS` setup in build.sh to find
+libcudart_static.a across distros — the find_cuda_helper crate only
+searches `<root>/lib64` paths, which misses Debian/Ubuntu multiarch
+layouts. All of that is gone now.
+
+What hooked the deletion into the rest of the system cleanly:
+
+- `provider: ollama` already existed and worked end-to-end through
+  LocalProvider (the HTTP-proxy provider, not the embedded one — the
+  naming was confusing because "local.rs" hosts the Ollama HTTP client).
+  Dropping `provider: local` was a single match arm, not a rewrite.
+- The reconciler's `reconcile_models` already pulls per-base_url for
+  every Ollama-using agent (added in PR #102's pass). That's now the
+  *only* model-acquisition path. No new endpoint needed.
+- `cached_gguf_path` and `model_path` were threaded through complete_setup
+  and add_agent, both of which I'd touched in PR #102. The blast radius
+  was contained — three call sites updated.
+
+Things I deliberately did NOT do:
+
+- Did not introduce `POST /api/setup/pull-model` with SSE progress.
+  Tempting, but the reconciler already pulls and the wizard's "agent
+  will start replying once Ollama finishes pulling" message is honest
+  about the asynchrony. Deferred to a follow-up if anyone complains.
+- Did not collapse `system::detect` / `system::recommend_model` to drop
+  GPU detection. The recommendations still feed the Ollama tag picker,
+  and an Apple-Silicon-with-32GB-of-unified-memory user genuinely benefits
+  from being told "you can run a 27B model" rather than "qwen3.5:4b".
+  The function used to exist for picking GGUF quantization tiers; now
+  it picks Ollama tag size. Same numbers, different downstream consumer.
+- Did not rename `local.rs` → `ollama.rs`. The struct is `LocalProvider`
+  and used in places I'd need to chase. Renaming buys consistency but
+  costs review noise; bundled into a future janitorial pass.
+- Did not delete the `local_model` / `local_base_url` field names from
+  the wizard's request body. They're still used — they're now Ollama-
+  only — and renaming them would force the frontend to update.
+  Documented as Ollama-only in the struct comments.
+
+ADR shape: ADR-011 is the ADR that introduced this stuff and I marked
+it "Superseded by ADR-023" with an explanatory note (matching ADR-002's
+existing pattern of an inline note above ## Context). ADR-023 has the
+full rationale.
+
+The XpressAI HuggingFace org has GGUF builds (see
+https://huggingface.co/XpressAI/Qwen3.6-27B-RYS-UD-Q4_K_XL-GGUF) that
+outperform base Qwen3.5/3.6 — using them now requires republishing to
+Ollama Hub. The user flagged this as separate work; ADR-023's "Future"
+section captures it.
+
+Stacked on PR #102 (fix/per-agent-llm-config-v2). The PR base on GitHub
+is that branch — not main — so the diff against the base shows only the
+llama-cpp removal, not the per-agent refactor.

@@ -1,0 +1,46 @@
+Why a 4-line config tweak (and not a wholesale removal):
+
+User initially asked to remove the forced memory recall/remember system,
+then asked "The hooks can't just be empty?" — choosing the smallest
+change that solves the symptom over a full demolition.
+
+The forced behavior came from three things stacked together in
+HooksConfig:
+
+  a. Default::default returned non-empty Vecs containing
+     "memory_recall" and "memory_remember".
+  b. Both fields had serde skip_deserializing, so YAML/JSON values were
+     silently dropped and replaced with the defaults — even users
+     *trying* to disable hooks couldn't.
+  c. The call sites in processor.rs, dispatcher.rs, and reconciler.rs
+     gate on has_recall_hook / has_remember_hook, which scan the Vec.
+
+The minimal fix flips a. to empty defaults and removes b. The gates in
+c. keep working — they just always return false now. All MemoryHooks
+machinery in memory/hooks.rs and the hooks: HooksConfig field on
+AgentConfig stay intact. A user on a capable model who edits their
+YAML to add `hooks: {before_message: [memory_recall], after_message:
+[memory_remember]}` gets the old behavior back.
+
+Why I considered then rejected full removal:
+
+- Deleting hooks.rs (350 lines), ripping out HooksConfig, removing the
+  API surface in routes/agents.rs, and the frontend types — all
+  reachable from one boolean check returning false. The infrastructure
+  isn't actively harmful, just dormant.
+- The user's complaint is "small models get confused" — not "this code
+  shouldn't exist." Empty defaults solve the actual complaint.
+- Leaving the path means re-enabling for Sonnet/GPT-4-class agents is
+  a config edit, not a re-implementation.
+
+The earlier commit 4bb12982 (XCLAW-77) had already cleaned up the
+hooks' implementation to use no MCP tools — Rust-side memory search
++ LLM synthesis. That work isn't wasted; it's just gated off by
+default now.
+
+Tests: existing test_update_config_wake_on_and_hooks now genuinely
+round-trips a user-supplied hooks config. Before, it passed only by
+coincidence — sending the same values that skip_deserializing was
+forcing back. The semantics are stronger, not weaker, after this
+change. No new test added because the existing one already covers the
+round-trip path.

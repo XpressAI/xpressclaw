@@ -1,0 +1,42 @@
+Why `!e.isComposing` alone didn't work (this is the non-obvious part):
+
+On macOS's built-in Japanese IME, when the user presses Enter to confirm
+a candidate, `compositionend` fires *before* the Enter keydown, so by
+the time `onkeydown` runs, `e.isComposing === false` and `e.keyCode === 13`.
+The first pass (just `!e.isComposing`) passed svelte-check and looked
+right, but the confirming Enter was still sending messages — verified
+live in the Tauri desktop app.
+
+The working pattern needs all three:
+  1. `oncompositionstart` → `composing = true`
+  2. `oncompositionend` → `setTimeout(() => composing = false, 0)` (NOT
+     immediate — the confirming Enter keydown is scheduled right after
+     compositionend and must still see the flag as true)
+  3. keydown check: `!e.isComposing && !composing && e.keyCode !== 229`
+
+Why defer clearing with setTimeout(0): putting it on the macrotask queue
+lets the Enter keydown finish processing before the flag flips. Clearing
+synchronously in compositionend would mean keydown sees false and submits.
+
+VariablePopup didn't get the full pattern because it's a child that
+receives a pre-fired KeyboardEvent from its parent — no input ownership,
+no place to attach composition listeners. It gets the weaker
+`!e.isComposing && keyCode !== 229` guard, which handles the
+"still-composing" case but not the post-compositionend case. Acceptable
+trade-off for a variable-picker popup (accidentally picking a variable
+is recoverable).
+
+The bundled Tauri sidecar at crates/xpressclaw-tauri/binaries/xpressclaw-<triple>
+is embedded from frontend/build/ at CLI release-build time via rust-embed.
+When iterating on frontend fixes for the desktop app, you MUST rebuild
+the CLI (./build.sh --skip-test --skip-tauri --skip-docker --skip-check)
+and re-copy to binaries/ before launching tauri dev — otherwise tauri's
+externalBin copy stays stale and the window loads the old embedded JS.
+`cargo tauri dev` also drops the bundled binary at target/debug/xpressclaw,
+which is what the desktop app's current_exe-relative sidecar resolver
+actually picks up in dev mode.
+
+Inputs NOT touched (VariablePopup aside) that still have only
+!e.isComposing: none — every Enter-submit handler in the frontend got at
+least the keyCode !== 229 check. Search for `key === 'Enter'` in
+frontend/src to confirm coverage if adding new inputs.

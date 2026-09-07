@@ -1,0 +1,1 @@
+ADR-017 initial implementation: apps table (migration v13), CRUD API, sidebar listing, iframe view page with chat/pop-out buttons. Container launching, proxy, and publish_app MCP tool are not yet implemented — those require docker manager integration. The data model and UI surface are ready.

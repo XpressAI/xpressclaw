@@ -1,0 +1,1 @@
+Two fixes: 1) SDK MCP tool handlers were running sync httpx calls in the async event loop, causing TaskGroup errors. Now uses run_in_executor. 2) build-app SKILL.md now has strong MUST-use directive for create_app_workspace — agents were ignoring the soft instructions and using Write directly.

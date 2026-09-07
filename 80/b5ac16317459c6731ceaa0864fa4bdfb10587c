@@ -1,0 +1,1 @@
+Claude CLI (2.1.81) has limited MCP server connections — only ~2 out of 7 servers were loading. Root cause unclear (no error, servers work individually). Fix: consolidated tasks+memory+skills+apps into one mcp_xpressclaw.py that imports all modules and dispatches by tool name. Now 3 MCP servers total (xpressclaw, filesystem, shell) which is within the CLI's limit.
