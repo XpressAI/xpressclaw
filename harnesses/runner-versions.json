@@ -290,7 +290,7 @@
     },
     "grok": {
       "auto_update": true,
-      "version": "1.0.21",
+      "version": "1.0.24",
       "acp_command": [
         "grok",
         "agent",
@@ -307,7 +307,7 @@
       ],
       "build_args": {
         "AGENT_KIND": "grok",
-        "AGENT_PACKAGE": "@xai-official/grok@1.0.21",
+        "AGENT_PACKAGE": "@xai-official/grok@1.0.24",
         "AGENT_BINARY": "grok"
       }
     },
