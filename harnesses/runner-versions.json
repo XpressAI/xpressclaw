@@ -141,7 +141,7 @@
     },
     "opencode": {
       "auto_update": true,
-      "version": "1.18.29",
+      "version": "1.18.30",
       "acp_command": [
         "opencode",
         "acp"
@@ -156,7 +156,7 @@
         }
       ],
       "build_args": {
-        "OPENCODE_VERSION": "1.18.29"
+        "OPENCODE_VERSION": "1.18.30"
       }
     },
     "pi": {
@@ -199,7 +199,7 @@
     },
     "qwen": {
       "auto_update": true,
-      "version": "0.23.0",
+      "version": "0.23.1",
       "acp_command": [
         "qwen",
         "--acp",
@@ -216,7 +216,7 @@
       ],
       "build_args": {
         "AGENT_KIND": "qwen",
-        "AGENT_PACKAGE": "@qwen-code/qwen-code@0.23.0",
+        "AGENT_PACKAGE": "@qwen-code/qwen-code@0.23.1",
         "AGENT_BINARY": "qwen"
       }
     },
@@ -313,7 +313,7 @@
     },
     "kilo": {
       "auto_update": true,
-      "version": "7.5.15",
+      "version": "7.5.16",
       "acp_command": [
         "kilo",
         "acp"
@@ -329,7 +329,7 @@
       ],
       "build_args": {
         "AGENT_KIND": "kilo",
-        "AGENT_PACKAGE": "@kilocode/cli@7.5.15",
+        "AGENT_PACKAGE": "@kilocode/cli@7.5.16",
         "AGENT_BINARY": "kilo"
       }
     },
