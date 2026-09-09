@@ -36,8 +36,21 @@ export interface WorkspacePaneState {
 	width: number;
 }
 
+export interface WorkspaceTabDrag {
+	source: { paneId: string; tabId: string };
+	target: { paneId: string; index: number } | null;
+}
+
 export const WORKSPACE_OPEN_SPLIT_EVENT = 'xpressclaw:workspace-open-split';
 export const TASK_FILE_SPLIT_MIN_PANE_WIDTH = 480;
+
+/** Insertion point for a drag positioned over the tab at `index`: left half inserts before it, right half after. */
+export function tabDropIndex(event: DragEvent, index: number): number {
+	const element = event.currentTarget as HTMLElement | null;
+	if (!element) return index;
+	const bounds = element.getBoundingClientRect();
+	return event.clientX < bounds.left + bounds.width / 2 ? index : index + 1;
+}
 
 export interface WorkspaceOpenSplitDetail {
 	path: string;
