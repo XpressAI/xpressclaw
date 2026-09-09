@@ -16,6 +16,7 @@
 		projectPath,
 		sameWorkspaceTab,
 		statusPriority,
+		tabDropIndex,
 		validWorkspacePane,
 		workspaceId,
 		workspacePath,
@@ -25,6 +26,7 @@
 		type WorkspaceOpenSplitDetail,
 		type ProjectSection,
 		type WorkspaceTab,
+		type WorkspaceTabDrag,
 		type WorkspaceTabKind,
 	} from '$lib/workspace';
 	import ContextMenu from '../ContextMenu.svelte';
@@ -71,6 +73,7 @@
 	let workflowList = $state<Workflow[]>([]);
 	let scheduleList = $state<Schedule[]>([]);
 	let contextMenu = $state<WorkspaceContextMenu | null>(null);
+	let tabDrag = $state<WorkspaceTabDrag | null>(null);
 	let projectMutationVersion = 0;
 	const projectMutations = new Map<string, { version: number; mutation: ProjectMutation }>();
 
@@ -86,7 +89,7 @@
 
 	let focusedPane = $derived(panes.find((pane) => pane.id === focusedPaneId) ?? panes[0]);
 	let focusedTab = $derived(focusedPane?.tabs.find((tab) => tab.id === focusedPane.activeTabId) ?? focusedPane?.tabs[0] ?? null);
-	let openTabs = $derived(panes.flatMap((pane) => pane.tabs.map((tab) => ({ paneId: pane.id, tab }))));
+	let openTabs = $derived(panes.flatMap((pane) => pane.tabs.map((tab, index) => ({ paneId: pane.id, tab, index }))));
 	let sidebarCategory = $derived(tabCategory(focusedTab?.kind));
 	let sidebarTitle = $derived(sidebarCategory === 'tasks'
 		? 'Tasks'
@@ -412,6 +415,148 @@
 		}
 	}
 
+	function moveTab(fromPaneId: string, tabId: string, toPaneId: string, insertIndex: number) {
+		const fromPaneIndex = panes.findIndex((pane) => pane.id === fromPaneId);
+		const toPaneIndex = panes.findIndex((pane) => pane.id === toPaneId);
+		if (fromPaneIndex < 0 || toPaneIndex < 0) return;
+		const sourcePane = panes[fromPaneIndex];
+		const fromTabIndex = sourcePane.tabs.findIndex((candidate) => candidate.id === tabId);
+		if (fromTabIndex < 0) return;
+		const tab = sourcePane.tabs[fromTabIndex];
+
+		if (fromPaneId === toPaneId) {
+			const targetIndex = Math.min(
+				Math.max(insertIndex > fromTabIndex ? insertIndex - 1 : insertIndex, 0),
+				sourcePane.tabs.length - 1,
+			);
+			if (targetIndex === fromTabIndex) return;
+			const reordered = sourcePane.tabs.filter((candidate) => candidate.id !== tabId);
+			reordered.splice(targetIndex, 0, tab);
+			panes = panes.map((pane, index) => index === fromPaneIndex ? { ...pane, tabs: reordered } : pane);
+			persistWorkspace();
+			return;
+		}
+
+		const moved = { ...tab, lastActiveAt: nextTabRecency() };
+		const remaining = sourcePane.tabs.filter((candidate) => candidate.id !== tabId);
+		const nextPanes: WorkspacePaneState[] = [];
+		panes.forEach((pane, index) => {
+			if (index === fromPaneIndex) {
+				// An emptied pane is dropped, matching closeTab; persisted panes always hold a tab.
+				if (remaining.length === 0) return;
+				nextPanes.push({
+					...pane,
+					tabs: remaining,
+					activeTabId: pane.activeTabId === tabId
+						? remaining[Math.min(fromTabIndex, remaining.length - 1)].id
+						: pane.activeTabId,
+				});
+				return;
+			}
+			if (index === toPaneIndex) {
+				const tabs = [...pane.tabs];
+				tabs.splice(Math.min(Math.max(insertIndex, 0), tabs.length), 0, moved);
+				nextPanes.push({ ...pane, tabs, activeTabId: moved.id });
+				return;
+			}
+			nextPanes.push(pane);
+		});
+
+		panes = enforceTabLimit(nextPanes);
+		focusedPaneId = toPaneId;
+		persistWorkspace();
+		if (currentRoute() !== moved.path) {
+			lastSyncedPath = moved.path;
+			goto(moved.path, { replaceState: true, keepFocus: true, noScroll: true });
+		}
+	}
+
+	function moveTabToNewSplit(paneId: string, tab: WorkspaceTab) {
+		if (!canCreatePane()) return;
+		const paneIndex = panes.findIndex((pane) => pane.id === paneId);
+		if (paneIndex < 0) return;
+		const source = panes[paneIndex];
+		const tabIndex = source.tabs.findIndex((candidate) => candidate.id === tab.id);
+		if (tabIndex < 0) return;
+		const remaining = source.tabs.filter((candidate) => candidate.id !== tab.id);
+		if (remaining.length === 0 && panes.length === 1) return;
+
+		const moved = { ...tab, lastActiveAt: nextTabRecency() };
+		const nextPane: WorkspacePaneState = { id: workspaceId('pane'), tabs: [moved], activeTabId: moved.id, width: 1 };
+		panes = enforceTabLimit([
+			...panes.slice(0, paneIndex),
+			...(remaining.length > 0 ? [{
+				...source,
+				tabs: remaining,
+				activeTabId: source.activeTabId === tab.id
+					? remaining[Math.min(tabIndex, remaining.length - 1)].id
+					: source.activeTabId,
+			}] : []),
+			nextPane,
+			...panes.slice(paneIndex + 1),
+		].map((candidate) => ({ ...candidate, width: 1 })));
+		focusedPaneId = nextPane.id;
+		persistWorkspace();
+		if (currentRoute() !== moved.path) {
+			lastSyncedPath = moved.path;
+			goto(moved.path, { replaceState: true, keepFocus: true, noScroll: true });
+		}
+	}
+
+	function beginTabDrag(event: DragEvent, paneId: string, tab: WorkspaceTab) {
+		if (!event.dataTransfer) return;
+		event.dataTransfer.effectAllowed = 'move';
+		event.dataTransfer.setData('text/plain', tabKey(paneId, tab.id));
+		tabDrag = { source: { paneId, tabId: tab.id }, target: null };
+	}
+
+	function dragOverTab(event: DragEvent, paneId: string, index: number) {
+		if (!tabDrag) return;
+		event.preventDefault();
+		if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
+		if (tabDrag.target?.paneId === paneId && tabDrag.target.index === index) return;
+		tabDrag = { ...tabDrag, target: { paneId, index } };
+	}
+
+	function leaveTabDrop(paneId: string) {
+		if (tabDrag?.target?.paneId !== paneId) return;
+		tabDrag = { ...tabDrag, target: null };
+	}
+
+	function dropTab(event: DragEvent, paneId: string, index: number) {
+		const source = tabDrag?.source;
+		tabDrag = null;
+		if (!source) return;
+		event.preventDefault();
+		moveTab(source.paneId, source.tabId, paneId, index);
+	}
+
+	function endTabDrag() {
+		tabDrag = null;
+	}
+
+	// Empty space in the compact strip sits past the last pane's tabs, so it appends there.
+	function compactStripDragOver(event: DragEvent) {
+		if (!tabDrag || (event.target as HTMLElement | null)?.closest('[data-workspace-tab]')) return;
+		const lastPane = panes[panes.length - 1];
+		if (!lastPane) return;
+		dragOverTab(event, lastPane.id, lastPane.tabs.length);
+	}
+
+	function compactStripDragLeave(event: DragEvent) {
+		if (!tabDrag?.target) return;
+		const strip = event.currentTarget as HTMLElement | null;
+		if (strip && event.relatedTarget instanceof Node && strip.contains(event.relatedTarget)) return;
+		tabDrag = { ...tabDrag, target: null };
+	}
+
+	function compactStripDrop(event: DragEvent) {
+		if (!tabDrag || (event.target as HTMLElement | null)?.closest('[data-workspace-tab]')) return;
+		const lastPane = panes[panes.length - 1];
+		if (!lastPane) return;
+		dropTab(event, lastPane.id, lastPane.tabs.length);
+	}
+
 	function showProjectContextMenu(event: MouseEvent, agent: Agent) {
 		event.preventDefault();
 		event.stopPropagation();
@@ -427,8 +572,16 @@
 	function contextMenuItems(target: WorkspaceContextMenu): ContextMenuItem[] {
 		if (target.kind === 'project') return PROJECT_CONTEXT_MENU_ITEMS;
 		const pane = panes.find((candidate) => candidate.id === target.paneId);
+		const tabIndex = pane?.tabs.findIndex((candidate) => candidate.id === target.tab.id) ?? -1;
 		return [
-			{ id: 'close-tab', label: 'Close Tab' },
+			{ id: 'move-tab-left', label: 'Move Left', disabled: tabIndex <= 0 },
+			{ id: 'move-tab-right', label: 'Move Right', disabled: !pane || tabIndex < 0 || tabIndex >= pane.tabs.length - 1 },
+			{
+				id: 'move-tab-to-split',
+				label: 'Move to New Split',
+				disabled: !canCreatePane() || (panes.length === 1 && (pane?.tabs.length ?? 0) <= 1),
+			},
+			{ id: 'close-tab', label: 'Close Tab', separatorBefore: true },
 			{ id: 'close-other-tabs', label: 'Close Other Tabs', disabled: !pane || pane.tabs.length <= 1 },
 			{ id: 'close-all-tabs', label: 'Close All Tabs' },
 			{ id: 'open-new-window', label: 'Open in New Window', separatorBefore: true },
@@ -444,7 +597,12 @@
 
 	function selectContextMenuItem(target: WorkspaceContextMenu, action: string) {
 		if (target.kind === 'tab') {
-			if (action === 'close-tab') closeTab(target.paneId, target.tab);
+			const pane = panes.find((candidate) => candidate.id === target.paneId);
+			const tabIndex = pane?.tabs.findIndex((candidate) => candidate.id === target.tab.id) ?? -1;
+			if (action === 'move-tab-left' && tabIndex > 0) moveTab(target.paneId, target.tab.id, target.paneId, tabIndex - 1);
+			else if (action === 'move-tab-right' && tabIndex >= 0) moveTab(target.paneId, target.tab.id, target.paneId, tabIndex + 2);
+			else if (action === 'move-tab-to-split') moveTabToNewSplit(target.paneId, target.tab);
+			else if (action === 'close-tab') closeTab(target.paneId, target.tab);
 			else if (action === 'close-other-tabs') closeOtherTabs(target.paneId, target.tab);
 			else if (action === 'close-all-tabs') closeAllTabs(target.paneId);
 			else if (action === 'open-new-window') launchWorkspaceWindow(target.tab.path, target.tab.title);
@@ -844,24 +1002,45 @@
 		</div>
 
 		{#if workspacePath($page.url.pathname)}
-			<div bind:this={compactTabStrip} data-workspace-tab-strip class="flex h-9 shrink-0 items-stretch overflow-x-auto border-b border-border bg-[hsl(var(--field))] lg:hidden scrollbar-hide">
+			<div
+				bind:this={compactTabStrip}
+				data-workspace-tab-strip
+				ondragover={compactStripDragOver}
+				ondragleave={compactStripDragLeave}
+				ondrop={compactStripDrop}
+				role="group"
+				aria-label="Open tabs"
+				class="flex h-9 shrink-0 items-stretch overflow-x-auto border-b border-border bg-[hsl(var(--field))] lg:hidden scrollbar-hide"
+			>
 				{#each openTabs as item (item.tab.id)}
 					{@const isActive = item.paneId === focusedPaneId && item.tab.id === focusedPane?.activeTabId}
+					{@const isDragged = Boolean(tabDrag) && tabDrag?.source.paneId === item.paneId && tabDrag?.source.tabId === item.tab.id}
+					{@const itemDropIndex = tabDrag && tabDrag.target && tabDrag.target.paneId === item.paneId ? tabDrag.target.index : null}
 					<!-- svelte-ignore a11y_no_static_element_interactions -->
 					<div
 						data-workspace-tab
 						data-workspace-tab-title={item.tab.title}
 						data-workspace-tab-active={isActive}
+						data-workspace-tab-dragging={isDragged}
+						draggable="true"
+						ondragstart={(event) => beginTabDrag(event, item.paneId, item.tab)}
+						ondragover={(event) => dragOverTab(event, item.paneId, tabDropIndex(event, item.index))}
+						ondrop={(event) => dropTab(event, item.paneId, tabDropIndex(event, item.index))}
+						ondragend={endTabDrag}
 						oncontextmenu={(event) => showTabContextMenu(event, item.paneId, item.tab)}
-						class="group relative flex max-w-52 shrink-0 items-center border-r border-border/70 transition-colors {isActive ? 'bg-card font-semibold text-primary shadow-[inset_0_0_0_1px_hsl(var(--border-strong))]' : 'text-muted-foreground hover:bg-[hsl(var(--hover))] hover:text-foreground'}"
+						class="group relative flex max-w-52 shrink-0 cursor-grab items-center border-r border-border/70 transition-colors active:cursor-grabbing {isDragged ? 'opacity-40' : ''} {isActive ? 'bg-card font-semibold text-primary shadow-[inset_0_0_0_1px_hsl(var(--border-strong))]' : 'text-muted-foreground hover:bg-[hsl(var(--hover))] hover:text-foreground'}"
 					>
 						<button type="button" onclick={() => activateTab(item.paneId, item.tab)} aria-current={isActive ? 'page' : undefined} class="flex min-w-0 flex-1 items-center gap-2 py-2 pl-3 text-xs">
 							{#if item.tab.status}<span class="h-1.5 w-1.5 shrink-0 rounded-full {statusDot(item.tab.status)}"></span>{/if}<span class="truncate">{item.tab.title}</span>
 						</button>
 						<button type="button" onclick={() => closeTab(item.paneId, item.tab)} class="mr-1 flex h-6 w-6 shrink-0 items-center justify-center rounded text-sm text-muted-foreground/60 hover:bg-accent hover:text-foreground" aria-label="Close {item.tab.title}">×</button>
+						{#if itemDropIndex === item.index}<span data-tab-drop-indicator class="pointer-events-none absolute inset-y-0 left-0 z-10 w-0.5 bg-primary" aria-hidden="true"></span>{/if}
 						{#if isActive}<span data-active-tab-indicator class="pointer-events-none absolute inset-x-2 bottom-0 h-0.5 rounded-full bg-primary" aria-hidden="true"></span>{/if}
 					</div>
 				{/each}
+				{#if tabDrag?.target && tabDrag.target.paneId === panes[panes.length - 1]?.id && tabDrag.target.index === panes[panes.length - 1]?.tabs.length}
+					<span data-tab-drop-indicator class="w-0.5 shrink-0 self-stretch bg-primary" aria-hidden="true"></span>
+				{/if}
 			</div>
 
 			<div bind:this={workspaceEl} class="flex min-h-0 flex-1 overflow-hidden">
@@ -872,11 +1051,17 @@
 							focused={pane.id === focusedPaneId}
 							compact={panes.length > 1}
 							canSplit={canCreatePane()}
+							drag={tabDrag}
 							onfocus={() => focusPane(pane.id)}
 							onactivate={(tab) => activateTab(pane.id, tab)}
 							onclose={(tab) => closeTab(pane.id, tab)}
 							oncontext={(event, tab) => showTabContextMenu(event, pane.id, tab)}
 							onsplit={() => splitPane(pane.id)}
+							ontabdragstart={(event, tab) => beginTabDrag(event, pane.id, tab)}
+							ontabdragover={(event, index) => dragOverTab(event, pane.id, index)}
+							ontabdragleave={() => leaveTabDrop(pane.id)}
+							ontabdrop={(event, index) => dropTab(event, pane.id, index)}
+							ontabdragend={endTabDrag}
 						/>
 					</div>
 					{#if index < panes.length - 1}
