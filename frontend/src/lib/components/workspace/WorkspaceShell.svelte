@@ -89,7 +89,12 @@
 
 	let focusedPane = $derived(panes.find((pane) => pane.id === focusedPaneId) ?? panes[0]);
 	let focusedTab = $derived(focusedPane?.tabs.find((tab) => tab.id === focusedPane.activeTabId) ?? focusedPane?.tabs[0] ?? null);
-	let openTabs = $derived(panes.flatMap((pane) => pane.tabs.map((tab, index) => ({ paneId: pane.id, tab, index }))));
+	let openTabs = $derived(panes.flatMap((pane) => pane.tabs.map((tab, index) => ({
+		paneId: pane.id,
+		tab,
+		index,
+		isLast: index === pane.tabs.length - 1,
+	}))));
 	let sidebarCategory = $derived(tabCategory(focusedTab?.kind));
 	let sidebarTitle = $derived(sidebarCategory === 'tasks'
 		? 'Tasks'
@@ -1037,10 +1042,11 @@
 						{#if itemDropIndex === item.index}<span data-tab-drop-indicator class="pointer-events-none absolute inset-y-0 left-0 z-10 w-0.5 bg-primary" aria-hidden="true"></span>{/if}
 						{#if isActive}<span data-active-tab-indicator class="pointer-events-none absolute inset-x-2 bottom-0 h-0.5 rounded-full bg-primary" aria-hidden="true"></span>{/if}
 					</div>
+					<!-- An append target is one past the pane's last tab, so the bar belongs after that item. -->
+					{#if item.isLast && itemDropIndex === item.index + 1}
+						<span data-tab-drop-indicator class="w-0.5 shrink-0 self-stretch bg-primary" aria-hidden="true"></span>
+					{/if}
 				{/each}
-				{#if tabDrag?.target && tabDrag.target.paneId === panes[panes.length - 1]?.id && tabDrag.target.index === panes[panes.length - 1]?.tabs.length}
-					<span data-tab-drop-indicator class="w-0.5 shrink-0 self-stretch bg-primary" aria-hidden="true"></span>
-				{/if}
 			</div>
 
 			<div bind:this={workspaceEl} class="flex min-h-0 flex-1 overflow-hidden">

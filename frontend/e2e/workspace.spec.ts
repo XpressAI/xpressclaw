@@ -4370,6 +4370,49 @@ test('the compact tab strip reorders tabs by drag on narrow screens', async ({ p
 	await expect(page).toHaveURL('/projects');
 });
 
+test('the compact strip previews appending into a pane that is not last', async ({ page }) => {
+	await page.setViewportSize({ width: 900, height: 700 });
+	await seedWorkspace(page, {
+		focusedPaneId: 'pane-left',
+		panes: [
+			{ id: 'pane-left', activeTabId: TAB_NEW_WORK.id, width: 1, tabs: [TAB_NEW_WORK, TAB_PROJECTS] },
+			{ id: 'pane-right', activeTabId: TAB_SETTINGS.id, width: 1, tabs: [TAB_SETTINGS] },
+		],
+	});
+	await page.goto('/');
+
+	const strip = page.locator('[data-workspace-tab-strip]:visible');
+	await expect(strip.locator('[data-workspace-tab]')).toHaveCount(3);
+	await expect(strip.locator('[data-tab-drop-indicator]')).toHaveCount(0);
+
+	// Drag the right pane's tab onto the right half of the left pane's last tab,
+	// which appends into a pane that is not the final one in the strip.
+	const dragEvent = (type: string, overTabTitle: string, sourceTabTitle: string) => page.evaluate(({ type, overTabTitle, sourceTabTitle }) => {
+		const compact = document.querySelector('[aria-label="Open tabs"]')!;
+		const tabs = [...compact.querySelectorAll<HTMLElement>('[data-workspace-tab]')];
+		const source = tabs.find((tab) => tab.dataset.workspaceTabTitle === sourceTabTitle)!;
+		const over = tabs.find((tab) => tab.dataset.workspaceTabTitle === overTabTitle)!;
+		const bounds = over.getBoundingClientRect();
+		source.dispatchEvent(new DragEvent('dragstart', { bubbles: true, dataTransfer: new DataTransfer() }));
+		over.dispatchEvent(new DragEvent(type, {
+			bubbles: true,
+			cancelable: true,
+			dataTransfer: new DataTransfer(),
+			clientX: bounds.right - 2,
+			clientY: bounds.top + bounds.height / 2,
+		}));
+	}, { type, overTabTitle, sourceTabTitle });
+
+	await dragEvent('dragover', 'Projects', 'Settings');
+	await expect(strip.locator('[data-tab-drop-indicator]')).toHaveCount(1);
+	await expect(strip.locator('[data-workspace-tab-title="Projects"] + [data-tab-drop-indicator]')).toHaveCount(1);
+
+	await dragEvent('drop', 'Projects', 'Settings');
+	await expect(page.locator('[data-workspace-pane]')).toHaveCount(1);
+	await expect.poll(() => tabTitles(strip)).toEqual(['New work', 'Projects', 'Settings']);
+	await expect(page).toHaveURL('/settings');
+});
+
 test('task pages show five recent tasks per project in the sidebar', async ({ page }) => {
 	await mockApi(page, { multipleAgents: true });
 	const sidebarTasks = [
