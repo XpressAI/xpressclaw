@@ -3,6 +3,7 @@ name: Release
 on:
   push:
     branches: [main]
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
     paths-ignore:
       - '*.md'
       - 'docs/**'
@@ -27,6 +28,8 @@ jobs:
       tag: ${{ steps.meta.outputs.tag }}
       sha: ${{ steps.meta.outputs.sha }}
       runner_tag: ${{ steps.meta.outputs.runner_tag }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+      source_tag: ${{ steps.meta.outputs.source_tag }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -40,25 +43,25 @@ jobs:
         id: meta
         shell: bash
         run: |
-          SHORT_SHA=$(git rev-parse --short HEAD)
-          LAST_BUILD=$(
-            {
-              git tag -l 'beta-*' | sed -nE 's/^beta-([0-9]+)$/\1/p'
-              git tag -l 'v*-build.*' | sed -nE 's/^v.*-build\.([0-9]+)$/\1/p'
-              git tag -l 'v*' | sed -nE 's/^v[0-9]+\.[0-9]+\.([0-9]+)$/\1/p'
-            } | sort -n | tail -1
-          )
-          NEXT_BUILD=$((${LAST_BUILD:-0} + 1))
-          VERSION=$(node scripts/release-metadata.mjs --release-version "$NEXT_BUILD")
-          TAG="v${VERSION}"
-          RUNNER_TAG=$(bash scripts/runner-revision.sh)
+          node scripts/release-plan.mjs | tee -a "$GITHUB_OUTPUT"
 
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "build=$NEXT_BUILD" >> "$GITHUB_OUTPUT"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
-          echo "runner_tag=$RUNNER_TAG" >> "$GITHUB_OUTPUT"
-          echo "Release: XpressClaw $VERSION ($SHORT_SHA)"
+      - name: Protect an already published stable release
+        if: steps.meta.outputs.prerelease == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          node --input-type=module <<'NODE'
+          const url = `https://api.github.com/repos/${process.env.GITHUB_REPOSITORY}/releases/tags/${encodeURIComponent(process.env.RELEASE_TAG)}`;
+          const response = await fetch(url, {headers: {
+            Authorization: `Bearer ${process.env.GH_TOKEN}`,
+            Accept: 'application/vnd.github+json'
+          }});
+          if (response.status !== 404) {
+            if (!response.ok) throw new Error(`Cannot check existing release: HTTP ${response.status}`);
+            if (!(await response.json()).draft) throw new Error('This stable version is already published; choose a new version.');
+          }
+          NODE
 
   build-tauri:
     needs: release-metadata
@@ -96,7 +99,7 @@ jobs:
 
       - name: Stamp release metadata
         run: |
-          node scripts/release-metadata.mjs --build ${{ needs.release-metadata.outputs.build }}
+          node scripts/release-metadata.mjs --build ${{ needs.release-metadata.outputs.build }} --version ${{ needs.release-metadata.outputs.version }}
           node scripts/release-metadata.mjs --check
 
       - uses: dtolnay/rust-toolchain@stable
@@ -270,7 +273,7 @@ jobs:
           name: xpressclaw-${{ matrix.label }}.rpm
           path: target/${{ matrix.target }}/release/bundle/rpm/*.rpm
 
-  pre-release:
+  publish-release:
     needs: [release-metadata, build-tauri]
     runs-on: ubuntu-latest
     permissions:
@@ -307,40 +310,88 @@ jobs:
             > release-assets/SHA256SUMS
           ls -lh release-assets/
 
-      - name: Create pre-release
+      - name: Verify all platform downloads and checksums
+        env:
+          VERSION: ${{ needs.release-metadata.outputs.version }}
+        run: |
+          expected=(
+            "xpressclaw_${VERSION}_aarch64.dmg"
+            "xpressclaw_${VERSION}_x64.dmg"
+            "xpressclaw_${VERSION}_x64_en-US.msi"
+            "xpressclaw_${VERSION}_x64-setup.exe"
+            "xpressclaw_${VERSION}_amd64.deb"
+            "xpressclaw-${VERSION}-1.x86_64.rpm"
+            "xpressclaw-cli-aarch64-apple-darwin.tar.gz"
+            "xpressclaw-cli-x86_64-apple-darwin.tar.gz"
+            "xpressclaw-cli-x86_64-pc-windows-msvc.zip"
+            "xpressclaw-cli-x86_64-unknown-linux-gnu.tar.gz"
+          )
+          for asset in "${expected[@]}"; do
+            test -s "release-assets/$asset" || { echo "Missing release asset: $asset" >&2; exit 1; }
+          done
+          cd release-assets
+          sha256sum --check --strict SHA256SUMS
+
+      - name: Prepare release notes
+        shell: bash
+        env:
+          VERSION: ${{ needs.release-metadata.outputs.version }}
+          TAG: ${{ needs.release-metadata.outputs.tag }}
+          RUNNER_TAG: ${{ needs.release-metadata.outputs.runner_tag }}
+          PRERELEASE: ${{ needs.release-metadata.outputs.prerelease }}
+        run: |
+          if [[ "$PRERELEASE" == false ]]; then
+            cat "docs/releases/${VERSION}.md" > release-notes.md
+          else
+            printf 'XpressClaw `%s`.\n' "$VERSION" > release-notes.md
+          fi
+          cat >> release-notes.md <<EOF
+
+          Built from \`${GITHUB_SHA}\`.
+          Runner images are pinned to \`${RUNNER_TAG}\`.
+
+          **Desktop downloads:**
+          - macOS (Apple Silicon): \`.dmg\` arm64 — signed and notarized
+          - macOS (Intel): \`.dmg\` x64 — signed and notarized
+          - Windows: \`.exe\` NSIS installer, \`.msi\` MSI installer
+          - Linux: \`.deb\` (Debian/Ubuntu), \`.rpm\` (Fedora/RHEL)
+
+          **Standalone CLI/server downloads:**
+          - macOS: signed \`aarch64-apple-darwin\` and \`x86_64-apple-darwin\` archives
+          - Linux: \`x86_64-unknown-linux-gnu\` archive
+          - Windows: \`x86_64-pc-windows-msvc\` archive
+          - \`SHA256SUMS\` covers every release asset
+
+          Install this version explicitly:
+
+          \`\`\`bash
+          curl -fsSL https://raw.githubusercontent.com/XpressAI/xpressclaw/main/install.sh | XPRESSCLAW_VERSION=${TAG} sh
+          \`\`\`
+
+          The unpinned installer follows GitHub's latest stable release and ignores prereleases.
+
+          Desktop bundles and automatically starts the default local control-plane instance.
+          EOF
+
+      - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.release-metadata.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           name: "XpressClaw ${{ needs.release-metadata.outputs.version }}"
-          body: |
-            XpressClaw `${{ needs.release-metadata.outputs.version }}`.
-
-            Built from `main` at `${{ github.sha }}` (`${{ needs.release-metadata.outputs.sha }}`).
-            Runner images are pinned to `${{ needs.release-metadata.outputs.runner_tag }}`.
-
-            **Desktop downloads:**
-            - macOS (Apple Silicon): `.dmg` arm64 — signed and notarized
-            - macOS (Intel): `.dmg` x64 — signed and notarized
-            - Windows: `.exe` NSIS installer, `.msi` MSI installer
-            - Linux: `.deb` (Debian/Ubuntu), `.rpm` (Fedora/RHEL)
-
-            **Standalone CLI/server downloads:**
-            - macOS: signed `aarch64-apple-darwin` and `x86_64-apple-darwin` archives
-            - Linux: `x86_64-unknown-linux-gnu` archive
-            - Windows: `x86_64-pc-windows-msvc` archive
-            - `SHA256SUMS` covers every release asset
-
-            Install this prerelease explicitly:
-
-            ```bash
-            curl -fsSL https://raw.githubusercontent.com/XpressAI/xpressclaw/main/install.sh | XPRESSCLAW_VERSION=${{ needs.release-metadata.outputs.tag }} sh
-            ```
-
-            The unpinned installer follows GitHub's latest stable release and therefore ignores prereleases.
-
-            Desktop bundles and automatically starts the default local control-plane instance.
-          prerelease: true
+          body_path: release-notes.md
+          # Upload all stable assets before making the release public.
+          draft: ${{ needs.release-metadata.outputs.prerelease == 'false' }}
+          prerelease: ${{ needs.release-metadata.outputs.prerelease == 'true' }}
           make_latest: false
+          fail_on_unmatched_files: true
           files: release-assets/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Make the complete stable release public and latest
+        if: needs.release-metadata.outputs.prerelease == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.release-metadata.outputs.tag }}
+        run: gh release edit "$RELEASE_TAG" --draft=false --prerelease=false --latest

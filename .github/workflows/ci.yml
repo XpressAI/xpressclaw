@@ -71,6 +71,7 @@ jobs:
 
       - name: Check release version metadata
         run: |
+          node --test ../scripts/release-*.test.mjs
           node ../scripts/release-metadata.mjs --check
           node ../scripts/release-metadata.mjs --build 1
           node ../scripts/release-metadata.mjs --check

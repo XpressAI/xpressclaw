@@ -109,7 +109,11 @@ test('image and release workflows resolve the same immutable runner revision', a
     /xpressclaw-runner-\$\{\{ matrix\.runner\.id \}\}\$\{\{ matrix\.variant\.suffix \}\}:\$\{\{ needs\.runner-matrix\.outputs\.runner_tag \}\}/,
   );
   assert.doesNotMatch(harnessWorkflow, /xpressclaw-runner-.*:\$\{\{ github\.sha \}\}/);
-  assert.match(releaseWorkflow, /RUNNER_TAG=\$\(bash scripts\/runner-revision\.sh\)/);
+  assert.match(releaseWorkflow, /node scripts\/release-plan\.mjs/);
+  assert.match(
+    releaseWorkflow,
+    /XPRESSCLAW_RUNNER_TAG: \$\{\{ needs\.release-metadata\.outputs\.runner_tag \}\}/,
+  );
 });
 
 test('updates tracked registry and npm sources while leaving a pinned runner unchanged', async () => {

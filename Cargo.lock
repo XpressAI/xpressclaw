@@ -8223,7 +8223,7 @@ dependencies = [
 
 [[package]]
 name = "xpressclaw-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -8243,7 +8243,7 @@ dependencies = [
 
 [[package]]
 name = "xpressclaw-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
@@ -8293,7 +8293,7 @@ dependencies = [
 
 [[package]]
 name = "xpressclaw-server"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -8328,7 +8328,7 @@ dependencies = [
 
 [[package]]
 name = "xpressclaw-tauri"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
