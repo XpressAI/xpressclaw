@@ -440,6 +440,8 @@ async fn create_task(
         }
     }
 
+    // Enqueueing updates session fields and advances the planning revision.
+    let task = board.get(&task.id).map_err(internal_error)?;
     Ok((StatusCode::CREATED, Json(json!(task))))
 }
 
@@ -1064,6 +1066,13 @@ async fn create_tasks_batch(
         }
     }
 
+    // Return snapshots after every creation/enqueue mutation so callers can
+    // use these revisions for their first planning edit.
+    let tasks = tasks
+        .iter()
+        .map(|task| board.get(&task.id))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(internal_error)?;
     Ok((StatusCode::CREATED, Json(json!(tasks))))
 }
 
@@ -1170,6 +1179,74 @@ mod tests {
     async fn body_json(body: Body) -> Value {
         let bytes = body.collect().await.unwrap().to_bytes();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn assert_creation_revisions_are_ready_for_planning(batch: bool) {
+        let (app, db) = test_app_with_db();
+        let inputs = vec![
+            json!({"title":"Queued task", "agent_id":"atlas"}),
+            json!({"title":"Backlog task", "agent_id":"atlas", "backlog":true}),
+            json!({"title":"Unassigned task"}),
+        ];
+        let requests = if batch {
+            vec![json!({"tasks":inputs})]
+        } else {
+            inputs
+        };
+        for request in requests {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post(if batch { "/tasks/batch" } else { "/tasks" })
+                        .header("content-type", "application/json")
+                        .body(Body::from(request.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED);
+            let response = body_json(response.into_body()).await;
+            let tasks = if batch {
+                response.as_array().unwrap().clone()
+            } else {
+                vec![response]
+            };
+            assert_eq!(tasks.len(), if batch { 3 } else { 1 });
+            for task in tasks {
+                let id = task["id"].as_str().unwrap();
+                let patch = || {
+                    Request::patch(format!("/tasks/{id}/planning"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"action":"priority", "priority":10, "expected_revision":task["revision"]}).to_string())).unwrap()
+                };
+                // A creation response must be usable immediately, without a GET
+                // to discover mutations performed by creation itself.
+                let response = app.clone().oneshot(patch()).await.unwrap();
+                assert_eq!(
+                    response.status(),
+                    StatusCode::OK,
+                    "Creation of {} returned a stale revision",
+                    task["title"]
+                );
+                let updated = body_json(response.into_body()).await;
+                assert_eq!(updated["priority"], 10);
+                let stored = TaskBoard::new(db.clone()).get(id).unwrap();
+                assert_eq!(updated["revision"], stored.revision);
+                // The same revision must still reject a genuinely stale edit.
+                let response = app.clone().oneshot(patch()).await.unwrap();
+                assert_eq!(response.status(), StatusCode::CONFLICT);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn single_task_creation_returns_current_revision_for_planning() {
+        assert_creation_revisions_are_ready_for_planning(false).await;
+    }
+
+    #[tokio::test]
+    async fn batch_task_creation_returns_current_revisions_for_planning() {
+        assert_creation_revisions_are_ready_for_planning(true).await;
     }
 
     #[tokio::test]
