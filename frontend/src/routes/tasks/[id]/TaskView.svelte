@@ -149,7 +149,7 @@
 	let editTitle = $state('');
 	let editDesc = $state('');
 	let editAgentId = $state('');
-	let originalEditAgentId = '';
+	let originalEditAgentId = $state('');
 	let editPriority = $state(0);
 	let editDeps = $state<string[]>([]);
 	let messageInput = $state('');
@@ -1188,12 +1188,16 @@
 		editSaving = true;
 		editError = '';
 		try {
+			if (originalEditAgentId && !editAgentId) {
+				throw new Error('Use Plan / schedule → Backlog to keep queued work from starting.');
+			}
 			// Update task fields
 			await tasks.update(task.id, {
 				title: editTitle,
 				description: editDesc || undefined,
-				// Sending an unchanged assignment can enqueue a new turn.
-				...(editAgentId !== originalEditAgentId ? { agent_id: editAgentId } : {}),
+				// Unchanged assignments can enqueue another turn; this endpoint
+				// also cannot retire queued work when clearing an assignment.
+				...(editAgentId && editAgentId !== originalEditAgentId ? { agent_id: editAgentId } : {}),
 				priority: editPriority,
 			});
 			// Add new dependencies
@@ -1563,13 +1567,14 @@
 			<div class="flex flex-col gap-3 sm:flex-row">
 				<div class="flex-1">
 					<label for={viewId + '-agent'} class="block text-xs text-muted-foreground mb-1">Agent</label>
-					<select id={viewId + '-agent'} bind:value={editAgentId}
+					<select id={viewId + '-agent'} bind:value={editAgentId} aria-describedby={originalEditAgentId ? viewId + '-assignment-help' : undefined}
 						class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring">
-						<option value="">Unassigned</option>
+						<option value="" disabled={!!originalEditAgentId}>Unassigned</option>
 						{#each agentList as agent}
 							<option value={agent.id}>{agent.title || agent.name}</option>
 						{/each}
 					</select>
+					{#if originalEditAgentId}<p id={viewId + '-assignment-help'} class="mt-1 text-xs text-muted-foreground">Use Plan / schedule → Backlog to park work.</p>{/if}
 				</div>
 				<div class="w-24">
 					<label for={viewId + '-priority'} class="block text-xs text-muted-foreground mb-1">Priority</label>

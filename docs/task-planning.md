@@ -84,8 +84,10 @@ focus to its card when the card remains in view.
 
 In a task, the **Task settings** gear contains **Edit details** and
 **Plan / schedule**. Start, complete, and cancel use labeled icon buttons and
-report any lifecycle errors in the header. **Hide task details** collapses the
-Details / Changed files sidebar and remembers that choice in this browser;
+report any lifecycle errors in the header. The editor can assign an Agent but
+cannot unassign existing work; use **Plan / schedule → Backlog** to park it.
+**Hide task details** collapses the Details / Changed files sidebar and remembers
+that choice in this browser;
 **Show task details** restores it. On phones and narrow split panes, details
 open in a modal instead of taking space from the conversation.
 

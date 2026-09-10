@@ -297,6 +297,7 @@ async function mockApi(
 		taskTitle?: string;
 		taskDescription?: string;
 		taskStatus?: string;
+		taskAgentId?: string | null;
 		taskActivityStatus?: string;
 		taskSubtasks?: Record<string, unknown>[];
 		taskMessages?: Record<string, unknown>[];
@@ -463,7 +464,7 @@ async function mockApi(
 		description: options.taskDescription ?? 'Inspect the project and report what you find.',
 		status,
 		priority: 0,
-		agent_id: agentId,
+		agent_id: options.taskAgentId === undefined ? agentId : options.taskAgentId,
 		parent_task_id: null,
 		sop_id: null,
 		conversation_id: null,
@@ -5934,6 +5935,8 @@ for (const viewport of [{ width: 1440, height: 900 }, { width: 390, height: 844 
 		await gear.click();
 		await page.getByRole('menuitem', { name: 'Edit details' }).click();
 		const editor = page.getByRole('dialog', { name: 'Edit task details', exact: true });
+		await expect(editor.getByLabel('Agent', { exact: true }).getByRole('option', { name: 'Unassigned' })).toBeDisabled();
+		await expect(editor.getByText('Use Plan / schedule → Backlog to park work.')).toBeVisible();
 		await editor.getByLabel('Title', { exact: true }).fill('Streamlined task controls');
 		await editor.getByLabel('Description', { exact: true }).fill('A draft worth preserving.');
 		await editor.getByLabel('Priority', { exact: true }).selectOption('5');
@@ -6044,3 +6047,37 @@ for (const viewport of [{ width: 390, height: 844 }, { width: 820, height: 900 }
 		await expect(page.locator('[data-workspace-sidebar]')).toBeVisible();
 	});
 }
+
+test('unassigned tasks can be edited and assigned without enabling later unassignment', async ({ page }) => {
+	const taskUpdateRequests: Record<string, unknown>[] = [];
+	await mockApi(page, { taskStatus: 'pending', taskAgentId: null, taskUpdateRequests });
+	await page.goto(`/tasks/${taskId}`);
+	const editor = page.getByRole('dialog', { name: 'Edit task details', exact: true });
+	const openEditor = async () => {
+		await page.getByRole('button', { name: 'Task settings', exact: true }).click();
+		await page.getByRole('menuitem', { name: 'Edit details', exact: true }).click();
+	};
+	await openEditor();
+	const assignment = editor.getByLabel('Agent', { exact: true });
+	await expect(assignment).toHaveValue('');
+	await expect(assignment.getByRole('option', { name: 'Unassigned' })).toBeEnabled();
+	await editor.getByLabel('Title', { exact: true }).fill('Work waiting for an agent');
+	await editor.getByRole('button', { name: 'Save', exact: true }).click();
+	await expect(editor).toBeHidden();
+	expect(taskUpdateRequests).toHaveLength(1);
+	expect(taskUpdateRequests[0]).not.toHaveProperty('agent_id');
+
+	await openEditor();
+	await assignment.selectOption(agentId);
+	await editor.getByRole('button', { name: 'Save', exact: true }).click();
+	await expect(editor).toBeHidden();
+	expect(taskUpdateRequests).toHaveLength(2);
+	expect(taskUpdateRequests[1].agent_id).toBe(agentId);
+
+	await openEditor();
+	await expect(assignment).toHaveValue(agentId);
+	await expect(assignment.getByRole('option', { name: 'Unassigned' })).toBeDisabled();
+	await editor.getByRole('button', { name: 'Cancel', exact: true }).click();
+	await expect(editor).toBeHidden();
+	expect(taskUpdateRequests).toHaveLength(2);
+});
