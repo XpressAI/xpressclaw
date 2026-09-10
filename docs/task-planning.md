@@ -42,8 +42,9 @@ current task's Project and transfers its queued work to the selected Agent.
 ## Start no earlier than
 
 Set **Start no earlier than** when creating a task, from its Actions sheet, or
-through **Plan / schedule** in task details. The local timezone is named beside
-the picker; the server stores an unambiguous UTC timestamp. Clearing the date
+through the **Task settings** gear → **Plan / schedule** in task details. The local
+timezone is named beside the picker; the server stores an unambiguous UTC
+timestamp. Clearing the date
 removes only the date constraint; it does not clear Backlog.
 
 The task cannot acquire an execution slot before this threshold. At the
@@ -68,12 +69,27 @@ on the chosen day; the picker gives precise control.
 
 ## Phone and narrow panes
 
+Task and project sidebars stay hidden in compact workspaces. Tap **Browse** in
+the bottom navigation (or the top menu button) to open a modal with the current
+section's navigation. Select a destination, tap **Done**, tap outside, or press
+Escape to dismiss it. The list scrolls inside the modal and leaves the current
+task's conversation and draft in place.
+
 Board, Timeline, List, Filters, and New Task controls sit at the bottom of the
 pane. The board's lane selector and the timeline's agenda avoid precise dragging.
 Every editable card has an Actions button with Move, Assign, Priority, and Schedule
 controls. Sheets respect safe areas and the visible keyboard viewport, scroll
 independently, and support screen readers and Escape. Closing a task sheet returns
 focus to its card when the card remains in view.
+
+In a task, the **Task settings** gear contains **Edit details** and
+**Plan / schedule**. Start, complete, and cancel use labeled icon buttons and
+report any lifecycle errors in the header. The editor can assign an Agent but
+cannot unassign existing work; use **Plan / schedule → Backlog** to park it.
+**Hide task details** collapses the Details / Changed files sidebar and remembers
+that choice in this browser;
+**Show task details** restores it. On phones and narrow split panes, details
+open in a modal instead of taking space from the conversation.
 
 Views refresh every five seconds while visible. Changes are confirmed by the
 server. If another client or an Agent changed the task, the edit is rejected,

@@ -276,6 +276,11 @@ async function mockApi(
 		live?: boolean;
 		attemptError?: string;
 		taskLoadFailureOnce?: boolean;
+		taskUpdateRequests?: Record<string, unknown>[];
+		taskUpdateFailureOnce?: boolean;
+		taskStatusRequests?: string[];
+		taskStatusFailureOnce?: boolean;
+		taskPlanRequests?: Record<string, unknown>[];
 		agentTimeline?: boolean;
 		agentResponseLinks?: boolean;
 		richToolActivity?: boolean;
@@ -292,6 +297,7 @@ async function mockApi(
 		taskTitle?: string;
 		taskDescription?: string;
 		taskStatus?: string;
+		taskAgentId?: string | null;
 		taskActivityStatus?: string;
 		taskSubtasks?: Record<string, unknown>[];
 		taskMessages?: Record<string, unknown>[];
@@ -422,6 +428,8 @@ async function mockApi(
 	};
 	let projectSyncConflictReturned = false;
 	let taskLoadFailed = false;
+	let taskUpdateFailed = false;
+	let taskStatusFailed = false;
 	const deletedConversationMessageIds = new Set<number>();
 	const status = options.taskStatus ?? (options.pendingElicitation ? 'waiting_for_input' : options.live ? 'in_progress' : 'completed');
 	const attemptStatus = options.attemptError
@@ -449,11 +457,14 @@ async function mockApi(
 		: "Yes, I'll inspect the project.\n\nI'm starting with the timeline component so this update remains readable even when it spans multiple lines.";
 	const task = {
 		id: taskId,
+		revision: 0,
+		start_after: null as string | null,
+		backlog: false,
 		title: options.taskTitle ?? 'Browser-tested workspace',
 		description: options.taskDescription ?? 'Inspect the project and report what you find.',
 		status,
 		priority: 0,
-		agent_id: agentId,
+		agent_id: options.taskAgentId === undefined ? agentId : options.taskAgentId,
 		parent_task_id: null,
 		sop_id: null,
 		conversation_id: null,
@@ -1127,7 +1138,43 @@ async function mockApi(
 						return true;
 					}),
 			};
+		} else if (path === `/api/tasks/${taskId}/planning`) {
+			if (request.method() === 'PATCH') {
+				const payload = request.postDataJSON() as Record<string, unknown>;
+				options.taskPlanRequests?.push(payload);
+				if (payload.expected_revision !== task.revision || task.status !== 'pending') {
+					await route.fulfill({ status: 409, json: { error: 'Task changed or is controlled by its current lifecycle.' } });
+					return;
+				}
+				if (payload.action === 'schedule') task.start_after = payload.start_after as string | null;
+				task.revision++;
+			}
+			response = { ...task, planning: {
+				lane: task.start_after ? 'scheduled' : task.status === 'pending' ? 'queue' : 'working',
+				disabled_reason: task.status === 'pending' ? null : 'This task has an active turn. Planning cannot interrupt it.',
+				queued: true, actual_started_at: null,
+			} };
+		} else if (path === `/api/tasks/${taskId}/status`) {
+			const payload = request.postDataJSON() as { status: string };
+			options.taskStatusRequests?.push(payload.status);
+			if (options.taskStatusFailureOnce && !taskStatusFailed) {
+				taskStatusFailed = true;
+				await route.fulfill({ status: 409, json: { error: 'Task still requires review.' } });
+				return;
+			}
+			Object.assign(task, { status: payload.status, activity_status: payload.status, revision: task.revision + 1 });
+			response = task;
 		} else if (path === `/api/tasks/${taskId}`) {
+			if (request.method() === 'PATCH') {
+				const payload = request.postDataJSON() as Record<string, unknown>;
+				options.taskUpdateRequests?.push(payload);
+				if (options.taskUpdateFailureOnce && !taskUpdateFailed) {
+					taskUpdateFailed = true;
+					await route.fulfill({ status: 503, json: { error: 'Could not save task details.' } });
+					return;
+				}
+				Object.assign(task, payload, { revision: task.revision + 1 });
+			}
 			if (options.taskLoadFailureOnce && !taskLoadFailed) {
 				taskLoadFailed = true;
 				await route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: 'Temporary task load failure' }) });
@@ -4071,7 +4118,7 @@ test('workspace panes split on wide screens and collapse cleanly on mobile', asy
 	expect(await mobile.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 
 	await mobile.getByRole('button', { name: 'Open agent switcher' }).click();
-	await mobile.locator('aside:visible').getByRole('button', { name: 'Close' }).click();
+	await mobile.locator('aside:visible').getByRole('button', { name: 'Close', exact: true }).click();
 	await mobile.locator('nav a[href="/projects"]').click();
 	await expect(mobile).toHaveURL('/projects');
 	await mobile.getByRole('button', { name: 'Open agent switcher' }).click();
@@ -4859,7 +4906,7 @@ test('agent, task, and automation lists remain scrollable on mobile', async ({ b
 	await expectVerticalScroll(mobile.locator('[data-projects-scroll]'));
 	await mobile.getByRole('button', { name: 'Open agent switcher' }).click();
 	await expectVerticalScroll(mobile.locator('aside:visible [data-mobile-sidebar-scroll]'));
-	await mobile.locator('aside:visible').getByRole('button', { name: 'Close' }).click();
+	await mobile.locator('aside:visible').getByRole('button', { name: 'Close', exact: true }).click();
 
 	await mobile.goto('/tasks');
 	await mobile.getByRole('combobox', { name: 'Task status' }).selectOption('done');
@@ -4867,7 +4914,7 @@ test('agent, task, and automation lists remain scrollable on mobile', async ({ b
 	await expectVerticalScroll(mobile.locator('[data-tasks-scroll]'));
 	await mobile.getByRole('button', { name: 'Open agent switcher' }).click();
 	await expectVerticalScroll(mobile.locator('aside:visible [data-mobile-sidebar-scroll]'));
-	await mobile.locator('aside:visible').getByRole('button', { name: 'Close' }).click();
+	await mobile.locator('aside:visible').getByRole('button', { name: 'Close', exact: true }).click();
 
 	await mobile.goto('/automations');
 	await expect(mobile.locator('[data-workflows-scroll] [data-workflow-card]')).toHaveCount(30);
@@ -5107,7 +5154,7 @@ test('automation and settings pages show context-specific sidebar lists', async 
 	await page.getByRole('button', { name: 'Open agent switcher' }).click();
 	await expect(page.locator('aside:visible [data-sidebar-mode="automations"] [data-sidebar-workflow]')).toHaveCount(2);
 	await expect(page.locator('aside:visible [data-sidebar-mode="automations"] [data-sidebar-schedule]')).toHaveCount(1);
-	await page.locator('aside:visible').getByRole('button', { name: 'Close' }).click();
+	await page.locator('aside:visible').getByRole('button', { name: 'Close', exact: true }).click();
 	await page.locator('nav a[href="/settings"]:visible').click();
 	await page.getByRole('button', { name: 'Open agent switcher' }).click();
 	await expect(page.locator('aside:visible [data-sidebar-mode="settings"] [data-sidebar-setting]')).toHaveCount(5);
@@ -5820,4 +5867,217 @@ test('shared terminals join named sessions, send interactive input and share the
 	await expect(terminal.getByRole('button', { name: 'Share', exact: true })).toBeEnabled();
 	await terminal.getByRole('button', { name: 'Share', exact: true }).click();
 	await expect(page.locator('html')).toHaveAttribute('data-shared-terminal', new RegExp(`/agents/${agentId}\\?tab=files&terminal=build$`));
+});
+
+test('task details can be hidden and stay hidden across live updates, resizing, and reloads', async ({ page }, testInfo) => {
+	await page.setViewportSize({ width: 1440, height: 900 });
+	await mockApi(page, { live: true });
+	await page.goto(`/tasks/${taskId}`);
+	const details = page.locator('[data-task-details-sidebar]');
+	const transcript = page.locator('[data-task-transcript-scroll]');
+	await expect(details).toBeVisible();
+	const originalWidth = (await transcript.boundingBox())!.width;
+	await page.getByRole('button', { name: 'Hide task details' }).focus();
+	await page.keyboard.press('Space');
+	await expect(details).toBeHidden();
+	await expect(page.getByRole('button', { name: 'Show task details' })).toHaveAttribute('aria-expanded', 'false');
+	expect((await transcript.boundingBox())!.width).toBeGreaterThan(originalWidth + 250);
+	await page.waitForResponse((response) => new URL(response.url()).pathname === `/api/tasks/${taskId}/activity`);
+	await page.setViewportSize({ width: 1280, height: 800 });
+	await expect(details).toBeHidden();
+	await page.reload();
+	await expect(page.getByRole('button', { name: 'Show task details' })).toBeVisible();
+	await expect(details).toBeHidden();
+	await page.screenshot({ path: testInfo.outputPath('task-desktop-details-hidden.png') });
+	await page.getByRole('button', { name: 'Show task details' }).click();
+	await expect(details).toBeVisible();
+	await page.screenshot({ path: testInfo.outputPath('task-desktop-details-visible.png') });
+});
+
+test('narrow task panes open details in a modal without losing the conversation draft', async ({ page }) => {
+	await page.setViewportSize({ width: 1024, height: 768 });
+	await mockApi(page, { live: true });
+	await page.goto(`/tasks/${taskId}`);
+	await page.getByRole('button', { name: 'Split active tab right' }).click();
+	const pane = page.locator('[data-workspace-pane]').first();
+	const composer = pane.locator(`#task-message-input-${taskId}`);
+	await composer.fill('Keep my follow-up draft.');
+	const toggle = pane.getByRole('button', { name: 'Show task details' });
+	await toggle.click();
+	const dialog = page.getByRole('dialog', { name: 'Task details', exact: true });
+	await expect(dialog).toBeVisible();
+	await expect(dialog.getByText('CHANGED FILES', { exact: false })).toBeVisible();
+	await page.keyboard.press('Escape');
+	await expect(dialog).toBeHidden();
+	await expect(toggle).toBeFocused();
+	await expect(composer).toHaveValue('Keep my follow-up draft.');
+	await expect(pane.locator('[data-task-details-sidebar]')).toBeHidden();
+});
+
+for (const viewport of [{ width: 1440, height: 900 }, { width: 390, height: 844 }]) {
+	test(`task settings combine edit and scheduling at ${viewport.width}px`, async ({ page }, testInfo) => {
+		await page.setViewportSize(viewport);
+		const taskUpdateRequests: Record<string, unknown>[] = [];
+		const taskPlanRequests: Record<string, unknown>[] = [];
+		await mockApi(page, { taskStatus: 'pending', taskUpdateRequests, taskUpdateFailureOnce: true, taskPlanRequests });
+		await page.goto(`/tasks/${taskId}`);
+		const gear = page.getByRole('button', { name: 'Task settings', exact: true });
+		await expect(page.getByRole('button', { name: 'Plan / schedule', exact: true })).toHaveCount(0);
+		await gear.click();
+		await expect(page.getByRole('menuitem', { name: 'Edit details' })).toBeFocused();
+		await page.keyboard.press('ArrowDown');
+		await expect(page.getByRole('menuitem', { name: 'Plan / schedule' })).toBeFocused();
+		await page.keyboard.press('Escape');
+		await expect(gear).toBeFocused();
+		await gear.click();
+		await gear.click();
+		await expect(page.getByRole('menu', { name: 'Task settings' })).toBeHidden();
+		await gear.click();
+		await page.getByRole('menuitem', { name: 'Edit details' }).click();
+		const editor = page.getByRole('dialog', { name: 'Edit task details', exact: true });
+		await expect(editor.getByLabel('Agent', { exact: true }).getByRole('option', { name: 'Unassigned' })).toBeDisabled();
+		await expect(editor.getByText('Use Plan / schedule → Backlog to park work.')).toBeVisible();
+		await editor.getByLabel('Title', { exact: true }).fill('Streamlined task controls');
+		await editor.getByLabel('Description', { exact: true }).fill('A draft worth preserving.');
+		await editor.getByLabel('Priority', { exact: true }).selectOption('5');
+		await editor.getByRole('button', { name: 'Save', exact: true }).click();
+		await expect(editor.getByRole('alert')).toContainText('Could not save task details.');
+		await expect(editor.getByLabel('Title', { exact: true })).toHaveValue('Streamlined task controls');
+		if (viewport.width < 640) {
+			await page.evaluate(() => {
+				Object.defineProperty(window.visualViewport!, 'height', { configurable: true, value: 430 });
+				Object.defineProperty(window.visualViewport!, 'offsetTop', { configurable: true, value: 24 });
+				window.visualViewport!.dispatchEvent(new Event('resize'));
+			});
+			await expect.poll(async () => { const rect = await editor.boundingBox(); return rect!.y + rect!.height; }).toBeLessThanOrEqual(455);
+			await editor.getByRole('button', { name: 'Save', exact: true }).scrollIntoViewIfNeeded();
+		}
+		await page.screenshot({ path: testInfo.outputPath(`task-editor-${viewport.width}.png`) });
+		await editor.getByRole('button', { name: 'Save', exact: true }).click();
+		await expect(editor).toBeHidden();
+		await expect(gear).toBeFocused();
+		await expect(page.getByRole('heading', { name: 'Streamlined task controls', exact: true })).toBeVisible();
+		expect(taskUpdateRequests).toHaveLength(2);
+		expect(taskUpdateRequests[1]).toEqual({ title: 'Streamlined task controls', description: 'A draft worth preserving.', priority: 5 });
+		await gear.click();
+		await page.getByRole('menuitem', { name: 'Plan / schedule' }).click();
+		const planning = page.getByRole('dialog', { name: 'Plan Streamlined task controls', exact: true });
+		await planning.getByLabel('Start no earlier than').fill('2030-10-12T14:30');
+		await planning.getByRole('button', { name: 'Save schedule', exact: true }).click();
+		await expect.poll(() => taskPlanRequests.length).toBe(1);
+		expect(taskPlanRequests[0]).toMatchObject({ action: 'schedule', expected_revision: 1, start_after: '2030-10-12T14:30:00.000Z' });
+		await planning.getByRole('button', { name: 'Clear schedule' }).click();
+		await expect.poll(() => taskPlanRequests.length).toBe(2);
+		expect(taskPlanRequests[1]).toMatchObject({ action: 'schedule', expected_revision: 2, start_after: null });
+		await planning.getByRole('button', { name: 'Done', exact: true }).click();
+		await expect(planning).toBeHidden();
+		await expect(gear).toBeFocused();
+		expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+	});
+}
+
+test('task status icons keep lifecycle errors visible and support retry', async ({ page }) => {
+	const taskStatusRequests: string[] = [];
+	await mockApi(page, { live: true, taskStatusRequests, taskStatusFailureOnce: true });
+	await page.goto(`/tasks/${taskId}`);
+	await expect(page.getByRole('button', { name: 'Stop and cancel task' })).toBeVisible();
+	await page.getByRole('button', { name: 'Complete task', exact: true }).click();
+	await expect(page.getByRole('alert')).toContainText('Task still requires review.');
+	await expect(page.getByRole('button', { name: 'Complete task', exact: true })).toBeEnabled();
+	await page.getByRole('button', { name: 'Complete task', exact: true }).click();
+	await expect(page.getByRole('button', { name: 'Complete task', exact: true })).toBeHidden();
+	expect(taskStatusRequests).toEqual(['completed', 'completed']);
+});
+
+test('start and stop task icons call the existing lifecycle actions', async ({ page }) => {
+	const taskStatusRequests: string[] = [];
+	await mockApi(page, { taskStatus: 'pending', taskStatusRequests });
+	await page.goto(`/tasks/${taskId}`);
+	await page.getByRole('button', { name: 'Start task', exact: true }).click();
+	await page.getByRole('button', { name: 'Stop and cancel task' }).click();
+	await expect.poll(() => taskStatusRequests).toEqual(['in_progress', 'cancelled']);
+	await expect(page.getByRole('button', { name: 'Stop and cancel task' })).toBeHidden();
+});
+
+for (const viewport of [{ width: 390, height: 844 }, { width: 820, height: 900 }]) {
+	test(`compact navigation is modal and leaves task content full width at ${viewport.width}px`, async ({ page }, testInfo) => {
+		await page.setViewportSize(viewport);
+		await mockApi(page, { live: true, projectCount: 15, completedTaskCount: 45 });
+		await page.goto(`/tasks/${taskId}`);
+		await expect(page.locator('[data-workspace-sidebar]')).toBeHidden();
+		await expect(page.locator('[data-task-details-sidebar]')).toBeHidden();
+		const transcript = page.locator('[data-task-transcript-scroll]');
+		await expect(transcript).toBeVisible();
+		expect((await transcript.boundingBox())!.width).toBeGreaterThan(viewport.width - 5);
+		const composer = page.locator(`#task-message-input-${taskId}`);
+		await composer.fill('Do not lose this draft when browsing tasks.');
+		const browse = page.getByRole('button', { name: 'Browse workspace', exact: true });
+		const dialog = page.getByRole('dialog', { name: 'Browse workspace', exact: true });
+		await expect(dialog).toBeHidden();
+		expect((await browse.boundingBox())!.y).toBeGreaterThan(viewport.height - 100);
+		await page.screenshot({ path: testInfo.outputPath(`task-compact-${viewport.width}.png`) });
+		await browse.click();
+		await expect(dialog).toBeVisible();
+		expect(await dialog.evaluate((element) => element.matches(':modal'))).toBe(true);
+		await expect(dialog.getByRole('link', { name: 'Board', exact: true })).toBeVisible();
+		await dialog.getByRole('button', { name: 'Close navigation' }).focus();
+		await page.keyboard.press('Tab');
+		expect(await dialog.evaluate((element) => element.contains(document.activeElement))).toBe(true);
+		await page.screenshot({ path: testInfo.outputPath(`task-navigation-${viewport.width}.png`) });
+		await page.keyboard.press('Escape');
+		await expect(dialog).toBeHidden();
+		await expect(browse).toBeFocused();
+		await expect(composer).toHaveValue('Do not lose this draft when browsing tasks.');
+		await browse.click();
+		await page.mouse.click(viewport.width - 4, 4);
+		await expect(dialog).toBeHidden();
+		await browse.click();
+		await dialog.getByRole('link', { name: 'Board', exact: true }).click();
+		await expect(dialog).toBeHidden();
+		await expect(page).toHaveURL('/tasks?view=board');
+		await page.goto(`/tasks/${taskId}`);
+		await page.getByRole('button', { name: 'Show task details' }).click();
+		const details = page.getByRole('dialog', { name: 'Task details', exact: true });
+		await expect(details).toBeVisible();
+		await page.screenshot({ path: testInfo.outputPath(`task-details-sheet-${viewport.width}.png`) });
+		await details.getByRole('button', { name: 'Close task details' }).click();
+		await browse.click();
+		await page.setViewportSize({ width: 1280, height: 900 });
+		await expect(dialog).toBeHidden();
+		await expect(page.locator('[data-workspace-sidebar]')).toBeVisible();
+	});
+}
+
+test('unassigned tasks can be edited and assigned without enabling later unassignment', async ({ page }) => {
+	const taskUpdateRequests: Record<string, unknown>[] = [];
+	await mockApi(page, { taskStatus: 'pending', taskAgentId: null, taskUpdateRequests });
+	await page.goto(`/tasks/${taskId}`);
+	const editor = page.getByRole('dialog', { name: 'Edit task details', exact: true });
+	const openEditor = async () => {
+		await page.getByRole('button', { name: 'Task settings', exact: true }).click();
+		await page.getByRole('menuitem', { name: 'Edit details', exact: true }).click();
+	};
+	await openEditor();
+	const assignment = editor.getByLabel('Agent', { exact: true });
+	await expect(assignment).toHaveValue('');
+	await expect(assignment.getByRole('option', { name: 'Unassigned' })).toBeEnabled();
+	await editor.getByLabel('Title', { exact: true }).fill('Work waiting for an agent');
+	await editor.getByRole('button', { name: 'Save', exact: true }).click();
+	await expect(editor).toBeHidden();
+	expect(taskUpdateRequests).toHaveLength(1);
+	expect(taskUpdateRequests[0]).not.toHaveProperty('agent_id');
+
+	await openEditor();
+	await assignment.selectOption(agentId);
+	await editor.getByRole('button', { name: 'Save', exact: true }).click();
+	await expect(editor).toBeHidden();
+	expect(taskUpdateRequests).toHaveLength(2);
+	expect(taskUpdateRequests[1].agent_id).toBe(agentId);
+
+	await openEditor();
+	await expect(assignment).toHaveValue(agentId);
+	await expect(assignment.getByRole('option', { name: 'Unassigned' })).toBeDisabled();
+	await editor.getByRole('button', { name: 'Cancel', exact: true }).click();
+	await expect(editor).toBeHidden();
+	expect(taskUpdateRequests).toHaveLength(2);
 });
