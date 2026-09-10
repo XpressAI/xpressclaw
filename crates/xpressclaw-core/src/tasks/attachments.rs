@@ -8,7 +8,7 @@ pub const MAX_TOTAL_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 
 const ALLOWED_IMAGE_TYPES: &[&str] = &["image/png", "image/jpeg", "image/gif", "image/webp"];
 
-/// Base64 image submitted by an API client.
+/// Base64 attachment submitted by an API client (legacy type name).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ImageAttachmentInput {
     #[serde(default)]
@@ -18,7 +18,7 @@ pub struct ImageAttachmentInput {
     pub data: String,
 }
 
-/// Validated image bytes ready to persist with a task message.
+/// Validated attachment bytes ready to persist with a task message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedImageAttachment {
     pub name: String,
@@ -68,27 +68,27 @@ pub fn decode_attachments(
             MAX_TOTAL_IMAGE_BYTES
         };
         if attachment.name.chars().count() > 255 {
-            return Err("image filename cannot exceed 255 characters".to_string());
+            return Err("attachment filename cannot exceed 255 characters".to_string());
         }
 
         // Reject oversized encoded values before allocating their decoded form.
         let max_encoded_len = limit.div_ceil(3) * 4 + 4;
         if attachment.data.len() > max_encoded_len {
             return Err(format!(
-                "image '{}' exceeds the {} MiB limit",
+                "attachment '{}' exceeds the {} MiB limit",
                 display_name(&attachment.name),
                 limit / 1024 / 1024
             ));
         }
         let data = STANDARD.decode(&attachment.data).map_err(|_| {
             format!(
-                "image '{}' does not contain valid base64 data",
+                "attachment '{}' does not contain valid base64 data",
                 display_name(&attachment.name)
             )
         })?;
         if data.len() > limit {
             return Err(format!(
-                "image '{}' exceeds the {} MiB limit",
+                "attachment '{}' exceeds the {} MiB limit",
                 display_name(&attachment.name),
                 limit / 1024 / 1024
             ));
@@ -188,5 +188,22 @@ mod tests {
         file.mime_type = "text/plain\r\nx-injected: yes".into();
         assert!(decode_attachments(&[file]).is_err());
         assert!(!is_prompt_image("image/svg+xml"));
+    }
+
+    #[test]
+    fn file_validation_errors_describe_attachments() {
+        let mut file = ImageAttachmentInput {
+            name: "report.pdf".into(),
+            mime_type: "application/pdf".into(),
+            data: "invalid!".into(),
+        };
+        let error = decode_attachments(&[file.clone()]).unwrap_err();
+        assert!(error.contains("attachment 'report.pdf'"));
+        assert!(!error.contains("image"));
+        file.name = "a".repeat(256);
+        assert_eq!(
+            decode_attachments(&[file]).unwrap_err(),
+            "attachment filename cannot exceed 255 characters"
+        );
     }
 }

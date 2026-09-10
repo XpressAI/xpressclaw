@@ -9,6 +9,30 @@ const hash = data => crypto.createHash('sha256').update(data).digest('hex');
 const MAX_FILE = 4 * 1024 * 1024;
 const MAX_DOWNLOAD = 100 * 1024 * 1024;
 const MAX_UPLOAD = 20 * 1024 * 1024;
+function downloadLimit(input) {
+  const limit = input.max_bytes ?? MAX_DOWNLOAD;
+  if (!Number.isSafeInteger(limit) || limit < 0 || limit > MAX_DOWNLOAD) throw new Error('Download limit must be between 0 and 100 MiB');
+  return limit;
+}
+// Inspect metadata before reading bytes or starting tar. Do not follow links
+// inside folders, matching tar's default behavior. Bound metadata work too.
+async function downloadSize(filename, limit) {
+  let size = 0;
+  let entries = 0;
+  async function visit(current) {
+    if (++entries > 20000) throw new Error('Folder has too many entries to publish; download it from Files');
+    const info = await fs.lstat(current);
+    if (info.isDirectory()) {
+      const directory = await fs.opendir(current);
+      for await (const entry of directory) await visit(path.join(current, entry.name));
+    } else {
+      size += info.size;
+      if (size > limit) throw new Error(`Files exceed the ${limit} byte download budget`);
+    }
+  }
+  await visit(filename);
+  return size;
+}
 function mime(filename) {
   return ({ '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp', '.pdf': 'application/pdf', '.txt': 'text/plain', '.md': 'text/markdown', '.json': 'application/json', '.csv': 'text/csv', '.zip': 'application/zip', '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation', '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })[path.extname(filename).toLowerCase()] ?? 'application/octet-stream';
 }
@@ -56,6 +80,11 @@ async function main(input) {
     throw new Error('Device and kernel files are not available in the file browser');
   }
   const details = await fs.stat(resolved);
+  if (input.operation === 'stat') {
+    if (resolved === '/') throw new Error('Choose a folder below the container root');
+    if (!details.isFile() && !details.isDirectory()) throw new Error('Not a regular file or folder');
+    return { size: await downloadSize(resolved, downloadLimit(input)), kind: details.isDirectory() ? 'directory' : 'file' };
+  }
   if (input.operation === 'tree') {
     if (!details.isDirectory()) throw new Error('Not a directory');
     const names = await fs.readdir(resolved, { withFileTypes: true });
@@ -69,11 +98,14 @@ async function main(input) {
   }
   if (input.operation === 'download' && details.isDirectory()) {
     if (resolved === '/') throw new Error('Choose a folder below the container root');
-    const { stdout } = await promisify(execFile)('tar', ['-czf', '-', '-C', path.dirname(resolved), '--', path.basename(resolved)], { encoding: 'buffer', maxBuffer: MAX_DOWNLOAD, timeout: 60000 });
+    const limit = downloadLimit(input);
+    if (input.max_bytes !== undefined) await downloadSize(resolved, limit);
+    if (limit === 0) throw new Error('No download budget remains for this archive');
+    const { stdout } = await promisify(execFile)('tar', ['-czf', '-', '-C', path.dirname(resolved), '--', path.basename(resolved)], { encoding: 'buffer', maxBuffer: limit, timeout: 60000 });
     return { name: path.basename(resolved) + '.tar.gz', mime_type: 'application/gzip', data: stdout.toString('base64') };
   }
   if (!details.isFile()) throw new Error('Not a regular file');
-  const limit = input.operation === 'download' ? MAX_DOWNLOAD : MAX_FILE;
+  const limit = input.operation === 'download' ? downloadLimit(input) : MAX_FILE;
   // O_NONBLOCK prevents a raced FIFO from blocking the exec process.
   const file = await fs.open(resolved, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   let data;

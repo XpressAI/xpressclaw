@@ -116,7 +116,9 @@ async fn require_internal_token(
     let agent_capability_route = (callback_path.starts_with("/api/workspaces/")
         && callback_path.ends_with("/repository/resolve-github"))
         || (callback_path.starts_with("/api/tasks/") && callback_path.ends_with("/pull-requests"))
-        || callback_path.starts_with("/api/environments/");
+        || supplied_agent.is_some_and(|agent| {
+            environment_agent_capability_route(request.method(), callback_path, agent)
+        });
     let agent_capability_matches =
         supplied_agent
             .zip(supplied)
@@ -134,6 +136,32 @@ async fn require_internal_token(
         return Err(StatusCode::UNAUTHORIZED);
     }
     Ok(next.run(request).await)
+}
+
+fn environment_agent_capability_route(
+    method: &axum::http::Method,
+    path: &str,
+    agent_id: &str,
+) -> bool {
+    use axum::http::Method;
+    let parts: Vec<_> = path.split('/').collect();
+    match parts.as_slice() {
+        ["", "api", "environments", agent, "ports"] if *agent == agent_id => {
+            matches!(*method, Method::GET | Method::POST)
+        }
+        ["", "api", "environments", agent, "ports", id] if *agent == agent_id && !id.is_empty() => {
+            *method == Method::DELETE
+        }
+        ["", "api", "environments", agent, "tasks"] if *agent == agent_id => {
+            *method == Method::POST
+        }
+        ["", "api", "environments", agent, "tasks", task, "files"]
+            if *agent == agent_id && !task.is_empty() =>
+        {
+            *method == Method::POST
+        }
+        _ => false,
+    }
 }
 
 /// Start the HTTP server on the safe local default.
@@ -530,6 +558,53 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(overbroad_agent_request.status(), StatusCode::UNAUTHORIZED);
+        for (method, path, expected) in [
+            (
+                "GET",
+                "/api/environments/atlas/ports",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "GET",
+                "/api/environments/helper/ports",
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                "GET",
+                "/api/environments/atlas/file?path=/tmp/report",
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                "PUT",
+                "/api/environments/atlas/ports",
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                "POST",
+                "/api/environments/atlas/tasks/one/files/extra",
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                "GET",
+                "/api/environments/atlas/future-admin-route",
+                StatusCode::UNAUTHORIZED,
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header("x-xpressclaw-internal-token", &agent_capability)
+                        .header("x-xpressclaw-agent-id", "atlas")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{method} {path}");
+        }
         let agent_authorized = app
             .clone()
             .oneshot(

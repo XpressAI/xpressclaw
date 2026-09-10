@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdtemp, readFile, rm, writeFile, symlink, mkdir, stat, realpath } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile, symlink, mkdir, stat, realpath, truncate } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -107,6 +107,77 @@ test('bridge accepts a loopback connection, transfers binary data and closes its
     const exited = once(child, 'exit'); child.stdin.end(); await exited;
     const reused = createServer(); reused.listen(port, '127.0.0.1'); await once(reused, 'listening'); await new Promise(resolve => reused.close(resolve));
   } finally { child.kill(); }
+});
+
+test('file size preflight and bounded downloads reject oversized files and folders', { timeout: 10000 }, async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'xpressclaw-file-budget-'));
+  try {
+    const oversized = path.join(directory, 'oversized.bin');
+    await writeFile(oversized, '');
+    await truncate(oversized, 21 * 1024 * 1024);
+    for (const filename of [oversized, directory]) {
+      const size = await files({ operation: 'stat', path: filename, max_bytes: 20 * 1024 * 1024 });
+      assert.match(size.error, /download budget/);
+      const download = await files({ operation: 'download', path: filename, max_bytes: 20 * 1024 * 1024 });
+      assert.ok(download.error);
+      assert.equal(download.data, undefined);
+    }
+    const links = path.join(directory, 'links');
+    await mkdir(links);
+    await symlink(oversized, path.join(links, 'large-link'));
+    const info = await files({ operation: 'stat', path: links, max_bytes: 1024 });
+    assert.ifError(info.error);
+    assert.ok(info.size < 1024, 'preflight must not follow archive symlinks');
+    await truncate(oversized, 101 * 1024 * 1024);
+    assert.match((await files({ operation: 'download', path: oversized })).error, /100 MiB/);
+    assert.match((await files({ operation: 'download', path: oversized, max_bytes: 101 * 1024 * 1024 })).error, /between 0 and 100 MiB/);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test('blackholed container connections time out and release all socket slots', { timeout: 5000 }, async () => {
+  // Inject sockets that never emit connect, and accelerate only the production
+  // connection deadline. No live network blackhole or platform firewall needed.
+  const injection = `{
+    const net = require('node:net');
+    const { Duplex } = require('node:stream');
+    net.createConnection = () => new Duplex({ read() {}, write(data, encoding, done) { done(); } });
+    const timeout = global.setTimeout;
+    global.setTimeout = (callback, delay) => timeout(callback, delay === 10000 ? 25 : delay);
+  }\n`;
+  const child = spawn(process.execPath, ['-e', injection + bridgeScript, 'container_to_host', '3000']);
+  const lines = createInterface({ input: child.stdout })[Symbol.asyncIterator]();
+  try {
+    assert.equal(JSON.parse((await lines.next()).value).type, 'ready');
+    for (let id = 1; id <= 64; id++) child.stdin.write(JSON.stringify({ type: 'open', id }) + '\n');
+    const closed = new Set();
+    for (let count = 0; count < 64; count++) {
+      const frame = JSON.parse((await lines.next()).value);
+      assert.equal(frame.type, 'close'); closed.add(frame.id);
+    }
+    assert.equal(closed.size, 64);
+    child.stdin.write(JSON.stringify({ type: 'open', id: 1 }) + '\n');
+    assert.deepEqual(JSON.parse((await lines.next()).value), { type: 'close', id: 1 });
+  } finally { child.kill(); }
+});
+
+test('successful container connections clear the connect deadline', { timeout: 5000 }, async () => {
+  const server = createServer(socket => socket.pipe(socket));
+  server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  const injection = `{ const timeout = global.setTimeout; global.setTimeout = (callback, delay) => timeout(callback, delay === 10000 ? 100 : delay); }\n`;
+  const child = spawn(process.execPath, ['-e', injection + bridgeScript, 'container_to_host', String(server.address().port)]);
+  const lines = createInterface({ input: child.stdout })[Symbol.asyncIterator]();
+  try {
+    assert.equal(JSON.parse((await lines.next()).value).type, 'ready');
+    const accepted = once(server, 'connection');
+    child.stdin.write(JSON.stringify({ type: 'open', id: 1 }) + '\n');
+    await accepted;
+    await new Promise(resolve => setTimeout(resolve, 200));
+    child.stdin.write(JSON.stringify({ type: 'data', id: 1, data: 'aGVsbG8=' }) + '\n');
+    assert.deepEqual(JSON.parse((await lines.next()).value), { type: 'data', id: 1, data: 'aGVsbG8=' });
+  } finally {
+    const exited = once(child, 'exit'); child.kill(); await exited;
+    await new Promise(resolve => server.close(resolve));
+  }
 });
 
 test('bridge reports an occupied container port before readiness', { timeout: 5000 }, async () => {

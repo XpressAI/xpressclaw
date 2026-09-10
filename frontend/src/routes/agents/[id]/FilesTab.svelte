@@ -249,6 +249,18 @@
 	function downloadUrl(path: string): string {
 		return environments.downloadUrl(agentId, `${status?.container_root ?? '/workspace'}/${path}`);
 	}
+	function changeSource(event: Event) {
+		const select = event.currentTarget as HTMLSelectElement;
+		if (select.value === source) return;
+		if ((source === 'workspace' ? dirty : containerDirty)
+			&& !window.confirm('Discard the unsaved changes in the current file?')) {
+			select.value = source;
+			return;
+		}
+		if (source === 'workspace') editorValue = selectedFile?.content ?? '';
+		containerDirty = false;
+		source = select.value as typeof source;
+	}
 </script>
 
 <div class="flex h-full min-h-0 flex-col bg-background" data-workspace-files>
@@ -263,7 +275,7 @@
 		</div>
 		<div class="flex items-center gap-2">
 			{#if source === 'workspace'}<a href={downloadUrl('')} download class="rounded-md border border-border px-2.5 py-1.5 text-xs hover:bg-accent">Download workspace</a>{/if}
-			<select aria-label="File location" value={source} onchange={(event) => { if (!containerDirty || window.confirm('Discard the unsaved changes in the current file?')) source = event.currentTarget.value as typeof source; else event.currentTarget.value = source; }} class="rounded-md border border-border bg-background px-2 py-1.5 text-xs"><option value="workspace">Workspace</option><option value="container">Container</option></select>
+			<select aria-label="File location" value={source} onchange={changeSource} class="rounded-md border border-border bg-background px-2 py-1.5 text-xs"><option value="workspace">Workspace</option><option value="container">Container</option></select>
 			<button type="button" onclick={toggleTree} aria-expanded={showTree} class="rounded-md border border-border px-2.5 py-1.5 text-xs hover:bg-accent">
 				{showTree ? 'Hide files' : 'Show files'}
 			</button>

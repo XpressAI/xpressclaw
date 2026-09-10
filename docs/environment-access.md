@@ -38,14 +38,17 @@ server machine. TCP is forwarded without interpreting HTTP, so WebSockets and
 streamed LLM responses use the same connection. List and remove mappings with
 `list_port_forwards` and `remove_port_forward`.
 
-Another Agent on this instance can reach the service by calling
-`forward_port` with `direction: "host_to_container"`, that host port, and an
-unused port in its own container. Listeners bind only to loopback; remote
-clients need their usual access tunnel to the server machine.
+An exposed host port is reserved across Agents. Another Agent cannot reuse it
+for a listener or import it as a host service; adding such a mapping returns a
+conflict with the owning Agent and port. Multiple Agents may import the same
+host LLM port when it is not an Agent's exposed listener. Listeners bind only
+to loopback; remote clients need their usual access tunnel to the server machine.
 
 The bridge uses an owned Docker/Podman exec stream instead of container IPs,
 host networking, or container creation-time port bindings. It supports TCP,
-up to 16 mappings per Agent and 64 concurrent connections per mapping. UDP is
+up to 16 mappings per Agent and 64 concurrent connections per mapping. Connections
+to either loopback target time out after 10 seconds if they cannot connect.
+Startup and shutdown wait independently for each Agent. UDP is
 not forwarded. Configuration is installation-local and excluded from Project
 sync; deleting the Agent or Project removes its saved mappings.
 
@@ -67,7 +70,9 @@ by running a task at least once.
 Agents should call `publish_task_files` with file or folder paths to copy
 results into durable task attachments. Absolute container paths, including
 `/tmp`, are supported. Up to eight items and 20 MiB total may be published per
-message. Attachments remain downloadable after the container is removed.
+message. File and folder sizes are checked before downloading; publication
+limits both the uncompressed inputs and resulting attachments to 20 MiB.
+Attachments remain downloadable after the container is removed.
 `send_conversation_message` also accepts files and folder paths outside the
 workspace. Larger output directories can be downloaded from Files.
 
@@ -78,6 +83,11 @@ retained container, outside its workspace, so Git status and `git add -A` cannot
 include them. The Agent receives the container path and original filename in
 the prompt. Staged copies remain until the container is removed; the original
 task attachments remain downloadable from the task.
+
+Project conversation turns use the same staging path for files attached to the
+triggering message. Supported images become ACP image blocks; PDFs and other
+files are staged with their container paths in the prompt. Older conversation
+attachments remain available through their download references.
 
 The native XpressClaw MCP now exposes `create_task`. It defaults to the current
 task as parent; explicit unfinished child tasks block that parent from

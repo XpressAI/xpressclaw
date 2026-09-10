@@ -13,11 +13,14 @@ use serde_json::{json, Value};
 use xpressclaw_core::{
     agents::registry::AgentRegistry,
     docker::{
-        environment::{save_forwards, saved_forwards, ForwardDirection, PortForward},
+        environment::{
+            check_forward_reservations, save_forwards, saved_forwards, ForwardDirection,
+            PortForward,
+        },
         manager::DockerManager,
     },
-    message_artifacts::PublishedFileAttachment,
     tasks::{
+        attachments::DecodedImageAttachment,
         board::{CreateTask, TaskBoard},
         conversation::TaskConversation,
         queue::TaskQueue,
@@ -29,6 +32,12 @@ type ApiResult<T> = Result<T, ApiError>;
 fn bad(error: impl std::fmt::Display) -> ApiError {
     (
         StatusCode::BAD_REQUEST,
+        Json(json!({"error":error.to_string()})),
+    )
+}
+fn conflict(error: impl std::fmt::Display) -> ApiError {
+    (
+        StatusCode::CONFLICT,
         Json(json!({"error":error.to_string()})),
     )
 }
@@ -149,10 +158,6 @@ async fn add_port(
     Json(input): Json<PortInput>,
 ) -> ApiResult<Json<Value>> {
     authorize(&state, &agent_id, &headers)?;
-    let _lock = state.config_write_lock.lock().await;
-    let docker = docker(&state).await?;
-    let _forwards_lock = docker.forwarding_lifecycle.lock().await;
-    let mut ports = saved_forwards(&state.db, &agent_id).map_err(bad)?;
     let spec = PortForward {
         id: uuid::Uuid::new_v4().to_string(),
         direction: input.direction,
@@ -160,16 +165,22 @@ async fn add_port(
         container_port: input.container_port,
     };
     spec.validate().map_err(bad)?;
+    check_forward_reservations(&state.db, &agent_id, std::slice::from_ref(&spec))
+        .map_err(conflict)?;
+    let docker = docker(&state).await?;
+    let _forwards_lock = docker.lock_agent_forwards(&agent_id).await;
+    let mut ports = saved_forwards(&state.db, &agent_id).map_err(bad)?;
     if let Some(existing) = ports.iter().find(|port| {
         port.direction == spec.direction
             && port.host_port == spec.host_port
             && port.container_port == spec.container_port
     }) {
+        save_forwards(&state.db, &agent_id, &ports).map_err(conflict)?;
         if docker.is_running(&agent_id).await {
             docker
                 .start_forward(&agent_id, existing)
                 .await
-                .map_err(bad)?;
+                .map_err(conflict)?;
         }
         return Ok(forward_result(
             existing,
@@ -189,13 +200,24 @@ async fn add_port(
         return Err(bad("This listening port already has a mapping"));
     }
     let active = docker.is_running(&agent_id).await;
-    if active {
-        docker.start_forward(&agent_id, &spec).await.map_err(bad)?;
+    if !active && spec.direction == ForwardDirection::ContainerToHost {
+        // Detect occupied host listeners even when the container is stopped.
+        tokio::net::TcpListener::bind(("127.0.0.1", spec.host_port))
+            .await
+            .map_err(|error| {
+                conflict(format!("Cannot bind host port {}: {error}", spec.host_port))
+            })?;
     }
+    let previous = ports.clone();
     ports.push(spec.clone());
-    if let Err(error) = save_forwards(&state.db, &agent_id, &ports) {
-        docker.stop_forward(&agent_id, &spec.id).await;
-        return Err(bad(error));
+    // Reserve host ports atomically before doing Docker I/O. Other Agents can
+    // save independent mappings without waiting for this bridge's readiness.
+    save_forwards(&state.db, &agent_id, &ports).map_err(conflict)?;
+    if active {
+        if let Err(error) = docker.start_forward(&agent_id, &spec).await {
+            save_forwards(&state.db, &agent_id, &previous).map_err(bad)?;
+            return Err(conflict(error));
+        }
     }
     Ok(forward_result(&spec, active))
 }
@@ -214,18 +236,17 @@ async fn remove_port(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     authorize(&state, &agent_id, &headers)?;
-    let _lock = state.config_write_lock.lock().await;
     let docker = state.docker().await;
     let _forwards_lock = match docker.as_ref() {
-        Some(docker) => Some(docker.forwarding_lifecycle.lock().await),
+        Some(docker) => Some(docker.lock_agent_forwards(&agent_id).await),
         None => None,
     };
     let mut ports = saved_forwards(&state.db, &agent_id).map_err(bad)?;
     ports.retain(|port| port.id != id);
-    save_forwards(&state.db, &agent_id, &ports).map_err(bad)?;
     if let Some(docker) = docker.as_ref() {
         docker.stop_forward(&agent_id, &id).await;
     }
+    save_forwards(&state.db, &agent_id, &ports).map_err(bad)?;
     Ok(Json(json!({"removed":true})))
 }
 
@@ -416,21 +437,61 @@ async fn publish_task_files(
         return Err(bad("Publish between 1 and 8 files or folders"));
     }
     let docker = docker(&state).await?;
-    let mut files = vec![];
-    let mut size = 0;
-    for path in input.files {
-        let value = docker
-            .container_files(&agent_id, json!({"operation":"download", "path":path}))
+    let files = collect_published_files(&input.files, |request| {
+        docker.container_files(&agent_id, request)
+    })
+    .await?;
+    let message = TaskConversation::new(state.db.clone())
+        .add_message_with_attachments(&task_id, "assistant", &input.content, &files)
+        .map_err(bad)?;
+    Ok(Json(json!(message)))
+}
+
+async fn collect_published_files<F, Fut>(
+    paths: &[String],
+    mut read: F,
+) -> ApiResult<Vec<DecodedImageAttachment>>
+where
+    F: FnMut(Value) -> Fut,
+    Fut: std::future::Future<Output = xpressclaw_core::error::Result<Value>>,
+{
+    const LIMIT: usize = 20 * 1024 * 1024;
+    const TOO_LARGE: &str =
+        "Published files cannot exceed 20 MiB per message; download larger folders from Files";
+    let mut remaining = LIMIT;
+    // Preflight the whole request before materializing even its first file.
+    for path in paths {
+        let info = read(json!({"operation":"stat", "path":path, "max_bytes":remaining}))
             .await
             .map_err(bad)?;
-        let data = STANDARD
-            .decode(value["data"].as_str().unwrap_or(""))
-            .map_err(bad)?;
-        size += data.len();
-        if size > 20 * 1024 * 1024 {
-            return Err(bad("Published files cannot exceed 20 MiB per message; download larger folders from Files"));
+        let size = info["size"]
+            .as_u64()
+            .ok_or_else(|| bad("Container did not return the file size"))?;
+        if size > remaining as u64 {
+            return Err(bad(TOO_LARGE));
         }
-        files.push(PublishedFileAttachment {
+        remaining -= size as usize;
+    }
+    let mut files = vec![];
+    remaining = LIMIT;
+    for path in paths {
+        // Recheck and bound reads/tar in the container as files can grow after
+        // preflight. The host JSON response limit uses this same byte budget.
+        let value = read(json!({"operation":"download", "path":path, "max_bytes":remaining}))
+            .await
+            .map_err(bad)?;
+        let encoded = value["data"]
+            .as_str()
+            .ok_or_else(|| bad("Container did not return file data"))?;
+        if encoded.len() > remaining.div_ceil(3) * 4 {
+            return Err(bad(TOO_LARGE));
+        }
+        let data = STANDARD.decode(encoded).map_err(bad)?;
+        if data.len() > remaining {
+            return Err(bad(TOO_LARGE));
+        }
+        remaining -= data.len();
+        files.push(DecodedImageAttachment {
             name: value["name"].as_str().unwrap_or("file").into(),
             mime_type: value["mime_type"]
                 .as_str()
@@ -439,20 +500,7 @@ async fn publish_task_files(
             data,
         });
     }
-    let files: Vec<_> = files
-        .into_iter()
-        .map(
-            |file| xpressclaw_core::tasks::attachments::DecodedImageAttachment {
-                name: file.name,
-                mime_type: file.mime_type,
-                data: file.data,
-            },
-        )
-        .collect();
-    let message = TaskConversation::new(state.db.clone())
-        .add_message_with_attachments(&task_id, "assistant", &input.content, &files)
-        .map_err(bad)?;
-    Ok(Json(json!(message)))
+    Ok(files)
 }
 
 #[cfg(test)]
@@ -490,6 +538,69 @@ mod tests {
             true,
         );
         (routes().merge(internal_routes()).with_state(state), db)
+    }
+
+    #[tokio::test]
+    async fn cross_agent_host_port_conflicts_return_an_actionable_http_error() {
+        let (app, db) = app();
+        save_forwards(
+            &db,
+            "helper",
+            &[PortForward {
+                id: "server".into(),
+                direction: ForwardDirection::ContainerToHost,
+                host_port: 3000,
+                container_port: 3001,
+            }],
+        )
+        .unwrap();
+        let response = app.oneshot(Request::post("/atlas/ports")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"direction":"host_to_container", "host_port":3000, "container_port":8080}).to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let value: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert!(value["error"]
+            .as_str()
+            .unwrap()
+            .contains("Host port 3000 is reserved by Agent helper"));
+        assert!(saved_forwards(&db, "atlas").unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn publishing_checks_all_sizes_before_any_download() {
+        let mut operations = vec![];
+        let result = collect_published_files(&["/tmp/small".into(), "/tmp/large".into()], |request| {
+            operations.push(request.clone());
+            std::future::ready(Ok(json!({"size":if request["path"] == "/tmp/large" { 21 * 1024 * 1024 } else { 10 }})))
+        }).await;
+        assert_eq!(result.unwrap_err().0, StatusCode::BAD_REQUEST);
+        assert_eq!(operations.len(), 2);
+        assert!(operations
+            .iter()
+            .all(|request| request["operation"] == "stat"));
+        assert_eq!(operations[1]["max_bytes"], 20 * 1024 * 1024 - 10);
+    }
+
+    #[tokio::test]
+    async fn publishing_bounds_downloads_by_the_remaining_message_budget() {
+        let mut operations = vec![];
+        let files = collect_published_files(&["/tmp/a".into(), "/tmp/b".into()], |request| {
+            operations.push(request.clone());
+            std::future::ready(Ok(if request["operation"] == "stat" {
+                json!({"size":2})
+            } else {
+                json!({"name":"file", "data":"YWJj", "mime_type":"text/plain"})
+            }))
+        })
+        .await
+        .unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].data, b"abc");
+        assert_eq!(operations[2]["operation"], "download");
+        assert_eq!(operations[2]["max_bytes"], 20 * 1024 * 1024);
+        assert_eq!(operations[3]["max_bytes"], 20 * 1024 * 1024 - 3);
     }
 
     #[tokio::test]

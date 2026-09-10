@@ -886,6 +886,13 @@ async fn open_terminal(
     websocket: WebSocketUpgrade,
 ) -> ApiResult<Response> {
     require_same_origin(&headers)?;
+    let session = query.session.unwrap_or_else(|| "xpressclaw".into());
+    if !xpressclaw_core::docker::manager::valid_terminal_session_name(&session) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Invalid tmux session name",
+        ));
+    }
     let _ = workspace_root(&state, &agent_id).await?;
     let docker = state.docker().await.ok_or_else(|| {
         api_error(
@@ -906,13 +913,6 @@ async fn open_terminal(
     docker.restore_forwards(&state.db, &agent_id).await;
     let columns = query.columns.unwrap_or(120).clamp(20, 500);
     let rows = query.rows.unwrap_or(32).clamp(5, 300);
-    let session = query.session.unwrap_or_else(|| "xpressclaw".into());
-    if !xpressclaw_core::docker::manager::valid_terminal_session_name(&session) {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "Invalid tmux session name",
-        ));
-    }
     Ok(websocket.on_upgrade(move |socket| {
         terminal_socket(socket, docker, agent_id, columns, rows, session)
     }))

@@ -191,10 +191,10 @@ pub struct ContainerOutput {
 
 /// Manages Docker/Podman containers for agent isolation.
 pub struct DockerManager {
-    /// Serializes saved mapping changes with restoration after a restart.
-    pub forwarding_lifecycle: tokio::sync::Mutex<()>,
+    /// Serializes mapping changes and restoration independently for each Agent.
+    pub(crate) forwarding_lifecycle: super::environment::ForwardingLifecycle,
     pub(crate) forwards:
-        tokio::sync::Mutex<HashMap<(String, String), super::environment::LiveForward>>,
+        tokio::sync::Mutex<HashMap<String, std::sync::Arc<super::environment::AgentForwards>>>,
     docker: Docker,
     rootless: bool,
     socket_path: Option<PathBuf>,
@@ -1814,6 +1814,28 @@ fn recorded_container_id_matches(actual_id: Option<&str>, recorded_id: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_session_names_accept_only_bounded_ascii_identifiers() {
+        for name in ["xpressclaw", "login_2-test", "0", &"a".repeat(64)] {
+            assert!(valid_terminal_session_name(name), "{name:?}");
+        }
+        for name in [
+            "",
+            "two words",
+            "a.b",
+            "a:b",
+            "a/b",
+            "a\nb",
+            "\0",
+            "$(id)",
+            ";id",
+            "ログイン",
+            &"a".repeat(65),
+        ] {
+            assert!(!valid_terminal_session_name(name), "{name:?}");
+        }
+    }
 
     #[tokio::test]
     async fn test_connect() {

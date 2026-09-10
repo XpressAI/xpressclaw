@@ -38,7 +38,12 @@ lines.on('line', line => {
     const message = JSON.parse(line);
     if (message.type === 'open' && direction === 'container_to_host') {
       if (sockets.size >= 64 || sockets.has(message.id)) return;
-      track(message.id, net.createConnection({ host: '127.0.0.1', port, allowHalfOpen: true }));
+      const socket = net.createConnection({ host: '127.0.0.1', port, allowHalfOpen: true });
+      const connecting = setTimeout(() => socket.destroy(new Error('TCP connect timed out')), 10000);
+      const connected = () => clearTimeout(connecting);
+      socket.once('connect', connected);
+      socket.once('close', connected);
+      track(message.id, socket);
     } else {
       const socket = sockets.get(message.id);
       if (message.type === 'data' && socket) {

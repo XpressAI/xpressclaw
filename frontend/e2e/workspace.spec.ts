@@ -5715,6 +5715,46 @@ test('container files browse outside the workspace and download folders', async 
 	expect((await downloaded).suggestedFilename()).toBe('results.tar.gz');
 });
 
+test('file source switches guard unsaved workspace and container edits', async ({ page }) => {
+	await mockApi(page);
+	await page.route('**/api/environments/**', async route => {
+		const url = new URL(route.request().url());
+		await route.fulfill({ json: url.pathname.endsWith('/tree')
+			? { path: '/tmp', entries: [{ name: 'report.txt', path: '/tmp/report.txt', kind: 'file', symlink: false, size: 7, modified_at: null }], truncated: false }
+			: { path: '/tmp/report.txt', content: 'Results', revision: 'revision-1', size: 7 } });
+	});
+	await page.goto('/agents/' + agentId + '?tab=files&path=src%2Fmain.ts');
+	const location = page.getByLabel('File location');
+	const editor = page.locator('[data-monaco-editor]');
+	await expect(editor).toBeVisible({ timeout: 20_000 });
+	await expect(page.getByText('Loading editor…')).toBeHidden({ timeout: 20_000 });
+	await editor.locator('.view-lines').click();
+	await page.keyboard.press('Control+A');
+	await page.keyboard.insertText('unsaved workspace text');
+	await expect(page.getByRole('button', { name: 'Save', exact: true })).toBeEnabled();
+	page.once('dialog', dialog => dialog.dismiss());
+	await location.selectOption('container');
+	await expect(location).toHaveValue('workspace');
+	await expect(editor.locator('.view-lines')).toContainText('unsaved workspace text');
+	page.once('dialog', dialog => dialog.accept());
+	await location.selectOption('container');
+	await expect(page.getByLabel('Container directory')).toBeVisible();
+	await page.getByRole('button', { name: '▧ report.txt' }).click();
+	await expect(editor.locator('.view-lines')).toContainText('Results');
+	await editor.locator('.view-lines').click();
+	await page.keyboard.press('Control+A');
+	await page.keyboard.insertText('unsaved container text');
+	await expect(page.getByRole('button', { name: 'Save', exact: true })).toBeEnabled();
+	page.once('dialog', dialog => dialog.dismiss());
+	await location.selectOption('workspace');
+	await expect(location).toHaveValue('container');
+	await expect(editor.locator('.view-lines')).toContainText('unsaved container text');
+	page.once('dialog', dialog => dialog.accept());
+	await location.selectOption('workspace');
+	await expect(page.getByRole('button', { name: 'Save', exact: true })).toBeDisabled();
+	await expect(editor.locator('.view-lines')).not.toContainText('unsaved workspace text');
+});
+
 test('environment port forwarding saves both directions and removes mappings', async ({ page }) => {
 	await mockApi(page);
 	const ports: Record<string, unknown>[] = [];

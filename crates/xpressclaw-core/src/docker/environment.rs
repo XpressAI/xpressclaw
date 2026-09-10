@@ -1,6 +1,7 @@
 //! Harness-independent access to retained containers. All processes go through
 //! DockerManager's installation/Agent ownership checks, never a host shell.
 use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -23,6 +24,26 @@ use crate::{
     db::Database,
     error::{Error, Result},
 };
+
+pub const MAX_CONTAINER_DOWNLOAD_BYTES: usize = 100 * 1024 * 1024;
+// Base64 expands each three bytes to four. Allow a small, separate envelope
+// for the JSON fields; this is a transport limit, not the decoded file cap.
+fn file_response_limit(request: &Value) -> Result<usize> {
+    let bytes = if request["operation"] == "download" {
+        match request.get("max_bytes") {
+            Some(value) => value
+                .as_u64()
+                .filter(|size| *size <= MAX_CONTAINER_DOWNLOAD_BYTES as u64)
+                .ok_or_else(|| {
+                    Error::Container("Download limit must be between 0 and 100 MiB".into())
+                })? as usize,
+            None => MAX_CONTAINER_DOWNLOAD_BYTES,
+        }
+    } else {
+        MAX_CONTAINER_DOWNLOAD_BYTES
+    };
+    Ok(bytes.div_ceil(3) * 4 + 64 * 1024)
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -67,13 +88,80 @@ pub fn saved_forwards(db: &Database, agent_id: &str) -> Result<Vec<PortForward>>
 }
 
 pub fn save_forwards(db: &Database, agent_id: &str, forwards: &[PortForward]) -> Result<()> {
+    for spec in forwards {
+        spec.validate()?;
+    }
     let value =
         serde_json::to_string(forwards).map_err(|error| Error::Container(error.to_string()))?;
     db.with_conn(|conn| {
+        // The database connection lock makes reservation and persistence one
+        // atomic operation across all Agents, including stopped containers.
+        check_host_port_reservations(conn, agent_id, forwards)?;
         conn.execute("INSERT INTO config (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value", [format!("port_forwards:{agent_id}"), value])?;
         Ok(())
     })
 }
+
+pub fn check_forward_reservations(
+    db: &Database,
+    agent_id: &str,
+    forwards: &[PortForward],
+) -> Result<()> {
+    db.with_conn(|conn| check_host_port_reservations(conn, agent_id, forwards))
+}
+
+fn check_host_port_reservations(
+    conn: &rusqlite::Connection,
+    agent_id: &str,
+    forwards: &[PortForward],
+) -> Result<()> {
+    let mut statement = conn
+        .prepare("SELECT key, value FROM config WHERE key LIKE 'port_forwards:%' AND key != ?1")?;
+    let saved = statement.query_map([format!("port_forwards:{agent_id}")], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for saved in saved {
+        let (key, value) = saved?;
+        let others: Vec<PortForward> =
+            serde_json::from_str(&value).map_err(|error| Error::Container(error.to_string()))?;
+        for spec in forwards {
+            if others.iter().any(|other| host_ports_conflict(spec, other)) {
+                return Err(Error::Container(format!("Host port {} is reserved by Agent {}; remove its mapping or choose another port", spec.host_port, key.trim_start_matches("port_forwards:"))));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn host_ports_conflict(left: &PortForward, right: &PortForward) -> bool {
+    left.host_port == right.host_port
+        && (left.direction == ForwardDirection::ContainerToHost
+            || right.direction == ForwardDirection::ContainerToHost)
+}
+
+#[derive(Default)]
+pub(crate) struct ForwardingLifecycle(Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>);
+
+impl ForwardingLifecycle {
+    async fn lock(&self, agent_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut agents = self.0.lock().unwrap();
+            agents.retain(|_, lock| lock.strong_count() > 0);
+            let entry = agents.entry(agent_id.into()).or_default();
+            match entry.upgrade() {
+                Some(lock) => lock,
+                None => {
+                    let lock = Arc::new(tokio::sync::Mutex::new(()));
+                    *entry = Arc::downgrade(&lock);
+                    lock
+                }
+            }
+        };
+        lock.lock_owned().await
+    }
+}
+
+pub(crate) type AgentForwards = tokio::sync::Mutex<HashMap<String, LiveForward>>;
 
 pub(crate) struct LiveForward {
     spec: PortForward,
@@ -107,7 +195,21 @@ fn stream_reader(attached: &mut AttachedContainer) -> impl tokio::io::AsyncRead 
 }
 
 impl DockerManager {
+    pub async fn lock_agent_forwards(&self, agent_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        self.forwarding_lifecycle.lock(agent_id).await
+    }
+
+    async fn agent_forwards(&self, agent_id: &str) -> Arc<AgentForwards> {
+        self.forwards
+            .lock()
+            .await
+            .entry(agent_id.into())
+            .or_default()
+            .clone()
+    }
+
     pub async fn container_files(&self, agent_id: &str, request: Value) -> Result<Value> {
+        let response_limit = file_response_limit(&request)?;
         self.start_project_environment(agent_id).await?;
         let mut attached = self
             .open_project_process(
@@ -125,12 +227,14 @@ impl DockerManager {
                 .map_err(io_error)?;
             let mut data = Vec::new();
             stream_reader(&mut attached)
-                .take(140 * 1024 * 1024 + 1)
+                .take(response_limit as u64 + 1)
                 .read_to_end(&mut data)
                 .await
                 .map_err(io_error)?;
-            if data.len() > 140 * 1024 * 1024 {
-                return Err(Error::Container("Download exceeds 100 MiB".into()));
+            if data.len() > response_limit {
+                return Err(Error::Container(format!(
+                    "Container file response exceeds its {response_limit} byte transport limit"
+                )));
             }
             let value: Value = serde_json::from_slice(&data).map_err(|error| {
                 Error::Container(format!("Container file operation failed: {error}"))
@@ -152,49 +256,36 @@ impl DockerManager {
     }
 
     pub async fn forward_active(&self, agent_id: &str, id: &str) -> bool {
-        self.forwards
-            .lock()
-            .await
-            .get(&(agent_id.into(), id.into()))
-            .is_some_and(|forward| !forward.task.is_finished())
+        let forwards = self.agent_forwards(agent_id).await;
+        let mut forwards = forwards.lock().await;
+        forwards.retain(|_, forward| !forward.task.is_finished());
+        forwards.contains_key(id)
     }
 
     pub async fn stop_forward(&self, agent_id: &str, id: &str) {
-        let forward = self
-            .forwards
-            .lock()
-            .await
-            .remove(&(agent_id.into(), id.into()));
-        if let Some(mut forward) = forward {
-            forward.cancellation.cancel();
-            if tokio::time::timeout(Duration::from_secs(3), &mut forward.task)
-                .await
-                .is_err()
-            {
-                forward.task.abort();
-            }
+        let forwards = self.agent_forwards(agent_id).await;
+        let forward = forwards.lock().await.remove(id);
+        if let Some(forward) = forward {
+            shutdown_forward(forward).await;
         }
     }
 
     pub(crate) async fn stop_agent_forwards(&self, agent_id: &str) {
-        let _lock = self.forwarding_lifecycle.lock().await;
-        let ids: Vec<_> = self
-            .forwards
+        let _lock = self.lock_agent_forwards(agent_id).await;
+        let forwards = self.agent_forwards(agent_id).await;
+        let forwards: Vec<_> = forwards
             .lock()
             .await
-            .keys()
-            .filter(|(agent, _)| agent == agent_id)
-            .map(|(_, id)| id.clone())
+            .drain()
+            .map(|(_, forward)| forward)
             .collect();
-        for id in ids {
-            self.stop_forward(agent_id, &id).await;
-        }
+        futures_util::future::join_all(forwards.into_iter().map(shutdown_forward)).await;
     }
 
     /// Saved forwards are optional runtime services; a conflict must not block
     /// an Agent turn or prevent other mappings from being restored.
     pub async fn restore_forwards(&self, db: &Database, agent_id: &str) {
-        let _lock = self.forwarding_lifecycle.lock().await;
+        let _lock = self.lock_agent_forwards(agent_id).await;
         let forwards = match saved_forwards(db, agent_id) {
             Ok(forwards) => forwards,
             Err(error) => {
@@ -203,6 +294,12 @@ impl DockerManager {
             }
         };
         for forward in forwards {
+            if let Err(error) =
+                check_forward_reservations(db, agent_id, std::slice::from_ref(&forward))
+            {
+                tracing::warn!(%agent_id, forward_id = %forward.id, %error, "saved port forward conflicts with another Agent; leaving it inactive");
+                continue;
+            }
             if let Err(error) = self.start_forward(agent_id, &forward).await {
                 tracing::warn!(%agent_id, forward_id = %forward.id, host_port = forward.host_port, container_port = forward.container_port, %error, "saved port forward is inactive; continuing with the environment");
             }
@@ -211,8 +308,12 @@ impl DockerManager {
 
     pub async fn start_forward(&self, agent_id: &str, spec: &PortForward) -> Result<()> {
         spec.validate()?;
-        let mut registry = self.forwards.lock().await;
-        let key = (agent_id.to_string(), spec.id.clone());
+        // Only this Agent waits for exec/readiness. The installation registry
+        // is released before any container I/O.
+        let forwards = self.agent_forwards(agent_id).await;
+        let mut registry = forwards.lock().await;
+        registry.retain(|_, forward| !forward.task.is_finished());
+        let key = spec.id.clone();
         if registry
             .get(&key)
             .is_some_and(|live| live.spec == *spec && !live.task.is_finished())
@@ -319,6 +420,16 @@ impl DockerManager {
     }
 }
 
+async fn shutdown_forward(mut forward: LiveForward) {
+    forward.cancellation.cancel();
+    if tokio::time::timeout(Duration::from_secs(3), &mut forward.task)
+        .await
+        .is_err()
+    {
+        forward.task.abort();
+    }
+}
+
 async fn bridge_loop(
     input: &mut (dyn tokio::io::AsyncWrite + Send + Unpin),
     reader: impl futures_util::Stream<Item = std::result::Result<String, LinesCodecError>> + Unpin,
@@ -346,6 +457,26 @@ async fn bridge_router(
     host_port: u16,
     writer: mpsc::Sender<Value>,
 ) -> Result<()> {
+    let exposes_host = listener.is_some();
+    let accepts = futures_util::stream::unfold(listener, |listener| async move {
+        let accepted = match &listener {
+            Some(listener) => listener.accept().await.map(|(socket, _)| socket),
+            None => std::future::pending().await,
+        };
+        Some((accepted, listener))
+    });
+    bridge_router_with_accepts(reader, accepts, exposes_host, host_port, writer).await
+}
+
+async fn bridge_router_with_accepts(
+    reader: impl futures_util::Stream<Item = std::result::Result<String, LinesCodecError>> + Unpin,
+    accepts: impl futures_util::Stream<Item = std::io::Result<TcpStream>>,
+    exposes_host: bool,
+    host_port: u16,
+    writer: mpsc::Sender<Value>,
+) -> Result<()> {
+    tokio::pin!(accepts);
+    let mut accept_after = tokio::time::Instant::now();
     let mut pending = VecDeque::new();
     let mut lines = reader;
     let (events, mut receiver) = mpsc::channel::<Value>(32);
@@ -359,8 +490,16 @@ async fn bridge_router(
                 permit.send(pending.pop_front().unwrap());
             },
             _ = tasks.join_next(), if !tasks.is_empty() => {},
-            accepted = async { match &listener { Some(listener) => listener.accept().await, None => std::future::pending().await } }, if sockets.len() < 64 && pending.len() < 64 => {
-                let (socket, _) = accepted.map_err(io_error)?;
+            accepted = async { tokio::time::sleep_until(accept_after).await; accepts.next().await }, if sockets.len() < 64 && pending.len() < 64 => {
+                let socket = match accepted {
+                    Some(Ok(socket)) => socket,
+                    Some(Err(error)) => {
+                        tracing::warn!(%error, "TCP bridge accept failed; retrying");
+                        accept_after = tokio::time::Instant::now() + Duration::from_millis(100);
+                        continue;
+                    }
+                    None => break,
+                };
                 next_id += 1;
                 let id = next_id;
                 let (sender, incoming) = mpsc::channel(16);
@@ -380,7 +519,7 @@ async fn bridge_router(
                 if line.len() > 100000 { return Err(Error::Container("Oversized TCP bridge frame".into())); }
                 let frame: Value = serde_json::from_str(&line).map_err(|error| Error::Container(error.to_string()))?;
                 let id = frame["id"].as_u64().unwrap_or(0);
-                if frame["type"] == "open" && listener.is_none() && sockets.len() < 64 && !sockets.contains_key(&id) {
+                if frame["type"] == "open" && !exposes_host && sockets.len() < 64 && !sockets.contains_key(&id) {
                     let (sender, incoming) = mpsc::channel(16);
                     sockets.insert(id, sender);
                     let events = events.clone();
@@ -486,6 +625,144 @@ mod tests {
         assert!(saved_forwards(&db, "atlas").unwrap().is_empty());
     }
 
+    #[test]
+    fn host_port_reservations_reject_cross_agent_exposures_in_either_order() {
+        let db = Database::open_memory().unwrap();
+        let import = PortForward {
+            id: "llm".into(),
+            direction: ForwardDirection::HostToContainer,
+            host_port: 8080,
+            container_port: 8081,
+        };
+        let expose = PortForward {
+            direction: ForwardDirection::ContainerToHost,
+            ..import.clone()
+        };
+        save_forwards(&db, "atlas", std::slice::from_ref(&import)).unwrap();
+        // A host LLM may be deliberately imported by multiple Agents.
+        save_forwards(&db, "helper", std::slice::from_ref(&import)).unwrap();
+        let error = save_forwards(&db, "helper", std::slice::from_ref(&expose))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Host port 8080 is reserved by Agent atlas"));
+        assert_eq!(saved_forwards(&db, "helper").unwrap(), vec![import.clone()]);
+        save_forwards(&db, "helper", &[]).unwrap();
+        save_forwards(&db, "atlas", std::slice::from_ref(&expose)).unwrap();
+        assert!(save_forwards(&db, "helper", &[import]).is_err());
+        assert!(save_forwards(&db, "helper", &[expose]).is_err());
+        assert!(saved_forwards(&db, "helper").unwrap().is_empty());
+    }
+
+    #[test]
+    fn competing_agents_cannot_race_host_port_reservations() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let threads: Vec<_> = [
+            ForwardDirection::HostToContainer,
+            ForwardDirection::ContainerToHost,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(id, direction)| {
+            let db = db.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                save_forwards(
+                    &db,
+                    &id.to_string(),
+                    &[PortForward {
+                        id: "forward".into(),
+                        direction,
+                        host_port: 3000,
+                        container_port: 3001,
+                    }],
+                )
+                .is_ok()
+            })
+        })
+        .collect();
+        assert_eq!(
+            threads
+                .into_iter()
+                .filter_map(|thread| thread.join().unwrap().then_some(()))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarding_lifecycle_does_not_block_other_agents() {
+        let locks = ForwardingLifecycle::default();
+        let first = locks.lock("atlas").await;
+        let second = tokio::time::timeout(Duration::from_millis(100), locks.lock("helper"))
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), locks.lock("atlas"))
+                .await
+                .is_err()
+        );
+        drop(first);
+        tokio::time::timeout(Duration::from_millis(100), locks.lock("atlas"))
+            .await
+            .unwrap();
+        drop(second);
+    }
+
+    #[test]
+    fn file_transport_limit_accounts_for_base64_and_the_requested_budget() {
+        assert_eq!(
+            file_response_limit(&json!({"operation":"download"})).unwrap(),
+            MAX_CONTAINER_DOWNLOAD_BYTES.div_ceil(3) * 4 + 64 * 1024
+        );
+        assert_eq!(
+            file_response_limit(&json!({"operation":"download", "max_bytes":20 * 1024 * 1024}))
+                .unwrap(),
+            (20usize * 1024 * 1024).div_ceil(3) * 4 + 64 * 1024
+        );
+        for size in [
+            json!(-1),
+            json!(MAX_CONTAINER_DOWNLOAD_BYTES + 1),
+            json!("unbounded"),
+        ] {
+            assert!(
+                file_response_limit(&json!({"operation":"download", "max_bytes":size})).is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bridge_accept_errors_are_retried_without_losing_the_router() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (socket, _) = listener.accept().await.unwrap();
+        let accepts = futures_util::stream::iter(vec![
+            Err(std::io::Error::from(std::io::ErrorKind::ConnectionAborted)),
+            Err(std::io::Error::from(std::io::ErrorKind::Other)),
+            Ok(socket),
+        ])
+        .chain(futures_util::stream::pending());
+        let (writer, mut frames) = mpsc::channel(32);
+        let router = tokio::spawn(bridge_router_with_accepts(
+            futures_util::stream::pending(),
+            accepts,
+            true,
+            0,
+            writer,
+        ));
+        let frame = tokio::time::timeout(Duration::from_secs(2), frames.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame["type"], "open");
+        assert!(!router.is_finished());
+        drop(client);
+        router.abort();
+    }
+
     async fn capture(docker: &DockerManager, script: &str) -> String {
         let mut process = docker
             .open_project_process(
@@ -539,6 +816,16 @@ mod tests {
                 }
             });
             docker.start_forward("loopback", &inbound).await.unwrap();
+            // A blocked/slow Agent registry cannot hold up another Agent.
+            let other_forwards = docker.agent_forwards("other").await;
+            let other_guard = other_forwards.lock().await;
+            assert!(tokio::time::timeout(Duration::from_millis(100), docker.forward_active("loopback", &inbound.id)).await.unwrap());
+            drop(other_guard);
+            let mut finished = tokio::spawn(async {});
+            (&mut finished).await.unwrap();
+            other_forwards.lock().await.insert("dead".into(), LiveForward { spec: inbound.clone(), cancellation: CancellationToken::new(), task: finished });
+            assert!(!docker.forward_active("other", "dead").await);
+            assert!(other_forwards.lock().await.is_empty());
             eprintln!("host-to-container bridge ready");
             let echoed = capture(&docker, "const s=require('net').connect(18081,'127.0.0.1'); const data=Buffer.alloc(2*1024*1024,87); const chunks=[]; s.on('connect',()=>s.end(data)); s.on('data',d=>chunks.push(d)); s.on('end',()=>console.log(Buffer.concat(chunks).equals(data)?'echo ok':'corrupted')); s.on('error',e=>{console.error(e);process.exit(1)});").await;
             assert_eq!(echoed.trim(), "echo ok");
