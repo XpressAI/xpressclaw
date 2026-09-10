@@ -843,6 +843,7 @@ async fn execute_conversation_turn(
     let base = project_processes
         .get_or_start(&docker, &agent.name, &spec)
         .await?;
+    docker.restore_forwards(&db, &agent.name).await?;
     let live = conversation_processes
         .get_or_start(
             &docker,
@@ -1415,6 +1416,7 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
     }
     let workload_id = agent.name.as_str();
     let live = processes.get_or_start(&docker, workload_id, &spec).await?;
+    docker.restore_forwards(&db, workload_id).await?;
     if let Err(error) = sessions.set_container(attempt_id, &live.container_id) {
         processes.invalidate(workload_id, &live.process).await;
         let _ = docker.stop_preserving(workload_id).await;
@@ -1465,6 +1467,7 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
             warn!(%error, attempt_id, "failed to capture task Git baseline");
         }
     }
+    stage_prompt_files(&mut prompt, &repository.active_root, &container_workspace)?;
     let turn = live
         .process
         .run_turn(
@@ -1847,6 +1850,62 @@ pub fn resolve_runner_kind(agent: &AgentConfig) -> Result<String> {
 struct AgentPrompt {
     content: String,
     attachments: Vec<PromptImageAttachment>,
+}
+
+fn stage_prompt_files(
+    prompt: &mut AgentPrompt,
+    workspace: &Path,
+    container_workspace: &str,
+) -> Result<()> {
+    use crate::tasks::attachments::is_prompt_image;
+    use std::io::Write;
+    let mut images = Vec::new();
+    for attachment in std::mem::take(&mut prompt.attachments) {
+        if is_prompt_image(&attachment.mime_type) {
+            images.push(attachment);
+            continue;
+        }
+        let root = cap_std::fs::Dir::open_ambient_dir(workspace, cap_std::ambient_authority())
+            .map_err(|error| Error::Task(error.to_string()))?;
+        let directory = format!(".xpressclaw/attachments/{}", uuid::Uuid::new_v4());
+        root.create_dir_all(&directory)
+            .map_err(|error| Error::Task(error.to_string()))?;
+        let mut name: String = attachment
+            .name
+            .chars()
+            .map(|ch| {
+                if ch.is_alphanumeric() || ".-_ ".contains(ch) {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .take(180)
+            .collect();
+        while name.len() > 180 {
+            name.pop();
+        }
+        let name = if name.trim_matches('.').is_empty() {
+            "attachment"
+        } else {
+            &name
+        };
+        let relative = format!("{directory}/{name}");
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use cap_std::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        root.open_with(&relative, &options)
+            .and_then(|mut file| file.write_all(&attachment.data))
+            .map_err(|error| Error::Task(error.to_string()))?;
+        let path = format!("{}/{relative}", container_workspace.trim_end_matches('/'));
+        prompt.content.push_str(&format!("\n\nUser attached file (inspect with your file tools): {}\n", serde_json::json!({"name":attachment.name, "path":path, "mime_type":attachment.mime_type})));
+    }
+    prompt.attachments = images;
+    Ok(())
 }
 
 const PLAN_LIFECYCLE_GUIDANCE: &str = "<xpressclaw-plan-lifecycle>\n\
@@ -4066,6 +4125,39 @@ fn truncate(value: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stages_non_image_uploads_as_files_in_the_container_workspace() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut prompt = super::AgentPrompt {
+            content: "Inspect uploads".into(),
+            attachments: vec![
+                super::PromptImageAttachment {
+                    name: "資料".repeat(100) + ".bin",
+                    mime_type: "application/octet-stream".into(),
+                    data: vec![0, 255, 1],
+                },
+                super::PromptImageAttachment {
+                    name: "image.png".into(),
+                    mime_type: "image/png".into(),
+                    data: vec![1, 2],
+                },
+            ],
+        };
+        super::stage_prompt_files(&mut prompt, directory.path(), "/workspace/product").unwrap();
+        assert_eq!(prompt.attachments.len(), 1);
+        assert_eq!(prompt.attachments[0].mime_type, "image/png");
+        let metadata: serde_json::Value =
+            serde_json::from_str(&prompt.content[prompt.content.find('{').unwrap()..]).unwrap();
+        let relative = metadata["path"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("/workspace/product/")
+            .unwrap();
+        assert_eq!(
+            std::fs::read(directory.path().join(relative)).unwrap(),
+            [0, 255, 1]
+        );
+    }
     use super::*;
 
     fn run_git(repository: &Path, arguments: &[&str]) {

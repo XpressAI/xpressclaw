@@ -19,7 +19,7 @@ RUN test -n "${AGENT_KIND}" \
     && test -n "${AGENT_BINARY}" \
     && test -n "${AGENT_PATH}" \
     && apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl gh git openssh-client ripgrep unzip \
+    && apt-get install -y --no-install-recommends ca-certificates curl gh git openssh-client ripgrep tmux unzip \
     && rm -rf /var/lib/apt/lists/* \
     && install -d /opt/xpressclaw/libexec /opt/agent \
     && mv /usr/bin/gh /opt/xpressclaw/libexec/gh \

@@ -8,7 +8,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use xpressclaw_core::sessions::SessionManager;
-use xpressclaw_core::tasks::attachments::{decode_image_attachments, ImageAttachmentInput};
+use xpressclaw_core::tasks::attachments::{
+    decode_attachments, is_prompt_image, ImageAttachmentInput,
+};
 use xpressclaw_core::tasks::board::{CreateTask, Task, TaskBoard, UpdateTask};
 use xpressclaw_core::tasks::conversation::TaskConversation;
 use xpressclaw_core::tasks::queue::TaskQueue;
@@ -713,7 +715,7 @@ async fn get_message_attachment(
                 Json(json!({ "error": "attachment not found" })),
             )
         })?;
-    let disposition = if attachment.mime_type.starts_with("image/") {
+    let disposition = if is_prompt_image(&attachment.mime_type) {
         "inline"
     } else {
         "attachment"
@@ -888,10 +890,10 @@ async fn add_message(
     if content.is_empty() && req.attachments.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "message must include text or an image" })),
+            Json(json!({ "error": "message must include text or a file" })),
         ));
     }
-    let attachments = decode_image_attachments(&req.attachments).map_err(bad_request)?;
+    let attachments = decode_attachments(&req.attachments).map_err(bad_request)?;
 
     let board = TaskBoard::new(state.db.clone());
     let task = board.get(&id).map_err(|error| match &error {
@@ -903,9 +905,9 @@ async fn add_message(
     })?;
     let summary = if content.is_empty() {
         if attachments.len() == 1 {
-            "Sent an image".to_string()
+            "Sent a file".to_string()
         } else {
-            format!("Sent {} images", attachments.len())
+            format!("Sent {} files", attachments.len())
         }
     } else {
         content.clone()

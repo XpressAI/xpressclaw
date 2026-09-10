@@ -1,10 +1,11 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
-	import { workspaces } from '$lib/api';
+	import { workspaces, environments } from '$lib/api';
 	import type { GitChange, WorkspaceEntry, WorkspaceFile, WorkspaceGitDiff, WorkspaceGitStatus, WorkspaceStatus } from '$lib/api';
 	import MonacoEditor from '$lib/components/MonacoEditor.svelte';
 	import TerminalPanel from '$lib/components/TerminalPanel.svelte';
+	import ContainerFiles from '$lib/components/ContainerFiles.svelte';
 
 	let { agentId, route = '' }: { agentId: string; route?: string } = $props();
 	let status = $state<WorkspaceStatus | null>(null);
@@ -20,6 +21,9 @@
 	let loadingFile = $state(false);
 	let saving = $state(false);
 	let showTerminal = $state(false);
+	let source = $state<'workspace' | 'container'>('workspace');
+	let containerDirty = $state(false);
+	let containerBrowser = $state<{ refresh: () => void }>();
 	let showTree = $state(true);
 	let initialized = $state(false);
 	let syncedRoute = '';
@@ -33,6 +37,7 @@
 	let changeByPath = $derived(new Map((git?.files ?? []).map((change) => [change.path, change])));
 
 	onMount(() => {
+		showTerminal = Boolean(routeState(route).terminal);
 		showTree = routeState(route).showTree;
 		void initialize().finally(() => (initialized = true));
 	});
@@ -44,12 +49,13 @@
 		void applyRoute(requestedRoute);
 	});
 
-	function routeState(value: string): { path: string; showTree: boolean } {
+	function routeState(value: string): { path: string; showTree: boolean; terminal: string | null } {
 		const search = value.includes('?') ? value.slice(value.indexOf('?')) : window.location.search;
 		const params = new URLSearchParams(search);
 		return {
 			path: params.get('path') ?? '',
 			showTree: params.get('tree') !== 'collapsed',
+			terminal: params.get('terminal'),
 		};
 	}
 
@@ -66,6 +72,7 @@
 		const previousPath = selectedPath;
 		const previousShowTree = showTree;
 		const requested = routeState(requestedRoute);
+		if (requested.terminal) showTerminal = true;
 		showTree = requested.showTree;
 		if (requested.path === selectedPath) {
 			fileOpenSequence += 1;
@@ -239,22 +246,28 @@
 	function basename(path: string): string {
 		return path.split('/').pop() || path;
 	}
+	function downloadUrl(path: string): string {
+		return environments.downloadUrl(agentId, `${status?.container_root ?? '/workspace'}/${path}`);
+	}
 </script>
 
 <div class="flex h-full min-h-0 flex-col bg-background" data-workspace-files>
 	<div class="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-border px-3 py-2">
 		<div class="min-w-0">
-			<div class="truncate text-xs font-medium">{status?.root ?? 'Workspace'}</div>
-			<div class="text-[11px] text-muted-foreground">
+			<div class="truncate text-xs font-medium">{source === 'container' ? 'Container filesystem' : status?.root ?? 'Workspace'}</div>
+			{#if source === 'workspace'}<div class="text-[11px] text-muted-foreground">
 				{#if git?.repository}{git.branch || 'detached HEAD'} · {git.files.length} changed{:else}{status?.repository.message ?? 'No active Git repository'}{/if}
 			</div>
 			{#if status?.repository.github_status === 'attached'}<div class="mt-0.5 text-[10px] text-emerald-600 dark:text-emerald-400">GitHub MCP · {status.repository.github_repository}</div>{/if}
+			{/if}
 		</div>
 		<div class="flex items-center gap-2">
+			{#if source === 'workspace'}<a href={downloadUrl('')} download class="rounded-md border border-border px-2.5 py-1.5 text-xs hover:bg-accent">Download workspace</a>{/if}
+			<select aria-label="File location" value={source} onchange={(event) => { if (!containerDirty || window.confirm('Discard the unsaved changes in the current file?')) source = event.currentTarget.value as typeof source; else event.currentTarget.value = source; }} class="rounded-md border border-border bg-background px-2 py-1.5 text-xs"><option value="workspace">Workspace</option><option value="container">Container</option></select>
 			<button type="button" onclick={toggleTree} aria-expanded={showTree} class="rounded-md border border-border px-2.5 py-1.5 text-xs hover:bg-accent">
 				{showTree ? 'Hide files' : 'Show files'}
 			</button>
-			<button type="button" onclick={refreshGit} class="rounded-md border border-border px-2.5 py-1.5 text-xs hover:bg-accent">Refresh</button>
+			<button type="button" onclick={() => source === 'container' ? containerBrowser?.refresh() : refreshGit()} class="rounded-md border border-border px-2.5 py-1.5 text-xs hover:bg-accent">Refresh</button>
 			<button
 				type="button"
 				onclick={() => (showTerminal = !showTerminal)}
@@ -272,7 +285,9 @@
 		</div>
 	{/if}
 
-	{#if loading}
+	{#if source === 'container'}
+		<ContainerFiles bind:this={containerBrowser} {agentId} {showTree} onDirtyChange={(value) => (containerDirty = value)} />
+	{:else if loading}
 		<div class="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground">Loading workspace…</div>
 	{:else}
 		<div class="flex min-h-0 flex-1 flex-col md:flex-row">
@@ -296,6 +311,7 @@
 				<div class="min-h-0 flex-1 overflow-y-auto pb-2" data-workspace-tree>
 					{#each visibleEntries as row (row.entry.path)}
 						{@const change = changeByPath.get(row.entry.path)}
+						<div class="flex items-center">
 						<button
 							type="button"
 							onclick={() => row.entry.kind === 'directory' ? toggleDirectory(row.entry.path) : row.entry.kind === 'file' ? openFile(row.entry.path) : undefined}
@@ -312,6 +328,8 @@
 							<span class="min-w-0 flex-1 truncate">{row.entry.name}</span>
 							{#if change}<span class="font-mono text-[9px] text-amber-500">{statusLabel(change)}</span>{/if}
 						</button>
+						{#if row.entry.kind === 'file' || row.entry.kind === 'directory'}<a href={downloadUrl(row.entry.path)} download title="Download {row.entry.name}" aria-label="Download {row.entry.name}" class="px-2 text-xs">↓</a>{/if}
+						</div>
 					{/each}
 				</div>
 			</div>
@@ -361,7 +379,9 @@
 	{#if showTerminal}
 		<div class="h-56 shrink-0 border-t border-border">
 			{#if status?.terminal_available}
-				<TerminalPanel {agentId} />
+				{#key routeState(route).terminal}
+					<TerminalPanel {agentId} initialSession={routeState(route).terminal || 'xpressclaw'} />
+				{/key}
 			{:else}
 				<div class="flex h-full flex-col items-center justify-center px-6 text-center text-sm text-muted-foreground">
 					<p>The retained container has not been initialized yet.</p>

@@ -1935,19 +1935,21 @@ test('new activity follows only while the transcript is at the bottom', async ({
 	await expect.poll(() => scroller.evaluate((element) => element.scrollHeight - element.scrollTop - element.clientHeight)).toBeLessThanOrEqual(24);
 });
 
-test('task messages accept selected and pasted images', async ({ page }) => {
+test('task messages accept selected files and pasted images', async ({ page }) => {
 	const postedMessages: Record<string, unknown>[] = [];
 	await installTauriClipboardImage(page);
 	await mockApi(page, { postedMessages });
 	await page.goto(`/tasks/${taskId}`);
 
-	const fileInput = page.locator('input[type="file"][accept*="image/png"]');
+	const fileInput = page.locator('input[type="file"]');
 	await fileInput.setInputFiles({
 		name: 'selected.png',
 		mimeType: 'image/png',
 		buffer: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
 	});
 	await expect(page.getByAltText('selected.png')).toBeVisible();
+	await fileInput.setInputFiles({ name: 'reference.pdf', mimeType: 'application/pdf', buffer: Buffer.from('%PDF-1.7\nfixture') });
+	await expect(page.getByRole('link', { name: 'Download reference.pdf' })).toBeVisible();
 
 	const composer = page.locator(`#task-message-input-${taskId}`);
 	await composer.evaluate((element) => {
@@ -1989,8 +1991,9 @@ test('task messages accept selected and pasted images', async ({ page }) => {
 	await expect.poll(() => postedMessages.length).toBe(1);
 	const attachments = postedMessages[0].attachments as { name: string; mime_type: string; data: string }[];
 	expect(postedMessages[0].content).toBe('');
-	expect(attachments.map((attachment) => attachment.name)).toEqual(['selected.png', 'pasted.png', 'pasted-image.png']);
-	expect(attachments.every((attachment) => attachment.mime_type === 'image/png' && attachment.data.length > 0)).toBe(true);
+	expect(attachments.map((attachment) => attachment.name)).toEqual(['selected.png', 'reference.pdf', 'pasted.png', 'pasted-image.png']);
+	expect(attachments[1].mime_type).toBe('application/pdf');
+	expect(attachments.every((attachment) => attachment.data.length > 0)).toBe(true);
 	expect(await page.evaluate(() => (
 		window as unknown as { __clipboardCommands: string[] }
 	).__clipboardCommands)).toContain('plugin:resources|close');
@@ -5679,4 +5682,94 @@ test('local collaboration upgrade saves the visible pinned images first', async 
 	await expect.poll(() => collaborationActions).toEqual(['save', 'upgrade']);
 	await expect(page.getByLabel('GitBucket image')).toHaveValue('ghcr.io/gitbucket/gitbucket:4.47.0');
 	await expect(page.getByText('Upgrade completed.')).toBeVisible();
+});
+
+test('container files browse outside the workspace and download folders', async ({ page }) => {
+	await mockApi(page);
+	const environmentHandler = async (route: import('@playwright/test').Route) => {
+		const url = new URL(route.request().url());
+		if (url.pathname.endsWith('/tree')) {
+			await route.fulfill({ json: { path: '/tmp', truncated: false, entries: [{ name: 'results', path: '/tmp/results', kind: 'directory', symlink: false, size: null, modified_at: null }, { name: 'report.txt', path: '/tmp/report.txt', kind: 'file', symlink: false, size: 7, modified_at: null }] } });
+		} else if (url.pathname.endsWith('/file')) {
+			await route.fulfill({ json: { path: '/tmp/report.txt', content: 'Results', revision: 'revision-1', size: 7 } });
+		} else if (url.pathname.endsWith('/download')) {
+			await route.fulfill({ body: 'folder archive', headers: { 'content-type': 'application/gzip', 'content-disposition': 'attachment; filename="results.tar.gz"' } });
+		} else await route.fulfill({ json: {} });
+	};
+	await page.route('**/api/environments/**', environmentHandler);
+	await page.goto(`/agents/${agentId}?tab=files`);
+	await page.getByLabel('File location').selectOption('container');
+	await expect(page.getByLabel('Container directory')).toHaveValue('/tmp');
+	await page.getByRole('button', { name: '▧ report.txt' }).click();
+	await expect(page.locator('[data-container-files] [data-monaco-editor]')).toBeVisible();
+	await expect(page.locator('[data-container-files] .view-lines')).toContainText('Results');
+	await page.screenshot({ path: test.info().outputPath('container-files.png') });
+	const link = page.getByRole('link', { name: 'Download results', exact: true });
+	await expect(link).toHaveAttribute('href', `/api/environments/${agentId}/download?path=%2Ftmp%2Fresults`);
+	await expect(link).toHaveAttribute('download', '');
+	// Chromium bypasses request routing for the download attribute (Playwright #22650).
+	// Use the server's Content-Disposition to exercise the same download response.
+	await link.evaluate(element => { element.removeAttribute('download'); element.setAttribute('data-sveltekit-reload', ''); });
+	const downloaded = page.waitForEvent('download');
+	await link.click();
+	expect((await downloaded).suggestedFilename()).toBe('results.tar.gz');
+});
+
+test('environment port forwarding saves both directions and removes mappings', async ({ page }) => {
+	await mockApi(page);
+	const ports: Record<string, unknown>[] = [];
+	await page.route('**/api/environments/**', async (route) => {
+		if (route.request().method() === 'POST') {
+			const value = { ...route.request().postDataJSON(), id: String(ports.length + 1), active: true };
+			ports.push(value); await route.fulfill({ json: value });
+		} else if (route.request().method() === 'DELETE') {
+			ports.splice(ports.findIndex(port => port.id === route.request().url().split('/').pop()), 1); await route.fulfill({ json: { removed: true } });
+		} else await route.fulfill({ json: { ports } });
+	});
+	await page.goto(`/agents/${agentId}?tab=workspace`);
+	const panel = page.locator('[data-environment-ports]');
+	await panel.getByRole('button', { name: 'Add forward' }).click();
+	await expect.poll(() => ports.length).toBe(1);
+	expect(ports[0]).toMatchObject({ direction: 'host_to_container', host_port: 8080, container_port: 8080 });
+	await panel.getByLabel('Direction').selectOption('container_to_host');
+	await panel.getByLabel('Host port', { exact: true }).fill('3000');
+	await panel.getByLabel('Container port', { exact: true }).fill('3000');
+	await panel.getByRole('button', { name: 'Add forward' }).click();
+	await expect.poll(() => ports.length).toBe(2);
+	expect(ports[1]).toMatchObject({ direction: 'container_to_host', host_port: 3000, container_port: 3000 });
+	await page.screenshot({ path: test.info().outputPath('environment-ports.png') });
+	await panel.getByRole('button', { name: 'Remove' }).first().click();
+	await expect.poll(() => ports.length).toBe(1);
+});
+
+test('shared terminals join named sessions, send interactive input and share the connected session', async ({ page }) => {
+	await mockApi(page);
+	await page.route('**/api/environments/**/terminal-sessions', route => route.fulfill({ json: { sessions: ['login', 'build'] } }));
+	await page.addInitScript(() => {
+		Object.defineProperty(navigator, 'clipboard', { value: {
+			writeText: async (value: string) => { document.documentElement.dataset.sharedTerminal = value; },
+		} });
+	});
+	const connections: string[] = [];
+	const input: string[] = [];
+	await page.routeWebSocket('**/api/workspaces/**/terminal?**', websocket => {
+		connections.push(new URL(websocket.url()).searchParams.get('session') || '');
+		websocket.onMessage(message => { if (typeof message !== 'string') input.push(message.toString()); });
+		websocket.send(JSON.stringify({ type: 'ready' }));
+	});
+	await page.goto(`/agents/${agentId}?tab=files&terminal=login`);
+	const terminal = page.locator('[data-project-terminal]');
+	await expect(terminal.getByText('Container terminal', { exact: true })).toBeVisible();
+	await expect.poll(() => connections).toEqual(['login']);
+	await terminal.locator('.xterm-helper-textarea').pressSequentially('example-input');
+	await terminal.locator('.xterm-helper-textarea').press('Enter');
+	await expect.poll(() => input.join('')).toBe('example-input\r');
+	await terminal.getByLabel('tmux session name').fill('build');
+	await terminal.getByRole('button', { name: 'Share', exact: true }).click();
+	await expect(page.locator('html')).toHaveAttribute('data-shared-terminal', new RegExp(`/agents/${agentId}\\?tab=files&terminal=login$`));
+	await terminal.getByRole('button', { name: 'Join / create' }).click();
+	await expect.poll(() => connections).toEqual(['login', 'build']);
+	await expect(terminal.getByRole('button', { name: 'Share', exact: true })).toBeEnabled();
+	await terminal.getByRole('button', { name: 'Share', exact: true }).click();
+	await expect(page.locator('html')).toHaveAttribute('data-shared-terminal', new RegExp(`/agents/${agentId}\\?tab=files&terminal=build$`));
 });

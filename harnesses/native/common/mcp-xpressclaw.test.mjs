@@ -22,6 +22,42 @@ import {
 
 const execFile = promisify(execFileCallback);
 
+test('native environment tools bind ports, task creation and publication to their Agent', { timeout: 5000 }, async () => {
+  const requests = [];
+  const server = createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    requests.push({ url: request.url, agent: request.headers['x-xpressclaw-agent-id'], body: chunks.length ? JSON.parse(Buffer.concat(chunks).toString()) : null });
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end('{}');
+  });
+  server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  const child = spawn(process.execPath, [fileURLToPath(new URL('./mcp-xpressclaw.mjs', import.meta.url))], {
+    env: { ...process.env, XPRESSCLAW_URL: `http://127.0.0.1:${server.address().port}`, XPRESSCLAW_AGENT_ID: 'atlas', XPRESSCLAW_TASK_ID: 'parent-task' }, stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  const output = createInterface({ input: child.stdout })[Symbol.asyncIterator]();
+  let id = 0;
+  async function call(name, args) {
+    child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: ++id, method: 'tools/call', params: { name, arguments: args } }) + '\n');
+    const response = JSON.parse((await output.next()).value);
+    assert.equal(response.result.isError, false, JSON.stringify(response));
+  }
+  try {
+    child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: ++id, method: 'tools/list' }) + '\n');
+    const names = JSON.parse((await output.next()).value).result.tools.map(tool => tool.name);
+    for (const name of ['create_task', 'forward_port', 'expose_port', 'list_port_forwards', 'remove_port_forward', 'publish_task_files']) assert.ok(names.includes(name));
+    await call('create_task', { title: 'Delegated work', agent_id: 'reviewer' });
+    assert.deepEqual(requests.at(-1), { url: '/api/environments/atlas/tasks', agent: 'atlas', body: { title: 'Delegated work', agent_id: 'reviewer', parent_task_id: 'parent-task' } });
+    await call('expose_port', { container_port: 3000 });
+    assert.deepEqual(requests.at(-1).body, { direction: 'container_to_host', container_port: 3000, host_port: 3000 });
+    await call('forward_port', { direction: 'host_to_container', host_port: 8080, container_port: 8081 });
+    assert.equal(requests.at(-1).body.direction, 'host_to_container');
+    await call('publish_task_files', { files: ['/tmp/report', 'results'], content: 'Files ready' });
+    assert.equal(requests.at(-1).url, '/api/environments/atlas/tasks/parent-task/files');
+    assert.deepEqual(requests.at(-1).body.files, ['/tmp/report', path.resolve('results')]);
+  } finally { child.kill(); await new Promise(resolve => server.close(resolve)); }
+});
+
 test('binds a scheduled wake-up to the task that armed it', () => {
   const request = buildWakeupRequest(
     {
@@ -726,7 +762,7 @@ test('conversation tools publish files, download attachments, and create linked 
       ['send_conversation_message', 'download_conversation_attachment', 'create_conversation_task'],
     );
     const sendConversationMessage = listed.result.tools.find((tool) => tool.name === 'send_conversation_message');
-    assert.match(sendConversationMessage.description, /genuine interim update or publish workspace files/);
+    assert.match(sendConversationMessage.description, /genuine interim update or publish container files or folders/);
     assert.match(sendConversationMessage.description, /normal final response is delivered automatically/);
     assert.match(sendConversationMessage.description, /never use this tool to duplicate it/);
 

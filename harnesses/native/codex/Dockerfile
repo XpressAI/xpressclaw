@@ -22,6 +22,7 @@ RUN apt-get update \
         openssh-client \
         poppler-utils \
         ripgrep \
+        tmux \
         unzip \
     && rm -rf /var/lib/apt/lists/* \
     && install -d /opt/xpressclaw/libexec \

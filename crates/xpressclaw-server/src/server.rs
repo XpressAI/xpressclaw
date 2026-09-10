@@ -115,7 +115,8 @@ async fn require_internal_token(
     let callback_path = request.uri().path();
     let agent_capability_route = (callback_path.starts_with("/api/workspaces/")
         && callback_path.ends_with("/repository/resolve-github"))
-        || (callback_path.starts_with("/api/tasks/") && callback_path.ends_with("/pull-requests"));
+        || (callback_path.starts_with("/api/tasks/") && callback_path.ends_with("/pull-requests"))
+        || callback_path.starts_with("/api/environments/");
     let agent_capability_matches =
         supplied_agent
             .zip(supplied)

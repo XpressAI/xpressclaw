@@ -1,16 +1,32 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import '@xterm/xterm/css/xterm.css';
-	import { request } from '$lib/api';
+	import { request, environments } from '$lib/api';
 
-	let { agentId }: { agentId: string } = $props();
+	let { agentId, initialSession = 'xpressclaw' }: { agentId: string; initialSession?: string } = $props();
 	let host = $state<HTMLDivElement>();
 	let connected = $state(false);
 	let connecting = $state(true);
 	let error = $state('');
 	let reconnect = $state<() => void>(() => {});
+	let session = $state('xpressclaw');
+	let joinedSession = $state('');
+	let sessions = $state<string[]>([]);
+	let shareMessage = $state('');
+	async function refreshSessions() {
+		try { sessions = (await environments.terminalSessions(agentId)).sessions; }
+		catch (cause) { error = String(cause); }
+	}
+	async function shareSession() {
+		if (!connected || !joinedSession) return;
+		const url = new URL(`/agents/${encodeURIComponent(agentId)}`, window.location.origin);
+		url.searchParams.set('tab', 'files'); url.searchParams.set('terminal', joinedSession);
+		try { await navigator.clipboard.writeText(url.toString()); shareMessage = 'Link copied'; }
+		catch { shareMessage = url.toString(); }
+	}
 
 	onMount(() => {
+		session = initialSession;
 		let disposed = false;
 		let cleanup = () => {};
 		void (async () => {
@@ -22,7 +38,7 @@
 			if (disposed || !host) return;
 			const terminal = new Terminal({
 				cursorBlink: true,
-				convertEol: true,
+				convertEol: false,
 				fontSize: 13,
 				fontFamily: "'JetBrains Mono', 'Cascadia Code', 'SFMono-Regular', Consolas, monospace",
 				scrollback: 10_000,
@@ -41,6 +57,8 @@
 			const decoder = new TextDecoder();
 
 			function connect() {
+				if (!/^[A-Za-z0-9_-]{1,64}$/.test(session)) { error = 'Use 1–64 letters, digits, underscores or hyphens for the session name.'; connecting = false; return; }
+				const requestedSession = session;
 				websocket?.close();
 				connected = false;
 				connecting = true;
@@ -50,16 +68,21 @@
 				url.protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
 				url.searchParams.set('columns', String(terminal.cols));
 				url.searchParams.set('rows', String(terminal.rows));
+				url.searchParams.set('session', requestedSession);
 				websocket = new WebSocket(url);
+				const connection = websocket;
 				websocket.binaryType = 'arraybuffer';
 				websocket.onmessage = (event) => {
+					if (websocket !== connection || disposed) return;
 					if (typeof event.data === 'string') {
 						try {
 							const control = JSON.parse(event.data) as { type?: string; message?: string };
 							if (control.type === 'ready') {
 								connected = true;
+								joinedSession = requestedSession;
 								connecting = false;
 								terminal.focus();
+								void refreshSessions();
 							} else if (control.type === 'error') {
 								error = control.message || 'The terminal failed to start.';
 								connecting = false;
@@ -83,6 +106,7 @@
 					}
 				};
 			websocket.onerror = () => {
+				if (websocket !== connection || disposed) return;
 				connected = false;
 				connecting = false;
 				error = 'Could not connect to the retained project environment.';
@@ -92,6 +116,7 @@
 				void request(`/api/agents/${encodeURIComponent(agentId)}`).catch(() => undefined);
 			};
 				websocket.onclose = () => {
+					if (websocket !== connection || disposed) return;
 					connected = false;
 					connecting = false;
 				};
@@ -153,11 +178,18 @@
 			<span class="h-1.5 w-1.5 rounded-full {connected ? 'bg-emerald-500' : connecting ? 'animate-pulse bg-amber-500' : 'bg-muted-foreground'}"></span>
 			<span>{connected ? 'Container terminal' : connecting ? 'Connecting…' : 'Terminal disconnected'}</span>
 		</div>
+		<form class="flex items-center gap-2" onsubmit={(event) => { event.preventDefault(); shareMessage = ''; reconnect(); }}>
+			<input aria-label="tmux session name" list={`terminal-sessions-${agentId}`} bind:value={session} class="w-28 rounded border border-border bg-background px-2 py-0.5" />
+			<datalist id={`terminal-sessions-${agentId}`}>{#each sessions as name}<option value={name}></option>{/each}</datalist>
+			<button class="rounded border border-border px-2 py-0.5">Join / create</button>
+			<button type="button" disabled={!connected} onclick={shareSession} class="rounded border border-border px-2 py-0.5 disabled:opacity-50">Share</button>
+		</form>
 		{#if !connected && !connecting}
 			<button type="button" onclick={() => reconnect()} class="rounded border border-border px-2 py-0.5 hover:bg-accent">Reconnect</button>
 		{/if}
 	</div>
 	<div bind:this={host} class="min-h-0 flex-1 p-2"></div>
+	{#if shareMessage}<p class="px-3 text-xs text-muted-foreground">{shareMessage}</p>{/if}
 	{#if error}
 		<div class="shrink-0 border-t border-destructive/30 bg-destructive/5 px-3 py-1.5 text-[11px] text-destructive">{error}</div>
 	{/if}

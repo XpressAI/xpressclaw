@@ -624,6 +624,7 @@ export const sessions = {
 // -- Project workspaces --
 
 export interface WorkspaceStatus {
+    container_root?: string;
 	agent_id: string;
 	root: string;
 	repository: WorkspaceRepositoryStatus;
@@ -1407,4 +1408,22 @@ export const workflows = {
 	instances: (id: string) => request<WorkflowInstance[]>(`/api/workflows/${id}/instances`),
 	getInstance: (instanceId: string) => request<WorkflowInstanceDetails>(`/api/workflows/instances/${instanceId}`),
 	cancelInstance: (instanceId: string) => request<void>(`/api/workflows/instances/${instanceId}/cancel`, { method: 'POST' }),
+};
+
+export interface PortForward {
+ id: string;
+ direction: 'host_to_container' | 'container_to_host';
+ host_port: number;
+ container_port: number;
+ active: boolean;
+}
+export const environments = {
+ ports: (id: string) => request<{ports: PortForward[]}>(`/api/environments/${encodeURIComponent(id)}/ports`),
+ addPort: (id: string, port: Pick<PortForward, 'direction' | 'host_port' | 'container_port'>) => request<PortForward>(`/api/environments/${encodeURIComponent(id)}/ports`, { method: 'POST', body: JSON.stringify(port) }),
+ removePort: (id: string, port: string) => request(`/api/environments/${encodeURIComponent(id)}/ports/${encodeURIComponent(port)}`, { method: 'DELETE' }),
+ tree: (id: string, path: string) => request<WorkspaceDirectory>(`/api/environments/${encodeURIComponent(id)}/tree?path=${encodeURIComponent(path)}`),
+ readFile: (id: string, path: string) => request<WorkspaceFile>(`/api/environments/${encodeURIComponent(id)}/file?path=${encodeURIComponent(path)}`),
+ saveFile: (id: string, file: WorkspaceFile) => request<WorkspaceFile>(`/api/environments/${encodeURIComponent(id)}/file`, { method: 'PUT', body: JSON.stringify({path: file.path, content: file.content, expected_revision: file.revision}) }),
+ downloadUrl: (id: string, path: string) => `/api/environments/${encodeURIComponent(id)}/download?path=${encodeURIComponent(path)}`,
+ terminalSessions: (id: string) => request<{sessions: string[]}>(`/api/environments/${encodeURIComponent(id)}/terminal-sessions`),
 };

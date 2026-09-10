@@ -1,0 +1,91 @@
+import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
+import { mkdtemp, readFile, rm, writeFile, symlink, mkdir } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import test from 'node:test';
+import { createServer, createConnection } from 'node:net';
+import { createInterface } from 'node:readline';
+
+const filesScript = await readFile(new URL('../../../crates/xpressclaw-core/src/docker/files.cjs', import.meta.url), 'utf8');
+const bridgeScript = await readFile(new URL('../../../crates/xpressclaw-core/src/docker/bridge.cjs', import.meta.url), 'utf8');
+async function files(request) {
+  const child = spawn(process.execPath, ['-e', filesScript], { stdio: ['pipe', 'pipe', 'pipe'] });
+  const chunks = [];
+  child.stdout.on('data', chunk => chunks.push(chunk));
+  const exited = once(child, 'exit');
+  child.stdin.write(JSON.stringify(request) + '\n');
+  const [code] = await exited;
+  assert.equal(code, 0);
+  return JSON.parse(Buffer.concat(chunks).toString());
+}
+
+test('container files support binary downloads, archives, UTF-8 edits and revision conflicts', { timeout: 10000 }, async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'xpressclaw-files-'));
+  try {
+    const file = path.join(directory, 'résumé.txt');
+    await writeFile(file, 'original 日本語');
+    await writeFile(path.join(directory, 'binary.bin'), Buffer.from([0, 255, 1]));
+    await mkdir(path.join(directory, 'nested'));
+    await symlink('/proc', path.join(directory, 'kernel-link'));
+    const tree = await files({ operation: 'tree', path: directory });
+    assert.equal(tree.entries.find(entry => entry.name === 'kernel-link').kind, 'symlink');
+    const opened = await files({ operation: 'read', path: file });
+    assert.equal(opened.content, 'original 日本語');
+    await writeFile(file, 'changed externally');
+    assert.match((await files({ operation: 'write', path: file, content: 'overwrite', expected_revision: opened.revision })).error, /changed/);
+    const current = await files({ operation: 'read', path: file });
+    const saved = await files({ operation: 'write', path: file, content: 'new content', expected_revision: current.revision });
+    assert.equal(saved.content, 'new content');
+    assert.equal(await readFile(file, 'utf8'), 'new content');
+    assert.ok((await files({ operation: 'read', path: path.join(directory, 'binary.bin') })).error);
+    const binary = await files({ operation: 'download', path: path.join(directory, 'binary.bin') });
+    assert.deepEqual(Buffer.from(binary.data, 'base64'), Buffer.from([0, 255, 1]));
+    assert.match((await files({ operation: 'tree', path: path.join(directory, 'kernel-link') })).error, /kernel/);
+    const archive = await files({ operation: 'download', path: directory });
+    assert.equal(archive.name, path.basename(directory) + '.tar.gz');
+    assert.equal(archive.mime_type, 'application/gzip');
+    assert.deepEqual(Buffer.from(archive.data, 'base64').subarray(0, 2), Buffer.from([0x1f, 0x8b]));
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test('bridge accepts a loopback connection, transfers binary data and closes its listener on stdin EOF', { timeout: 10000 }, async () => {
+  const reservation = createServer(); reservation.listen(0, '127.0.0.1'); await once(reservation, 'listening');
+  const port = reservation.address().port;
+  await new Promise(resolve => reservation.close(resolve));
+  const child = spawn(process.execPath, ['-e', bridgeScript, 'host_to_container', String(port)]);
+  const lines = createInterface({ input: child.stdout })[Symbol.asyncIterator]();
+  try {
+    assert.equal(JSON.parse((await lines.next()).value).type, 'ready');
+    const socket = createConnection({ host: '127.0.0.1', port, allowHalfOpen: true });
+    await once(socket, 'connect');
+    const opened = JSON.parse((await lines.next()).value); assert.equal(opened.type, 'open');
+    const received = []; socket.on('data', chunk => received.push(chunk));
+    const ended = once(socket, 'end');
+    child.stdin.write(JSON.stringify({ type: 'data', id: opened.id, data: Buffer.from([0, 1, 255]).toString('base64') }) + '\n');
+    child.stdin.write(JSON.stringify({ type: 'end', id: opened.id }) + '\n');
+    await ended; assert.deepEqual(Buffer.concat(received), Buffer.from([0, 1, 255]));
+    socket.end('response');
+    let response = Buffer.alloc(0);
+    for await (const line of { [Symbol.asyncIterator]: () => lines }) {
+      const frame = JSON.parse(line);
+      if (frame.type === 'data') response = Buffer.concat([response, Buffer.from(frame.data, 'base64')]);
+      if (frame.type === 'end') break;
+    }
+    assert.equal(response.toString(), 'response');
+    const exited = once(child, 'exit'); child.stdin.end(); await exited;
+    const reused = createServer(); reused.listen(port, '127.0.0.1'); await once(reused, 'listening'); await new Promise(resolve => reused.close(resolve));
+  } finally { child.kill(); }
+});
+
+test('bridge reports an occupied container port before readiness', { timeout: 5000 }, async () => {
+  const server = createServer(); server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  const child = spawn(process.execPath, ['-e', bridgeScript, 'host_to_container', String(server.address().port)]);
+  try {
+    const lines = createInterface({ input: child.stdout });
+    const [line] = await once(lines, 'line');
+    const frame = JSON.parse(line);
+    assert.equal(frame.type, 'error'); assert.match(frame.message, /EADDRINUSE/);
+  } finally { child.kill(); await new Promise(resolve => server.close(resolve)); }
+});

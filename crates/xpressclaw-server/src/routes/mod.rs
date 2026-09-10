@@ -8,6 +8,7 @@ mod agents;
 pub(crate) mod auth;
 mod conversations;
 mod dashboard;
+mod environment;
 mod health;
 mod memory;
 mod open_url;
@@ -34,7 +35,9 @@ pub fn api_routes() -> Router<AppState> {
 /// Runner-only callbacks. These routes are mounted exclusively on the
 /// independently authenticated callback listener and never on the public API.
 pub fn internal_api_routes() -> Router<AppState> {
-    Router::new().nest("/workspaces", workspace::internal_routes())
+    Router::new()
+        .nest("/workspaces", workspace::internal_routes())
+        .nest("/environments", environment::internal_routes())
 }
 
 /// Public browser API. Health/bootstrap/login remain reachable while all
@@ -58,6 +61,7 @@ fn protected_api_routes() -> Router<AppState> {
         .nest("/agents", agents::routes())
         .nest("/conversations", conversations::routes())
         .nest("/dashboard", dashboard::routes())
+        .nest("/environments", environment::routes())
         .nest("/memory", memory::routes())
         .nest("/projects", projects::routes())
         .nest("/tasks", tasks::routes())

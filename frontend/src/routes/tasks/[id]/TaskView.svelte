@@ -11,7 +11,7 @@
 	import AiMessage from '$lib/components/AiMessage.svelte';
 	import ImageAttachmentPreviews from '$lib/components/ImageAttachmentPreviews.svelte';
 	import { clearComposerDraft, loadComposerDraft, saveComposerDraft } from '$lib/composerDrafts';
-	import { appendImageFiles, imageDataUrl, IMAGE_FILE_ACCEPT, MAX_IMAGE_ATTACHMENTS, pastedImageFiles, shouldHandleImagePaste } from '$lib/imageAttachments';
+	import { appendImageFiles, imageDataUrl, MAX_IMAGE_ATTACHMENTS, pastedImageFiles, shouldHandleImagePaste } from '$lib/imageAttachments';
 	import { coalesceAgentMessageFragments } from '$lib/agentMessageFragments';
 	import { TASK_FILE_SPLIT_MIN_PANE_WIDTH, WORKSPACE_OPEN_SPLIT_EVENT, type WorkspaceOpenSplitDetail } from '$lib/workspace';
 
@@ -121,6 +121,7 @@
 	let messageImagePreviews = $derived(messageAttachments.map((attachment) => ({
 		name: attachment.name,
 		src: imageDataUrl(attachment),
+		mimeType: attachment.mime_type,
 	})));
 	let sessionEvents = $state<SessionEvent[]>([]);
 	let configOptions = $state<AcpConfigOption[]>([]);
@@ -1011,7 +1012,7 @@
 
 	async function addMessageImages(files: File[]) {
 		try {
-			messageAttachments = await appendImageFiles(messageAttachments, files);
+			messageAttachments = await appendImageFiles(messageAttachments, files, true);
 			messageAttachmentError = '';
 		} catch (e) {
 			messageAttachmentError = e instanceof Error ? e.message : String(e);
@@ -1794,10 +1795,10 @@
 						{#if messageAttachmentError}<div class="px-4 pb-1 text-xs text-destructive">{messageAttachmentError}</div>{/if}
 
 						<div class="flex min-h-9 items-center gap-2 px-3 pb-2">
-							<input bind:this={messageImageInput} type="file" accept={IMAGE_FILE_ACCEPT} multiple onchange={handleMessageImageInput} class="hidden" />
+							<input bind:this={messageImageInput} type="file" multiple onchange={handleMessageImageInput} class="hidden" />
 							<button type="button" onclick={() => messageImageInput?.click()}
 								disabled={messageSending || interrupting || !task.agent_id || composerBlockedByElicitation || messageAttachments.length >= MAX_IMAGE_ATTACHMENTS}
-								aria-label="Attach images" title="Attach images (you can also paste)"
+								aria-label="Attach files" title="Attach files (you can also paste images)"
 								class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-30">
 								<svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" /></svg>
 							</button>

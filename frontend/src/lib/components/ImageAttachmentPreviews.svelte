@@ -56,6 +56,7 @@
 				{:else}
 					<a
 						href={attachment.src}
+						download={attachment.name}
 						target="_blank"
 						rel="noopener noreferrer"
 						aria-label="Download {attachment.name}"

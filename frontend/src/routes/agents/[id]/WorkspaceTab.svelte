@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { workspaces, type LiveConfig, type WorkspaceRepositoryStatus } from '$lib/api';
 	import DirectoryPicker from '$lib/components/DirectoryPicker.svelte';
+	import EnvironmentPorts from '$lib/components/EnvironmentPorts.svelte';
 
 	interface Props {
 		agentId: string;
@@ -133,6 +134,7 @@
 </script>
 
 <div class="mx-auto max-w-3xl space-y-6">
+	<EnvironmentPorts {agentId} />
 	<div class="ai-card p-5">
 		<h2 class="text-sm font-semibold">Primary workspace</h2>
 		<p class="mt-1 text-xs text-muted-foreground">The durable writable boundary mounted at <code>/workspace</code>. Repository adoption never grants access outside it.</p>

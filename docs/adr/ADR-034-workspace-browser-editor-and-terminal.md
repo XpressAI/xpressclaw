@@ -78,3 +78,14 @@ boundary.
 - Concurrent edits fail visibly instead of silently overwriting agent work.
 - Binary files, new-file creation, rename/delete actions, search, and a full
   source-control UI remain future work.
+
+## Container access extension
+
+Files also offers an explicit Container location, backed by exec operations in
+the retained Agent container. It can browse and edit outside the host-mounted
+workspace, including `/tmp`, and download files or directory archives. The
+original workspace capability boundary remains in place for host-side file
+operations. Shared tmux sessions replace per-connection shells where tmux is
+installed. Environment port forwards use a multiplexed exec stream in either
+direction, with loopback listeners and installation-local saved mappings.
+See [Environment access](../environment-access.md) for limits and examples.
