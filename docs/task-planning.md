@@ -6,6 +6,10 @@ Project, Agent, and status. Search includes task text and saved conversation
 history. Project and Agent names remain on every card. Durable subtasks appear
 with a Subtask label; current-turn ACP checklist rows stay in their parent.
 
+Filter choices take effect only with **Apply filters**. **Reset** clears the draft
+choices; closing the sheet with × or Escape discards them. Applied filters remain
+in place during live workspace updates.
+
 ## Board and queue order
 
 The board distinguishes Backlog, To do, Scheduled, Working, Needs you, Blocked,

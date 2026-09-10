@@ -96,6 +96,7 @@ async function planningApi(page: Page) {
   });
   const changes: Record<string, unknown>[] = [];
   const creates: Record<string, unknown>[] = [];
+  const planningQueries: Record<string, string>[] = [];
   await page.addInitScript(() => {
     localStorage.removeItem("xpressclaw.workspace.v1");
     localStorage.removeItem("xpressclaw.tasks.view");
@@ -113,6 +114,7 @@ async function planningApi(page: Page) {
     else if (path === "/api/settings/sync") data = { projects: [] };
     else if (path === "/api/tasks/planning") {
       const p = url.searchParams;
+      planningQueries.push(Object.fromEntries(p));
       const status = p.get("status") ?? "active";
       const search = (p.get("search") ?? "").toLowerCase();
       const matches = rows.filter(
@@ -213,6 +215,7 @@ async function planningApi(page: Page) {
   return {
     changes,
     creates,
+    planningQueries,
     rows,
     concurrentClaim: () => {
       rows[0].revision++;
@@ -220,6 +223,72 @@ async function planningApi(page: Page) {
       rows[0].planning.disabled_reason = "This task has an active turn.";
     },
   };
+}
+
+for (const phone of [false, true]) {
+  test(`filter drafts require Apply, including after dismissal and refresh (${phone ? "phone" : "desktop"})`, async ({ page }) => {
+    await page.setViewportSize(phone ? { width: 390, height: 844 } : { width: 1440, height: 1000 });
+    await page.clock.install();
+    const state = await planningApi(page);
+    await page.goto(`/tasks?view=${phone ? "list" : "board"}`);
+    const summary = page.locator(".planner-header p");
+    await expect(summary).toHaveText("56 tasks · All projects", { timeout: 15000 });
+    const open = phone
+      ? page.getByRole("group", { name: "Task controls" }).getByRole("button", { name: "Filters" })
+      : page.locator(".top-controls").getByRole("button", { name: /Filters/ });
+    const filters = page.getByRole("dialog", { name: "Task filters", exact: true });
+    const project = filters.getByLabel("Filter project", { exact: true });
+    const agent = filters.getByLabel("Filter agent", { exact: true });
+    const status = filters.getByLabel("Filter status", { exact: true });
+    const apply = filters.getByRole("button", { name: "Apply filters", exact: true });
+    const refresh = async (expected: Record<string, string>) => {
+      const count = state.planningQueries.length;
+      await page.clock.fastForward(5100);
+      await expect.poll(() => state.planningQueries.length).toBeGreaterThan(count);
+      for (const query of state.planningQueries.slice(count)) {
+        expect({ project_id: query.project_id ?? "", agent_id: query.agent_id ?? "", status: query.status }).toEqual(expected);
+      }
+    };
+    const initial = { project_id: "", agent_id: "", status: "active" };
+    for (const dismiss of ["close", "escape"] as const) {
+      await open.click();
+      await expect(project).toHaveValue("");
+      await expect(agent).toHaveValue("");
+      await expect(status).toHaveValue("active");
+      await project.selectOption("project-1");
+      await agent.selectOption("agent-1-0");
+      await status.selectOption("queue");
+      await expect(summary).toHaveText("56 tasks · All projects");
+      await refresh(initial);
+      if (dismiss === "close") await filters.getByRole("button", { name: "Close filters", exact: true }).click();
+      else await page.keyboard.press("Escape");
+      await expect(filters).not.toBeVisible();
+      await refresh(initial);
+      await expect(summary).toHaveText("56 tasks · All projects");
+    }
+    await open.click();
+    await project.selectOption("project-1");
+    await agent.selectOption("agent-1-0");
+    await status.selectOption("queue");
+    await apply.click();
+    await expect(summary).toHaveText("2 tasks · Research");
+    await expect(page.locator("[data-planning-card]")).toHaveCount(2);
+    const applied = { project_id: "project-1", agent_id: "agent-1-0", status: "queue" };
+    await refresh(applied);
+    await open.click();
+    await expect(project).toHaveValue("project-1");
+    await expect(agent).toHaveValue("agent-1-0");
+    await expect(status).toHaveValue("queue");
+    await filters.getByRole("button", { name: "Reset", exact: true }).click();
+    await expect(project).toHaveValue("");
+    await expect(agent).toHaveValue("");
+    await expect(status).toHaveValue("active");
+    await expect(summary).toHaveText("2 tasks · Research");
+    await refresh(applied);
+    await apply.click();
+    await expect(summary).toHaveText("56 tasks · All projects");
+    await refresh(initial);
+  });
 }
 
 test("backlog has a quick collection flow while ordinary creation defaults to To do", async ({ page }) => {

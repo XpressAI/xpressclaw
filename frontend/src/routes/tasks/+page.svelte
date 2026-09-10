@@ -23,15 +23,20 @@
   import CreateTask from "$lib/components/planning/CreateTask.svelte";
   let { route = "/tasks" }: { route?: string } = $props();
   let mounted = $state(false);
+  let appliedRoute: string | undefined;
   $effect(() => {
     const next = route;
-    if (mounted)
+    // Workspace metadata refreshes replace the tab object even when its path
+    // stays the same. Only navigation should reapply route-based filters.
+    if (mounted && next !== appliedRoute)
       untrack(() => {
+        appliedRoute = next;
         const url = new URL(next, location.origin);
         const mode = url.searchParams.get("view");
         if (mode && ["board", "timeline", "list"].includes(mode))
           view = mode as View;
         projectId = url.searchParams.get("project") ?? "";
+        agentId = "";
         reset();
       });
   });
@@ -55,6 +60,9 @@
   let projectId = $state("");
   let agentId = $state("");
   let status = $state("active");
+  let draftProjectId = $state("");
+  let draftAgentId = $state("");
+  let draftStatus = $state("active");
   let searchText = $state("");
   let search = $state("");
   let composing = false;
@@ -183,6 +191,19 @@
     page = 0;
     error = "";
     void load();
+  }
+  function openFilters() {
+    draftProjectId = projectId;
+    draftAgentId = agentId;
+    draftStatus = status;
+    filters.showModal();
+  }
+  function applyFilters() {
+    projectId = draftProjectId;
+    agentId = draftAgentId;
+    status = draftStatus;
+    reset();
+    filters.close();
   }
   function setView(next: View) {
     view = next;
@@ -364,7 +385,7 @@
           onclick={() => setView(id as View)}>{label}</button
         >{/each}
     </nav>
-    <button onclick={() => filters.showModal()}
+    <button onclick={openFilters}
       >Filters{projectId || agentId ? " · active" : ""}</button
     >
   </div>
@@ -554,7 +575,7 @@
     {#each [["board", "Board"], ["timeline", "Timeline"], ["list", "List"]] as [id, label]}<button
         aria-pressed={view === id}
         onclick={() => setView(id as View)}>{label}</button
-      >{/each}<button onclick={() => filters.showModal()}>Filters</button
+      >{/each}<button onclick={openFilters}>Filters</button
     ><button
       class="primary"
       onclick={() => (showCreate = true)}
@@ -562,7 +583,7 @@
     >
   </footer>
 </div>
-<dialog bind:this={filters} class="filters-sheet" aria-label="Task filters">
+<dialog bind:this={filters} use:planningViewport class="filters-sheet" aria-label="Task filters">
   <header>
     <h2>Filter tasks</h2>
     <button aria-label="Close filters" onclick={() => filters.close()}>×</button
@@ -572,22 +593,22 @@
     <label
       >Project<select
         aria-label="Filter project"
-        bind:value={projectId}
-        onchange={() => (agentId = "")}
+        bind:value={draftProjectId}
+        onchange={() => (draftAgentId = "")}
         ><option value="">All projects</option
         >{#each projectList as project}<option value={project.id}
             >{project.name}</option
           >{/each}</select
       ></label
     ><label
-      >Agent<select aria-label="Filter agent" bind:value={agentId}
+      >Agent<select aria-label="Filter agent" bind:value={draftAgentId}
         ><option value="">All agents</option
-        >{#each agentList.filter((a) => !projectId || a.project_id === projectId) as agent}<option
+        >{#each agentList.filter((a) => !draftProjectId || a.project_id === draftProjectId) as agent}<option
             value={agent.id}>{agent.title || agent.name}</option
           >{/each}</select
       ></label
     ><label
-      >Status<select aria-label="Filter status" bind:value={status}
+      >Status<select aria-label="Filter status" bind:value={draftStatus}
         ><option value="active">Active</option><option value="all">All</option
         ><option value="attention">Needs attention</option
         >{#each lanes as lane}<option value={lane.id}>{lane.label}</option
@@ -598,18 +619,13 @@
   <footer>
     <button
       onclick={() => {
-        projectId = "";
-        agentId = "";
-        status = "active";
-        reset();
-        filters.close();
+        draftProjectId = "";
+        draftAgentId = "";
+        draftStatus = "active";
       }}>Reset</button
     ><button
       class="primary"
-      onclick={() => {
-        reset();
-        filters.close();
-      }}>Apply filters</button
+      onclick={applyFilters}>Apply filters</button
     >
   </footer>
 </dialog>

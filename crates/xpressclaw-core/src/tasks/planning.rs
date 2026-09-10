@@ -262,7 +262,9 @@ impl TaskPlanner {
                     if position.is_none() {
                         // Rebalance only when the gap runs out of precision. Normal
                         // moves must not invalidate every other task's revision.
-                        tx.execute("WITH ranks AS (SELECT id, ROW_NUMBER() OVER (ORDER BY position, id) * 1024.0 AS rank FROM tasks WHERE priority = ?1) UPDATE tasks SET position = (SELECT rank FROM ranks WHERE ranks.id = tasks.id) WHERE priority = ?1", [target.task.priority])?;
+                        // Snapshot ranks before writing: an inlined CTE can
+                        // otherwise recalculate them from partially updated rows.
+                        tx.execute("WITH ranks AS MATERIALIZED (SELECT id, ROW_NUMBER() OVER (ORDER BY position, id) * 1024.0 AS rank FROM tasks WHERE priority = ?1) UPDATE tasks SET position = (SELECT rank FROM ranks WHERE ranks.id = tasks.id) WHERE priority = ?1", [target.task.priority])?;
                         position = insertion_position(&tx, id, &read_planning(&tx, &target.task.id)?.task, before)?;
                     }
                     let position = position.ok_or_else(|| Error::Task("Task order changed. Refresh and try again.".into()))?;
@@ -651,6 +653,52 @@ mod tests {
                 }
             )
             .is_err());
+    }
+    #[test]
+    fn reordering_tied_positions_preserves_other_order_in_both_directions() {
+        // Import order and id order can differ. Ranking must use one snapshot,
+        // even while the UPDATE changes the indexed positions underneath it.
+        for reverse_import in [false, true] {
+            for target in ["c", "d"] {
+                for before in [false, true] {
+                    let db = Arc::new(Database::open_memory().unwrap());
+                    let (_, _, planner) = setup(db.clone());
+                    let mut imported =
+                        vec![("a", 1024), ("b", 2048), ("c", 1), ("d", 1), ("e", 3072)];
+                    if reverse_import {
+                        imported.reverse();
+                    }
+                    db.with_conn(|conn| {
+                        for (id, position) in imported {
+                            conn.execute("INSERT INTO tasks(id, title, position) VALUES(?1, ?1, ?2)", params![id, position])?;
+                        }
+                        conn.execute("INSERT INTO tasks(id, title, priority, position) VALUES('other-priority', 'Other priority', 10, 1)", [])
+                    }).unwrap();
+                    change(
+                        &planner,
+                        "e",
+                        PlanningAction::Reorder {
+                            before_id: before.then(|| target.into()),
+                            after_id: (!before).then(|| target.into()),
+                        },
+                    );
+                    let page = planner.list(&PlanningFilter::default()).unwrap();
+                    let tasks: Vec<_> =
+                        page.tasks.iter().filter(|t| t.task.priority == 0).collect();
+                    assert!(tasks.windows(2).all(|pair| pair[0].task.position < pair[1].task.position), "Rebalance must leave unique positions (reverse import: {reverse_import}, target: {target}, before: {before})");
+                    let mut expected = vec!["c", "d", "a", "b"];
+                    let index = expected.iter().position(|id| *id == target).unwrap();
+                    expected.insert(index + usize::from(!before), "e");
+                    assert_eq!(
+                        tasks.iter().map(|t| t.task.id.as_str()).collect::<Vec<_>>(),
+                        expected
+                    );
+                    let untouched = planner.get("other-priority").unwrap().task;
+                    assert_eq!(untouched.position, 1.0);
+                    assert_eq!(untouched.revision, 0);
+                }
+            }
+        }
     }
     #[test]
     fn dependencies_order_assignment_and_project_state_still_gate_dispatch() {
