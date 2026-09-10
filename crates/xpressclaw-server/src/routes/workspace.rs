@@ -64,6 +64,7 @@ struct GithubRepositoryResolutionInput {
 struct TerminalQuery {
     columns: Option<u16>,
     rows: Option<u16>,
+    session: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -128,6 +129,18 @@ async fn workspace_status(
     require_same_origin(&headers)?;
     let root = workspace_root(&state, &agent_id).await?;
     let repository = repository_status_json(&state, &agent_id).await?;
+    let (agent, bootstrap) = agent_workspace(&state, &agent_id)?;
+    let container_root = if agent.runner.container_engine
+        == xpressclaw_core::config::ContainerEngineAccess::Host
+        && cfg!(unix)
+    {
+        root.clone()
+    } else {
+        PathBuf::from("/workspace").join(
+            root.strip_prefix(&bootstrap)
+                .map_err(|_| internal_error("Workspace is outside the bootstrap root"))?,
+        )
+    };
     let docker = state.docker().await;
     let container_exists = match docker.as_ref() {
         Some(docker) => docker.is_project_container(&agent_id).await,
@@ -140,6 +153,7 @@ async fn workspace_status(
     Ok(Json(json!({
         "agent_id": agent_id,
         "root": root.display().to_string(),
+        "container_root": container_root.display().to_string().replace('\\', "/"),
         "repository": repository,
         "container_exists": container_exists,
         "container_running": container_running,
@@ -872,6 +886,13 @@ async fn open_terminal(
     websocket: WebSocketUpgrade,
 ) -> ApiResult<Response> {
     require_same_origin(&headers)?;
+    let session = query.session.unwrap_or_else(|| "xpressclaw".into());
+    if !xpressclaw_core::docker::manager::valid_terminal_session_name(&session) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Invalid tmux session name",
+        ));
+    }
     let _ = workspace_root(&state, &agent_id).await?;
     let docker = state.docker().await.ok_or_else(|| {
         api_error(
@@ -885,12 +906,16 @@ async fn open_terminal(
             "run a task once to initialize this agent's retained environment",
         ));
     }
+    docker
+        .start_project_environment(&agent_id)
+        .await
+        .map_err(core_error)?;
+    docker.restore_forwards(&state.db, &agent_id).await;
     let columns = query.columns.unwrap_or(120).clamp(20, 500);
     let rows = query.rows.unwrap_or(32).clamp(5, 300);
-    Ok(
-        websocket
-            .on_upgrade(move |socket| terminal_socket(socket, docker, agent_id, columns, rows)),
-    )
+    Ok(websocket.on_upgrade(move |socket| {
+        terminal_socket(socket, docker, agent_id, columns, rows, session)
+    }))
 }
 
 async fn terminal_socket(
@@ -899,9 +924,13 @@ async fn terminal_socket(
     agent_id: String,
     columns: u16,
     rows: u16,
+    session: String,
 ) {
     let (mut sender, mut receiver) = socket.split();
-    let terminal = match docker.open_project_terminal(&agent_id, columns, rows).await {
+    let terminal = match docker
+        .open_project_terminal(&agent_id, columns, rows, &session)
+        .await
+    {
         Ok(terminal) => terminal,
         Err(error) => {
             let _ = sender
@@ -958,7 +987,7 @@ async fn terminal_socket(
                         if let Ok(control) = serde_json::from_str::<TerminalControl>(data.as_str()) {
                             if control.kind == "resize" {
                                 if let (Some(columns), Some(rows)) = (control.columns, control.rows) {
-                                    let _ = docker.resize_terminal(&exec_id, columns, rows).await;
+                                    let _ = docker.resize_terminal(&exec_id, columns.clamp(20, 500), rows.clamp(5, 300)).await;
                                 }
                             }
                         }
@@ -1207,7 +1236,7 @@ fn git_command_error(command: &str, output: &Output) -> ApiError {
 /// access are intentionally as powerful as local access to the project. Calls
 /// without an Origin header remain available to the desktop shell and trusted
 /// local API clients.
-fn require_same_origin(headers: &HeaderMap) -> ApiResult<()> {
+pub(super) fn require_same_origin(headers: &HeaderMap) -> ApiResult<()> {
     let Some(origin) = headers
         .get(header::ORIGIN)
         .and_then(|value| value.to_str().ok())

@@ -843,6 +843,7 @@ async fn execute_conversation_turn(
     let base = project_processes
         .get_or_start(&docker, &agent.name, &spec)
         .await?;
+    docker.restore_forwards(&db, &agent.name).await;
     let live = conversation_processes
         .get_or_start(
             &docker,
@@ -859,7 +860,7 @@ async fn execute_conversation_turn(
         .map(AcpSessionStart::Resume)
         .unwrap_or(AcpSessionStart::New);
     let previous_trigger_message_id = conversation_prompt_boundary(&queue, &turn, &session_start)?;
-    let prompt = build_conversation_prompt(
+    let content = build_conversation_prompt(
         &manager,
         &conversation,
         &turn,
@@ -867,6 +868,14 @@ async fn execute_conversation_turn(
         &session_start,
         previous_trigger_message_id,
     )?;
+    let mut prompt = AgentPrompt {
+        content,
+        attachments: conversation_prompt_attachments(&manager, &turn)?,
+    };
+    stage_prompt_files(&mut prompt, &container_workspace, |request| {
+        docker.container_files(&turn.agent_id, request)
+    })
+    .await?;
     turn_controls.begin_attempt(&turn.id);
     if !queue.is_running(&turn.id)? {
         turn_controls.finish_attempt(&turn.id);
@@ -910,7 +919,7 @@ async fn execute_conversation_turn(
             AcpTurnRuntime::for_conversation(recorder, elicitation_broker, turn_controls.clone()),
             session_start,
             Path::new(&container_workspace),
-            &prompt,
+            &prompt.content,
             AcpTurnOptions {
                 model: agent.runner.model.clone(),
                 session_config: agent.runner.session_config.clone(),
@@ -918,7 +927,7 @@ async fn execute_conversation_turn(
                 mcp_servers,
                 mcp_signature,
                 additional_directories: presentation_support.additional_directories,
-                image_attachments: vec![],
+                image_attachments: prompt.attachments,
             },
         )
         .await;
@@ -971,6 +980,30 @@ async fn execute_conversation_turn(
     );
     event_bus.send(&turn.conversation_id, ConversationEvent::Done);
     Ok(())
+}
+
+/// Materialize only the triggering message's attachments. Older history keeps
+/// download references so resuming a long conversation does not restage it all.
+fn conversation_prompt_attachments(
+    manager: &ConversationManager,
+    turn: &ConversationTurn,
+) -> Result<Vec<PromptImageAttachment>> {
+    let Some(message_id) = turn.trigger_message_id else {
+        return Ok(vec![]);
+    };
+    manager
+        .attachments(message_id)?
+        .into_iter()
+        .map(|attachment| {
+            let (attachment, data) =
+                manager.attachment_data(&turn.conversation_id, &attachment.id)?;
+            Ok(PromptImageAttachment {
+                name: attachment.name,
+                mime_type: attachment.mime_type,
+                data,
+            })
+        })
+        .collect()
 }
 
 fn build_conversation_prompt(
@@ -1415,6 +1448,7 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
     }
     let workload_id = agent.name.as_str();
     let live = processes.get_or_start(&docker, workload_id, &spec).await?;
+    docker.restore_forwards(&db, workload_id).await;
     if let Err(error) = sessions.set_container(attempt_id, &live.container_id) {
         processes.invalidate(workload_id, &live.process).await;
         let _ = docker.stop_preserving(workload_id).await;
@@ -1465,6 +1499,10 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
             warn!(%error, attempt_id, "failed to capture task Git baseline");
         }
     }
+    stage_prompt_files(&mut prompt, &container_workspace, |request| {
+        docker.container_files(workload_id, request)
+    })
+    .await?;
     let turn = live
         .process
         .run_turn(
@@ -1847,6 +1885,39 @@ pub fn resolve_runner_kind(agent: &AgentConfig) -> Result<String> {
 struct AgentPrompt {
     content: String,
     attachments: Vec<PromptImageAttachment>,
+}
+
+async fn stage_prompt_files<F, Fut>(
+    prompt: &mut AgentPrompt,
+    container_workspace: &str,
+    mut stage: F,
+) -> Result<()>
+where
+    F: FnMut(Value) -> Fut,
+    Fut: std::future::Future<Output = Result<Value>>,
+{
+    use crate::tasks::attachments::is_prompt_image;
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let mut images = Vec::new();
+    for attachment in std::mem::take(&mut prompt.attachments) {
+        if is_prompt_image(&attachment.mime_type) {
+            images.push(attachment);
+            continue;
+        }
+        let staged = stage(json!({
+            "operation": "stage",
+            "workspace": container_workspace,
+            "name": attachment.name,
+            "data": STANDARD.encode(&attachment.data),
+        }))
+        .await?;
+        let path = staged["path"]
+            .as_str()
+            .ok_or_else(|| Error::Task("Container did not return the staged upload path".into()))?;
+        prompt.content.push_str(&format!("\n\nAttached file (inspect with your file tools): {}\n", serde_json::json!({"name":attachment.name, "path":path, "mime_type":attachment.mime_type})));
+    }
+    prompt.attachments = images;
+    Ok(())
 }
 
 const PLAN_LIFECYCLE_GUIDANCE: &str = "<xpressclaw-plan-lifecycle>\n\
@@ -4066,6 +4137,47 @@ fn truncate(value: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn stages_non_image_uploads_outside_the_container_workspace() {
+        let mut prompt = super::AgentPrompt {
+            content: "Inspect uploads".into(),
+            attachments: vec![
+                super::PromptImageAttachment {
+                    name: "資料".repeat(100) + ".bin",
+                    mime_type: "application/octet-stream".into(),
+                    data: vec![0, 255, 1],
+                },
+                super::PromptImageAttachment {
+                    name: "image.png".into(),
+                    mime_type: "image/png".into(),
+                    data: vec![1, 2],
+                },
+            ],
+        };
+        let mut staged = Vec::new();
+        super::stage_prompt_files(&mut prompt, "/workspace/product", |request| {
+            staged.push(request);
+            std::future::ready(Ok(
+                serde_json::json!({"path":"/var/tmp/xpressclaw-uploads-test/upload.bin"}),
+            ))
+        })
+        .await
+        .unwrap();
+        assert_eq!(staged.len(), 1);
+        assert_eq!(staged[0]["operation"], "stage");
+        assert_eq!(staged[0]["workspace"], "/workspace/product");
+        assert_eq!(staged[0]["data"], "AP8B");
+        assert_eq!(prompt.attachments.len(), 1);
+        assert_eq!(prompt.attachments[0].mime_type, "image/png");
+        let metadata: serde_json::Value =
+            serde_json::from_str(&prompt.content[prompt.content.find('{').unwrap()..]).unwrap();
+        assert_eq!(
+            metadata["path"],
+            "/var/tmp/xpressclaw-uploads-test/upload.bin"
+        );
+        assert_eq!(metadata["mime_type"], "application/octet-stream");
+        assert_eq!(metadata["name"], "資料".repeat(100) + ".bin");
+    }
     use super::*;
 
     fn run_git(repository: &Path, arguments: &[&str]) {
@@ -4398,8 +4510,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn conversation_prompt_stops_at_its_claimed_trigger_and_explains_reply_delivery() {
+    #[tokio::test]
+    async fn conversation_prompt_stops_at_its_claimed_trigger_and_explains_reply_delivery() {
         let db = Arc::new(Database::open_memory().unwrap());
         db.with_conn(|conn| {
             conn.execute(
@@ -4505,6 +4617,50 @@ mod tests {
             "Reserve send_conversation_message for genuine interim updates or publishing workspace files while you continue working."
         ));
         assert!(prompt.contains("Never use the tool to duplicate your final response."));
+
+        manager
+            .add_attachment(first.id, "old.pdf", "application/pdf", b"old", None)
+            .unwrap();
+        manager
+            .add_attachment(
+                trigger.id,
+                "input.pdf",
+                "application/pdf",
+                b"%PDF-1.7",
+                None,
+            )
+            .unwrap();
+        manager
+            .add_attachment(
+                trigger.id,
+                "image.png",
+                "image/png",
+                b"\x89PNG\r\n\x1a\n",
+                None,
+            )
+            .unwrap();
+        let mut attached_prompt = AgentPrompt {
+            content: prompt,
+            attachments: conversation_prompt_attachments(&manager, &turn).unwrap(),
+        };
+        let mut staged = vec![];
+        stage_prompt_files(&mut attached_prompt, "/workspace/product", |request| {
+            staged.push(request);
+            std::future::ready(Ok(
+                json!({"path":"/var/tmp/xpressclaw-uploads-test/input.pdf"}),
+            ))
+        })
+        .await
+        .unwrap();
+        assert_eq!(staged.len(), 1);
+        assert_eq!(staged[0]["name"], "input.pdf");
+        assert_eq!(staged[0]["data"], "JVBERi0xLjc=");
+        assert!(attached_prompt
+            .content
+            .contains("/var/tmp/xpressclaw-uploads-test/input.pdf"));
+        assert_eq!(attached_prompt.attachments.len(), 1);
+        assert_eq!(attached_prompt.attachments[0].mime_type, "image/png");
+        assert_eq!(attached_prompt.attachments[0].name, "image.png");
 
         db.with_conn(|conn| {
             conn.execute(

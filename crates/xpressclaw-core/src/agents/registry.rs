@@ -296,6 +296,10 @@ impl AgentRegistry {
                 [agent_id],
             )?;
             transaction.execute("DELETE FROM schedules WHERE agent_id = ?1", [agent_id])?;
+            transaction.execute(
+                "DELETE FROM config WHERE key = ?1",
+                [format!("port_forwards:{agent_id}")],
+            )?;
             transaction.execute("DELETE FROM agents WHERE id = ?1", [agent_id])?;
             transaction.commit()
         })?;

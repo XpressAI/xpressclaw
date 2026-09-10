@@ -1035,6 +1035,7 @@ impl ProjectManager {
                        (SELECT id FROM agents WHERE project_id = ?1)",
                 [id],
             )?;
+            transaction.execute("DELETE FROM config WHERE key IN (SELECT 'port_forwards:' || id FROM agents WHERE project_id = ?1)", [id])?;
             transaction.execute("DELETE FROM agents WHERE project_id = ?1", [id])?;
             transaction.execute(
                 "DELETE FROM project_memory_notes WHERE project_id = ?1",

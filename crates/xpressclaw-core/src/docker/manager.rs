@@ -191,6 +191,10 @@ pub struct ContainerOutput {
 
 /// Manages Docker/Podman containers for agent isolation.
 pub struct DockerManager {
+    /// Serializes mapping changes and restoration independently for each Agent.
+    pub(crate) forwarding_lifecycle: super::environment::ForwardingLifecycle,
+    pub(crate) forwards:
+        tokio::sync::Mutex<HashMap<String, std::sync::Arc<super::environment::AgentForwards>>>,
     docker: Docker,
     rootless: bool,
     socket_path: Option<PathBuf>,
@@ -293,6 +297,8 @@ impl DockerManager {
             "connected to container runtime"
         );
         Ok(Self {
+            forwarding_lifecycle: Default::default(),
+            forwards: Default::default(),
             docker,
             rootless,
             socket_path,
@@ -713,6 +719,7 @@ impl DockerManager {
 
     /// Stop an Agent container without deleting its writable layer.
     pub async fn stop_preserving(&self, agent_id: &str) -> Result<()> {
+        self.stop_agent_forwards(agent_id).await;
         let container_name = self.owned_project_container_name(agent_id)?;
         if !self.is_container_running(&container_name).await {
             return Ok(());
@@ -752,6 +759,7 @@ impl DockerManager {
     /// inspect failures are reported instead of being mistaken for absence.
     /// A same-named container without matching ownership labels is preserved.
     pub async fn remove_owned_workload(&self, agent_id: &str) -> Result<()> {
+        self.stop_agent_forwards(agent_id).await;
         let mut candidates = Vec::with_capacity(2);
         if let Some(installation_id) = self.installation_id.as_deref() {
             candidates.push(project_container_name(installation_id, agent_id));
@@ -858,7 +866,13 @@ impl DockerManager {
         agent_id: &str,
         columns: u16,
         rows: u16,
+        session: &str,
     ) -> Result<TerminalSession> {
+        if !valid_terminal_session_name(session) {
+            return Err(Error::Container(
+                "Session names must contain 1–64 letters, digits, underscores or hyphens".into(),
+            ));
+        }
         let installation_id = self.installation_id()?;
         let container_name = project_container_name(installation_id, agent_id);
         let container = self.inspect_by_name(&container_name).await.ok_or_else(|| {
@@ -909,12 +923,7 @@ impl DockerManager {
                         "TERM=xterm-256color".to_string(),
                         "COLORTERM=truecolor".to_string(),
                     ]),
-                    cmd: Some(vec![
-                        "/bin/sh".to_string(),
-                        "-lc".to_string(),
-                        "if command -v bash >/dev/null 2>&1; then exec bash -l; else exec sh -l; fi"
-                            .to_string(),
-                    ]),
+                    cmd: Some(vec!["/bin/sh".into(), "-c".into(), "if command -v tmux >/dev/null 2>&1; then exec tmux new-session -A -s \"$1\"; else printf 'tmux is unavailable in this image. Rebuild it with tmux for persistent shared sessions.\\n'; if command -v bash >/dev/null 2>&1; then exec bash -l; else exec sh -l; fi; fi".into(), "xpressclaw-terminal".into(), session.into()]),
                     ..Default::default()
                 },
             )
@@ -944,6 +953,26 @@ impl DockerManager {
         };
         let _ = self.resize_terminal(&session.exec_id, columns, rows).await;
         Ok(session)
+    }
+
+    pub async fn start_project_environment(&self, agent_id: &str) -> Result<()> {
+        if !self.is_project_container(agent_id).await {
+            return Err(Error::ContainerNotFound {
+                id: format!(
+                    "retained environment for {agent_id}; run a task once to initialize it"
+                ),
+            });
+        }
+        let name = self.owned_project_container_name(agent_id)?;
+        if !self.is_container_running(&name).await {
+            self.docker
+                .start_container::<String>(&name, None)
+                .await
+                .map_err(|error| {
+                    Error::Container(format!("Failed to restart retained environment: {error}"))
+                })?;
+        }
+        Ok(())
     }
 
     /// Start another non-TTY ACP process inside a retained Agent container.
@@ -1056,6 +1085,7 @@ impl DockerManager {
 
     /// Stop and remove an agent container.
     pub async fn stop(&self, agent_id: &str) -> Result<()> {
+        self.stop_agent_forwards(agent_id).await;
         let retained_name = self.owned_project_container_name(agent_id).ok();
         let container_name = match retained_name {
             Some(name) if self.inspect_by_name(&name).await.is_some() => name,
@@ -1505,6 +1535,14 @@ impl DockerManager {
     }
 }
 
+pub fn valid_terminal_session_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
+}
+
 fn configured_unix_socket() -> Option<PathBuf> {
     if let Some(host) = std::env::var_os("DOCKER_HOST") {
         return unix_socket_from_host(&host.to_string_lossy());
@@ -1776,6 +1814,28 @@ fn recorded_container_id_matches(actual_id: Option<&str>, recorded_id: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_session_names_accept_only_bounded_ascii_identifiers() {
+        for name in ["xpressclaw", "login_2-test", "0", &"a".repeat(64)] {
+            assert!(valid_terminal_session_name(name), "{name:?}");
+        }
+        for name in [
+            "",
+            "two words",
+            "a.b",
+            "a:b",
+            "a/b",
+            "a\nb",
+            "\0",
+            "$(id)",
+            ";id",
+            "ログイン",
+            &"a".repeat(65),
+        ] {
+            assert!(!valid_terminal_session_name(name), "{name:?}");
+        }
+    }
 
     #[tokio::test]
     async fn test_connect() {

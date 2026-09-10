@@ -9,7 +9,7 @@ LABEL io.xpressclaw.protocol="acp-xpressclaw-v2" \
     io.xpressclaw.runner.version="${RUNNER_VERSION}"
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates gh git openssh-client ripgrep \
+    && apt-get install -y --no-install-recommends ca-certificates gh git openssh-client ripgrep tmux \
     && rm -rf /var/lib/apt/lists/* \
     && install -d /opt/xpressclaw/libexec \
     && mv /usr/bin/gh /opt/xpressclaw/libexec/gh \

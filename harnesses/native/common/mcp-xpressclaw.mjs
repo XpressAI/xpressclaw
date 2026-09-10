@@ -23,13 +23,41 @@ const LOCAL_COLLABORATION = process.env.XPRESSCLAW_LOCAL_COLLABORATION === '1';
 const COLLABORATION_TOKEN = process.env.XPRESSCLAW_COLLABORATION_TOKEN ?? '';
 const execFile = promisify(execFileCallback);
 
-const INSTRUCTIONS = `Use schedule_wakeup whenever work must pause and resume later.
+const INSTRUCTIONS = `Container paths such as /tmp are not user download links. Use publish_task_files for task deliverables, or send_conversation_message with files for conversation deliverables. Both support files and folder archives. Users can browse the container and download larger folders from Files → Container. Use forward_port for a host-local LLM and expose_port for a container server. For shared interactive logins, run tmux new-session -s NAME; the user can join NAME from the Files terminal.\n\nUse schedule_wakeup whenever work must pause and resume later.
 
 The wake-up is stored by XpressClaw, survives control-plane restarts, and starts exactly one future turn in this project's existing ACP conversation. After it is armed, end the current turn instead of sleeping, polling, or claiming that an OS timer can initiate a model turn.
 
 XpressClaw also provides durable, project-scoped memory. Read memory://project/briefing or call get_project_memory_index near the start of work that depends on project conventions or prior decisions. Search before making a project-wide choice. Store only durable, reusable knowledge as an atomic note; do not use memory as a task log. Typed links are explicit claims, while vector similarity is only a retrieval aid.${CONVERSATION_ID ? '\n\nThis turn is linked to a project conversation. Your normal final response is automatically delivered to this project conversation; use it for your one final reply. Reserve send_conversation_message for genuine interim updates or publishing workspace files while you continue working. Never use the tool to duplicate your final response. Use download_conversation_attachment to inspect files people or other Agents published, and create_conversation_task when substantial work should continue independently.' : ''}`;
 
 export const TOOLS = [
+  {
+    name: 'create_task',
+    description: 'Create durable work in the current project, optionally assigned to another Agent in this project. Defaults to the current task as parent; unfinished child tasks block the parent from completing.',
+    inputSchema: { type: 'object', properties: { title: { type: 'string', minLength: 1 }, description: { type: 'string' }, agent_id: { type: 'string' }, parent_task_id: { type: 'string' }, priority: { type: 'integer' } }, required: ['title'], additionalProperties: false },
+  },
+  {
+    name: 'forward_port',
+    description: 'Forward TCP between this container and the machine running XpressClaw. host_to_container makes host 127.0.0.1:host_port available at container 127.0.0.1:container_port (for example a local LLM). container_to_host exposes a container server on host loopback. Mappings persist across environment restarts. Another Agent can reach an exposed server by forwarding its host port into their own container.',
+    inputSchema: { type: 'object', properties: { direction: { type: 'string', enum: ['host_to_container', 'container_to_host'] }, host_port: { type: 'integer', minimum: 1, maximum: 65535 }, container_port: { type: 'integer', minimum: 1, maximum: 65535 } }, required: ['direction', 'host_port', 'container_port'], additionalProperties: false },
+  },
+  {
+    name: 'expose_port',
+    description: 'Expose a server listening on container loopback to the user at host 127.0.0.1:host_port. Defaults to using the same host and container port. Returns the address and whether the bridge is active.',
+    inputSchema: { type: 'object', properties: { container_port: { type: 'integer', minimum: 1, maximum: 65535 }, host_port: { type: 'integer', minimum: 1, maximum: 65535 } }, required: ['container_port'], additionalProperties: false },
+  },
+  {
+    name: 'list_port_forwards', description: 'List this Agent’s saved port forwards and their live status.',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+  },
+  {
+    name: 'remove_port_forward', description: 'Stop and remove a saved port forward belonging to this Agent.',
+    inputSchema: { type: 'object', properties: { id: { type: 'string', minLength: 1 } }, required: ['id'], additionalProperties: false },
+  },
+  ...(TASK_ID ? [{
+    name: 'publish_task_files',
+    description: 'Copy files or whole folders from this container into durable downloadable attachments on the current task. Absolute paths including /tmp are supported; relative paths resolve from the working directory. Folders become .tar.gz archives. Up to 8 items and 20 MiB total; use the Files tab for larger downloads. Use this instead of giving the user inaccessible container paths.',
+    inputSchema: { type: 'object', properties: { files: { type: 'array', items: { type: 'string', minLength: 1 }, minItems: 1, maxItems: 8 }, content: { type: 'string' } }, required: ['files'], additionalProperties: false },
+  }] : []),
   {
     name: 'schedule_wakeup',
     description: 'Schedule exactly one future turn in the current project conversation. Provide either a relative delay or an absolute RFC 3339 timestamp. Use this instead of shell sleep, polling, or a sentinel-only timer.',
@@ -291,7 +319,7 @@ export const TOOLS = [
   ...(CONVERSATION_ID ? [
     {
       name: 'send_conversation_message',
-      description: 'Send a genuine interim update or publish workspace files to the current XpressClaw conversation while continuing work. Your normal final response is delivered automatically; never use this tool to duplicate it.',
+      description: 'Send a genuine interim update or publish container files or folders to the current XpressClaw conversation while continuing work. Your normal final response is delivered automatically; never use this tool to duplicate it.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -839,11 +867,14 @@ async function conversationAttachment(filename) {
 	const workspace = await realpath(process.env.XPRESSCLAW_WORKSPACE ?? '/workspace');
   const requested = path.isAbsolute(filename) ? filename : path.join(workspace, filename);
   const resolved = await realpath(requested);
-  if (resolved !== workspace && !resolved.startsWith(`${workspace}${path.sep}`)) {
-    throw new Error(`conversation files must be inside /workspace: ${filename}`);
-  }
+  if (['/proc', '/sys', '/dev'].some(root => resolved === root || resolved.startsWith(root + '/'))) throw new Error('Cannot publish device or kernel files');
   const details = await stat(resolved);
-  if (!details.isFile()) throw new Error(`conversation attachment is not a regular file: ${filename}`);
+  if (details.isDirectory()) {
+    if (resolved === '/') throw new Error('Choose a folder below the container root');
+    const { stdout } = await execFile('tar', ['-czf', '-', '-C', path.dirname(resolved), '--', path.basename(resolved)], { encoding: 'buffer', maxBuffer: 20 * 1024 * 1024, timeout: 60000 });
+    return { name: path.basename(resolved) + '.tar.gz', mime_type: 'application/gzip', data: stdout.toString('base64') };
+  }
+  if (!details.isFile()) throw new Error('Attachment is not a regular file');
   if (details.size > 20 * 1024 * 1024) throw new Error(`conversation attachment exceeds 20 MiB: ${filename}`);
   const data = await readFile(resolved);
   return {
@@ -1101,6 +1132,17 @@ export async function runManagedGitPush({
 }
 
 async function callTool(name, argumentsValue) {
+  const environmentPath = `/api/environments/${encodeURIComponent(AGENT_ID)}`;
+  if (name === 'create_task') return api(`${environmentPath}/tasks`, { method: 'POST', body: JSON.stringify({ ...argumentsValue, parent_task_id: argumentsValue?.parent_task_id ?? (TASK_ID || undefined) }) });
+  if (name === 'forward_port') return api(`${environmentPath}/ports`, { method: 'POST', body: JSON.stringify(argumentsValue) });
+  if (name === 'expose_port') return api(`${environmentPath}/ports`, { method: 'POST', body: JSON.stringify({ direction: 'container_to_host', container_port: argumentsValue?.container_port, host_port: argumentsValue?.host_port ?? argumentsValue?.container_port }) });
+  if (name === 'list_port_forwards') return api(`${environmentPath}/ports`);
+  if (name === 'remove_port_forward') return api(`${environmentPath}/ports/${encodeURIComponent(argumentsValue?.id ?? '')}`, { method: 'DELETE' });
+  if (name === 'publish_task_files') {
+    if (!TASK_ID) throw new Error('This turn has no task');
+    if (!Array.isArray(argumentsValue?.files)) throw new Error('files is required');
+    return api(`${environmentPath}/tasks/${encodeURIComponent(TASK_ID)}/files`, { method: 'POST', body: JSON.stringify({ content: argumentsValue.content ?? '', files: argumentsValue.files.map(file => path.resolve(file)) }) });
+  }
   if (name === 'schedule_wakeup') return scheduleWakeup(argumentsValue);
   if (name === 'list_wakeups') return { wakeups: await wakeups() };
   if (name === 'cancel_wakeup') return cancelWakeup(argumentsValue);

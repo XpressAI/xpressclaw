@@ -113,7 +113,14 @@ jobs:
         run: bash build.sh --skip-tauri --skip-docker --skip-check
 
       - name: Test native control-plane MCP servers
-        run: node --test harnesses/native/common/mcp-xpressclaw.test.mjs harnesses/native/common/mcp-github.test.mjs
+        run: node --test harnesses/native/common/*.test.mjs
+
+      - name: Test retained container access
+        run: |
+          docker build -f crates/xpressclaw-core/tests/fixtures/environment.Dockerfile -t xpressclaw-environment-test:local crates/xpressclaw-core/tests/fixtures
+          test_name=docker::environment::tests::retained_environment_roundtrip
+          cargo test -p xpressclaw-core --lib "$test_name" -- --ignored --exact --list | grep -Fx "$test_name: test"
+          XPRESSCLAW_ENVIRONMENT_TEST_IMAGE=xpressclaw-environment-test:local cargo test -p xpressclaw-core --lib "$test_name" -- --ignored --exact --nocapture
 
       - name: Clippy
         run: cargo clippy -p xpressclaw-core -p xpressclaw-server -p xpressclaw-cli -p xpressclaw-tauri --all-targets -- -D warnings

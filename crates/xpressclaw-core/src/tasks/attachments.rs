@@ -8,7 +8,7 @@ pub const MAX_TOTAL_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 
 const ALLOWED_IMAGE_TYPES: &[&str] = &["image/png", "image/jpeg", "image/gif", "image/webp"];
 
-/// Base64 image submitted by an API client.
+/// Base64 attachment submitted by an API client (legacy type name).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ImageAttachmentInput {
     #[serde(default)]
@@ -18,7 +18,7 @@ pub struct ImageAttachmentInput {
     pub data: String,
 }
 
-/// Validated image bytes ready to persist with a task message.
+/// Validated attachment bytes ready to persist with a task message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedImageAttachment {
     pub name: String,
@@ -30,48 +30,70 @@ pub struct DecodedImageAttachment {
 pub fn decode_image_attachments(
     attachments: &[ImageAttachmentInput],
 ) -> std::result::Result<Vec<DecodedImageAttachment>, String> {
+    if let Some(attachment) = attachments
+        .iter()
+        .find(|attachment| !ALLOWED_IMAGE_TYPES.contains(&attachment.mime_type.as_str()))
+    {
+        return Err(format!("unsupported image type '{}'", attachment.mime_type));
+    }
+    decode_attachments(attachments)
+}
+
+/// Decode uploads of any file type; only supported raster formats become ACP images.
+pub fn decode_attachments(
+    attachments: &[ImageAttachmentInput],
+) -> std::result::Result<Vec<DecodedImageAttachment>, String> {
     if attachments.len() > MAX_IMAGES_PER_MESSAGE {
         return Err(format!(
-            "a message can include at most {MAX_IMAGES_PER_MESSAGE} images"
+            "a message can include at most {MAX_IMAGES_PER_MESSAGE} files"
         ));
     }
 
     let mut total_size = 0usize;
     let mut decoded = Vec::with_capacity(attachments.len());
     for attachment in attachments {
-        if !ALLOWED_IMAGE_TYPES.contains(&attachment.mime_type.as_str()) {
-            return Err(format!(
-                "unsupported image type '{}'; use PNG, JPEG, GIF, or WebP",
-                attachment.mime_type
-            ));
+        if attachment.mime_type.len() > 128
+            || !attachment.mime_type.contains('/')
+            || !attachment
+                .mime_type
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"/!#$&^_.+-".contains(&byte))
+        {
+            return Err("invalid attachment MIME type".into());
         }
+        let image = is_prompt_image(&attachment.mime_type);
+        let limit = if image {
+            MAX_IMAGE_BYTES
+        } else {
+            MAX_TOTAL_IMAGE_BYTES
+        };
         if attachment.name.chars().count() > 255 {
-            return Err("image filename cannot exceed 255 characters".to_string());
+            return Err("attachment filename cannot exceed 255 characters".to_string());
         }
 
         // Reject oversized encoded values before allocating their decoded form.
-        let max_encoded_len = MAX_IMAGE_BYTES.div_ceil(3) * 4 + 4;
+        let max_encoded_len = limit.div_ceil(3) * 4 + 4;
         if attachment.data.len() > max_encoded_len {
             return Err(format!(
-                "image '{}' exceeds the {} MiB limit",
+                "attachment '{}' exceeds the {} MiB limit",
                 display_name(&attachment.name),
-                MAX_IMAGE_BYTES / 1024 / 1024
+                limit / 1024 / 1024
             ));
         }
         let data = STANDARD.decode(&attachment.data).map_err(|_| {
             format!(
-                "image '{}' does not contain valid base64 data",
+                "attachment '{}' does not contain valid base64 data",
                 display_name(&attachment.name)
             )
         })?;
-        if data.len() > MAX_IMAGE_BYTES {
+        if data.len() > limit {
             return Err(format!(
-                "image '{}' exceeds the {} MiB limit",
+                "attachment '{}' exceeds the {} MiB limit",
                 display_name(&attachment.name),
-                MAX_IMAGE_BYTES / 1024 / 1024
+                limit / 1024 / 1024
             ));
         }
-        if !matches_image_signature(&attachment.mime_type, &data) {
+        if image && !matches_image_signature(&attachment.mime_type, &data) {
             return Err(format!(
                 "image '{}' does not match its declared {} type",
                 display_name(&attachment.name),
@@ -82,7 +104,7 @@ pub fn decode_image_attachments(
         total_size = total_size.saturating_add(data.len());
         if total_size > MAX_TOTAL_IMAGE_BYTES {
             return Err(format!(
-                "images in one message cannot exceed {} MiB in total",
+                "files in one message cannot exceed {} MiB in total",
                 MAX_TOTAL_IMAGE_BYTES / 1024 / 1024
             ));
         }
@@ -93,6 +115,10 @@ pub fn decode_image_attachments(
         });
     }
     Ok(decoded)
+}
+
+pub fn is_prompt_image(mime_type: &str) -> bool {
+    ALLOWED_IMAGE_TYPES.contains(&mime_type)
 }
 
 fn display_name(name: &str) -> &str {
@@ -145,5 +171,39 @@ mod tests {
         assert!(decode_image_attachments(&too_many)
             .unwrap_err()
             .contains("at most"));
+    }
+
+    #[test]
+    fn general_files_preserve_bytes_and_validate_mime_headers() {
+        let mut file = ImageAttachmentInput {
+            name: "data.bin".into(),
+            mime_type: "application/octet-stream".into(),
+            data: STANDARD.encode([0, 255, 1]),
+        };
+        assert_eq!(
+            decode_attachments(&[file.clone()]).unwrap()[0].data,
+            [0, 255, 1]
+        );
+        assert!(decode_image_attachments(&[file.clone()]).is_err());
+        file.mime_type = "text/plain\r\nx-injected: yes".into();
+        assert!(decode_attachments(&[file]).is_err());
+        assert!(!is_prompt_image("image/svg+xml"));
+    }
+
+    #[test]
+    fn file_validation_errors_describe_attachments() {
+        let mut file = ImageAttachmentInput {
+            name: "report.pdf".into(),
+            mime_type: "application/pdf".into(),
+            data: "invalid!".into(),
+        };
+        let error = decode_attachments(&[file.clone()]).unwrap_err();
+        assert!(error.contains("attachment 'report.pdf'"));
+        assert!(!error.contains("image"));
+        file.name = "a".repeat(256);
+        assert_eq!(
+            decode_attachments(&[file]).unwrap_err(),
+            "attachment filename cannot exceed 255 characters"
+        );
     }
 }

@@ -12,28 +12,30 @@ const allowedTypes = new Set(IMAGE_FILE_ACCEPT.split(','));
 export async function appendImageFiles(
 	current: ImageAttachmentUpload[],
 	files: File[],
+	allowFiles = false,
 ): Promise<ImageAttachmentUpload[]> {
 	if (files.length === 0) return current;
 	if (current.length + files.length > MAX_IMAGE_ATTACHMENTS) {
-		throw new Error(`You can attach up to ${MAX_IMAGE_ATTACHMENTS} images.`);
+		throw new Error(`You can attach up to ${MAX_IMAGE_ATTACHMENTS} files.`);
 	}
 	for (const file of files) {
-		if (!allowedTypes.has(file.type)) {
+		if (!allowFiles && !allowedTypes.has(file.type)) {
 			throw new Error(`${file.name || 'This file'} is not a PNG, JPEG, GIF, or WebP image.`);
 		}
-		if (file.size > MAX_IMAGE_BYTES) {
-			throw new Error(`${file.name || 'This image'} is larger than 5 MiB.`);
+		const limit = allowedTypes.has(file.type) ? MAX_IMAGE_BYTES : MAX_TOTAL_IMAGE_BYTES;
+		if (file.size > limit) {
+			throw new Error(`${file.name || 'This file'} is larger than ${limit / 1024 / 1024} MiB.`);
 		}
 	}
 	const currentSize = current.reduce((total, attachment) => total + decodedSize(attachment.data), 0);
 	const addedSize = files.reduce((total, file) => total + file.size, 0);
 	if (currentSize + addedSize > MAX_TOTAL_IMAGE_BYTES) {
-		throw new Error('Images in one message cannot exceed 20 MiB in total.');
+		throw new Error('Files in one message cannot exceed 20 MiB in total.');
 	}
 
 	const additions = await Promise.all(files.map(async (file): Promise<ImageAttachmentUpload> => ({
 		name: file.name || `pasted-image.${extensionFor(file.type)}`,
-		mime_type: file.type,
+		mime_type: file.type || 'application/octet-stream',
 		data: await fileAsBase64(file),
 	})));
 	return [...current, ...additions];
