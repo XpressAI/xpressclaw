@@ -111,9 +111,7 @@ async fn active_docker(
         .start_project_environment(agent_id)
         .await
         .map_err(bad)?;
-    if let Err(error) = docker.restore_forwards(&state.db, agent_id).await {
-        tracing::warn!(%agent_id, %error, "could not restore a port forward while opening environment files");
-    }
+    docker.restore_forwards(&state.db, agent_id).await;
     Ok(docker)
 }
 

@@ -191,12 +191,22 @@ impl DockerManager {
         }
     }
 
-    pub async fn restore_forwards(&self, db: &Database, agent_id: &str) -> Result<()> {
+    /// Saved forwards are optional runtime services; a conflict must not block
+    /// an Agent turn or prevent other mappings from being restored.
+    pub async fn restore_forwards(&self, db: &Database, agent_id: &str) {
         let _lock = self.forwarding_lifecycle.lock().await;
-        for forward in saved_forwards(db, agent_id)? {
-            self.start_forward(agent_id, &forward).await?;
+        let forwards = match saved_forwards(db, agent_id) {
+            Ok(forwards) => forwards,
+            Err(error) => {
+                tracing::warn!(%agent_id, %error, "could not load saved port forwards");
+                return;
+            }
+        };
+        for forward in forwards {
+            if let Err(error) = self.start_forward(agent_id, &forward).await {
+                tracing::warn!(%agent_id, forward_id = %forward.id, host_port = forward.host_port, container_port = forward.container_port, %error, "saved port forward is inactive; continuing with the environment");
+            }
         }
-        Ok(())
     }
 
     pub async fn start_forward(&self, agent_id: &str, spec: &PortForward) -> Result<()> {
@@ -564,6 +574,12 @@ mod tests {
             assert_eq!(archive["name"], "artifacts.tar.gz");
             assert!(!STANDARD.decode(archive["data"].as_str().unwrap()).unwrap().is_empty());
 
+            let staged = docker.container_files("loopback", json!({"operation":"stage", "workspace":"/tmp", "name":"input.bin", "data":STANDARD.encode([0, 255, 1])})).await.unwrap();
+            let staged_path = staged["path"].as_str().unwrap();
+            assert!(staged_path.starts_with("/var/tmp/xpressclaw-uploads-"));
+            let upload = docker.container_files("loopback", json!({"operation":"download", "path":staged_path})).await.unwrap();
+            assert_eq!(STANDARD.decode(upload["data"].as_str().unwrap()).unwrap(), [0, 255, 1]);
+
             let mut first = docker.open_project_terminal("loopback", 100, 30, "shared").await.unwrap();
             first.input.write_all(b"export XC_SHARED_LOGIN=ready; printf started > /tmp/shared-started\r").await.unwrap();
             for _ in 0..50 {
@@ -590,8 +606,18 @@ mod tests {
             assert!(!docker.forward_active("loopback", "llm").await);
             let retained = docker.container_files("loopback", json!({"operation":"read", "path":"/tmp/artifacts/report.txt"})).await.unwrap();
             assert_eq!(retained["content"], "saved outside workspace");
-            docker.restore_forwards(&db, "loopback").await.unwrap();
+            let available = TcpListener::bind(("127.0.0.1", outbound.host_port)).await.unwrap();
+            let occupied = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            drop(available);
+            let unavailable = PortForward { id: "unavailable".into(), host_port: occupied.local_addr().unwrap().port(), ..outbound.clone() };
+            save_forwards(&db, "loopback", &[unavailable.clone(), outbound.clone()]).unwrap();
+            docker.restore_forwards(&db, "loopback").await;
+            assert!(!docker.forward_active("loopback", "unavailable").await);
             assert!(docker.forward_active("loopback", "preview").await);
+            assert_eq!(capture(&docker, "console.log('turn can run')").await.trim(), "turn can run");
+            drop(occupied);
+            docker.restore_forwards(&db, "loopback").await;
+            assert!(docker.forward_active("loopback", "unavailable").await);
         }).catch_unwind().await;
         docker.stop("loopback").await.unwrap();
         if let Err(panic) = result {

@@ -21,7 +21,9 @@ Agent prompt and when the environment is opened through Files or Terminal.
 Adding a mapping to a running container applies it immediately. Removing it
 stops the bridge and forgets the mapping. A stopped or recreated container
 gets its mappings back when started through XpressClaw. An occupied listening
-port is reported as an error. Services can remain bound to `127.0.0.1`.
+port is reported as an error when adding a mapping. On restoration, a failed
+mapping stays inactive and its error is logged; other mappings and Agent turns
+continue. Services can remain bound to `127.0.0.1`.
 
 ## Share a container server
 
@@ -71,8 +73,11 @@ workspace. Larger output directories can be downloaded from Files.
 
 Task chat accepts up to five uploaded files with a 20 MiB aggregate limit.
 Supported raster images keep their 5 MiB per-image limit and are sent as ACP
-images. Other files are staged in a private file under the mounted workspace;
-the Agent receives its container path and original filename in the prompt.
+images. Other files are staged in private temporary directories inside the
+retained container, outside its workspace, so Git status and `git add -A` cannot
+include them. The Agent receives the container path and original filename in
+the prompt. Staged copies remain until the container is removed; the original
+task attachments remain downloadable from the task.
 
 The native XpressClaw MCP now exposes `create_task`. It defaults to the current
 task as parent; explicit unfinished child tasks block that parent from

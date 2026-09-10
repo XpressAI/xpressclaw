@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdtemp, readFile, rm, writeFile, symlink, mkdir } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile, symlink, mkdir, stat, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -20,6 +20,36 @@ async function files(request) {
   assert.equal(code, 0);
   return JSON.parse(Buffer.concat(chunks).toString());
 }
+
+test('uploads stay private and outside Git even without ignore rules', { timeout: 10000 }, async () => {
+  const workspace = await mkdtemp(path.join(tmpdir(), 'xpressclaw-upload-repository-'));
+  const stagedDirectories = [];
+  try {
+    execFileSync('git', ['init', '-q', workspace]);
+    const data = Buffer.alloc(6 * 1024 * 1024, 255);
+    const staged = await files({ operation: 'stage', workspace, name: '資料'.repeat(100) + '.bin', data: data.toString('base64') });
+    assert.ifError(staged.error);
+    stagedDirectories.push(path.dirname(staged.path));
+    assert.ok(!staged.path.startsWith((await realpath(workspace)) + path.sep));
+    assert.ok(Buffer.byteLength(path.basename(staged.path)) <= 180);
+    assert.deepEqual(await readFile(staged.path), data);
+    assert.equal((await stat(staged.path)).mode & 0o777, 0o600);
+    assert.equal((await stat(path.dirname(staged.path))).mode & 0o777, 0o700);
+    execFileSync('git', ['-C', workspace, 'add', '-A']);
+    assert.equal(execFileSync('git', ['-C', workspace, 'status', '--porcelain'], { encoding: 'utf8' }), '');
+    assert.equal(execFileSync('git', ['-C', workspace, 'ls-files'], { encoding: 'utf8' }), '');
+
+    const fallback = await files({ operation: 'stage', workspace: '/var/tmp', name: '../input.txt', data: 'aGVsbG8=' });
+    assert.ifError(fallback.error);
+    stagedDirectories.push(path.dirname(fallback.path));
+    assert.ok(!fallback.path.startsWith((await realpath('/var/tmp')) + path.sep));
+    assert.equal(await readFile(fallback.path, 'utf8'), 'hello');
+    assert.match((await files({ operation: 'stage', workspace: '/', name: 'input', data: '' })).error, /outside/);
+  } finally {
+    for (const directory of stagedDirectories) await rm(directory, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
 
 test('container files support binary downloads, archives, UTF-8 edits and revision conflicts', { timeout: 10000 }, async () => {
   const directory = await mkdtemp(path.join(tmpdir(), 'xpressclaw-files-'));

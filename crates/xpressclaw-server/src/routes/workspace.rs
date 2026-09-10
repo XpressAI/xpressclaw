@@ -903,9 +903,7 @@ async fn open_terminal(
         .start_project_environment(&agent_id)
         .await
         .map_err(core_error)?;
-    if let Err(error) = docker.restore_forwards(&state.db, &agent_id).await {
-        tracing::warn!(%agent_id, %error, "could not restore a port forward while opening the terminal");
-    }
+    docker.restore_forwards(&state.db, &agent_id).await;
     let columns = query.columns.unwrap_or(120).clamp(20, 500);
     let rows = query.rows.unwrap_or(32).clamp(5, 300);
     let session = query.session.unwrap_or_else(|| "xpressclaw".into());

@@ -8,10 +8,38 @@ const { promisify } = require('node:util');
 const hash = data => crypto.createHash('sha256').update(data).digest('hex');
 const MAX_FILE = 4 * 1024 * 1024;
 const MAX_DOWNLOAD = 100 * 1024 * 1024;
+const MAX_UPLOAD = 20 * 1024 * 1024;
 function mime(filename) {
   return ({ '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp', '.pdf': 'application/pdf', '.txt': 'text/plain', '.md': 'text/markdown', '.json': 'application/json', '.csv': 'text/csv', '.zip': 'application/zip', '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation', '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })[path.extname(filename).toLowerCase()] ?? 'application/octet-stream';
 }
 async function main(input) {
+  if (input.operation === 'stage') {
+    const workspace = await fs.realpath(input.workspace);
+    if (typeof input.data !== 'string' || input.data.length > Math.ceil(MAX_UPLOAD / 3) * 4) throw new Error('Upload exceeds 20 MiB');
+    const data = Buffer.from(input.data, 'base64');
+    if (data.length > MAX_UPLOAD) throw new Error('Upload exceeds 20 MiB');
+    const characters = [...String(input.name || 'attachment')].slice(0, 180).map(character => /[\p{L}\p{N}._ -]/u.test(character) ? character : '_');
+    while (Buffer.byteLength(characters.join('')) > 180) characters.pop();
+    const name = characters.join('').replace(/^\.+$/, '') || 'attachment';
+    // These are private files in the retained container, never host repository
+    // files. Check real paths so even a workspace rooted in /var/tmp uses a
+    // different staging root and a normal git add -A cannot include uploads.
+    for (const candidate of ['/var/tmp', '/tmp']) {
+      const root = await fs.realpath(candidate).catch(() => null);
+      if (!root || workspace === '/' || root === workspace || root.startsWith(workspace + '/')) continue;
+      const directory = await fs.mkdtemp(path.join(root, 'xpressclaw-uploads-')).catch(() => null);
+      if (!directory) continue;
+      try {
+        const filename = path.join(directory, name);
+        await fs.writeFile(filename, data, { flag: 'wx', mode: 0o600 });
+        return { path: filename, size: data.length };
+      } catch (error) {
+        await fs.rm(directory, { recursive: true, force: true });
+        throw error;
+      }
+    }
+    throw new Error('No writable upload storage exists outside the container workspace');
+  }
   if (input.operation === 'sessions') {
     try {
       const { stdout } = await promisify(execFile)('tmux', ['list-sessions', '-F', '#S'], { maxBuffer: 65536 });
@@ -82,7 +110,7 @@ let input = '';
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', data => {
   input += data;
-  if (input.length > 8 * 1024 * 1024) process.exit(1);
+  if (input.length > 32 * 1024 * 1024) process.exit(1);
   if (input.endsWith('\n')) {
     process.stdin.pause();
     main(JSON.parse(input)).then(result => { process.stdout.write(JSON.stringify(result)); }, error => { process.stdout.write(JSON.stringify({ error: error.message })); }).finally(() => process.stdin.destroy());
