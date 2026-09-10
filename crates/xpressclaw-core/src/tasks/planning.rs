@@ -20,11 +20,14 @@ use std::{collections::BTreeMap, sync::Arc};
 pub fn normalize_start_after(value: Option<&str>) -> Result<Option<String>> {
     value
         .map(|value| {
-            let time = DateTime::parse_from_rfc3339(value).map_err(|_| {
-                Error::Task(
-                    "Start no earlier than must be an RFC 3339 timestamp with a timezone".into(),
-                )
-            })?;
+            let time = DateTime::parse_from_rfc3339(value)
+                .map_err(|_| {
+                    Error::Task(
+                        "Start no earlier than must be an RFC 3339 timestamp with a timezone"
+                            .into(),
+                    )
+                })?
+                .with_timezone(&Utc);
             // SQLite date comparisons have millisecond precision. Round up,
             // never down, so sub-millisecond input cannot start work early.
             let remainder = time.timestamp_subsec_nanos() % 1_000_000;
@@ -33,14 +36,13 @@ pub fn normalize_start_after(value: Option<&str>) -> Result<Option<String>> {
             } else {
                 time + chrono::Duration::nanoseconds((1_000_000 - remainder).into())
             };
+            // Check the UTC year that SQLite will receive, including rounding carry.
             if !(1970..=9999).contains(&chrono::Datelike::year(&time)) {
                 return Err(Error::Task(
                     "Schedule year must be between 1970 and 9999".into(),
                 ));
             }
-            Ok(time
-                .with_timezone(&Utc)
-                .to_rfc3339_opts(SecondsFormat::Millis, true))
+            Ok(time.to_rfc3339_opts(SecondsFormat::Millis, true))
         })
         .transpose()
 }
@@ -573,6 +575,101 @@ mod tests {
             .unwrap()
             .is_none());
     }
+
+    #[test]
+    fn schedules_reject_out_of_range_utc_years_without_mutating_tasks() {
+        let (board, _, planner) = setup(Arc::new(Database::open_memory().unwrap()));
+        let original = board
+            .create(&CreateTask {
+                title: "Keep the existing plan".into(),
+                agent_id: Some("atlas".into()),
+                start_after: Some("2100-01-01T00:00:00Z".into()),
+                backlog: true,
+                ..Default::default()
+            })
+            .unwrap();
+        for value in [
+            "9999-12-31T23:59:59-01:00",
+            "9999-12-31T22:59:59.999000001-01:00",
+            "9999-12-31T23:59:59.999000001Z",
+            "1970-01-01T00:00:00+01:00",
+            "1969-12-31T23:59:59.998999999Z",
+        ] {
+            assert!(
+                board
+                    .create(&CreateTask {
+                        title: "Invalid schedule".into(),
+                        agent_id: Some("atlas".into()),
+                        start_after: Some(value.into()),
+                        ..Default::default()
+                    })
+                    .is_err(),
+                "creation accepted {value}"
+            );
+            assert!(
+                planner
+                    .change(
+                        &original.id,
+                        &PlanningChange {
+                            expected_revision: original.revision,
+                            change: PlanningAction::Schedule {
+                                start_after: Some(value.into()),
+                                activate: true,
+                            },
+                        },
+                    )
+                    .is_err(),
+                "planning edit accepted {value}"
+            );
+            let unchanged = planner.get(&original.id).unwrap();
+            assert_eq!(unchanged.task.start_after, original.start_after);
+            assert_eq!(unchanged.task.revision, original.revision);
+            assert!(unchanged.task.backlog);
+            assert!(!unchanged.planning.queued);
+        }
+        assert_eq!(planner.list(&PlanningFilter::default()).unwrap().total, 1);
+    }
+
+    #[test]
+    fn schedules_at_normalized_utc_year_boundaries_remain_claimable() {
+        for (input, expected) in [
+            ("1969-12-31T23:00:00-01:00", "1970-01-01T00:00:00.000Z"),
+            ("1969-12-31T23:59:59.999999999Z", "1970-01-01T00:00:00.000Z"),
+            ("1970-01-01T00:00:00.000000001Z", "1970-01-01T00:00:00.001Z"),
+            (
+                "9999-12-31T22:59:59.998000001-01:00",
+                "9999-12-31T23:59:59.999Z",
+            ),
+            ("9999-12-31T23:59:59.999Z", "9999-12-31T23:59:59.999Z"),
+        ] {
+            for agent in [None, Some("atlas")] {
+                let (board, queue, planner) = setup(Arc::new(Database::open_memory().unwrap()));
+                let task = create(&board, "Boundary schedule", Some(input), 0);
+                assert_eq!(task.start_after.as_deref(), Some(expected));
+                assert_eq!(
+                    planner.get(&task.id).unwrap().planning.lane,
+                    if is_scheduled(Some(expected)) {
+                        "scheduled"
+                    } else {
+                        "queue"
+                    }
+                );
+                let queued = queue.enqueue(&task.id, "atlas").unwrap();
+                let threshold = time(expected);
+                assert!(queue
+                    .claim_at(agent, threshold - chrono::Duration::milliseconds(1))
+                    .unwrap()
+                    .is_none());
+                assert_eq!(
+                    queue.claim_at(agent, threshold).unwrap().unwrap().id,
+                    queued.id,
+                    "input: {input}"
+                );
+                assert!(queue.claim_at(agent, threshold).unwrap().is_none());
+            }
+        }
+    }
+
     #[test]
     fn schedule_survives_reopening_and_recovery_on_the_same_task() {
         let folder = tempfile::tempdir().unwrap();
