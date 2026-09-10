@@ -34,7 +34,9 @@ Supported lane moves are:
 Work that is running, asking for input, blocked on an execution problem, awaiting
 review, or finished must use its task details for the relevant lifecycle action.
 Dragging cannot start an agent, complete a task, accept a review, or interrupt
-execution. Dependencies remain enforced. Assignment is available within the
+execution. Dependencies remain enforced. Required durable child tasks must also
+complete before a queued parent turn can run, including after a restart. ACP
+checklist rows do not block parent dispatch. Assignment is available within the
 current task's Project and transfers its queued work to the selected Agent.
 
 ## Start no earlier than

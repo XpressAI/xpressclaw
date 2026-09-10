@@ -61,6 +61,10 @@ pub(super) const ELIGIBLE: &str = "
     AND NOT EXISTS (
       SELECT 1 FROM task_dependencies d JOIN tasks dependency ON dependency.id = d.depends_on_id
       WHERE d.task_id = t.id AND dependency.status != 'completed'
+    )
+    AND NOT EXISTS (
+      SELECT 1 FROM tasks child
+      WHERE child.parent_task_id = t.id AND child.blocks_parent = 1 AND child.status != 'completed'
     )";
 
 const SNAPSHOT: &str = "WITH facts AS (
@@ -330,7 +334,7 @@ fn planning_row(row: &rusqlite::Row) -> Result<PlanningTask> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::board::{CreateTask, TaskBoard};
+    use super::super::board::{CreateTask, ReportedSubtask, TaskBoard, TaskStatus};
     use super::*;
     use crate::agents::registry::AgentRegistry;
     fn setup(db: Arc<Database>) -> (TaskBoard, TaskQueue, TaskPlanner) {
@@ -379,6 +383,146 @@ mod tests {
             )
             .unwrap()
     }
+    #[test]
+    fn queued_parent_continuations_wait_for_blocking_children_in_both_claim_paths() {
+        for by_agent in [false, true] {
+            let db = Arc::new(Database::open_memory().unwrap());
+            let (board, queue, planner) = setup(db.clone());
+            let sessions = crate::sessions::SessionManager::new(db);
+            let claim = || {
+                (if by_agent {
+                    queue.claim("atlas")
+                } else {
+                    queue.claim_next()
+                })
+                .unwrap()
+            };
+            let finish = |item: &super::super::queue::QueueItem| {
+                sessions
+                    .transition_attempt(
+                        item.attempt_id.as_deref().unwrap(),
+                        "completed",
+                        "Turn finished",
+                        None,
+                        None,
+                    )
+                    .unwrap();
+                queue.complete(item.id, "Turn finished").unwrap();
+            };
+            let parent = create(&board, "Parent", None, 100);
+            let initial = queue.enqueue(&parent.id, "atlas").unwrap();
+            assert_eq!(claim().unwrap().id, initial.id);
+            let child = board
+                .create(&CreateTask {
+                    title: "Required child".into(),
+                    agent_id: Some("helper".into()),
+                    parent_task_id: Some(parent.id.clone()),
+                    ..Default::default()
+                })
+                .unwrap();
+            let child_turn = queue.enqueue(&child.id, "helper").unwrap();
+            assert_eq!(queue.claim("helper").unwrap().unwrap().id, child_turn.id);
+            sessions
+                .transition_attempt(
+                    child_turn.attempt_id.as_deref().unwrap(),
+                    "running",
+                    "Child running",
+                    None,
+                    None,
+                )
+                .unwrap();
+            board.update_status(&child.id, "in_progress", None).unwrap();
+            let continuation = queue
+                .enqueue_continuation(&parent.id, "atlas")
+                .unwrap()
+                .unwrap();
+            finish(&initial);
+            assert_eq!(planner.get(&parent.id).unwrap().planning.lane, "blocked");
+
+            // The high-priority parent must not run or starve other ready work
+            // after releasing its session while the required child runs.
+            let ready = create(&board, "Independent work", None, 0);
+            let ready_turn = queue.enqueue(&ready.id, "atlas").unwrap();
+            assert_eq!(
+                claim().unwrap().id,
+                ready_turn.id,
+                "claim by agent: {by_agent}"
+            );
+            finish(&ready_turn);
+            assert!(claim().is_none());
+            assert_eq!(queue.get(continuation.id).unwrap().status, "queued");
+
+            finish(&child_turn);
+            board.update_status(&child.id, "completed", None).unwrap();
+            assert_eq!(planner.get(&parent.id).unwrap().planning.lane, "queue");
+            assert_eq!(claim().unwrap().id, continuation.id);
+            assert!(claim().is_none());
+        }
+    }
+
+    #[test]
+    fn blocking_child_gates_survive_restart_and_ignore_nonblocking_plan_rows() {
+        let folder = tempfile::tempdir().unwrap();
+        let filename = folder.path().join("children.db");
+        let (parent_id, child_id, continuation_id) = {
+            let (board, queue, _) = setup(Arc::new(Database::open(&filename).unwrap()));
+            let parent = create(&board, "Parent", None, 0);
+            let child = board
+                .create(&CreateTask {
+                    title: "Required child".into(),
+                    parent_task_id: Some(parent.id.clone()),
+                    agent_id: Some("helper".into()),
+                    ..Default::default()
+                })
+                .unwrap();
+            let continuation = queue
+                .enqueue_continuation(&parent.id, "atlas")
+                .unwrap()
+                .unwrap();
+            board
+                .sync_reported_subtasks(
+                    &parent.id,
+                    continuation.attempt_id.as_deref().unwrap(),
+                    &[ReportedSubtask {
+                        title: "Current-turn checklist".into(),
+                        status: TaskStatus::Pending,
+                    }],
+                )
+                .unwrap();
+            (parent.id, child.id, continuation.id)
+        };
+        let (board, queue, planner) = setup(Arc::new(Database::open(&filename).unwrap()));
+        queue.recover_in_progress().unwrap();
+        for status in [
+            "pending",
+            "in_progress",
+            "waiting_for_input",
+            "blocked",
+            "cancelled",
+        ] {
+            board.update_status(&child_id, status, None).unwrap();
+            assert_eq!(planner.get(&parent_id).unwrap().planning.lane, "blocked");
+            assert!(
+                queue.claim("atlas").unwrap().is_none(),
+                "child status: {status}"
+            );
+            assert!(
+                queue.claim_next().unwrap().is_none(),
+                "child status: {status}"
+            );
+        }
+        assert_eq!(queue.get(continuation_id).unwrap().status, "queued");
+        board.update_status(&child_id, "completed", None).unwrap();
+        assert!(board
+            .list_subtasks(&parent_id)
+            .unwrap()
+            .iter()
+            .any(|task| !task.blocks_parent && task.status == TaskStatus::Pending));
+        assert_eq!(planner.get(&parent_id).unwrap().planning.lane, "queue");
+        assert_eq!(queue.claim_next().unwrap().unwrap().id, continuation_id);
+        assert!(queue.claim_next().unwrap().is_none());
+    }
+
     #[test]
     fn threshold_is_inclusive_and_future_priority_cannot_starve_ready_work() {
         let db = Arc::new(Database::open_memory().unwrap());
