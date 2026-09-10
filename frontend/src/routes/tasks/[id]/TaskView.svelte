@@ -1,7 +1,9 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
+	import { Check, PanelRightClose, PanelRightOpen, Play, Settings, Square, X } from '@lucide/svelte';
+	import ContextMenu from '$lib/components/ContextMenu.svelte';
 	import TaskPlanningActions from '$lib/components/planning/TaskActions.svelte';
-	import { dateLabel } from '$lib/taskPlanning';
+	import { dateLabel, planningViewport } from '$lib/taskPlanning';
 	import { goto } from '$app/navigation';
 	import { tasks, agents, sessions, workspaces } from '$lib/api';
 	import type { AcpCommand, AcpConfigOption, AcpModeState, Task, TaskMessage, Agent, WorkAttempt, SessionEvent, ImageAttachmentUpload, GitChange, WorkspaceGitStatus, MessageVisualization } from '$lib/api';
@@ -20,12 +22,24 @@
 	let { taskId, compact = false }: { taskId: string; compact?: boolean } = $props();
 	let planningTask = $state<Task | null>(null);
 	let planningError = $state('');
+	let planningLoading = $state(false);
+	const viewId = $props.id();
+	let settingsMenu = $state<{ x: number; y: number } | null>(null);
+	let settingsButton = $state<HTMLButtonElement>();
+	let editDialog = $state<HTMLDialogElement>();
+	let editSaving = $state(false);
+	let editError = $state('');
+	let statusUpdating = $state(false);
+	let actionError = $state('');
 	async function openPlanning() {
 		planningError = '';
+		planningLoading = true;
 		try {
 			planningTask = await tasks.planningTask(taskId);
 		} catch (error) {
 			planningError = error instanceof Error ? error.message : String(error);
+		} finally {
+			planningLoading = false;
 		}
 	}
 	async function changePlanning(current: Task, action: Parameters<typeof tasks.plan>[1]) {
@@ -135,6 +149,7 @@
 	let editTitle = $state('');
 	let editDesc = $state('');
 	let editAgentId = $state('');
+	let originalEditAgentId = '';
 	let editPriority = $state(0);
 	let editDeps = $state<string[]>([]);
 	let messageInput = $state('');
@@ -168,7 +183,12 @@
 	let composerEl = $state<HTMLDivElement>();
 	let taskViewEl = $state<HTMLDivElement>();
 	let taskViewResizeObserver: ResizeObserver | null = null;
-	let showDetailsSidebar = $state(false);
+	const detailsPreferenceKey = 'xpressclaw.task.details.collapsed';
+	let detailsCollapsed = $state(false);
+	let detailsSidebarFits = $state(false);
+	let detailsSheetOpen = $state(false);
+	let detailsDialog = $state<HTMLDialogElement>();
+	let showDetailsSidebar = $derived(detailsSidebarFits && !detailsCollapsed && !detailsSheetOpen);
 	let prevMessageCount = 0;
 	let lastActivityEventId = 0;
 	let hasEarlierActivity = $state(false);
@@ -771,8 +791,38 @@
 	}
 
 	function updateDetailsSidebarVisibility() {
-		showDetailsSidebar = !compact || (taskViewEl?.clientWidth ?? 0) >= TASK_FILE_SPLIT_MIN_PANE_WIDTH;
+		detailsSidebarFits = typeof window !== 'undefined'
+			&& window.innerWidth >= 1024
+			&& (!compact || (taskViewEl?.clientWidth ?? 0) >= TASK_FILE_SPLIT_MIN_PANE_WIDTH);
 	}
+
+	function toggleDetailsSidebar() {
+		if (detailsSidebarFits) {
+			detailsCollapsed = !detailsCollapsed;
+			try { localStorage.setItem(detailsPreferenceKey, String(detailsCollapsed)); } catch { /* Storage may be unavailable. */ }
+		} else {
+			detailsSheetOpen = true;
+		}
+	}
+
+	function openSettings(event: MouseEvent) {
+		const button = event.currentTarget as HTMLButtonElement;
+		const bounds = button.getBoundingClientRect();
+		settingsMenu = settingsMenu ? null : { x: bounds.right - 208, y: bounds.bottom + 6 };
+	}
+
+	function chooseSetting(action: string) {
+		settingsMenu = null;
+		if (action === 'edit') startEditing();
+		else void openPlanning();
+	}
+
+	$effect(() => {
+		if (editing && editDialog && !editDialog.open) editDialog.showModal();
+	});
+	$effect(() => {
+		if (detailsSheetOpen && detailsDialog && !detailsDialog.open) detailsDialog.showModal();
+	});
 
 	$effect(() => {
 		compact;
@@ -781,6 +831,7 @@
 	});
 
 	onMount(async () => {
+		try { detailsCollapsed = localStorage.getItem(detailsPreferenceKey) === 'true'; } catch { /* Use the default when storage is unavailable. */ }
 		document.addEventListener('pointerdown', handleComposerPointerDown);
 		taskViewResizeObserver = new ResizeObserver(updateDetailsSidebarVisibility);
 		if (taskViewEl) taskViewResizeObserver.observe(taskViewEl);
@@ -1099,20 +1150,26 @@
 	}
 
 	async function updateStatus(status: string) {
-		if (!task) return;
+		if (!task || statusUpdating) return;
+		statusUpdating = true;
+		actionError = '';
 		try {
 			task = await tasks.updateStatus(task.id, status);
 			await load();
 		} catch (e) {
-			alert(String(e));
+			actionError = e instanceof Error ? e.message : String(e);
+		} finally {
+			statusUpdating = false;
 		}
 	}
 
 	function startEditing() {
 		if (!task) return;
+		editError = '';
 		editTitle = task.title;
 		editDesc = task.description || '';
 		editAgentId = task.agent_id || '';
+		originalEditAgentId = editAgentId;
 		editPriority = task.priority;
 		editDeps = task.depends_on ? [...task.depends_on] : [];
 		editing = true;
@@ -1127,26 +1184,31 @@
 	}
 
 	async function saveEdit() {
-		if (!task) return;
+		if (!task || editSaving) return;
+		editSaving = true;
+		editError = '';
 		try {
 			// Update task fields
 			await tasks.update(task.id, {
 				title: editTitle,
 				description: editDesc || undefined,
-				agent_id: editAgentId || undefined,
+				// Sending an unchanged assignment can enqueue a new turn.
+				...(editAgentId !== originalEditAgentId ? { agent_id: editAgentId } : {}),
 				priority: editPriority,
 			});
 			// Add new dependencies
 			const currentDeps = task.depends_on || [];
 			for (const depId of editDeps) {
 				if (!currentDeps.includes(depId)) {
-					await tasks.addDependency(task.id, depId).catch(() => {});
+					await tasks.addDependency(task.id, depId);
 				}
 			}
-			editing = false;
 			await load();
+			editDialog?.close();
 		} catch (e) {
-			console.error('Save failed:', e);
+			editError = e instanceof Error ? e.message : String(e);
+		} finally {
+			editSaving = false;
 		}
 	}
 
@@ -1230,6 +1292,7 @@
 	function openChangedFile(event: MouseEvent, agentId: string, path: string) {
 		if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
 		event.preventDefault();
+		detailsDialog?.close();
 		const route = `${workspaceFileUrl(agentId, path)}&tree=collapsed`;
 		window.dispatchEvent(new CustomEvent<WorkspaceOpenSplitDetail>(WORKSPACE_OPEN_SPLIT_EVENT, {
 			detail: { path: route },
@@ -1242,8 +1305,166 @@
 	}
 
 </script>
+
+{#snippet taskDetails(current: Task)}
+				<!-- Details -->
+				<div class="space-y-2">
+					<h3 class="text-xs font-medium text-muted-foreground uppercase tracking-wide">Details</h3>
+					<dl class="space-y-1.5 text-sm">
+						<div class="flex justify-between">
+							<dt class="text-muted-foreground">ID</dt>
+							<dd class="font-mono text-xs truncate max-w-[140px]">{current.id}</dd>
+						</div>
+						<div class="flex justify-between">
+							<dt class="text-muted-foreground">Status</dt>
+							<dd class="{statusColor(taskActivityStatus)}">{statusLabel(taskActivityStatus)}</dd>
+						</div>
+						<div class="flex justify-between">
+							<dt class="text-muted-foreground">Priority</dt>
+							<dd>{priorityLabel(current.priority)}</dd>
+						</div>
+						{#if current.agent_id}
+							<div class="flex justify-between">
+								<dt class="text-muted-foreground">Agent</dt>
+								<dd><a href="/agents/{current.agent_id}" class="underline hover:text-foreground">{sessionLabel(current.agent_id)}</a></dd>
+							</div>
+						{/if}
+						<div class="flex justify-between">
+							<dt class="text-muted-foreground">Created</dt>
+							<dd class="text-xs">{timeAgo(current.created_at)}</dd>
+						</div>
+						{#if current.completed_at}
+							<div class="flex justify-between">
+								<dt class="text-muted-foreground">Completed</dt>
+								<dd class="text-xs">{timeAgo(current.completed_at)}</dd>
+							</div>
+						{/if}
+					</dl>
+				</div>
+
+				{#if contextUsage}
+					<div class="space-y-2" data-context-usage>
+						<div class="flex items-center justify-between">
+							<h3 class="text-xs font-medium uppercase tracking-wide text-muted-foreground">Context window</h3>
+							<span class="text-xs tabular-nums text-muted-foreground">{contextUsage.percent.toFixed(1)}%</span>
+						</div>
+						<div class="h-1.5 overflow-hidden rounded-full bg-secondary">
+							<div class="h-full rounded-full bg-blue-500 transition-[width] duration-300" style:width={`${contextUsage.percent}%`}></div>
+						</div>
+						<div class="text-right text-xs tabular-nums text-muted-foreground">
+							<span class="text-foreground">{formatTokens(contextUsage.used)}</span>
+							<span> / {formatTokens(contextUsage.size)} tokens</span>
+						</div>
+					</div>
+				{/if}
+
+				{#if current.agent_id && workspaceGit}
+					<div class="space-y-2" data-task-changed-files>
+						<div class="flex items-center justify-between gap-2">
+							<h3 class="text-xs font-medium uppercase tracking-wide text-muted-foreground">Changed files</h3>
+							<a href={workspaceFileUrl(current.agent_id)} class="text-[11px] text-muted-foreground hover:text-foreground">Open files</a>
+						</div>
+						{#if workspaceGit.repository && workspaceGit.files.length > 0}
+							<div class="space-y-0.5">
+								{#each workspaceGit.files.slice(0, 12) as change (change.path)}
+									<a
+										href={workspaceFileUrl(current.agent_id, change.path)}
+										onclick={(event) => openChangedFile(event, current.agent_id ?? '', change.path)}
+										title={change.path}
+										class="flex items-center gap-2 rounded px-1.5 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-foreground"
+									>
+										<span class="w-3 shrink-0 font-mono text-[10px] text-amber-500">{changedFileStatus(change)}</span>
+										<span class="truncate">{change.path}</span>
+									</a>
+								{/each}
+								{#if workspaceGit.files.length > 12}
+									<a href={workspaceFileUrl(current.agent_id)} class="block px-1.5 pt-1 text-[11px] text-muted-foreground hover:text-foreground">
+										+{workspaceGit.files.length - 12} more
+									</a>
+								{/if}
+							</div>
+						{:else if workspaceGit.repository}
+							<p class="text-xs text-muted-foreground">Working tree clean</p>
+						{:else}
+							<p class="text-xs text-muted-foreground">{workspaceGit.repository_status?.message || 'No active Git repository'}</p>
+						{/if}
+					</div>
+				{/if}
+
+				<!-- Subtasks -->
+				{#if subtaskList.length > 0}
+					<div class="space-y-2">
+						<h3 class="text-xs font-medium text-muted-foreground uppercase tracking-wide">
+							Steps ({completedStepCount()} complete{deferredStepCount() ? `, ${deferredStepCount()} deferred` : ''})
+						</h3>
+						<div class="space-y-1.5">
+							{#each subtaskList as sub}
+								{@const deferred = isDeferredPlanItem(sub)}
+								<div class="flex items-start gap-2 rounded p-1.5 text-sm">
+									<span class="mt-0.5 flex-shrink-0 h-4 w-4 rounded border flex items-center justify-center
+										{sub.status === 'completed'
+											? 'bg-emerald-500/20 border-emerald-500 text-emerald-400'
+											: sub.status === 'in_progress'
+											? 'border-blue-400 text-blue-400'
+											: 'border-muted-foreground/30'}">
+										{#if sub.status === 'completed'}
+											<svg class="h-3 w-3" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+												<path stroke-linecap="round" stroke-linejoin="round" d="M5 13l4 4L19 7" />
+											</svg>
+										{:else if sub.status === 'in_progress'}
+											<span class="h-1.5 w-1.5 rounded-full bg-blue-400 animate-pulse"></span>
+										{:else if deferred}
+											<span class="text-[10px] text-muted-foreground">↳</span>
+										{/if}
+									</span>
+									<div class="flex-1 min-w-0">
+										<span class="block truncate {sub.status === 'completed' ? 'line-through text-muted-foreground' : deferred ? 'italic text-muted-foreground' : ''}">{sub.title}</span>
+										{#if deferred}<span class="mt-0.5 block text-[10px] font-medium uppercase tracking-wide text-muted-foreground">Deferred · does not block completion</span>{/if}
+										{#if sub.description}
+											<span class="block text-xs text-muted-foreground mt-0.5 line-clamp-2">{sub.description}</span>
+										{/if}
+									</div>
+								</div>
+							{/each}
+						</div>
+					</div>
+				{/if}
+
+				{#if current.agent_id}
+					<div class="space-y-2">
+						<h3 class="text-xs font-medium text-muted-foreground uppercase tracking-wide">Agent</h3>
+						<a href="/agents/{current.agent_id}" class="text-sm underline hover:text-foreground">Open agent</a>
+					</div>
+				{/if}
+				{#if current.conversation_id}
+					<div class="space-y-2">
+						<h3 class="text-xs font-medium uppercase tracking-wide text-muted-foreground">Conversation</h3>
+						<a href="/conversations/{current.conversation_id}" class="text-sm underline hover:text-foreground">Open conversation</a>
+					</div>
+				{/if}
+{/snippet}
+
+{#if settingsMenu}
+	<div class="task-settings-menu">
+		<ContextMenu x={settingsMenu.x} y={settingsMenu.y} anchor={settingsButton} label="Task settings"
+			items={[
+				{ id: 'edit', label: 'Edit details', disabled: !task || ['completed', 'cancelled'].includes(task.status) },
+				{ id: 'plan', label: 'Plan / schedule' },
+			]}
+			onselect={chooseSetting} onclose={() => settingsMenu = null} />
+	</div>
+{/if}
+{#if detailsSheetOpen && task}
+	<dialog bind:this={detailsDialog} id={viewId + '-details-dialog'} use:planningViewport class="task-sheet" aria-label="Task details" onclose={() => detailsSheetOpen = false}>
+		<header class="task-sheet-header">
+			<h2>Task details</h2>
+			<button type="button" class="task-action" aria-label="Close task details" title="Close task details" onclick={() => detailsDialog?.close()}><X size={18} aria-hidden="true" /></button>
+		</header>
+		<div class="task-sheet-content space-y-4">{@render taskDetails(task)}</div>
+	</dialog>
+{/if}
 {#if planningTask}
-	<TaskPlanningActions task={planningTask} {agentList} onclose={() => planningTask = null} onchange={changePlanning} />
+	<TaskPlanningActions task={planningTask} {agentList} onclose={() => { planningTask = null; settingsButton?.focus({ preventScroll: true }); }} onchange={changePlanning} />
 {/if}
 
 <div bind:this={taskViewEl} class="flex min-h-0 h-full flex-col">
@@ -1277,12 +1498,12 @@
 			<div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
 				<div class="min-w-0">
 					<h1 class="text-lg font-bold sm:text-xl">{task.title}</h1>
-                    <div class="mt-1 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-                        {#if task.start_after}<span>Start no earlier than {dateLabel(task.start_after)}</span>{/if}
-                        {#if task.backlog}<span>Backlog</span>{/if}
-                        <button class="min-h-9 rounded-md border border-border px-2 hover:bg-accent" onclick={openPlanning}>Plan / schedule</button>
-                        {#if planningError}<span role="alert">{planningError}</span>{/if}
-                    </div>
+					{#if task.start_after || task.backlog}
+						<div class="mt-1 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+							{#if task.start_after}<span>Start no earlier than {dateLabel(task.start_after)}</span>{/if}
+							{#if task.backlog}<span>Backlog</span>{/if}
+						</div>
+					{/if}
 					<div class="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs sm:text-sm">
 						<span class="flex items-center gap-1.5">
 							<span data-task-activity-status={taskActivityStatus} class="h-2 w-2 rounded-full {taskActivityStatus === 'in_progress' ? 'animate-pulse' : ''}
@@ -1302,44 +1523,47 @@
 						<span class="text-xs text-muted-foreground">{timeAgo(task.created_at)}</span>
 					</div>
 				</div>
-				<div class="flex shrink-0 gap-2 overflow-x-auto">
-					{#if task.status !== 'completed' && task.status !== 'cancelled'}
-						<button onclick={startEditing}
-							class="rounded-md border border-border px-3 py-1.5 text-xs font-medium hover:bg-accent">
-							Edit
-						</button>
-					{/if}
+				<div class="flex shrink-0 items-center gap-1" data-task-header-actions>
+					<button bind:this={settingsButton} type="button" class="task-action" aria-label="Task settings" title="Edit task and schedule" aria-haspopup="menu" aria-expanded={!!settingsMenu} disabled={planningLoading || statusUpdating} onclick={openSettings}>
+						<Settings size={17} aria-hidden="true" />
+					</button>
 					{#if task.status === 'pending'}
-						<button onclick={() => updateStatus('in_progress')}
-							class="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90">
-							Start
-						</button>
+						<button type="button" class="task-action text-primary" aria-label="Start task" title="Start task when eligible" disabled={statusUpdating} onclick={() => updateStatus('in_progress')}><Play size={17} aria-hidden="true" /></button>
 					{/if}
 					{#if ['in_progress', 'pending', 'waiting_for_input', 'blocked'].includes(task.status)}
-						<button onclick={() => updateStatus('completed')}
-							class="rounded-md border border-emerald-500/50 px-3 py-1.5 text-xs font-medium text-emerald-400 hover:bg-emerald-500/10">
-							Complete
-						</button>
-						<button onclick={() => updateStatus('cancelled')}
-							class="rounded-md border border-border px-3 py-1.5 text-xs font-medium text-muted-foreground hover:bg-accent">
-							Cancel
+						<button type="button" class="task-action text-emerald-600 dark:text-emerald-400" aria-label="Complete task" title="Complete task" disabled={statusUpdating} onclick={() => updateStatus('completed')}><Check size={18} aria-hidden="true" /></button>
+						<button type="button" class="task-action" aria-label={task.status === 'in_progress' ? 'Stop and cancel task' : 'Cancel task'} title={task.status === 'in_progress' ? 'Stop and cancel task' : 'Cancel task'} disabled={statusUpdating} onclick={() => updateStatus('cancelled')}>
+							{#if task.status === 'in_progress'}<Square size={14} aria-hidden="true" />{:else}<X size={18} aria-hidden="true" />{/if}
 						</button>
 					{/if}
+					<button type="button" class="task-action" aria-label={showDetailsSidebar ? 'Hide task details' : 'Show task details'} title={showDetailsSidebar ? 'Hide task details' : 'Show task details'} aria-expanded={showDetailsSidebar || detailsSheetOpen} aria-controls={viewId + (detailsSheetOpen || !detailsSidebarFits ? '-details-dialog' : '-details')} onclick={toggleDetailsSidebar}>
+						{#if showDetailsSidebar}<PanelRightClose size={17} aria-hidden="true" />{:else}<PanelRightOpen size={17} aria-hidden="true" />{/if}
+					</button>
 				</div>
 			</div>
 		{/if}
+		{#if planningError || actionError}<p role="alert" class="mt-2 text-sm text-destructive">{planningError || actionError}</p>{/if}
 	</div>
 
 	{#if editing && task}
-		<div class="shrink-0 space-y-3 overflow-y-auto border-b border-border bg-card/50 px-3 py-3 sm:px-6 sm:py-4">
-			<input type="text" bind:value={editTitle} placeholder="Task title..."
+		<dialog bind:this={editDialog} use:planningViewport class="task-sheet" aria-label="Edit task details" onclose={() => editing = false} oncancel={(event) => { if (editSaving) event.preventDefault(); }}>
+			<header class="task-sheet-header">
+				<h2>Edit task details</h2>
+				<button type="button" class="task-action" aria-label="Close task editor" title="Close task editor" disabled={editSaving} onclick={() => editDialog?.close()}><X size={18} aria-hidden="true" /></button>
+			</header>
+			<form class="task-sheet-content" onsubmit={(event) => { event.preventDefault(); void saveEdit(); }}>
+			{#if editError}<p role="alert" class="mb-3 text-sm text-destructive">{editError}</p>{/if}
+			<fieldset disabled={editSaving} class="min-w-0 space-y-3">
+			<label class="block text-xs text-muted-foreground" for={viewId + '-title'}>Title</label>
+			<input id={viewId + '-title'} type="text" bind:value={editTitle} placeholder="Task title..." required
 				class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring" />
-			<textarea bind:value={editDesc} placeholder="Description..." rows="2"
+			<label class="block text-xs text-muted-foreground" for={viewId + '-description'}>Description</label>
+			<textarea id={viewId + '-description'} bind:value={editDesc} placeholder="Description..." rows="3"
 				class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring resize-none"></textarea>
 			<div class="flex flex-col gap-3 sm:flex-row">
 				<div class="flex-1">
-					<div class="text-xs text-muted-foreground mb-1">Agent</div>
-					<select bind:value={editAgentId}
+					<label for={viewId + '-agent'} class="block text-xs text-muted-foreground mb-1">Agent</label>
+					<select id={viewId + '-agent'} bind:value={editAgentId}
 						class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring">
 						<option value="">Unassigned</option>
 						{#each agentList as agent}
@@ -1348,8 +1572,8 @@
 					</select>
 				</div>
 				<div class="w-24">
-					<div class="text-xs text-muted-foreground mb-1">Priority</div>
-					<select bind:value={editPriority}
+					<label for={viewId + '-priority'} class="block text-xs text-muted-foreground mb-1">Priority</label>
+					<select id={viewId + '-priority'} bind:value={editPriority}
 						class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring">
 						<option value={0}>Normal</option>
 						<option value={5}>High</option>
@@ -1374,16 +1598,18 @@
 				</div>
 			{/if}
 			<div class="flex gap-2">
-				<button onclick={saveEdit}
+				<button type="submit"
 					class="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90">
-					Save
+					{editSaving ? 'Saving…' : 'Save'}
 				</button>
-				<button onclick={() => (editing = false)}
+				<button type="button" onclick={() => editDialog?.close()}
 					class="rounded-md border border-border px-3 py-1.5 text-xs font-medium hover:bg-accent">
 					Cancel
 				</button>
 			</div>
-		</div>
+			</fieldset>
+			</form>
+		</dialog>
 	{/if}
 
 	{#if loading}
@@ -1467,7 +1693,7 @@
 					{/if}
 
 					{#if subtaskList.length > 0}
-					<section class="rounded-lg border border-border/60 bg-card/30 p-3 {showDetailsSidebar ? 'lg:hidden' : ''}">
+					<section class="rounded-lg border border-border/60 bg-card/30 p-3" hidden={showDetailsSidebar}>
 							<div class="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
 								Steps ({completedStepCount()} complete{deferredStepCount() ? `, ${deferredStepCount()} deferred` : ''})
 							</div>
@@ -1898,144 +2124,51 @@
 				</div>
 			</div>
 
-			<!-- Right: details sidebar -->
-			<div data-task-details-sidebar class="hidden w-72 shrink-0 space-y-4 overflow-y-auto border-l border-border p-4 {showDetailsSidebar ? 'lg:block' : ''}">
-				<!-- Details -->
-				<div class="space-y-2">
-					<h3 class="text-xs font-medium text-muted-foreground uppercase tracking-wide">Details</h3>
-					<dl class="space-y-1.5 text-sm">
-						<div class="flex justify-between">
-							<dt class="text-muted-foreground">ID</dt>
-							<dd class="font-mono text-xs truncate max-w-[140px]">{task.id}</dd>
-						</div>
-						<div class="flex justify-between">
-							<dt class="text-muted-foreground">Status</dt>
-							<dd class="{statusColor(taskActivityStatus)}">{statusLabel(taskActivityStatus)}</dd>
-						</div>
-						<div class="flex justify-between">
-							<dt class="text-muted-foreground">Priority</dt>
-							<dd>{priorityLabel(task.priority)}</dd>
-						</div>
-						{#if task.agent_id}
-							<div class="flex justify-between">
-								<dt class="text-muted-foreground">Agent</dt>
-								<dd><a href="/agents/{task.agent_id}" class="underline hover:text-foreground">{sessionLabel(task.agent_id)}</a></dd>
-							</div>
-						{/if}
-						<div class="flex justify-between">
-							<dt class="text-muted-foreground">Created</dt>
-							<dd class="text-xs">{timeAgo(task.created_at)}</dd>
-						</div>
-						{#if task.completed_at}
-							<div class="flex justify-between">
-								<dt class="text-muted-foreground">Completed</dt>
-								<dd class="text-xs">{timeAgo(task.completed_at)}</dd>
-							</div>
-						{/if}
-					</dl>
-				</div>
-
-				{#if contextUsage}
-					<div class="space-y-2" data-context-usage>
-						<div class="flex items-center justify-between">
-							<h3 class="text-xs font-medium uppercase tracking-wide text-muted-foreground">Context window</h3>
-							<span class="text-xs tabular-nums text-muted-foreground">{contextUsage.percent.toFixed(1)}%</span>
-						</div>
-						<div class="h-1.5 overflow-hidden rounded-full bg-secondary">
-							<div class="h-full rounded-full bg-blue-500 transition-[width] duration-300" style:width={`${contextUsage.percent}%`}></div>
-						</div>
-						<div class="text-right text-xs tabular-nums text-muted-foreground">
-							<span class="text-foreground">{formatTokens(contextUsage.used)}</span>
-							<span> / {formatTokens(contextUsage.size)} tokens</span>
-						</div>
-					</div>
-				{/if}
-
-				{#if task.agent_id && workspaceGit}
-					<div class="space-y-2" data-task-changed-files>
-						<div class="flex items-center justify-between gap-2">
-							<h3 class="text-xs font-medium uppercase tracking-wide text-muted-foreground">Changed files</h3>
-							<a href={workspaceFileUrl(task.agent_id)} class="text-[11px] text-muted-foreground hover:text-foreground">Open files</a>
-						</div>
-						{#if workspaceGit.repository && workspaceGit.files.length > 0}
-							<div class="space-y-0.5">
-								{#each workspaceGit.files.slice(0, 12) as change (change.path)}
-									<a
-										href={workspaceFileUrl(task.agent_id, change.path)}
-										onclick={(event) => openChangedFile(event, task?.agent_id ?? '', change.path)}
-										title={change.path}
-										class="flex items-center gap-2 rounded px-1.5 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-foreground"
-									>
-										<span class="w-3 shrink-0 font-mono text-[10px] text-amber-500">{changedFileStatus(change)}</span>
-										<span class="truncate">{change.path}</span>
-									</a>
-								{/each}
-								{#if workspaceGit.files.length > 12}
-									<a href={workspaceFileUrl(task.agent_id)} class="block px-1.5 pt-1 text-[11px] text-muted-foreground hover:text-foreground">
-										+{workspaceGit.files.length - 12} more
-									</a>
-								{/if}
-							</div>
-						{:else if workspaceGit.repository}
-							<p class="text-xs text-muted-foreground">Working tree clean</p>
-						{:else}
-							<p class="text-xs text-muted-foreground">{workspaceGit.repository_status?.message || 'No active Git repository'}</p>
-						{/if}
-					</div>
-				{/if}
-
-				<!-- Subtasks -->
-				{#if subtaskList.length > 0}
-					<div class="space-y-2">
-						<h3 class="text-xs font-medium text-muted-foreground uppercase tracking-wide">
-							Steps ({completedStepCount()} complete{deferredStepCount() ? `, ${deferredStepCount()} deferred` : ''})
-						</h3>
-						<div class="space-y-1.5">
-							{#each subtaskList as sub}
-								{@const deferred = isDeferredPlanItem(sub)}
-								<div class="flex items-start gap-2 rounded p-1.5 text-sm">
-									<span class="mt-0.5 flex-shrink-0 h-4 w-4 rounded border flex items-center justify-center
-										{sub.status === 'completed'
-											? 'bg-emerald-500/20 border-emerald-500 text-emerald-400'
-											: sub.status === 'in_progress'
-											? 'border-blue-400 text-blue-400'
-											: 'border-muted-foreground/30'}">
-										{#if sub.status === 'completed'}
-											<svg class="h-3 w-3" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-												<path stroke-linecap="round" stroke-linejoin="round" d="M5 13l4 4L19 7" />
-											</svg>
-										{:else if sub.status === 'in_progress'}
-											<span class="h-1.5 w-1.5 rounded-full bg-blue-400 animate-pulse"></span>
-										{:else if deferred}
-											<span class="text-[10px] text-muted-foreground">↳</span>
-										{/if}
-									</span>
-									<div class="flex-1 min-w-0">
-										<span class="block truncate {sub.status === 'completed' ? 'line-through text-muted-foreground' : deferred ? 'italic text-muted-foreground' : ''}">{sub.title}</span>
-										{#if deferred}<span class="mt-0.5 block text-[10px] font-medium uppercase tracking-wide text-muted-foreground">Deferred · does not block completion</span>{/if}
-										{#if sub.description}
-											<span class="block text-xs text-muted-foreground mt-0.5 line-clamp-2">{sub.description}</span>
-										{/if}
-									</div>
-								</div>
-							{/each}
-						</div>
-					</div>
-				{/if}
-
-				{#if task.agent_id}
-					<div class="space-y-2">
-						<h3 class="text-xs font-medium text-muted-foreground uppercase tracking-wide">Agent</h3>
-						<a href="/agents/{task.agent_id}" class="text-sm underline hover:text-foreground">Open agent</a>
-					</div>
-				{/if}
-				{#if task.conversation_id}
-					<div class="space-y-2">
-						<h3 class="text-xs font-medium uppercase tracking-wide text-muted-foreground">Conversation</h3>
-						<a href="/conversations/{task.conversation_id}" class="text-sm underline hover:text-foreground">Open conversation</a>
-					</div>
-				{/if}
-			</div>
+			<aside id={viewId + '-details'} data-task-details-sidebar aria-label="Task details" hidden={!showDetailsSidebar} class="w-72 shrink-0 space-y-4 overflow-y-auto border-l border-border p-4">
+				{@render taskDetails(task)}
+			</aside>
 		</div>
 	{/if}
 </div>
+
+<style>
+	.task-action {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		width: 34px;
+		height: 34px;
+		flex-shrink: 0;
+		border-radius: 7px;
+	}
+	.task-action:hover { background: hsl(var(--accent)); }
+	.task-action:focus-visible { outline: 2px solid hsl(var(--ring)); outline-offset: 2px; }
+	.task-action:disabled { opacity: .45; cursor: wait; }
+	.task-settings-menu :global([role='menuitem']) { min-height: 40px; }
+	.task-sheet {
+		width: min(560px, calc(100vw - 24px));
+		max-height: calc(var(--planning-viewport-height, 100dvh) - 32px);
+		margin: auto;
+		padding: 0;
+		border: 1px solid hsl(var(--border));
+		border-radius: 16px;
+		background: hsl(var(--background));
+		color: hsl(var(--foreground));
+		box-shadow: 0 22px 80px #0003;
+	}
+	.task-sheet[open] { display: flex; flex-direction: column; }
+	.task-sheet::backdrop { background: #0006; }
+	.task-sheet-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 20px; border-bottom: 1px solid hsl(var(--border)); flex-shrink: 0; }
+	.task-sheet-header h2 { font-size: 16px; font-weight: 600; }
+	.task-sheet-content { min-height: 0; padding: 16px 20px; overflow-y: auto; overscroll-behavior: contain; }
+	@media (max-width: 639px), (pointer: coarse) {
+		.task-action { width: 44px; height: 44px; }
+		.task-sheet button { min-height: 44px; }
+		.task-settings-menu :global([role='menuitem']) { min-height: 44px; }
+		.task-sheet :global(input), .task-sheet :global(textarea), .task-sheet :global(select) { font-size: 16px; }
+	}
+	@media (max-width: 639px) {
+		.task-sheet { position: fixed; inset: auto 0; top: calc(var(--planning-viewport-top, 0px) + var(--planning-viewport-height, 100dvh)); transform: translateY(-100%); width: 100%; max-width: none; max-height: calc(var(--planning-viewport-height, 100dvh) - 12px); margin: 0; border-radius: 16px 16px 0 0; }
+		.task-sheet-content { padding-bottom: max(20px, env(safe-area-inset-bottom)); }
+	}
+</style>

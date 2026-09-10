@@ -9,6 +9,7 @@
 	import { openWorkspaceWindow, WORKSPACE_WINDOW_PARAM } from '$lib/openWorkspaceWindow';
 	import { PROJECT_MUTATION_EVENT, sortProjectsByRecency, type ProjectMutation } from '$lib/projectEvents';
 	import { serverTimestampMs } from '$lib/serverTime';
+	import { planningViewport } from '$lib/taskPlanning';
 	import { agentRuntimeSummary, agentRuntimeTitle, timeAgo } from '$lib/utils';
 	import {
 		createWorkspaceTab,
@@ -65,6 +66,8 @@
 	let compactTabStrip = $state<HTMLDivElement>();
 	let sidebarCollapsed = $state(false);
 	let mobileMenuOpen = $state(false);
+	let mobileMenuDialog = $state<HTMLDialogElement>();
+	const navigationId = $props.id();
 	let agentList = $state<Agent[]>([]);
 	let projectList = $state<Project[]>([]);
 	let conversationList = $state<Conversation[]>([]);
@@ -160,6 +163,26 @@
 		});
 		return () => window.cancelAnimationFrame(frame);
 	});
+
+	$effect(() => {
+		if (mobileMenuOpen && mobileMenuDialog && !mobileMenuDialog.open) mobileMenuDialog.showModal();
+	});
+
+	function keepNavigationFocus(event: KeyboardEvent) {
+		if (event.key !== 'Tab' || event.defaultPrevented || !mobileMenuDialog) return;
+		const controls = Array.from(mobileMenuDialog.querySelectorAll<HTMLElement>('a[href], button, [tabindex]'))
+			.filter((element) => element.tabIndex >= 0 && !element.matches(':disabled') && element.getClientRects().length > 0);
+		const first = controls[0];
+		const last = controls.at(-1);
+		if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+		else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+	}
+
+	function closeMobileMenu() {
+		contextMenu = null;
+		mobileMenuDialog?.close();
+		mobileMenuOpen = false;
+	}
 
 	function validWorkspaceWindowId(value: string | null): string | null {
 		return value && /^workspace-\d+-\d+$/.test(value) ? value : null;
@@ -614,7 +637,7 @@
 			return;
 		}
 
-		mobileMenuOpen = false;
+		closeMobileMenu();
 		if (action === 'open-new-window') {
 			launchWorkspaceWindow(projectPath(target.agent.id), target.agent.title || target.agent.name);
 			return;
@@ -898,6 +921,9 @@
 
 		loadWorkspaceSummary();
 		checkDocker();
+		const desktopViewport = window.matchMedia('(min-width: 1024px)');
+		const closeMobileOnDesktop = () => { if (desktopViewport.matches) closeMobileMenu(); };
+		desktopViewport.addEventListener('change', closeMobileOnDesktop);
 		const handleOnline = () => void checkConnection();
 		window.addEventListener('online', handleOnline);
 		window.addEventListener(PROJECT_MUTATION_EVENT, handleProjectMutation);
@@ -909,6 +935,7 @@
 		}, 3000);
 		return () => {
 			clearInterval(interval);
+			desktopViewport.removeEventListener('change', closeMobileOnDesktop);
 			window.removeEventListener('online', handleOnline);
 			window.removeEventListener(PROJECT_MUTATION_EVENT, handleProjectMutation);
 			window.removeEventListener(WORKSPACE_OPEN_SPLIT_EVENT, handleOpenSplit);
@@ -917,7 +944,7 @@
 </script>
 
 <div class="flex h-[100dvh] min-w-0 overflow-hidden">
-	<aside class="hidden shrink-0 flex-col border-r border-border/60 transition-[width] duration-200 md:flex {sidebarCollapsed ? 'w-14' : 'w-64'}" style="background: hsl(var(--sidebar))">
+	<aside data-workspace-sidebar class="hidden shrink-0 flex-col border-r border-border/60 transition-[width] duration-200 lg:flex {sidebarCollapsed ? 'w-14' : 'w-64'}" style="background: hsl(var(--sidebar))">
 		<div class="flex h-11 shrink-0 items-center {sidebarCollapsed ? 'justify-center' : 'gap-2 px-3'}">
 			<a href="/dashboard" class="flex min-w-0 items-center gap-2 rounded-md outline-none transition hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/50" aria-label="Open Control center" title="Control center">
 				<img src="/icon-32.png" alt="" class="h-5 w-5 rounded" />
@@ -989,9 +1016,9 @@
 		</div>
 	</aside>
 
-	<main class="flex min-w-0 flex-1 flex-col overflow-hidden pb-16 md:pb-0">
-		<div class="flex h-12 shrink-0 items-center gap-3 border-b border-border bg-background/95 px-3 backdrop-blur md:hidden">
-			<button type="button" onclick={() => (mobileMenuOpen = true)} aria-label="Open agent switcher" class="flex h-9 w-9 items-center justify-center rounded-lg text-muted-foreground hover:bg-accent hover:text-foreground">
+	<main class="flex min-w-0 flex-1 flex-col overflow-hidden pb-[calc(4rem+env(safe-area-inset-bottom))] lg:pb-0">
+		<div class="flex h-12 shrink-0 items-center gap-3 border-b border-border bg-background/95 px-3 backdrop-blur lg:hidden">
+			<button type="button" onclick={() => (mobileMenuOpen = true)} aria-label="Open agent switcher" title="Browse workspace" aria-haspopup="dialog" aria-expanded={mobileMenuOpen} aria-controls={navigationId} class="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg text-muted-foreground hover:bg-accent hover:text-foreground">
 				<svg class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><path stroke-linecap="round" d="M4 6h16M4 12h16M4 18h16" /></svg>
 			</button>
 			<a href="/dashboard" aria-label="Open Control center" title="Control center" class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"><img src="/icon-32.png" alt="" class="h-5 w-5 rounded" /></a>
@@ -1003,7 +1030,7 @@
 					<div class="truncate text-[10px] text-muted-foreground">{focusedProject.conversation_count} conversations · {focusedProject.agent_ids.length} Agents</div>
 				{/if}
 			</div>
-			<a href="/" aria-label="New work" class="flex h-9 w-9 items-center justify-center rounded-lg bg-primary text-lg text-primary-foreground">+</a>
+			<a href="/" aria-label="New work" class="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg bg-primary text-lg text-primary-foreground">+</a>
 		</div>
 
 		{#if workspacePath($page.url.pathname)}
@@ -1082,41 +1109,49 @@
 </div>
 
 {#if mobileMenuOpen}
-	<div class="fixed inset-0 z-50 md:hidden">
-		<button type="button" class="absolute inset-0 bg-black/60" aria-label="Close agent switcher" onclick={() => (mobileMenuOpen = false)}></button>
-		<aside class="absolute inset-y-0 left-0 flex min-h-0 w-[min(88vw,22rem)] flex-col overflow-hidden border-r border-border p-3 shadow-2xl" style="background: hsl(var(--sidebar))">
-			<div class="mb-3 flex h-9 shrink-0 items-center gap-2"><a href="/dashboard" onclick={() => (mobileMenuOpen = false)} class="flex min-w-0 items-center gap-2 rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50" aria-label="Open Control center"><img src="/icon-32.png" alt="" class="h-6 w-6 rounded" /><span class="text-sm font-semibold">xpressclaw</span></a><span class="min-w-0 flex-1 truncate text-right text-xs text-muted-foreground">{sidebarTitle}</span><button type="button" onclick={() => (mobileMenuOpen = false)} aria-label="Close" class="flex h-8 w-8 items-center justify-center rounded-lg text-xl text-muted-foreground hover:bg-accent">×</button></div>
-			<a href="/" onclick={() => (mobileMenuOpen = false)} class="mb-3 flex shrink-0 items-center justify-center gap-2 rounded-lg bg-primary px-3 py-2 text-sm font-medium text-primary-foreground">+ New work</a>
+	<dialog bind:this={mobileMenuDialog} id={navigationId} use:planningViewport class="workspace-navigation" aria-label="Browse workspace" onkeydown={keepNavigationFocus} onclose={() => { mobileMenuOpen = false; contextMenu = null; }}>
+		<button type="button" class="absolute inset-0" tabindex="-1" aria-label="Close agent switcher" onclick={closeMobileMenu}></button>
+		<aside class="navigation-sheet flex min-h-0 flex-col overflow-hidden rounded-2xl border border-border p-3 shadow-2xl" style="background: hsl(var(--sidebar))">
+			<div class="mb-3 flex h-9 shrink-0 items-center gap-2"><a href="/dashboard" onclick={closeMobileMenu} class="flex min-w-0 items-center gap-2 rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50" aria-label="Open Control center"><img src="/icon-32.png" alt="" class="h-6 w-6 rounded" /><span class="text-sm font-semibold">xpressclaw</span></a><span class="min-w-0 flex-1 truncate text-right text-xs text-muted-foreground">{sidebarTitle}</span><button type="button" onclick={closeMobileMenu} aria-label="Close" class="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg text-xl text-muted-foreground hover:bg-accent">×</button></div>
+			<a href="/" onclick={closeMobileMenu} class="mb-3 flex shrink-0 items-center justify-center gap-2 rounded-lg bg-primary px-3 py-2 text-sm font-medium text-primary-foreground">+ New work</a>
 			{#if sidebarCategory === 'tasks'}
 				<div data-mobile-sidebar-scroll class="workspace-scroll-y flex-1">
-					<SidebarTasks {projectList} {conversationList} {agentList} taskList={sidebarTaskList} activeTaskId={focusedTaskId} showHeading={false} onnavigate={() => (mobileMenuOpen = false)} />
+					<SidebarTasks {projectList} {conversationList} {agentList} taskList={sidebarTaskList} activeTaskId={focusedTaskId} showHeading={false} onnavigate={closeMobileMenu} />
 				</div>
 			{:else if sidebarCategory === 'automations'}
 				<div data-mobile-sidebar-scroll class="workspace-scroll-y flex-1">
-					<SidebarAutomations {workflowList} {scheduleList} activeWorkflowId={focusedWorkflowId} showHeading={false} onnavigate={() => (mobileMenuOpen = false)} />
+					<SidebarAutomations {workflowList} {scheduleList} activeWorkflowId={focusedWorkflowId} showHeading={false} onnavigate={closeMobileMenu} />
 				</div>
 			{:else if sidebarCategory === 'settings'}
 				<div data-mobile-sidebar-scroll class="workspace-scroll-y flex-1">
-					<SidebarSettings activeKind={focusedTab?.kind ?? 'settings'} showHeading={false} onnavigate={() => (mobileMenuOpen = false)} />
+					<SidebarSettings activeKind={focusedTab?.kind ?? 'settings'} showHeading={false} onnavigate={closeMobileMenu} />
 				</div>
 			{:else}
-				{#if attentionTasks.length > 0}
-					<div class="mb-4 shrink-0"><div class="mb-1 px-2 text-[10px] font-semibold uppercase tracking-[0.14em] text-orange-400">Needs you</div>{#each attentionTasks.slice(0, 5) as task (task.id)}<a href="/tasks/{task.id}" onclick={() => (mobileMenuOpen = false)} class="flex items-center gap-2 rounded-lg px-2 py-2 hover:bg-accent"><span class="h-2 w-2 rounded-full {task.status === 'blocked' ? 'bg-red-500' : 'bg-orange-500'}"></span><span class="min-w-0 flex-1 truncate text-sm">{task.title}</span></a>{/each}</div>
-				{/if}
 				<div data-mobile-sidebar-scroll class="workspace-scroll-y flex-1">
-					<SidebarProjects {projectList} {conversationList} {agentList} taskList={sidebarTaskList} {activeProjectId} activeConversationId={focusedConversation?.id ?? null} activeAgentId={focusedAgent?.id ?? null} onagentcontext={showProjectContextMenu} onnavigate={() => (mobileMenuOpen = false)} />
+				{#if attentionTasks.length > 0}
+					<div class="mb-4 shrink-0"><div class="mb-1 px-2 text-[10px] font-semibold uppercase tracking-[0.14em] text-orange-400">Needs you</div>{#each attentionTasks.slice(0, 5) as task (task.id)}<a href="/tasks/{task.id}" onclick={closeMobileMenu} class="flex items-center gap-2 rounded-lg px-2 py-2 hover:bg-accent"><span class="h-2 w-2 rounded-full {task.status === 'blocked' ? 'bg-red-500' : 'bg-orange-500'}"></span><span class="min-w-0 flex-1 truncate text-sm">{task.title}</span></a>{/each}</div>
+				{/if}
+					<SidebarProjects {projectList} {conversationList} {agentList} taskList={sidebarTaskList} {activeProjectId} activeConversationId={focusedConversation?.id ?? null} activeAgentId={focusedAgent?.id ?? null} onagentcontext={showProjectContextMenu} onnavigate={closeMobileMenu} />
 				</div>
 			{/if}
+			<button type="button" onclick={closeMobileMenu} class="mt-3 min-h-11 shrink-0 rounded-lg border border-border text-sm font-medium hover:bg-accent" aria-label="Close navigation">Done</button>
 		</aside>
-	</div>
+		{@render workspaceContextMenu()}
+	</dialog>
 {/if}
 
-<nav class="fixed inset-x-0 bottom-0 z-40 grid h-16 grid-cols-4 border-t border-border bg-background/95 pb-[env(safe-area-inset-bottom)] backdrop-blur md:hidden">
+<nav aria-label="Workspace navigation" class="fixed inset-x-0 bottom-0 z-40 grid h-[calc(4rem+env(safe-area-inset-bottom))] grid-cols-5 border-t border-border bg-background/95 pb-[env(safe-area-inset-bottom)] backdrop-blur lg:hidden">
+	<button type="button" onclick={() => mobileMenuOpen = true} aria-label="Browse workspace" aria-haspopup="dialog" aria-expanded={mobileMenuOpen} aria-controls={navigationId} class="flex flex-col items-center justify-center gap-1 text-[10px] text-muted-foreground hover:text-foreground">
+		<svg class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" d="M4 6h16M4 12h16M4 18h16" /></svg><span>Browse</span>
+	</button>
 	{#each utilityTabs as item}
 		<a href={item.href} class="flex flex-col items-center justify-center gap-1 text-[10px] {tabCategory(focusedTab?.kind) === tabCategory(item.kind) ? 'text-primary' : 'text-muted-foreground'}"><svg class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d={item.icon} /></svg><span>{item.label}</span></a>
 	{/each}
 </nav>
 
+{#if !mobileMenuOpen}{@render workspaceContextMenu()}{/if}
+
+{#snippet workspaceContextMenu()}
 {#if contextMenu}
 	<ContextMenu
 		x={contextMenu.x}
@@ -1127,6 +1162,8 @@
 		onclose={() => (contextMenu = null)}
 	/>
 {/if}
+
+{/snippet}
 
 {#if !serverConnected}
 	<div data-connection-status role="status" aria-live="polite" class="pointer-events-none fixed inset-x-0 top-14 z-[200] flex justify-center px-3">
@@ -1143,3 +1180,10 @@
 {#if !dockerAvailable}
 	<div class="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 backdrop-blur-sm"><div class="mx-4 w-full max-w-sm space-y-4 rounded-xl border border-border bg-card p-6 shadow-2xl"><div class="flex items-center gap-3"><div class="flex h-10 w-10 items-center justify-center rounded-full bg-amber-500/10"><svg class="h-5 w-5 text-amber-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z" /></svg></div><div><h3 class="text-sm font-semibold">Container runtime is not running</h3><p class="text-xs text-muted-foreground">{dockerInstalled ? 'Start Docker or Podman to run queued work.' : 'Install Docker or Podman to run ACP workers.'}</p></div></div><div class="flex justify-end gap-2"><button type="button" onclick={() => (dockerAvailable = true)} class="rounded-lg border border-border px-3 py-1.5 text-xs hover:bg-secondary">Dismiss</button>{#if dockerCanStart}<button type="button" onclick={startDocker} disabled={dockerStarting} class="rounded-lg bg-primary px-3 py-1.5 text-xs text-primary-foreground disabled:opacity-50">{dockerStarting ? 'Starting…' : 'Start runtime'}</button>{/if}</div></div></div>
 {/if}
+
+<style>
+	.workspace-navigation { position: fixed; inset: 0; width: 100%; max-width: none; height: 100dvh; max-height: none; margin: 0; padding: 0; border: 0; background: transparent; color: hsl(var(--foreground)); }
+	.workspace-navigation::backdrop { background: #0008; }
+	.navigation-sheet { position: absolute; top: calc(var(--planning-viewport-top, 0px) + var(--planning-viewport-height, 100dvh) - 12px); transform: translateY(-100%); left: max(12px, env(safe-area-inset-left)); width: min(calc(100% - 24px), 26rem); height: min(46rem, calc(var(--planning-viewport-height, 100dvh) - 24px)); padding-bottom: max(12px, env(safe-area-inset-bottom)); }
+	.navigation-sheet :global(a), .navigation-sheet :global(button) { min-height: 44px; }
+</style>

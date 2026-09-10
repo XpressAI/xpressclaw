@@ -1,11 +1,12 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, tick } from 'svelte';
 	import type { ContextMenuItem } from '$lib/contextMenu';
 
 	let {
 		x,
 		y,
 		label = 'Context menu',
+		anchor,
 		items,
 		onselect,
 		onclose,
@@ -13,6 +14,7 @@
 		x: number;
 		y: number;
 		label?: string;
+		anchor?: HTMLElement;
 		items: ContextMenuItem[];
 		onselect: (id: string) => void;
 		onclose: () => void;
@@ -26,14 +28,16 @@
 		return Array.from(menu?.querySelectorAll<HTMLButtonElement>('[role="menuitem"]:not(:disabled)') ?? []);
 	}
 
-	function placeAndFocus() {
+	async function placeAndFocus() {
 		if (!menu) return;
 		const bounds = menu.getBoundingClientRect();
 		const requestedLeft = Number.isFinite(x) ? x : 8;
 		const requestedTop = Number.isFinite(y) ? y : 8;
 		left = Math.max(8, Math.min(requestedLeft, window.innerWidth - bounds.width - 8));
 		top = Math.max(8, Math.min(requestedTop, window.innerHeight - bounds.height - 8));
-		enabledItems()[0]?.focus({ preventScroll: true });
+		// The initial menu is invisible until its measured position is rendered.
+		await tick();
+		if (menu?.isConnected) enabledItems()[0]?.focus({ preventScroll: true });
 	}
 
 	function handleKeydown(event: KeyboardEvent) {
@@ -66,7 +70,8 @@
 	onMount(() => {
 		const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
 		const closeOutside = (event: PointerEvent) => {
-			if (menu && !event.composedPath().includes(menu)) onclose();
+			const path = event.composedPath();
+			if (menu && !path.includes(menu) && (!anchor || !path.includes(anchor))) onclose();
 		};
 		const close = () => onclose();
 
