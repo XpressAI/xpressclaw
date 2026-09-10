@@ -930,6 +930,10 @@ mod tests {
     fn test_current_subtask_finds_in_progress() {
         let subtasks = vec![
             Task {
+                start_after: None,
+                backlog: false,
+                position: 0.0,
+                revision: 0,
                 id: "1".into(),
                 title: "Step 1".into(),
                 status: TaskStatus::Completed,
@@ -950,6 +954,10 @@ mod tests {
                 hidden: false,
             },
             Task {
+                start_after: None,
+                backlog: false,
+                position: 0.0,
+                revision: 0,
                 id: "2".into(),
                 title: "Step 2".into(),
                 status: TaskStatus::InProgress,
@@ -970,6 +978,10 @@ mod tests {
                 hidden: false,
             },
             Task {
+                start_after: None,
+                backlog: false,
+                position: 0.0,
+                revision: 0,
                 id: "3".into(),
                 title: "Step 3".into(),
                 status: TaskStatus::Pending,
@@ -998,6 +1010,10 @@ mod tests {
     #[test]
     fn test_current_subtask_falls_back_to_pending() {
         let subtasks = vec![Task {
+            start_after: None,
+            backlog: false,
+            position: 0.0,
+            revision: 0,
             id: "1".into(),
             title: "Step 1".into(),
             status: TaskStatus::Pending,
@@ -1025,6 +1041,10 @@ mod tests {
     #[test]
     fn test_current_subtask_none_when_all_done() {
         let subtasks = vec![Task {
+            start_after: None,
+            backlog: false,
+            position: 0.0,
+            revision: 0,
             id: "1".into(),
             title: "Step 1".into(),
             status: TaskStatus::Completed,
@@ -1063,6 +1083,8 @@ mod tests {
         // Create a completed task — dispatcher should skip it
         let task = board
             .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "Already done".into(),
                 description: None,
                 agent_id: Some("atlas".into()),

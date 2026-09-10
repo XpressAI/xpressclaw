@@ -32,7 +32,7 @@
 {:else if tab.kind === 'conversation' && tab.resourceId}
 	<ConversationView conversationId={tab.resourceId} />
 {:else if tab.kind === 'tasks'}
-	<TasksPage />
+	<TasksPage route={tab.path} />
 {:else if tab.kind === 'task' && tab.resourceId}
 	<TaskView taskId={tab.resourceId} {compact} />
 {:else if tab.kind === 'automations' || tab.kind === 'schedules' || tab.kind === 'workflows'}

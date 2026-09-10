@@ -4907,6 +4907,11 @@ mod tests {
             .transition_attempt(first_attempt_id, "preparing", "Preparing", None, None)
             .unwrap();
 
+        assert!(queue.claim("atlas").unwrap().is_none());
+        SessionManager::new(db.clone())
+            .transition_attempt(first_attempt_id, "completed", "Complete", None, None)
+            .unwrap();
+        queue.complete(first.id, "Complete").unwrap();
         let claimed_later = queue.claim("atlas").unwrap().unwrap();
         assert_eq!(claimed_later.id, later.id);
         let later_prompt =
@@ -4944,6 +4949,11 @@ mod tests {
             )
             .unwrap()
             .unwrap();
+        assert!(queue.claim("atlas").unwrap().is_none());
+        SessionManager::new(db.clone())
+            .transition_attempt(later_attempt_id, "completed", "Complete", None, None)
+            .unwrap();
+        queue.complete(later.id, "Complete").unwrap();
         let claimed_newest = queue.claim("atlas").unwrap().unwrap();
         assert_eq!(claimed_newest.id, newest.id);
         let newest_prompt =
@@ -7154,6 +7164,8 @@ flows:
             .unwrap();
         let task = TaskBoard::new(db.clone())
             .create(&crate::tasks::board::CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "Reply".to_string(),
                 description: Some("Reply from the native worker".to_string()),
                 agent_id: Some("atlas".to_string()),

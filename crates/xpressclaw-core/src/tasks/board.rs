@@ -52,6 +52,14 @@ pub struct Task {
     pub description: Option<String>,
     pub status: TaskStatus,
     pub priority: i32,
+    #[serde(default)]
+    pub start_after: Option<String>,
+    #[serde(default)]
+    pub backlog: bool,
+    #[serde(default)]
+    pub position: f64,
+    #[serde(default)]
+    pub revision: i64,
     pub agent_id: Option<String>,
     pub parent_task_id: Option<String>,
     pub sop_id: Option<String>,
@@ -98,6 +106,9 @@ const NATIVE_PLAN_PROVENANCE: &str = "native_plan";
 
 #[derive(Debug, Default, Deserialize)]
 pub struct CreateTask {
+    #[serde(default)]
+    pub backlog: bool,
+    pub start_after: Option<String>,
     pub title: String,
     pub description: Option<String>,
     pub agent_id: Option<String>,
@@ -228,6 +239,7 @@ impl TaskBoard {
             .format("%Y-%m-%d %H:%M:%S")
             .to_string();
         let priority = req.priority.unwrap_or(0);
+        let start_after = super::planning::normalize_start_after(req.start_after.as_deref())?;
         let context_json = req.context.as_ref().map(|c| c.to_string());
         let provenance = req
             .context
@@ -334,8 +346,8 @@ impl TaskBoard {
             ));
         }
         transaction.execute(
-            "INSERT INTO tasks (id, title, description, status, priority, agent_id, parent_task_id, sop_id, conversation_id, context, created_at, updated_at, project_id, provenance, blocks_parent)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            "INSERT INTO tasks (id, title, description, status, priority, agent_id, parent_task_id, sop_id, conversation_id, context, created_at, updated_at, project_id, provenance, blocks_parent, start_after, backlog, position)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, (SELECT COALESCE(MAX(position), 0) + 1024.0 FROM tasks))",
             rusqlite::params![
                 id,
                 req.title,
@@ -352,6 +364,8 @@ impl TaskBoard {
                 project_id,
                 provenance,
                 blocks_parent,
+                start_after,
+                req.backlog,
             ],
         )?;
         Ok(id)
@@ -1144,6 +1158,19 @@ impl TaskBoard {
     /// Derive what the UI should say from actual attempts, queue entries,
     /// review gates, and durable blocking descendants.
     pub fn activity_status(&self, task: &Task) -> Result<String> {
+        if matches!(task.status, TaskStatus::Pending | TaskStatus::InProgress)
+            && (task.backlog || super::planning::is_scheduled(task.start_after.as_deref()))
+        {
+            let owned = self.db.with_conn(|conn| conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM task_queue WHERE task_id=?1 AND status='running')
+                 OR EXISTS(SELECT 1 FROM work_attempts WHERE task_id=?1 AND status IN ('preparing','running','waiting_for_input','review'))
+                 OR EXISTS(SELECT 1 FROM task_pull_requests WHERE task_id=?1 AND status IN ('waiting','attention'))",
+                [&task.id], |row| row.get::<_, bool>(0),
+            ))?;
+            if !owned {
+                return Ok(if task.backlog { "backlog" } else { "scheduled" }.into());
+            }
+        }
         if task.status != TaskStatus::InProgress {
             return Ok(task.status.as_str().to_string());
         }
@@ -1483,6 +1510,8 @@ impl TaskBoard {
         // First pass: create all tasks and map refs to UUIDs
         for input in tasks {
             let task = self.create(&CreateTask {
+                start_after: input.start_after.clone(),
+                backlog: input.backlog,
                 title: input.title.clone(),
                 description: input.description.clone(),
                 agent_id: input.agent_id.clone(),
@@ -1540,7 +1569,7 @@ fn consistent_project_id<const N: usize>(
     Ok(selected.map(|(_, project_id)| project_id.to_string()))
 }
 
-fn ensure_task_agent_project(
+pub(super) fn ensure_task_agent_project(
     conn: &rusqlite::Connection,
     task_id: &str,
     agent_id: &str,
@@ -1774,7 +1803,10 @@ fn synchronize_pull_request_agent(
     Ok(Some(previous_agent_id))
 }
 
-fn refresh_logical_session_status(conn: &rusqlite::Connection, session_id: &str) -> Result<()> {
+pub(super) fn refresh_logical_session_status(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+) -> Result<()> {
     let active_attempt: bool = conn.query_row(
         "SELECT EXISTS(
             SELECT 1 FROM work_attempts
@@ -1822,7 +1854,7 @@ fn refresh_logical_session_status(conn: &rusqlite::Connection, session_id: &str)
     Ok(())
 }
 
-fn append_task_search(
+pub(super) fn append_task_search(
     sql: &mut String,
     params: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
     search: Option<&str>,
@@ -1862,6 +1894,9 @@ fn append_task_search(
 /// Input for batch task creation.
 #[derive(Debug, Deserialize)]
 pub struct BatchTaskInput {
+    #[serde(default)]
+    pub backlog: bool,
+    pub start_after: Option<String>,
     /// Local reference name for cross-referencing within the batch.
     #[serde(rename = "ref")]
     pub ref_name: Option<String>,
@@ -1878,7 +1913,7 @@ pub struct BatchTaskInput {
     pub depends_on: Option<Vec<String>>,
 }
 
-fn row_to_task(row: &rusqlite::Row) -> Result<Task> {
+pub(super) fn row_to_task(row: &rusqlite::Row) -> Result<Task> {
     let context_str: Option<String> = row.get("context")?;
     let context = context_str
         .as_deref()
@@ -1892,6 +1927,10 @@ fn row_to_task(row: &rusqlite::Row) -> Result<Task> {
         description: row.get("description")?,
         status: TaskStatus::parse(&status_str)?,
         priority: row.get("priority")?,
+        start_after: row.get("start_after").unwrap_or(None),
+        backlog: row.get("backlog").unwrap_or(false),
+        position: row.get("position").unwrap_or(0.0),
+        revision: row.get("revision").unwrap_or(0),
         agent_id: row.get("agent_id")?,
         parent_task_id: row.get("parent_task_id")?,
         sop_id: row.get("sop_id")?,
@@ -1947,6 +1986,8 @@ mod tests {
         .unwrap();
         let task = board
             .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "Test task".to_string(),
                 description: Some("A test".to_string()),
                 agent_id: Some("atlas".to_string()),
@@ -2286,6 +2327,8 @@ mod tests {
         add_test_agents(&db, &["atlas"]);
         let task = board
             .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "Status test".to_string(),
                 description: None,
                 agent_id: None,
@@ -2580,6 +2623,8 @@ mod tests {
         .unwrap();
         let parent = board
             .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "Implement feature".to_string(),
                 description: None,
                 agent_id: Some("developer".to_string()),
@@ -2935,6 +2980,8 @@ mod tests {
         add_test_agents(&db, &["developer"]);
         let task = board
             .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "Cancelled work".to_string(),
                 description: None,
                 agent_id: Some("developer".to_string()),
@@ -2959,6 +3006,8 @@ mod tests {
         let (_, board) = setup();
         let parent = board
             .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "Parent".to_string(),
                 description: None,
                 agent_id: None,
@@ -2972,6 +3021,8 @@ mod tests {
         let make_child = |title: &str| {
             board
                 .create(&CreateTask {
+                    backlog: false,
+                    start_after: None,
                     title: title.to_string(),
                     description: None,
                     agent_id: None,
@@ -3033,6 +3084,8 @@ mod tests {
         add_test_agents(&db, &["atlas"]);
         let first = board
             .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "Task 1".to_string(),
                 description: None,
                 agent_id: Some("atlas".to_string()),
@@ -3045,6 +3098,8 @@ mod tests {
             .unwrap();
         board
             .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "Task 2".to_string(),
                 description: None,
                 agent_id: Some("atlas".to_string()),
@@ -3334,6 +3389,8 @@ mod tests {
         let (_, board) = setup();
         let task = board
             .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "To delete".to_string(),
                 description: None,
                 agent_id: None,
@@ -3407,6 +3464,8 @@ mod tests {
             .create_batch(
                 &[
                     BatchTaskInput {
+                        backlog: false,
+                        start_after: None,
                         ref_name: Some("build".into()),
                         title: "Build".into(),
                         description: None,
@@ -3416,6 +3475,8 @@ mod tests {
                         depends_on: None,
                     },
                     BatchTaskInput {
+                        backlog: false,
+                        start_after: None,
                         ref_name: Some("test".into()),
                         title: "Test".into(),
                         description: None,
@@ -3425,6 +3486,8 @@ mod tests {
                         depends_on: Some(vec!["build".into()]),
                     },
                     BatchTaskInput {
+                        backlog: false,
+                        start_after: None,
                         ref_name: Some("deploy".into()),
                         title: "Deploy".into(),
                         description: None,

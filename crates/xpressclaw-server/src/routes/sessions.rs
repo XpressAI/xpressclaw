@@ -371,6 +371,8 @@ async fn post_message(
     let board = TaskBoard::new(state.db.clone());
     let task = board
         .create(&CreateTask {
+            backlog: false,
+            start_after: None,
             title,
             description: (!content.is_empty()).then(|| content.clone()),
             agent_id: Some(id.clone()),

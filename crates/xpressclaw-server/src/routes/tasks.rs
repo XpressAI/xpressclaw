@@ -116,6 +116,8 @@ pub fn routes() -> Router<AppState> {
         .route("/", get(list_tasks).post(create_task))
         .route("/batch", axum::routing::post(create_tasks_batch))
         .route("/counts", get(task_counts))
+        .route("/planning", get(list_planning))
+        .route("/{id}/planning", get(get_planning).patch(change_planning))
         .route("/recent-by-agent", get(list_recent_tasks_by_agent))
         .route(
             "/{id}",
@@ -274,6 +276,45 @@ fn pull_request_registration_error(
     }
 }
 
+fn planning_error(error: xpressclaw_core::error::Error) -> (StatusCode, Json<Value>) {
+    let status = match &error {
+        xpressclaw_core::error::Error::TaskNotFound { .. } => StatusCode::NOT_FOUND,
+        xpressclaw_core::error::Error::Task(_) => StatusCode::CONFLICT,
+        _ => StatusCode::BAD_REQUEST,
+    };
+    (status, Json(json!({"error":error.to_string()})))
+}
+async fn list_planning(
+    State(state): State<AppState>,
+    Query(filter): Query<xpressclaw_core::tasks::planning::PlanningFilter>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let page = xpressclaw_core::tasks::planning::TaskPlanner::new(state.db.clone())
+        .list(&filter)
+        .map_err(planning_error)?;
+    Ok(Json(json!(page)))
+}
+async fn get_planning(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    Ok(Json(json!(
+        xpressclaw_core::tasks::planning::TaskPlanner::new(state.db.clone())
+            .get(&id)
+            .map_err(planning_error)?
+    )))
+}
+async fn change_planning(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(change): Json<xpressclaw_core::tasks::planning::PlanningChange>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    Ok(Json(json!(
+        xpressclaw_core::tasks::planning::TaskPlanner::new(state.db.clone())
+            .change(&id, &change)
+            .map_err(planning_error)?
+    )))
+}
+
 async fn list_tasks(
     State(state): State<AppState>,
     Query(params): Query<ListParams>,
@@ -387,7 +428,7 @@ async fn create_task(
     let task = board.create(&req).map_err(task_write_error)?;
 
     // Auto-enqueue for the dispatcher if the task has an assigned agent
-    if let Some(ref agent_id) = task.agent_id {
+    if let Some(agent_id) = task.agent_id.as_ref().filter(|_| !task.backlog) {
         let queue = xpressclaw_core::tasks::queue::TaskQueue::new(state.db.clone());
         if let Err(e) = queue.enqueue(&task.id, agent_id) {
             tracing::warn!(
@@ -469,6 +510,7 @@ async fn update_task(
     // If agent was assigned and task is actionable, enqueue for dispatcher
     if let Some(ref agent_id) = new_agent {
         if !agent_id.is_empty()
+            && !task.backlog
             && (task.status == xpressclaw_core::tasks::board::TaskStatus::Pending
                 || task.status == xpressclaw_core::tasks::board::TaskStatus::InProgress)
         {
@@ -914,7 +956,7 @@ async fn add_message(
     };
 
     let sessions = SessionManager::new(state.db.clone());
-    let active_attempt = if let Some(ref agent_id) = task.agent_id {
+    let active_attempt = if let Some(agent_id) = task.agent_id.as_ref().filter(|_| !task.backlog) {
         sessions
             .ensure(agent_id, Some(agent_id))
             .map_err(internal_error)?;
@@ -946,7 +988,7 @@ async fn add_message(
         .map_err(internal_error)?;
 
     let mut delivery = "stored";
-    if let Some(ref agent_id) = task.agent_id {
+    if let Some(agent_id) = task.agent_id.as_ref().filter(|_| !task.backlog) {
         sessions
             .append_event(
                 agent_id,
@@ -1017,7 +1059,7 @@ async fn create_tasks_batch(
     // Enqueue tasks that have agents assigned
     let queue = xpressclaw_core::tasks::queue::TaskQueue::new(state.db.clone());
     for task in &tasks {
-        if let Some(ref agent_id) = task.agent_id {
+        if let Some(agent_id) = task.agent_id.as_ref().filter(|_| !task.backlog) {
             let _ = queue.enqueue(&task.id, agent_id);
         }
     }
@@ -1128,6 +1170,160 @@ mod tests {
     async fn body_json(body: Body) -> Value {
         let bytes = body.collect().await.unwrap().to_bytes();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn planning_api_filters_projects_and_enforces_revision_and_execution_boundaries() {
+        let (app, db) = test_app_with_db();
+        db.with_conn(|conn| conn.execute_batch("INSERT INTO projects(id,name) VALUES ('store','Store'),('lab','Lab'); UPDATE agents SET project_id='store' WHERE id='atlas'; UPDATE agents SET project_id='lab' WHERE id='beta';")).unwrap();
+        let create = |agent: &str, title: &str| {
+            Request::post("/tasks")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"title":title,"agent_id":agent,"start_after":"2100-01-01T09:00:00+09:00"}).to_string())).unwrap()
+        };
+        let response = app
+            .clone()
+            .oneshot(create("atlas", "Store integration"))
+            .await
+            .unwrap();
+        let created = body_json(response.into_body()).await;
+        let id = created["id"].as_str().unwrap();
+        app.clone()
+            .oneshot(create("beta", "Lab integration"))
+            .await
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(
+                    "/tasks/planning?project_id=store&status=scheduled&search=integration",
+                )
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let page = body_json(response.into_body()).await;
+        assert_eq!(page["total"], 1);
+        assert_eq!(page["counts"]["scheduled"], 1);
+        assert_eq!(page["tasks"][0]["start_after"], "2100-01-01T00:00:00.000Z");
+        assert!(TaskQueue::new(db.clone()).claim_next().unwrap().is_none());
+        let revision = page["tasks"][0]["revision"].as_i64().unwrap();
+        let patch = |revision, action: Value| {
+            let mut value = action;
+            value["expected_revision"] = json!(revision);
+            Request::patch(format!("/tasks/{id}/planning"))
+                .header("content-type", "application/json")
+                .body(Body::from(value.to_string()))
+                .unwrap()
+        };
+        let response = app
+            .clone()
+            .oneshot(patch(revision, json!({"action":"priority","priority":10})))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let changed = body_json(response.into_body()).await;
+        let response = app
+            .clone()
+            .oneshot(patch(
+                revision,
+                json!({"action":"schedule","start_after":null}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let response = app
+            .clone()
+            .oneshot(patch(
+                changed["revision"].as_i64().unwrap(),
+                json!({"action":"schedule","start_after":null}),
+            ))
+            .await
+            .unwrap();
+        let changed = body_json(response.into_body()).await;
+        let item = TaskQueue::new(db.clone()).claim_next().unwrap().unwrap();
+        assert_eq!(item.task_id, id);
+        let response = app
+            .oneshot(patch(
+                changed["revision"].as_i64().unwrap(),
+                json!({"action":"schedule","start_after":"2100-01-01T00:00:00Z"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(TaskBoard::new(db).get(id).unwrap().start_after.is_none());
+    }
+
+    #[tokio::test]
+    async fn backlog_creation_never_dispatches_and_default_creation_remains_to_do() {
+        let (app, db) = test_app_with_db();
+        for batch in [false, true] {
+            let payload = json!({"title":"Backlog idea", "agent_id":"atlas", "backlog":true});
+            let request = Request::post(if batch { "/tasks/batch" } else { "/tasks" })
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    if batch {
+                        json!({"tasks":[payload]})
+                    } else {
+                        payload
+                    }
+                    .to_string(),
+                ))
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED);
+            let created = body_json(response.into_body()).await;
+            let task = if batch { &created[0] } else { &created };
+            assert_eq!(task["backlog"], true);
+            assert_eq!(task["status"], "pending");
+            // Existing detail assignment must not turn a backlog idea into work.
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::patch(format!("/tasks/{}", task["id"].as_str().unwrap()))
+                        .header("content-type", "application/json")
+                        .body(Body::from(json!({"agent_id":"atlas"}).to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(body_json(response.into_body()).await["status"], "pending");
+        }
+        let queue = TaskQueue::new(db.clone());
+        assert!(queue.list(None, Some("queued"), 100).unwrap().is_empty());
+        assert!(queue.claim_next().unwrap().is_none());
+        for batch in [false, true] {
+            let payload = json!({"title":"Ordinary new work", "agent_id":"beta"});
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post(if batch { "/tasks/batch" } else { "/tasks" })
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            if batch {
+                                json!({"tasks":[payload]})
+                            } else {
+                                payload
+                            }
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED);
+            let created = body_json(response.into_body()).await;
+            let task = if batch { &created[0] } else { &created };
+            assert_eq!(task["backlog"], false);
+        }
+        assert_eq!(
+            queue.list(Some("beta"), Some("queued"), 100).unwrap().len(),
+            2
+        );
+        assert!(queue.claim("beta").unwrap().is_some());
     }
 
     #[tokio::test]

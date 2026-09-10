@@ -739,6 +739,11 @@ export const workspaces = {
 // -- Tasks --
 
 export interface Task {
+	start_after?: string | null;
+	backlog?: boolean;
+	position?: number;
+	revision?: number;
+	planning?: { lane: string; disabled_reason: string | null; queued: boolean; actual_started_at: string | null };
 	id: string;
 	title: string;
 	description: string | null;
@@ -787,7 +792,15 @@ export interface TaskListOptions {
 	search?: string;
 }
 
+export type PlanningAction = { action: 'schedule'; start_after: string | null; activate?: boolean } | { action: 'backlog' | 'queue' } | { action: 'assign'; agent_id: string } | { action: 'priority'; priority: number } | { action: 'reorder'; before_id?: string; after_id?: string };
 export const tasks = {
+    planning: (options: { project_id?: string; agent_id?: string; status?: string; search?: string; limit?: number; offset?: number }) => {
+        const query = new URLSearchParams();
+        for (const [key, value] of Object.entries(options)) if (value !== undefined && value !== '') query.set(key, String(value));
+        return request<{ tasks: Task[]; total: number; counts: Record<string, number> }>(`/api/tasks/planning?${query}`);
+    },
+    planningTask: (id: string) => request<Task>(`/api/tasks/${id}/planning`),
+    plan: (task: Task, change: PlanningAction) => request<Task>(`/api/tasks/${task.id}/planning`, { method: 'PATCH', body: JSON.stringify({ expected_revision: task.revision, ...change }) }),
 	list: (status?: string, agentId?: string, options: TaskListOptions = {}) => {
 		const params = new URLSearchParams();
 		if (status) params.set('status', status);
@@ -804,7 +817,7 @@ export const tasks = {
 	recentByAgent: (limit = 5) =>
 		request<{ tasks: Task[] }>(`/api/tasks/recent-by-agent?limit=${encodeURIComponent(limit)}`),
 	get: (id: string) => request<Task>(`/api/tasks/${id}`),
-	create: (data: { title: string; description?: string; agent_id?: string; priority?: number; context?: Record<string, unknown> }) =>
+	create: (data: { backlog?: boolean; start_after?: string; title: string; description?: string; agent_id?: string; priority?: number; context?: Record<string, unknown> }) =>
 		request<Task>('/api/tasks', { method: 'POST', body: JSON.stringify(data) }),
 	update: (id: string, data: { title?: string; description?: string; agent_id?: string; priority?: number }) =>
 		request<Task>(`/api/tasks/${id}`, {
@@ -848,7 +861,7 @@ export const tasks = {
 		{ method: 'POST', body: JSON.stringify(data) }
 	),
 	subtasks: (id: string) => request<{ tasks: Task[]; counts: TaskCounts }>(`/api/tasks?parent_task_id=${id}`),
-	createBatch: (data: { tasks: { ref: string; title: string; description?: string; agent_id?: string; priority?: number; new_session?: boolean; depends_on?: string[] }[]; parent_task_id?: string }) =>
+	createBatch: (data: { tasks: { ref: string; backlog?: boolean; start_after?: string; title: string; description?: string; agent_id?: string; priority?: number; new_session?: boolean; depends_on?: string[] }[]; parent_task_id?: string }) =>
 		request<Task[]>('/api/tasks/batch', { method: 'POST', body: JSON.stringify(data) }),
 	addDependency: (taskId: string, dependsOn: string) =>
 		request<{ task_id: string; depends_on: string }>(`/api/tasks/${taskId}/dependencies`, {

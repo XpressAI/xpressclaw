@@ -160,6 +160,12 @@ pub struct PortableWakeOnSettings {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct PortableTask {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_after: Option<String>,
+    #[serde(default)]
+    pub backlog: bool,
+    #[serde(default)]
+    pub position: f64,
     pub id: String,
     pub title: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -594,6 +600,10 @@ impl PortableSnapshot {
                 task.conversation_id.as_ref(),
                 &conversation_ids,
             )?;
+            crate::tasks::planning::normalize_start_after(task.start_after.as_deref())?;
+            if !task.position.is_finite() {
+                return Err(Error::Sync("task position must be finite".into()));
+            }
             validate_timestamp("task created_at", &task.created_at)?;
             validate_timestamp("task updated_at", &task.updated_at)?;
             if let Some(completed_at) = task.completed_at.as_deref() {

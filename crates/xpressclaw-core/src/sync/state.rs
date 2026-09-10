@@ -275,7 +275,7 @@ fn export_transaction(
         connection,
         "SELECT id, title, description, status, priority, task_type, hidden,
                 agent_id, parent_task_id, conversation_id, created_at, updated_at,
-                completed_at, provenance, blocks_parent
+                completed_at, provenance, blocks_parent, start_after, backlog, position
          FROM tasks
          WHERE project_id = ?1 AND hidden = 0 AND UPPER(task_type) <> 'IDLE'
            AND provenance != 'native_plan'
@@ -298,6 +298,9 @@ fn export_transaction(
                 completed_at: row.get(12)?,
                 provenance: row.get(13)?,
                 blocks_parent: row.get::<_, i32>(14)? != 0,
+                start_after: row.get(15)?,
+                backlog: row.get(16)?,
+                position: row.get(17)?,
             })
         },
     )?;
@@ -1213,8 +1216,8 @@ fn import_tasks(connection: &Connection, snapshot: &PortableSnapshot) -> Result<
             "INSERT INTO tasks
                 (id, title, description, status, priority, agent_id, parent_task_id,
                  conversation_id, project_id, created_at, updated_at, completed_at,
-                 task_type, hidden, provenance, blocks_parent)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                 task_type, hidden, provenance, blocks_parent, start_after, backlog, position)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
              ON CONFLICT(id) DO UPDATE SET
                 title = excluded.title,
                 description = excluded.description,
@@ -1228,7 +1231,10 @@ fn import_tasks(connection: &Connection, snapshot: &PortableSnapshot) -> Result<
                 task_type = excluded.task_type,
                 hidden = excluded.hidden,
                 provenance = excluded.provenance,
-                blocks_parent = excluded.blocks_parent",
+                blocks_parent = excluded.blocks_parent,
+                start_after = excluded.start_after,
+                backlog = excluded.backlog,
+                position = excluded.position",
             params![
                 task.id,
                 task.title,
@@ -1244,7 +1250,10 @@ fn import_tasks(connection: &Connection, snapshot: &PortableSnapshot) -> Result<
                 task.task_type,
                 task.hidden,
                 task.provenance,
-                task.blocks_parent
+                task.blocks_parent,
+                crate::tasks::planning::normalize_start_after(task.start_after.as_deref())?,
+                task.backlog,
+                task.position
             ],
         )?;
     }
@@ -1814,6 +1823,43 @@ mod tests {
             "projects/project-one",
         )
         .unwrap()
+    }
+
+    #[test]
+    fn task_planning_survives_portable_project_import() {
+        let source = Database::open_memory().unwrap();
+        insert_project_data(&source);
+        source.with_conn(|conn| conn.execute("UPDATE tasks SET start_after='2100-01-01T00:00:00Z', backlog=1, position=17 WHERE id='task-one'", [])).unwrap();
+        let mut config = Config {
+            agents: vec![AgentConfig {
+                name: "atlas".into(),
+                backend: "codex".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let snapshot = export_snapshot(&source, &config, &manifest()).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("xpressclaw.yaml");
+        config.save(&path).unwrap();
+        let target = std::sync::Arc::new(Database::open_memory().unwrap());
+        import_snapshot(&target, &mut config, &path, directory.path(), &snapshot).unwrap();
+        let task = crate::tasks::board::TaskBoard::new(target.clone())
+            .get("task-one")
+            .unwrap();
+        assert_eq!(
+            task.start_after.as_deref(),
+            Some("2100-01-01T00:00:00.000Z")
+        );
+        assert!(task.backlog);
+        assert_eq!(task.position, 17.0);
+        let queue = crate::tasks::queue::TaskQueue::new(target);
+        queue.enqueue(&task.id, "atlas").unwrap();
+        assert!(queue.claim_next().unwrap().is_none());
+        assert!(queue
+            .claim_at(None, "2101-01-01T00:00:00Z".parse().unwrap())
+            .unwrap()
+            .is_none());
     }
 
     #[test]

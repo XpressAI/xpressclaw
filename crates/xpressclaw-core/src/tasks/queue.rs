@@ -59,6 +59,10 @@ impl TaskQueue {
         agent_id: &str,
     ) -> Result<QueueItem> {
         ensure_task_project_accepts_work(transaction, task_id)?;
+        if let Some(item) = transaction.query_row(
+            "SELECT * FROM task_queue WHERE task_id = ?1 AND status = 'queued' ORDER BY id LIMIT 1",
+            [task_id], |row| Ok(row_to_item(row)),
+        ).optional()?.transpose()? { return Ok(item); }
         let (title, description, context) = transaction.query_row(
             "SELECT title, description, context FROM tasks WHERE id = ?1",
             [task_id],
@@ -707,33 +711,7 @@ impl TaskQueue {
 
     /// Claim the next queued item for an agent (atomically set to 'running').
     pub fn claim(&self, agent_id: &str) -> Result<Option<QueueItem>> {
-        self.db.with_conn(|conn| {
-            // Find the next queued item for this agent
-            let mut stmt = conn.prepare(
-                "SELECT id FROM task_queue WHERE agent_id = ?1 AND status = 'queued' ORDER BY queued_at ASC LIMIT 1",
-            )?;
-
-            let id: Option<i64> = stmt
-                .query_row([agent_id], |row| row.get(0))
-                .ok();
-
-            match id {
-                Some(id) => {
-                    conn.execute(
-                        "UPDATE task_queue SET status = 'running', started_at = CURRENT_TIMESTAMP WHERE id = ?1",
-                        [id],
-                    )?;
-                    // Need to drop conn before calling self.get
-                    Ok(Some(id))
-                }
-                None => Ok(None),
-            }
-        }).and_then(|opt_id| {
-            match opt_id {
-                Some(id) => self.get(id).map(Some),
-                None => Ok(None),
-            }
-        })
+        self.claim_at(Some(agent_id), chrono::Utc::now())
     }
 
     /// Claim the oldest queued item across all logical sessions.
@@ -741,14 +719,29 @@ impl TaskQueue {
     /// Dispatch is serialized per project even though several retained ACP
     /// project processes may run concurrently.
     pub fn claim_next(&self) -> Result<Option<QueueItem>> {
+        self.claim_at(None, chrono::Utc::now())
+    }
+
+    pub(crate) fn claim_at(
+        &self,
+        agent_id: Option<&str>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<QueueItem>> {
         self.db
             .with_conn(|conn| {
-                let id: Option<i64> = conn
+                let tx = rusqlite::Transaction::new_unchecked(
+                    conn,
+                    rusqlite::TransactionBehavior::Immediate,
+                )?;
+                let id: Option<i64> = tx
                     .query_row(
-                        "SELECT q.id FROM task_queue q
+                        &format!(
+                            "SELECT q.id FROM task_queue q
                          JOIN tasks t ON t.id = q.task_id
                          JOIN work_attempts candidate ON candidate.id = q.attempt_id
                          WHERE q.status = 'queued'
+                           AND ({eligible})
+                           AND (?2 IS NULL OR q.agent_id = ?2)
                            AND candidate.status = 'queued'
                            AND NOT EXISTS (
                                SELECT 1 FROM task_dependencies d
@@ -785,21 +778,28 @@ impl TaskQueue {
                                  AND monitored_pr.status IN ('waiting', 'attention')
                                  AND monitored_task.status NOT IN ('completed', 'cancelled')
                            )
-                         ORDER BY t.priority DESC, q.queued_at ASC LIMIT 1",
-                        [],
+                         ORDER BY t.priority DESC, t.position, q.queued_at, q.id LIMIT 1",
+                            eligible = super::planning::ELIGIBLE
+                        ),
+                        rusqlite::params![
+                            now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                            agent_id
+                        ],
                         |row| row.get(0),
                     )
-                    .ok();
+                    .optional()?;
                 if let Some(id) = id {
-                    let changed = conn.execute(
+                    let changed = tx.execute(
                         "UPDATE task_queue SET status = 'running', started_at = CURRENT_TIMESTAMP
                          WHERE id = ?1 AND status = 'queued'",
                         [id],
                     )?;
                     if changed == 1 {
+                        tx.commit()?;
                         return Ok(Some(id));
                     }
                 }
+                tx.commit()?;
                 Ok(None)
             })
             .and_then(|id| id.map(|id| self.get(id)).transpose())
@@ -1086,6 +1086,8 @@ mod tests {
         let board = TaskBoard::new(db);
         let task = board
             .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "Test task".into(),
                 description: None,
                 agent_id: Some("atlas".into()),
@@ -1117,6 +1119,8 @@ mod tests {
         let (db, queue) = setup();
         let task = TaskBoard::new(db.clone())
             .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "Owned workflow task".into(),
                 description: None,
                 agent_id: Some("atlas".into()),
@@ -1150,6 +1154,8 @@ mod tests {
         let board = TaskBoard::new(db.clone());
         let task = board
             .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "Interrupted task".into(),
                 description: None,
                 agent_id: Some("atlas".into()),
@@ -1207,6 +1213,8 @@ mod tests {
         let (db, queue) = setup();
         let task = TaskBoard::new(db.clone())
             .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "Finished before restart".into(),
                 description: None,
                 agent_id: Some("atlas".into()),
@@ -1243,6 +1251,8 @@ mod tests {
         let board = TaskBoard::new(db.clone());
         let first_task = board
             .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "Needs an answer".into(),
                 description: None,
                 agent_id: Some("atlas".into()),
@@ -1255,6 +1265,8 @@ mod tests {
             .unwrap();
         let second_task = board
             .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "Queued behind the answer".into(),
                 description: None,
                 agent_id: Some("atlas".into()),
@@ -1306,6 +1318,8 @@ mod tests {
         let board = TaskBoard::new(db.clone());
         let first_task = board
             .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "Cancel this turn".into(),
                 description: None,
                 agent_id: Some("atlas".into()),
@@ -1318,6 +1332,8 @@ mod tests {
             .unwrap();
         let second_task = board
             .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "Run after cleanup".into(),
                 description: None,
                 agent_id: Some("atlas".into()),
@@ -1368,6 +1384,8 @@ mod tests {
         let board = TaskBoard::new(db.clone());
         let task = board
             .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "Cancel while GitHub is polling".into(),
                 description: None,
                 agent_id: Some("atlas".into()),
@@ -1427,6 +1445,8 @@ mod tests {
         let board = TaskBoard::new(db.clone());
         let task = board
             .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "Cancel after a stale active-attempt read".into(),
                 description: None,
                 agent_id: Some("atlas".into()),
@@ -1492,6 +1512,8 @@ mod tests {
         for title in ["First turn", "Second turn"] {
             let task = board
                 .create(&CreateTask {
+                    backlog: false,
+                    start_after: None,
                     title: title.into(),
                     description: None,
                     agent_id: Some("atlas".into()),
@@ -1519,6 +1541,8 @@ mod tests {
         let board = TaskBoard::new(db.clone());
         let review_task = board
             .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "Await PR review".into(),
                 description: None,
                 agent_id: Some("atlas".into()),
@@ -1531,6 +1555,8 @@ mod tests {
             .unwrap();
         let next_task = board
             .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "Must wait for review".into(),
                 description: None,
                 agent_id: Some("atlas".into()),
@@ -1568,6 +1594,8 @@ mod tests {
         let board = TaskBoard::new(db.clone());
         let review_task = board
             .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "Await PR review".into(),
                 description: None,
                 agent_id: Some("atlas".into()),
@@ -1580,6 +1608,8 @@ mod tests {
             .unwrap();
         let next_task = board
             .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "Run after review".into(),
                 description: None,
                 agent_id: Some("atlas".into()),
@@ -1621,6 +1651,8 @@ mod tests {
         let board = TaskBoard::new(db.clone());
         let task = board
             .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "Waiting when the server stopped".into(),
                 description: None,
                 agent_id: Some("atlas".into()),
@@ -1667,6 +1699,8 @@ mod tests {
         let board = TaskBoard::new(db);
         let task = board
             .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "Complete test".into(),
                 description: None,
                 agent_id: Some("atlas".into()),
@@ -1693,6 +1727,8 @@ mod tests {
         let board = TaskBoard::new(db);
         let t1 = board
             .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "T1".into(),
                 description: None,
                 agent_id: Some("atlas".into()),
@@ -1705,6 +1741,8 @@ mod tests {
             .unwrap();
         let t2 = board
             .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "T2".into(),
                 description: None,
                 agent_id: Some("atlas".into()),
@@ -1731,6 +1769,8 @@ mod tests {
         let board = TaskBoard::new(db.clone());
         let task = board
             .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "Conversation".into(),
                 description: None,
                 agent_id: Some("atlas".into()),

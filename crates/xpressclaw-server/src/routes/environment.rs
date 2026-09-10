@@ -633,6 +633,11 @@ mod tests {
         assert_eq!(value["project_id"], "shared");
         assert_eq!(value["parent_task_id"], parent.id);
         assert_eq!(value["blocks_parent"], true);
+        assert_eq!(value["backlog"], false);
+        assert!(TaskQueue::new(db.clone())
+            .claim("helper")
+            .unwrap()
+            .is_some());
         assert_eq!(value["agent_id"], "helper");
         let queued: i64 = db
             .with_conn(|conn| {

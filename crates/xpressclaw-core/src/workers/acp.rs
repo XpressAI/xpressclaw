@@ -3363,6 +3363,8 @@ mod tests {
         .unwrap();
         let task = TaskBoard::new(db.clone())
             .create(&crate::tasks::board::CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "Parent task".to_string(),
                 description: None,
                 agent_id: Some("session-1".to_string()),

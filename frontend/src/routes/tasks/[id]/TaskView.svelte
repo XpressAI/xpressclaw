@@ -1,5 +1,7 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
+	import TaskPlanningActions from '$lib/components/planning/TaskActions.svelte';
+	import { dateLabel } from '$lib/taskPlanning';
 	import { goto } from '$app/navigation';
 	import { tasks, agents, sessions, workspaces } from '$lib/api';
 	import type { AcpCommand, AcpConfigOption, AcpModeState, Task, TaskMessage, Agent, WorkAttempt, SessionEvent, ImageAttachmentUpload, GitChange, WorkspaceGitStatus, MessageVisualization } from '$lib/api';
@@ -16,6 +18,30 @@
 	import { TASK_FILE_SPLIT_MIN_PANE_WIDTH, WORKSPACE_OPEN_SPLIT_EVENT, type WorkspaceOpenSplitDetail } from '$lib/workspace';
 
 	let { taskId, compact = false }: { taskId: string; compact?: boolean } = $props();
+	let planningTask = $state<Task | null>(null);
+	let planningError = $state('');
+	async function openPlanning() {
+		planningError = '';
+		try {
+			planningTask = await tasks.planningTask(taskId);
+		} catch (error) {
+			planningError = error instanceof Error ? error.message : String(error);
+		}
+	}
+	async function changePlanning(current: Task, action: Parameters<typeof tasks.plan>[1]) {
+		try {
+			const updated = await tasks.plan(current, action);
+			planningTask = updated;
+			if (task?.id === updated.id) {
+				const refreshed = await tasks.get(updated.id).catch(() => updated);
+				if (task?.id === updated.id) task = refreshed;
+			}
+			return updated;
+		} catch (error) {
+			planningTask = await tasks.planningTask(current.id).catch(() => current);
+			throw error;
+		}
+	}
 	const messageDraftScope = () => `task.${taskId}`;
 
 	interface ElicitationOption {
@@ -1140,6 +1166,7 @@
 	}
 
 	function statusLabel(status: string): string {
+		if (status === 'pending') return 'to do';
 		if (status === 'in_progress') return 'working';
 		if (status === 'awaiting_review') return 'awaiting review';
 		if (status === 'waiting_for_subtasks') return 'waiting on subtasks';
@@ -1171,9 +1198,9 @@
 	}
 
 	function priorityLabel(p: number): string {
-		if (p >= 3) return 'Urgent';
-		if (p >= 2) return 'High';
-		if (p >= 1) return 'Normal';
+		if (p >= 10) return 'Urgent';
+		if (p >= 5) return 'High';
+		if (p >= 0) return 'Normal';
 		return 'Low';
 	}
 
@@ -1215,6 +1242,9 @@
 	}
 
 </script>
+{#if planningTask}
+	<TaskPlanningActions task={planningTask} {agentList} onclose={() => planningTask = null} onchange={changePlanning} />
+{/if}
 
 <div bind:this={taskViewEl} class="flex min-h-0 h-full flex-col">
 	<!-- Header -->
@@ -1247,6 +1277,12 @@
 			<div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
 				<div class="min-w-0">
 					<h1 class="text-lg font-bold sm:text-xl">{task.title}</h1>
+                    <div class="mt-1 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                        {#if task.start_after}<span>Start no earlier than {dateLabel(task.start_after)}</span>{/if}
+                        {#if task.backlog}<span>Backlog</span>{/if}
+                        <button class="min-h-9 rounded-md border border-border px-2 hover:bg-accent" onclick={openPlanning}>Plan / schedule</button>
+                        {#if planningError}<span role="alert">{planningError}</span>{/if}
+                    </div>
 					<div class="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs sm:text-sm">
 						<span class="flex items-center gap-1.5">
 							<span data-task-activity-status={taskActivityStatus} class="h-2 w-2 rounded-full {taskActivityStatus === 'in_progress' ? 'animate-pulse' : ''}
