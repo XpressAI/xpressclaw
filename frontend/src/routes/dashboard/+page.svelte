@@ -12,6 +12,8 @@
 		type DashboardSnapshot,
 	} from '$lib/api';
 	import DashboardChart from '$lib/components/dashboard/DashboardChart.svelte';
+	import DashboardResources from '$lib/components/dashboard/DashboardResources.svelte';
+	import DashboardTokens from '$lib/components/dashboard/DashboardTokens.svelte';
 	import { serverTimestampMs } from '$lib/serverTime';
 	import { timeAgo } from '$lib/utils';
 
@@ -249,6 +251,12 @@
 			hasMoreOlder = false;
 			historyLimitReached = true;
 		}
+		// Control events still refresh live state and remove deleted messages,
+		// but do not animate/announce or scroll the text feed.
+		if (!isFeedMessage(event)) {
+			scheduleSummaryRefresh('data');
+			return;
+		}
 		newEventIds = new Set(newEventIds).add(event.event_id);
 		announcement = `${event.source_label} updated ${event.target_title}`;
 		const timer = setTimeout(() => {
@@ -483,6 +491,10 @@
 		}
 	}
 
+	function isFeedMessage(event: DashboardEvent): boolean {
+		return event.event_kind === 'agent_response' || event.event_kind === 'agent_update';
+	}
+
 	function uniqueEvents(events: DashboardEvent[]): DashboardEvent[] {
 		const latest = new Map<string, DashboardEvent>();
 		for (const event of events) {
@@ -490,7 +502,7 @@
 			if (!current || event.cursor > current.cursor) latest.set(event.event_id, event);
 		}
 		return [...latest.values()]
-			.filter((event) => event.event_kind !== 'conversation_message_deleted')
+			.filter(isFeedMessage)
 			.sort((left, right) => right.cursor - left.cursor);
 	}
 
@@ -511,6 +523,7 @@
 	function eventLabel(event: DashboardEvent): string {
 		const labels: Record<string, string> = {
 			agent_response: 'Response',
+			agent_update: 'Update',
 			task_message: 'Task message',
 			conversation_message: 'Conversation message',
 			tool_call: 'Tool',
@@ -585,37 +598,15 @@
 			</div>
 		{/if}
 
+		<DashboardResources needsAttention={counters.needs_attention} />
+
 		{#if loading && !snapshot}
-			<div class="grid grid-cols-2 gap-3 lg:grid-cols-4" aria-label="Loading dashboard summary">
-				{#each Array(4) as _}<div class="dashboard-card h-28 animate-pulse"><div class="m-4 h-3 w-24 rounded bg-muted"></div><div class="mx-4 mt-6 h-8 w-14 rounded bg-muted"></div></div>{/each}
-			</div>
-			<div class="grid gap-4 xl:grid-cols-[minmax(0,1.6fr)_minmax(20rem,.8fr)]">
+			<div aria-label="Loading dashboard summary" class="grid gap-4 xl:grid-cols-[minmax(0,1.6fr)_minmax(20rem,.8fr)]">
 				<div class="dashboard-card h-[22rem] animate-pulse bg-card/70"></div>
 				<div class="dashboard-card h-[22rem] animate-pulse bg-card/70"></div>
 			</div>
 		{:else}
-			<section class="grid grid-cols-2 gap-3 lg:grid-cols-4" aria-label="Live summary">
-				<div class="dashboard-card kpi-card" data-kpi="working-agents">
-					<div class="kpi-top"><span>Working Agents</span><span class="kpi-icon working" aria-hidden="true">◎</span></div>
-					<div class="kpi-value">{counters.working_agents}</div>
-					<div class="kpi-note"><span class="mini-beacon"></span>{counters.working_agents === 1 ? 'Agent responding now' : 'Agents responding now'}</div>
-				</div>
-				<div class="dashboard-card kpi-card" data-kpi="active-work">
-					<div class="kpi-top"><span>Active work</span><span class="kpi-icon" aria-hidden="true">↗</span></div>
-					<div class="kpi-value">{counters.active_work}</div>
-					<div class="kpi-note">Queued and active turns</div>
-				</div>
-				<div class="dashboard-card kpi-card {counters.needs_attention > 0 ? 'attention' : ''}" data-kpi="needs-attention">
-					<div class="kpi-top"><span>Needs you</span><span class="kpi-icon attention" aria-hidden="true">!</span></div>
-					<div class="kpi-value">{counters.needs_attention}</div>
-					<div class="kpi-note">Waiting or blocked</div>
-				</div>
-				<div class="dashboard-card kpi-card" data-kpi="tool-calls">
-					<div class="kpi-top"><span>Tool calls</span><span class="kpi-icon" aria-hidden="true">⌁</span></div>
-					<div class="kpi-value">{counters.tool_calls.toLocaleString()}</div>
-					<div class="kpi-note">Canonical starts · {range}</div>
-				</div>
-			</section>
+
 
 			{#if snapshot && snapshot.attention.length > 0}
 				<section class="attention-rail" aria-labelledby="attention-heading">
@@ -645,13 +636,14 @@
 							{/each}
 						</div>
 					</div>
+					{#if chartMode === 'context'}<DashboardTokens usage={snapshot?.token_usage} {range} />{/if}
 					<div class="px-2 pb-1 pt-3 sm:px-4"><DashboardChart points={snapshot?.series ?? []} mode={chartMode} /></div>
 				</section>
 
 				<section class="dashboard-card order-1 flex min-h-[20rem] flex-col overflow-hidden xl:order-none" aria-labelledby="active-now-heading" data-active-now>
 					<div class="flex items-center justify-between border-b border-border/70 px-4 py-3.5">
-						<div><h2 id="active-now-heading" class="text-sm font-semibold">Active now</h2><p class="mt-0.5 text-[11px] text-muted-foreground">Current Agent response cycles</p></div>
-					<span class="rounded-full bg-primary/10 px-2 py-1 text-[10px] font-semibold text-primary">{snapshot?.active_work.length ?? 0} live</span>
+						<div><h2 id="active-now-heading" class="text-sm font-semibold">Active now</h2><p class="mt-0.5 text-[11px] text-muted-foreground"><span data-working-agents>{counters.working_agents}</span> Agents responding now</p></div>
+					<span class="rounded-full bg-primary/10 px-2 py-1 text-[10px] font-semibold text-primary">{counters.active_work} queued / active</span>
 					</div>
 					<div class="workspace-scroll-y min-h-0 flex-1 p-2">
 						{#if snapshot && snapshot.active_work.length > 0}
@@ -678,11 +670,11 @@
 
 			<section class="dashboard-card order-2 flex min-h-[30rem] flex-1 flex-col overflow-hidden xl:order-none xl:col-span-2" aria-labelledby="live-feed-heading">
 				<div class="flex items-center justify-between border-b border-border/70 px-4 py-3.5">
-					<div><div class="flex items-center gap-2"><h2 id="live-feed-heading" class="text-sm font-semibold">Live feed</h2><span class="mini-beacon" aria-hidden="true"></span></div><p class="mt-0.5 text-[11px] text-muted-foreground">Newest activity first · safe summaries only</p></div>
+					<div><div class="flex items-center gap-2"><h2 id="live-feed-heading" class="text-sm font-semibold">Live feed</h2><span class="mini-beacon" aria-hidden="true"></span></div><p class="mt-0.5 text-[11px] text-muted-foreground">Agent Updates and responses · newest first</p></div>
 					{#if !atLiveEdge}<button type="button" onclick={() => feedScroller?.scrollTo({ top: 0, behavior: reducedMotion() ? 'auto' : 'smooth' })} class="rounded-lg border border-border bg-card px-2.5 py-1.5 text-[10px] font-semibold shadow-sm hover:bg-accent">Jump to live</button>{/if}
 				</div>
 				<div bind:this={feedScroller} onscroll={updateLiveEdge} data-live-feed class="workspace-scroll-y min-h-0 flex-1 overscroll-contain">
-					{#if feed.length > 0}
+					{#if feed.length > 0 || hasMoreOlder}
 						<div class="divide-y divide-border/60">
 							{#each feed as event (event.event_id)}
 								<a href={event.href} data-feed-event={event.event_id} data-new-event={newEventIds.has(event.event_id)} class="feed-row group {event.needs_attention ? 'needs-attention' : ''} {newEventIds.has(event.event_id) ? 'arriving' : ''}">
@@ -710,7 +702,7 @@
 						<div class="flex min-h-[26rem] flex-col items-center justify-center px-6 text-center">
 							<div class="empty-signal" aria-hidden="true"><i></i><i></i><i></i></div>
 							<h3 class="mt-5 text-sm font-semibold">No activity in this window</h3>
-							<p class="mt-1 max-w-sm text-xs leading-5 text-muted-foreground">Messages, safe Agent progress, tool starts, completions, failures, and requests for input will stream into this feed.</p>
+							<p class="mt-1 max-w-sm text-xs leading-5 text-muted-foreground">Agent Updates and responses will appear here. Running work and requests for input are shown in their own panels.</p>
 							<a href="/" class="mt-4 rounded-lg bg-primary px-3.5 py-2 text-xs font-semibold text-primary-foreground shadow-sm hover:bg-primary/90">Start new work</a>
 						</div>
 					{/if}
@@ -732,15 +724,6 @@
 	}
 	.control-glow { background: radial-gradient(ellipse at top, hsl(var(--primary) / .12), transparent 68%); filter: blur(4px); }
 	.dashboard-card { border: 1px solid hsl(var(--border) / .88); border-radius: .875rem; background: hsl(var(--card) / .94); box-shadow: 0 1px 1px rgb(15 23 42 / .025), 0 8px 24px rgb(15 23 42 / .035); }
-	.kpi-card { position: relative; min-height: 7rem; overflow: hidden; padding: .9rem 1rem; }
-	.kpi-card::after { position: absolute; inset: auto -20% -65% 35%; height: 7rem; border-radius: 999px; background: radial-gradient(circle, hsl(var(--primary) / .09), transparent 68%); content: ''; }
-	.kpi-card.attention { border-color: hsl(var(--warning) / .3); background: linear-gradient(135deg, hsl(var(--card)), hsl(var(--warning-tint))); }
-	.kpi-top { display: flex; align-items: center; justify-content: space-between; color: hsl(var(--muted-foreground)); font-size: .68rem; font-weight: 600; letter-spacing: .025em; }
-	.kpi-icon { display: grid; height: 1.65rem; width: 1.65rem; place-items: center; border-radius: .5rem; background: hsl(var(--muted)); color: hsl(var(--foreground-secondary)); font-size: .75rem; }
-	.kpi-icon.working { background: hsl(var(--primary) / .11); color: hsl(var(--primary)); }
-	.kpi-icon.attention { background: hsl(var(--warning) / .12); color: hsl(var(--warning)); }
-	.kpi-value { position: relative; z-index: 1; margin-top: .45rem; font-size: 1.75rem; font-weight: 650; letter-spacing: -.045em; }
-	.kpi-note { position: relative; z-index: 1; margin-top: .1rem; display: flex; align-items: center; gap: .35rem; color: hsl(var(--muted-foreground)); font-size: .65rem; }
 	.live-badge { display: inline-flex; height: 2.25rem; align-items: center; gap: .45rem; border: 1px solid hsl(var(--border)); border-radius: 999px; background: hsl(var(--card)); padding: 0 .7rem; color: hsl(var(--muted-foreground)); font-size: .68rem; font-weight: 600; box-shadow: 0 1px 2px rgb(0 0 0 / .04); }
 	.live-badge.live { border-color: hsl(var(--success) / .25); color: hsl(var(--success)); }
 	.live-badge.offline { border-color: hsl(var(--danger) / .25); color: hsl(var(--danger)); }
@@ -779,6 +762,6 @@
 	@keyframes feed-arrive { from { opacity: 0; transform: translateY(-7px); } to { opacity: 1; transform: translateY(0); } }
 	@keyframes feed-flash { from { background-color: hsl(var(--primary) / .1); } to { background-color: transparent; } }
 	:global(.dark) .dashboard-card { box-shadow: 0 1px 1px rgb(0 0 0 / .25), 0 10px 28px rgb(0 0 0 / .12); }
-	@media (max-width: 639px) { .feed-row { min-height: 0; padding: .8rem; } .kpi-card { min-height: 6.5rem; padding: .8rem; } .kpi-value { font-size: 1.5rem; } }
+	@media (max-width: 639px) { .feed-row { min-height: 0; padding: .8rem; } }
 	@media (prefers-reduced-motion: reduce) { .live-orbit::before, .attention-pulse, .mini-beacon, .quiet-radar::after, .feed-row.arriving { animation: none !important; } .active-row, .feed-row { transition: none; } }
 </style>

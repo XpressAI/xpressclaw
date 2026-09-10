@@ -808,6 +808,14 @@ impl AcpEventRecorder {
             state.last_assistant_text = message.clone();
             (message_id, message)
         };
+        if self.conversation_id.is_some() {
+            if let Err(error) = DashboardManager::new(self.db.clone())
+                .record_conversation_agent_update(&self.attempt_id, &message)
+            {
+                tracing::warn!(%error, "Could not index Conversation update for dashboard");
+            }
+            return Ok(());
+        }
         self.append_event(
             "runner_progress",
             &message,
@@ -1598,6 +1606,7 @@ async fn run_connected_turn(
     }));
     let prompt_request =
         connection.send_request(PromptRequest::new(session_id.clone(), prompt_blocks));
+    let prompt_id = uuid::Uuid::new_v4().to_string();
     recorder
         .persist_native_session(&native_session_id)
         .map_err(agent_client_protocol::Error::into_internal_error)?;
@@ -1624,6 +1633,22 @@ async fn run_connected_turn(
         }
     };
     let interrupted = interrupt_sent.load(Ordering::SeqCst);
+    if let Err(error) = DashboardManager::new(recorder.db.clone()).record_prompt_usage(
+        &prompt_id,
+        if recorder.conversation_id.is_some() {
+            "conversation_turn"
+        } else {
+            "attempt"
+        },
+        &recorder.attempt_id,
+        &recorder.runner,
+        response
+            .as_ref()
+            .ok()
+            .and_then(|response| response.usage.as_ref()),
+    ) {
+        tracing::warn!(%error, "Could not record ACP token usage");
+    }
     let response = match response {
         Ok(response) => response,
         Err(_) if interrupted => {
@@ -2152,7 +2177,7 @@ mod tests {
                         json!({
                             "jsonrpc": "2.0",
                             "id": id,
-                            "result": PromptResponse::new(StopReason::EndTurn),
+                            "result": PromptResponse::new(StopReason::EndTurn).usage(agent_client_protocol::schema::v1::Usage::new(1234, 1000, 234)),
                         })
                     }
                     other => panic!("unexpected ACP method: {other}"),
@@ -2224,6 +2249,18 @@ mod tests {
         assert_eq!(result.session_id, "acp-session-1");
         assert_eq!(result.stop_reason, "end_turn");
         assert_eq!(result.summary, "Work complete");
+        let usage = DashboardManager::new(db.clone())
+            .snapshot(
+                &crate::dashboard::DashboardFilter {
+                    project_id: None,
+                    range: crate::dashboard::DashboardRange::Hour,
+                },
+                20,
+            )
+            .unwrap()
+            .token_usage;
+        assert_eq!(usage.total_tokens, Some(1234));
+        assert_eq!(usage.reported_responses, 1);
         let events = SessionManager::new(db)
             .list_events("session-1", None, 20)
             .unwrap();

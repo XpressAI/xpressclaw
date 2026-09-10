@@ -674,6 +674,7 @@ mod tests {
         for path in [
             "/api/agents",
             "/api/dashboard/stream?range=1h",
+            "/api/dashboard/resources",
             "/api/conversations/example/attachments/example",
             "/api/tasks/example/messages/1/attachments/example",
             "/api/settings/collaboration/agent/git/example/repository/info/refs?service=git-receive-pack",

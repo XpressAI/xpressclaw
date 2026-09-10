@@ -23,6 +23,9 @@ const EVENT_RETENTION_DAYS: i64 = 8;
 const EVENT_RETENTION_ROWS: i64 = 20_000;
 const GIT_SNAPSHOT_DEBOUNCE_SECONDS: i64 = 20;
 
+mod tokens;
+pub use tokens::DashboardTokenUsage;
+
 /// Close Git attribution windows whose work is no longer executing. A worker
 /// restart moves interrupted work back to `queued`; leaving its old baseline
 /// open would make the next turn in the same workspace look concurrent.
@@ -184,6 +187,7 @@ pub struct DashboardSnapshot {
     pub cursor: i64,
     pub projects: Vec<DashboardProject>,
     pub counters: DashboardCounters,
+    pub token_usage: DashboardTokenUsage,
     pub series: Vec<DashboardSeriesPoint>,
     pub active_work: Vec<DashboardActiveWork>,
     pub attention: Vec<DashboardAttentionItem>,
@@ -262,6 +266,7 @@ impl DashboardManager {
             cursor,
             projects: self.projects()?,
             counters: self.counters(filter)?,
+            token_usage: self.token_usage(filter)?,
             series: self.series(filter)?,
             active_work: self.active_work(filter.project_id.as_deref())?,
             attention: self.attention(filter.project_id.as_deref())?,
@@ -296,6 +301,7 @@ impl DashboardManager {
                         work_kind, work_id
                  FROM ranked
                  WHERE event_version = 1 AND (?3 IS NULL OR cursor < ?3)
+                   AND event_kind IN ('agent_response', 'agent_update', 'conversation_message_deleted')
                  ORDER BY cursor DESC
                  LIMIT ?4",
             )?;
@@ -385,6 +391,32 @@ impl DashboardManager {
                 |row| row.get(0),
             )
             .map_err(Error::from)
+        })
+    }
+
+    /// Conversation intermediate ACP text has no session_events row. Index
+    /// only the same bounded, literal text shown as Updates on task pages.
+    pub fn record_conversation_agent_update(&self, turn_id: &str, text: &str) -> Result<()> {
+        self.db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO dashboard_events (
+                    event_id, event_kind, project_id, project_name, agent_id, agent_name,
+                    source_kind, source_label, target_type, target_id, target_title, href,
+                    preview, work_kind, work_id
+                 ) SELECT ?1, 'agent_update', c.project_id, p.name, ct.agent_id, a.name,
+                     'agent', COALESCE(a.name, ct.agent_id), 'conversation', c.id,
+                     COALESCE(c.title, 'Untitled conversation'), '/conversations/' || c.id,
+                     ?2, 'conversation_turn', ct.id
+                 FROM conversation_turns ct JOIN conversations c ON c.id = ct.conversation_id
+                 LEFT JOIN projects p ON p.id = c.project_id
+                 LEFT JOIN agents a ON a.id = ct.agent_id WHERE ct.id = ?3",
+                params![
+                    format!("agent-update:{}", uuid::Uuid::new_v4()),
+                    safe_preview(text, 240),
+                    turn_id
+                ],
+            )?;
+            Ok(())
         })
     }
 
@@ -1119,6 +1151,10 @@ impl DashboardManager {
     fn prune(&self) -> Result<()> {
         self.db.with_conn(|conn| {
             conn.execute(
+                "DELETE FROM dashboard_prompt_usage WHERE recorded_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?1)",
+                [format!("-{EVENT_RETENTION_DAYS} days")],
+            )?;
+            conn.execute(
                 "DELETE FROM dashboard_events
                  WHERE occurred_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?1)
                     OR cursor <= COALESCE((SELECT MAX(cursor) FROM dashboard_events), 0) - ?2",
@@ -1463,6 +1499,48 @@ mod tests {
     }
 
     #[test]
+    fn feed_preserves_adjacent_agent_updates_but_excludes_other_progress() {
+        let (db, project_id, agent_id, task_id) = fixture();
+        db.with_conn(|conn| {
+            conn.execute("INSERT INTO logical_sessions (id, agent_id, title) VALUES ('s', ?1, 'Updates')", [&agent_id]).unwrap();
+            conn.execute("INSERT INTO work_attempts (id, session_id, task_id, runner, status) VALUES ('a', 's', ?1, 'codex', 'running')", [&task_id]).unwrap();
+            for (kind, text, payload) in [
+                ("runner_progress", "Inspecting the UI", r#"{"item_type":"agent_message"}"#),
+                ("runner_progress", "Found the cause", r#"{"item_type":"agent_message"}"#),
+                ("runner_progress", "Booting the runner", "{}"),
+                ("agent_thought", "Private reasoning", r#"{"item_type":"agent_message"}"#),
+                ("tool_call", "Tool output", "{}"),
+            ] {
+                conn.execute("INSERT INTO session_events (session_id, attempt_id, task_id, source_type, event_type, summary, payload) VALUES ('s', 'a', ?1, 'acp', ?2, ?3, ?4)", params![task_id, kind, text, payload]).unwrap();
+            }
+            conn.execute("INSERT INTO conversations (id, project_id) VALUES ('c', ?1)", [&project_id]).unwrap();
+            conn.execute("INSERT INTO conversation_turns (id, conversation_id, agent_id, status) VALUES ('ct', 'c', ?1, 'running')", [&agent_id]).unwrap();
+        });
+        let manager = DashboardManager::new(db);
+        manager
+            .record_conversation_agent_update("ct", "Chat update")
+            .unwrap();
+        let page = manager
+            .feed(
+                &DashboardFilter {
+                    project_id: Some(project_id),
+                    range: DashboardRange::Hour,
+                },
+                None,
+                10,
+            )
+            .unwrap();
+        assert_eq!(page.events.len(), 3);
+        assert!(page
+            .events
+            .iter()
+            .all(|event| event.event_kind == "agent_update"));
+        for text in ["Inspecting the UI", "Found the cause", "Chat update"] {
+            assert!(page.events.iter().any(|event| event.preview == text));
+        }
+    }
+
+    #[test]
     fn source_triggers_create_bounded_literal_message_events() {
         let (db, project_id, _agent, task_id) = fixture();
         TaskConversation::new(db.clone())
@@ -1474,7 +1552,7 @@ mod tests {
             .unwrap();
         let message = "<script>alert('never')</script>\n".repeat(30);
         TaskConversation::new(db.clone())
-            .add_message(&task_id, "user", &message)
+            .add_message(&task_id, "assistant", &message)
             .unwrap();
         db.with_conn(|conn| {
             conn.execute(
@@ -1510,7 +1588,7 @@ mod tests {
             .feed
             .events
             .iter()
-            .find(|event| event.event_kind == "task_message")
+            .find(|event| event.event_kind == "agent_response" && event.target_type == "task")
             .unwrap();
         assert!(event.preview.starts_with("<script>alert('never')</script>"));
         assert!(!event.preview.contains('\n'));
@@ -1529,7 +1607,7 @@ mod tests {
             .feed
             .events
             .iter()
-            .any(|event| event.preview == "Visible conversation question"));
+            .all(|event| event.preview != "Visible conversation question"));
         assert!(snapshot
             .feed
             .events
@@ -1538,7 +1616,7 @@ mod tests {
     }
 
     #[test]
-    fn projectless_task_status_transitions_reach_the_all_projects_feed() {
+    fn projectless_task_status_transitions_still_reach_the_control_stream() {
         let db = Arc::new(Database::open_memory().unwrap());
         let task = TaskBoard::new(db.clone())
             .create(&CreateTask {
@@ -1554,7 +1632,7 @@ mod tests {
             .unwrap();
         });
 
-        let snapshot = DashboardManager::new(db)
+        let snapshot = DashboardManager::new(db.clone())
             .snapshot(
                 &DashboardFilter {
                     project_id: None,
@@ -1563,8 +1641,18 @@ mod tests {
                 20,
             )
             .unwrap();
-        let event = snapshot
-            .feed
+        assert!(snapshot.feed.events.is_empty());
+        let replay = DashboardManager::new(db)
+            .replay_after(
+                &DashboardFilter {
+                    project_id: None,
+                    range: DashboardRange::Hour,
+                },
+                0,
+                20,
+            )
+            .unwrap();
+        let event = replay
             .events
             .iter()
             .find(|event| event.event_kind == "completion" && event.target_id == task.id)
@@ -1643,8 +1731,18 @@ mod tests {
                 0
             );
         });
-        let tool = snapshot
-            .feed
+        assert!(snapshot.feed.events.is_empty());
+        let replay = manager
+            .replay_after(
+                &DashboardFilter {
+                    project_id: None,
+                    range: DashboardRange::Day,
+                },
+                0,
+                100,
+            )
+            .unwrap();
+        let tool = replay
             .events
             .iter()
             .find(|event| event.event_kind == "tool_call")
@@ -1886,7 +1984,7 @@ mod tests {
         let platform = manager
             .snapshot(
                 &DashboardFilter {
-                    project_id: Some(project_id),
+                    project_id: Some(project_id.clone()),
                     range: DashboardRange::Hour,
                 },
                 40,
@@ -1896,8 +1994,18 @@ mod tests {
         assert_eq!(platform.counters.active_work, 1);
         assert_eq!(platform.counters.tool_calls, 1);
         assert_eq!(platform.active_work.len(), 1);
-        let tool_event = platform
-            .feed
+        assert!(platform.feed.events.is_empty());
+        let replay = manager
+            .replay_after(
+                &DashboardFilter {
+                    project_id: Some(project_id.clone()),
+                    range: DashboardRange::Hour,
+                },
+                0,
+                100,
+            )
+            .unwrap();
+        let tool_event = replay
             .events
             .iter()
             .find(|event| event.event_kind == "tool_call")

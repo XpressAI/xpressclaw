@@ -22,6 +22,34 @@ pub fn routes() -> Router<AppState> {
         .route("/snapshot", get(snapshot))
         .route("/feed", get(feed))
         .route("/stream", get(stream))
+        .route("/resources", get(resources))
+}
+
+async fn resources(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let config = state.config();
+    let monitor = state.resource_monitor.clone();
+    let sample = tokio::task::spawn_blocking(move || {
+        monitor
+            .try_lock()
+            .map(|mut monitor| {
+                monitor.sample(&config.system.data_dir, &config.system.workspace_dir)
+            })
+            .map_err(|_| ())
+    })
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "Resource monitoring unavailable"})),
+        )
+    })?
+    .map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "Resource monitoring unavailable"})),
+        )
+    })?;
+    Ok(Json(json!(sample)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -229,6 +257,96 @@ mod tests {
         assert!(body["series"].as_array().unwrap().len() <= 14);
         assert!(body["counters"]["working_agents"].is_number());
         assert!(body["cursor"].is_number());
+        assert!(body["token_usage"]["total_tokens"].is_null());
+        assert_eq!(body["token_usage"]["reported_responses"], 0);
+        assert!(body["token_usage"]["recording_started_at"].is_string());
+    }
+
+    #[tokio::test]
+    async fn resources_are_independent_of_filters_and_share_one_sample() {
+        let app = app();
+        let mut samples = Vec::new();
+        for path in ["/resources", "/resources?project_id=missing&range=7d"] {
+            let response = app
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            samples.push(json_body(response).await);
+        }
+        assert_eq!(samples[0]["sampled_at"], samples[1]["sampled_at"]);
+        assert!(samples[0]["cpu_percent"].is_null());
+        assert!(samples[0]["cpu_count"].is_number());
+        assert!(!samples[0]["disks"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn feed_pagination_counts_agent_text_instead_of_noisy_control_events() {
+        let (app, db, project_id) = app_with_db();
+        AgentRegistry::new(db.clone())
+            .create_in_project("platform-agent", "native", &project_id)
+            .unwrap();
+        let task = TaskBoard::new(db.clone())
+            .create(&CreateTask {
+                title: "Readable feed".into(),
+                agent_id: Some("platform-agent".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let messages = TaskConversation::new(db.clone());
+        messages
+            .add_message(&task.id, "assistant", "Earlier response")
+            .unwrap();
+        for _ in 0..50 {
+            messages
+                .add_message(&task.id, "user", "User context")
+                .unwrap();
+            DashboardManager::new(db.clone())
+                .record_task_tool_call("a", &task.id, "Read workspace")
+                .unwrap();
+        }
+        messages
+            .add_message(&task.id, "assistant", "Latest response")
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(Request::get("/feed?limit=1").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let first = json_body(response).await;
+        assert_eq!(first["events"][0]["preview"], "Latest response");
+        assert_eq!(first["has_more"], true);
+        let response = app
+            .oneshot(
+                Request::get(format!("/feed?limit=1&before={}", first["next_before"]))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let second = json_body(response).await;
+        assert_eq!(second["events"][0]["preview"], "Earlier response");
+        assert_eq!(second["has_more"], false);
+    }
+
+    #[tokio::test]
+    async fn snapshots_keep_deletion_markers_to_evict_loaded_older_messages() {
+        let (app, db, project_id) = app_with_db();
+        db.with_conn(|conn| {
+            conn.execute("INSERT INTO conversations (id, project_id) VALUES ('c', ?1)", [&project_id]).unwrap();
+            conn.execute("INSERT INTO conversation_messages (conversation_id, sender_type, sender_id, content) VALUES ('c', 'agent', 'agent', 'Old response')", []).unwrap();
+            conn.execute("UPDATE conversation_messages SET deleted_at = CURRENT_TIMESTAMP WHERE conversation_id = 'c'", []).unwrap();
+        });
+        let response = app
+            .oneshot(Request::get("/snapshot").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = json_body(response).await;
+        let events = body["feed"]["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["event_kind"], "conversation_message_deleted");
+        assert_eq!(events[0]["preview"], "");
     }
 
     #[tokio::test]

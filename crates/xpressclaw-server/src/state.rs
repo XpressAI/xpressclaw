@@ -33,6 +33,9 @@ pub struct AppState {
     pub mcp_manager: Arc<McpManager>,
     /// Per-conversation event broadcast channels (ADR-019).
     pub event_bus: Arc<ConversationEventBus>,
+    /// Shared, cached host resource sampler. Only dashboard requests use it.
+    pub resource_monitor:
+        Arc<std::sync::Mutex<xpressclaw_core::system::resources::ResourceMonitor>>,
     /// Shared Docker connection (reused across all requests).
     pub docker: Arc<RwLock<Option<Arc<DockerManager>>>>,
     /// Live ACP forms waiting for a response from the task UI.
@@ -134,6 +137,7 @@ impl AppState {
             setup_complete: Arc::new(RwLock::new(setup_complete)),
             mcp_manager: Arc::new(McpManager::new()),
             event_bus: Arc::new(ConversationEventBus::new()),
+            resource_monitor: Arc::new(std::sync::Mutex::new(Default::default())),
             docker: Arc::new(RwLock::new(None)),
             elicitations: Arc::new(AcpElicitationBroker::new()),
             turn_controls: Arc::new(AcpTurnControlBroker::new()),

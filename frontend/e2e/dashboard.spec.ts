@@ -52,6 +52,7 @@ function snapshot(empty = false, cursorBase = 40) {
 		counters: empty
 			? { working_agents: 0, active_work: 0, needs_attention: 0, tool_calls: 0 }
 			: { working_agents: 2, active_work: 3, needs_attention: 1, tool_calls: 17 },
+		token_usage: { total_tokens: empty ? null : 125_400, input_tokens: empty ? null : 100_000, output_tokens: empty ? null : 25_400, cached_read_tokens: empty ? null : 60_000, cached_write_tokens: null, thought_tokens: null, reported_responses: empty ? 0 : 5, unreported_responses: empty ? 0 : 2, unclassified_responses: 0, recording_started_at: iso(24 * 60) },
 		series,
 		active_work: empty ? [] : [{
 			work_kind: 'attempt',
@@ -117,9 +118,13 @@ async function mockDashboard(page: Page, options: {
 	deleteRecentEventOnRefresh?: boolean;
 	deleteOlderEventOnRefresh?: boolean;
 	stream?: boolean;
+	resourceUnavailable?: boolean;
+	resourceFailureAfter?: number;
+	scopedTokens?: boolean;
 } = {}) {
 	const scopes: string[] = [];
 	let snapshotRequests = 0;
+	let resourceRequests = 0;
 	let feedRequests = 0;
 	let selectedProjectDeleted = false;
 	const attentionActions: string[] = [];
@@ -133,6 +138,13 @@ async function mockDashboard(page: Page, options: {
 	});
 	await page.route('**/api/**', async (route) => {
 		const url = new URL(route.request().url());
+		if (url.pathname === '/api/dashboard/resources') {
+			resourceRequests++;
+			if (options.resourceFailureAfter != null && resourceRequests > options.resourceFailureAfter) return route.fulfill({ status: 503, json: { error: 'Resource monitoring unavailable' } });
+			const capacity = { total_bytes: 16 * 1024 ** 3, available_bytes: 4 * 1024 ** 3, used_bytes: 12 * 1024 ** 3, used_percent: 75 };
+			return route.fulfill({ json: { sampled_at: new Date().toISOString(), cpu_percent: options.resourceUnavailable ? null : resourceRequests === 1 ? 32 : 48, cpu_count: 8, memory: options.resourceUnavailable ? null : capacity,
+				disks: [{ locations: ['Data', 'Workspaces'], mount_point: '/', capacity: options.resourceUnavailable ? null : { ...capacity, total_bytes: 512 * 1024 ** 3, used_bytes: 460.8 * 1024 ** 3, available_bytes: 51.2 * 1024 ** 3, used_percent: 90 } }] } });
+		}
 		if (url.pathname === '/api/dashboard/snapshot') {
 			const requestNumber = ++snapshotRequests;
 			const requestedProject = url.searchParams.get('project_id');
@@ -153,6 +165,9 @@ async function mockDashboard(page: Page, options: {
 				Boolean(options.empty || selectedProjectDeleted || (options.rollingWindow && requestNumber > 1)),
 				options.manyFeedEvents ? 1_000 : 40,
 			);
+			if (options.scopedTokens) {
+				response.token_usage.total_tokens = requestedProject ? (url.searchParams.get('range') === '7d' ? 321000 : 12345) : 125400;
+			}
 			if (selectedProjectDeleted) {
 				response.projects = response.projects.filter((project) => project.id !== projectId);
 				response.feed = {
@@ -246,6 +261,7 @@ async function mockDashboard(page: Page, options: {
 	});
 	return {
 		scopes,
+		resourceRequestCount: () => resourceRequests,
 		snapshotRequestCount: () => snapshotRequests,
 		releaseFirstRefresh,
 		releaseDeletedSnapshot,
@@ -405,7 +421,7 @@ test('brand opens the real-time Control center with deduplicated live navigation
 	await page.locator('a[aria-label="Open Control center"]').first().click();
 	await expect(page).toHaveURL(/\/dashboard$/);
 	await expect(page.getByRole('heading', { name: 'Control center' })).toBeVisible();
-	await expect(page.locator('[data-kpi="working-agents"]')).toContainText('2');
+	await expect(page.locator('[data-working-agents]')).toContainText('2');
 	await expect(page.locator('[data-kpi="needs-attention"]')).toContainText('1');
 	await expect(page.locator('[data-active-now] a[href="/tasks/task-dashboard"]')).toBeVisible();
 	await expect(page.locator('a[href="/tasks/task-attention"]').first()).toBeVisible();
@@ -440,6 +456,117 @@ test('brand opens the real-time Control center with deduplicated live navigation
 	}
 });
 
+test('resources refresh while quiet and stay independent of project and period token totals', async ({ page }) => {
+	await page.clock.install();
+	await installMockEventSource(page);
+	const { resourceRequestCount } = await mockDashboard(page, { scopedTokens: true });
+	await page.goto('/dashboard');
+	// A cold Vite server can take time to load the workspace's modules.
+	await expect(page.getByRole('heading', { name: 'Control center', exact: true })).toBeVisible({ timeout: 15_000 });
+	await expect(page.getByRole('meter', { name: 'CPU usage', exact: true })).toHaveAttribute('aria-valuenow', '32');
+	await expect(page.locator('[data-kpi="memory"]')).toContainText('4 GiB available');
+	await expect(page.locator('[data-kpi="disk"]')).toContainText('90%');
+	await expect(page.locator('[data-token-count="Total"]')).toHaveText('125,400');
+	await expect(page.locator('[data-token-count="Cache write"]')).toHaveText('—');
+	await page.getByLabel('Project scope').selectOption(projectId);
+	await expect(page.locator('[data-token-count="Total"]')).toHaveText('12,345');
+	await page.getByRole('button', { name: '7d', exact: true }).click();
+	await expect(page.locator('[data-token-count="Total"]')).toHaveText('321,000');
+	await expect(page.locator('[data-resource-summary]')).toContainText('all Projects');
+	await page.clock.runFor(5_100);
+	await expect.poll(resourceRequestCount).toBe(2);
+	await expect(page.getByRole('meter', { name: 'CPU usage', exact: true })).toHaveAttribute('aria-valuenow', '48');
+	await page.getByRole('button', { name: 'Tools', exact: true }).click();
+	await expect(page.getByRole('img', { name: 'Tool-call volume over time' })).toBeVisible();
+});
+
+test('missing resources and missing token data never look like zero usage on a phone', async ({ page }, testInfo) => {
+	await page.setViewportSize({ width: 390, height: 844 });
+	await installMockEventSource(page);
+	await mockDashboard(page, { empty: true, resourceUnavailable: true });
+	await page.goto('/dashboard');
+	// A cold Vite server can take time to load the workspace's modules.
+	await expect(page.getByRole('heading', { name: 'Control center', exact: true })).toBeVisible({ timeout: 15_000 });
+	await expect(page.locator('[data-kpi="cpu"]')).toContainText('Sampling…');
+	await expect(page.locator('[data-kpi="memory"]')).toContainText('Unavailable');
+	await expect(page.locator('[data-kpi="disk"]')).toContainText('Unavailable');
+	await expect(page.locator('[data-token-count="Total"]')).toHaveText('—');
+	await expect(page.locator('[data-token-usage]')).toContainText('No usable token counts');
+	await expect(page.getByRole('meter')).toHaveCount(0);
+	await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+	if (process.env.DASHBOARD_VISUAL_QA) {
+		await page.locator('[data-token-usage]').scrollIntoViewIfNeeded();
+		await page.screenshot({ path: testInfo.outputPath('dashboard-phone-tokens.png') });
+	}
+});
+
+test('resource failures retain explicitly stale readings and can be retried', async ({ page }) => {
+	await page.clock.install();
+	await installMockEventSource(page);
+	const { resourceRequestCount } = await mockDashboard(page, { resourceFailureAfter: 1 });
+	await page.goto('/dashboard');
+	// A cold Vite server can take time to load the workspace's modules.
+	await expect(page.getByRole('heading', { name: 'Control center', exact: true })).toBeVisible({ timeout: 15_000 });
+	await expect(page.locator('[data-kpi="cpu"]')).toContainText('32%');
+	await page.clock.runFor(5_100);
+	await expect(page.locator('[data-resource-status]')).toContainText('Readings stale');
+	await expect(page.locator('[data-kpi="cpu"]')).toContainText('32%');
+	await page.getByRole('button', { name: 'Retry resources' }).click();
+	await expect.poll(resourceRequestCount).toBe(3);
+	await expect(page.locator('[data-token-count="Total"]')).toHaveText('125,400');
+});
+
+test('resource polling pauses in hidden tabs and recovers from a timed-out request', async ({ page }) => {
+	await page.clock.install();
+	await installMockEventSource(page);
+	await mockDashboard(page);
+	let requests = 0;
+	await page.route('**/api/dashboard/resources', async (route) => {
+		requests++;
+		// Leave the second request unanswered until the browser aborts it.
+		if (requests === 2) return;
+		await route.fallback();
+	});
+	await page.goto('/dashboard');
+	// A cold Vite server can take time to load the workspace's modules.
+	await expect(page.getByRole('heading', { name: 'Control center', exact: true })).toBeVisible({ timeout: 15_000 });
+	await expect(page.locator('[data-kpi="cpu"]')).toContainText('32%');
+	await page.evaluate(() => {
+		Object.defineProperty(document, 'hidden', { configurable: true, value: true });
+		document.dispatchEvent(new Event('visibilitychange'));
+	});
+	await page.clock.runFor(20_000);
+	expect(requests).toBe(1);
+	await page.evaluate(() => {
+		Object.defineProperty(document, 'hidden', { configurable: true, value: false });
+		document.dispatchEvent(new Event('visibilitychange'));
+	});
+	await expect.poll(() => requests).toBe(2);
+	await page.clock.runFor(15_100);
+	await expect(page.getByRole('button', { name: 'Retry resources' })).toBeVisible();
+	await expect(page.locator('[data-resource-status]')).toContainText('Readings stale');
+	await page.getByRole('button', { name: 'Retry resources' }).click();
+	await expect(page.locator('[data-kpi="cpu"]')).toContainText('48%');
+	await expect(page.locator('[data-resource-status]')).not.toContainText('stale');
+});
+
+test('the feed accepts agent text and deletion events without tool, user, or lifecycle noise', async ({ page }) => {
+	await installMockEventSource(page);
+	const { snapshotRequestCount } = await mockDashboard(page);
+	await page.goto('/dashboard');
+	await expect(page.locator('[data-feed-event="evt-existing"]')).toBeVisible();
+	for (const [index, kind] of ['tool_call', 'task_message', 'conversation_message', 'progress', 'completion', 'waiting_for_input'].entries()) {
+		await emitDashboardEvent(page, event({ cursor: 100 + index, event_id: `noise-${kind}`, event_kind: kind, preview: `Noise ${kind}` }));
+	}
+	await expect(page.locator('[data-feed-event^="noise-"]')).toHaveCount(0);
+	await expect.poll(snapshotRequestCount).toBeGreaterThan(1);
+	await emitDashboardEvent(page, event({ cursor: 200, event_id: 'visible-update', event_kind: 'agent_update', preview: 'Build passed; checking the phone layout.' }));
+	await expect(page.locator('[data-feed-event="visible-update"]')).toContainText('Build passed');
+	await expect(page.locator('[data-feed-event="visible-update"] .event-kind')).toHaveText('Update');
+	await emitDashboardEvent(page, event({ cursor: 201, event_id: 'visible-update', event_kind: 'conversation_message_deleted', preview: '' }));
+	await expect(page.locator('[data-feed-event="visible-update"]')).toHaveCount(0);
+});
+
 test('loading, empty, reconnecting, themes, reduced motion, and mobile layout stay usable', async ({ page }, testInfo) => {
 	await page.emulateMedia({ reducedMotion: 'reduce' });
 	await page.setViewportSize({ width: 390, height: 844 });
@@ -468,9 +595,9 @@ test('loading, empty, reconnecting, themes, reduced motion, and mobile layout st
 
 	for (const dark of [false, true]) {
 		await page.evaluate((enabled) => document.documentElement.classList.toggle('dark', enabled), dark);
-		const styles = await page.locator('[data-kpi="working-agents"]').evaluate((element) => {
+		const styles = await page.locator('[data-kpi="cpu"]').evaluate((element) => {
 			const computed = getComputedStyle(element);
-			const label = getComputedStyle(element.querySelector('.kpi-top')!);
+			const label = getComputedStyle(element.querySelector('h2')!);
 			return { foreground: label.color, background: computed.backgroundColor };
 		});
 		expect(contrast(styles.foreground, styles.background)).toBeGreaterThanOrEqual(4.5);
@@ -496,13 +623,13 @@ test('an older page from a previous Project scope is discarded', async ({ page }
 test('a failed scope switch never relabels stale dashboard data', async ({ page }) => {
 	await mockDashboard(page, { failScopedSnapshot: true, stream: false });
 	await page.goto('/dashboard');
-	await expect(page.locator('[data-kpi="working-agents"]')).toContainText('2');
+	await expect(page.locator('[data-working-agents]')).toContainText('2');
 	await expect(page.locator('[data-feed-event="evt-existing"]')).toBeVisible();
 
 	await page.locator('#dashboard-project').selectOption(projectId);
 	await expect(page.getByRole('alert')).toContainText('Scoped dashboard unavailable');
 	await expect(page.locator('#dashboard-project')).toHaveValue(projectId);
-	await expect(page.locator('[data-kpi="working-agents"]')).toContainText('0');
+	await expect(page.locator('[data-working-agents]')).toContainText('0');
 	await expect(page.locator('[data-feed-event="evt-existing"]')).toHaveCount(0);
 });
 
@@ -510,7 +637,7 @@ test('live activity during a slow summary refresh queues one trailing refresh', 
 	await installMockEventSource(page);
 	const mocked = await mockDashboard(page, { outOfOrderRefresh: true });
 	await page.goto('/dashboard');
-	await expect(page.locator('[data-kpi="working-agents"]')).toContainText('2');
+	await expect(page.locator('[data-working-agents]')).toContainText('2');
 
 	await emitDashboardEvent(page, event({ cursor: 51, event_id: 'evt-refresh-one' }));
 	await expect.poll(mocked.snapshotRequestCount).toBe(2);
@@ -520,7 +647,7 @@ test('live activity during a slow summary refresh queues one trailing refresh', 
 
 	mocked.releaseFirstRefresh();
 	await expect.poll(mocked.snapshotRequestCount).toBe(3);
-	await expect(page.locator('[data-kpi="working-agents"]')).toContainText('9');
+	await expect(page.locator('[data-working-agents]')).toContainText('9');
 });
 
 test('a refreshed snapshot removes deleted recent activity without dropping newer live events', async ({ page }) => {
@@ -552,7 +679,7 @@ test('live activity coalesced into a failed summary refresh receives one retry',
 	await installMockEventSource(page);
 	const mocked = await mockDashboard(page, { failFirstRefresh: true, outOfOrderRefresh: true });
 	await page.goto('/dashboard');
-	await expect(page.locator('[data-kpi="working-agents"]')).toContainText('2');
+	await expect(page.locator('[data-working-agents]')).toContainText('2');
 
 	await emitDashboardEvent(page, event({ cursor: 51, event_id: 'evt-failed-refresh-one' }));
 	await expect.poll(mocked.snapshotRequestCount).toBe(2);
@@ -562,7 +689,7 @@ test('live activity coalesced into a failed summary refresh receives one retry',
 
 	mocked.releaseFirstRefresh();
 	await expect.poll(mocked.snapshotRequestCount).toBe(3);
-	await expect(page.locator('[data-kpi="working-agents"]')).toContainText('9');
+	await expect(page.locator('[data-working-agents]')).toContainText('9');
 });
 
 test('an open stream returns to Live after an in-stream error recovers', async ({ page }) => {
@@ -594,7 +721,7 @@ test('a successful transport-error probe does not claim the stream reopened', as
 	await expect.poll(mocked.snapshotRequestCount).toBe(2);
 	await expect(page.locator('[data-dashboard-connection]')).toContainText('Reconnecting');
 	mocked.releaseFirstRefresh();
-	await expect(page.locator('[data-kpi="working-agents"]')).toContainText('4');
+	await expect(page.locator('[data-working-agents]')).toContainText('4');
 	await expect(page.locator('[data-dashboard-connection]')).toContainText('Reconnecting');
 });
 
@@ -625,7 +752,7 @@ test('deleting the selected Project returns the dashboard to All Projects', asyn
 	await expect(page.locator('#dashboard-project')).toHaveValue('');
 	await expect(page.getByRole('option', { name: 'Platform', exact: true })).toHaveCount(0);
 	await expect(page.getByRole('option', { name: 'Docs', exact: true })).toHaveCount(1);
-	await expect(page.locator('[data-kpi="working-agents"]')).toContainText('0');
+	await expect(page.locator('[data-working-agents]')).toContainText('0');
 	await expect.poll(() => mocked.scopes.at(-1)).toBe('all');
 });
 
@@ -659,7 +786,7 @@ test('a failed stream reconnect probes and recovers a deleted selected Project',
 	await expect(page.locator('#dashboard-project')).toHaveValue('');
 	await expect(page.getByRole('option', { name: 'Platform', exact: true })).toHaveCount(0);
 	await expect(page.getByRole('option', { name: 'Docs', exact: true })).toHaveCount(1);
-	await expect(page.locator('[data-kpi="working-agents"]')).toContainText('0');
+	await expect(page.locator('[data-working-agents]')).toContainText('0');
 	await expect.poll(() => mocked.scopes.at(-1)).toBe('all');
 });
 
@@ -689,12 +816,12 @@ test('a quiet dashboard advances its rolling range and prunes expired activity',
 	await installMockEventSource(page);
 	const mocked = await mockDashboard(page, { rollingWindow: true });
 	await page.goto('/dashboard');
-	await expect(page.locator('[data-kpi="working-agents"]')).toContainText('2');
+	await expect(page.locator('[data-working-agents]')).toContainText('2');
 	await expect(page.locator('[data-feed-event="evt-existing"]')).toBeVisible();
 
 	await page.clock.runFor(60_100);
 	await expect.poll(mocked.snapshotRequestCount).toBeGreaterThan(1);
-	await expect(page.locator('[data-kpi="working-agents"]')).toContainText('0');
+	await expect(page.locator('[data-working-agents]')).toContainText('0');
 	await expect(page.locator('[data-feed-event]')).toHaveCount(0);
 });
 
@@ -702,7 +829,7 @@ test('bounded history disables pagination cleanly at the client cap', async ({ p
 	await mockDashboard(page, { manyFeedEvents: true, stream: false });
 	await page.goto('/dashboard');
 	const events = page.locator('[data-feed-event]');
-	for (const expected of [102, 202, 302, 400]) {
+	for (const expected of [101, 201, 301, 400]) {
 		await page.getByRole('button', { name: 'Load earlier activity' }).click();
 		await expect(events).toHaveCount(expected);
 	}
