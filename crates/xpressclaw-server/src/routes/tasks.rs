@@ -1118,6 +1118,7 @@ fn task_write_error(error: xpressclaw_core::error::Error) -> (StatusCode, Json<V
             StatusCode::CONFLICT,
             Json(json!({ "error": error.to_string() })),
         ),
+        xpressclaw_core::error::Error::Task(_) => bad_request(error),
         _ => internal_error(error),
     }
 }
@@ -1247,6 +1248,63 @@ mod tests {
     #[tokio::test]
     async fn batch_task_creation_returns_current_revisions_for_planning() {
         assert_creation_revisions_are_ready_for_planning(true).await;
+    }
+
+    #[tokio::test]
+    async fn batch_schedule_errors_leave_no_tasks_or_queue_entries_on_retry() {
+        let (app, db) = test_app_with_db();
+        let mut request = json!({"tasks":[
+            {"title":"Ready", "agent_id":"atlas"},
+            {"title":"Parked", "agent_id":"atlas", "backlog":true},
+            {"title":"Unassigned"},
+            {"title":"Scheduled", "agent_id":"atlas"}
+        ]});
+        let post = |request: &Value| {
+            Request::post("/tasks/batch")
+                .header("content-type", "application/json")
+                .body(Body::from(request.to_string()))
+                .unwrap()
+        };
+        for invalid in ["not-a-date", "9999-12-31T23:59:59-01:00"] {
+            request["tasks"][3]["start_after"] = json!(invalid);
+            for _ in 0..2 {
+                let response = app.clone().oneshot(post(&request)).await.unwrap();
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                assert!(body_json(response.into_body()).await["error"]
+                    .as_str()
+                    .is_some_and(|error| !error.is_empty()));
+                for table in ["tasks", "task_dependencies", "task_queue", "work_attempts"] {
+                    let count: i64 = db
+                        .with_conn(|conn| {
+                            conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                                row.get(0)
+                            })
+                        })
+                        .unwrap();
+                    assert_eq!(count, 0, "rejected batch left rows in {table}");
+                }
+            }
+        }
+
+        request["tasks"][3]["start_after"] = json!("2100-01-01T09:00:00+09:00");
+        let response = app.clone().oneshot(post(&request)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let created = body_json(response.into_body()).await;
+        let tasks = created.as_array().unwrap();
+        assert_eq!(tasks.len(), 4);
+        assert_eq!(TaskBoard::new(db.clone()).counts().unwrap().pending, 4);
+        assert_eq!(tasks[3]["start_after"], "2100-01-01T00:00:00.000Z");
+        let planner = xpressclaw_core::tasks::planning::TaskPlanner::new(db);
+        for (index, lane, queued) in [
+            (0, "queue", true),
+            (1, "backlog", false),
+            (2, "queue", false),
+            (3, "scheduled", true),
+        ] {
+            let task = planner.get(tasks[index]["id"].as_str().unwrap()).unwrap();
+            assert_eq!(task.planning.lane, lane);
+            assert_eq!(task.planning.queued, queued);
+        }
     }
 
     #[tokio::test]

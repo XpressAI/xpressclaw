@@ -1503,14 +1503,20 @@ impl TaskBoard {
         tasks: &[BatchTaskInput],
         parent_task_id: Option<&str>,
     ) -> Result<Vec<Task>> {
+        // Validate every schedule before the first task commits. A bad date in
+        // a later entry must not leave a partially created batch behind.
+        let schedules = tasks
+            .iter()
+            .map(|input| super::planning::normalize_start_after(input.start_after.as_deref()))
+            .collect::<Result<Vec<_>>>()?;
         let mut ref_to_id: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
         let mut created = Vec::new();
 
         // First pass: create all tasks and map refs to UUIDs
-        for input in tasks {
+        for (input, start_after) in tasks.iter().zip(schedules) {
             let task = self.create(&CreateTask {
-                start_after: input.start_after.clone(),
+                start_after,
                 backlog: input.backlog,
                 title: input.title.clone(),
                 description: input.description.clone(),
@@ -3455,6 +3461,62 @@ mod tests {
         board.add_dependency(&b.id, &a.id).unwrap(); // B → A ok
         assert!(board.add_dependency(&a.id, &b.id).is_err()); // A → B cycle!
         assert!(board.add_dependency(&a.id, &a.id).is_err()); // self-cycle
+    }
+
+    #[test]
+    fn batch_schedules_are_validated_before_creating_any_children() {
+        let (db, board) = setup();
+        add_test_agents(&db, &["atlas"]);
+        let parent = board
+            .create(&CreateTask {
+                title: "Existing parent".into(),
+                agent_id: Some("atlas".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let mut inputs: Vec<BatchTaskInput> = serde_json::from_value(serde_json::json!([
+            {"ref":"build", "title":"Build", "agent_id":"atlas"},
+            {"title":"Test", "agent_id":"atlas", "depends_on":["build"],
+             "start_after":"2100-01-01T09:00:00.0001+09:00", "new_session":true},
+            {"title":"Idea", "agent_id":"atlas", "backlog":true}
+        ]))
+        .unwrap();
+
+        for invalid in [
+            "not-a-date",
+            "2100-01-01T00:00:00",
+            "9999-12-31T23:59:59-01:00",
+        ] {
+            for index in 0..inputs.len() {
+                let original = inputs[index].start_after.replace(invalid.into());
+                assert!(board.create_batch(&inputs, Some(&parent.id)).is_err());
+                assert!(
+                    board.list_subtasks(&parent.id).unwrap().is_empty(),
+                    "invalid schedule {invalid} at index {index} left partial children"
+                );
+                assert!(board.subtasks_complete(&parent.id).unwrap());
+                assert_eq!(board.get(&parent.id).unwrap().revision, parent.revision);
+                inputs[index].start_after = original;
+            }
+        }
+
+        // Correcting the request creates the intended children once and retains
+        // normalization, dependency refs, Backlog, and session-mode semantics.
+        let tasks = board.create_batch(&inputs, Some(&parent.id)).unwrap();
+        assert_eq!(tasks.len(), 3);
+        assert_eq!(board.list_subtasks(&parent.id).unwrap().len(), 3);
+        assert!(tasks[0].start_after.is_none());
+        assert!(!tasks[0].backlog);
+        assert_eq!(
+            tasks[1].start_after.as_deref(),
+            Some("2100-01-01T00:00:00.001Z")
+        );
+        assert_eq!(
+            board.get_dependencies(&tasks[1].id).unwrap(),
+            vec![tasks[0].id.clone()]
+        );
+        assert_eq!(tasks[1].context.as_ref().unwrap()["session_mode"], "new");
+        assert!(tasks[2].backlog);
     }
 
     #[test]
