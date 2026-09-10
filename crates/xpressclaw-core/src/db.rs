@@ -2687,6 +2687,72 @@ BEGIN
 END;
 "#;
 
+const MIGRATION_V48: &str = r#"
+-- Final prompt reports only. Context occupancy and legacy character-based
+-- usage estimates must never be mixed into these token totals.
+CREATE TABLE dashboard_prompt_usage (
+    prompt_id TEXT PRIMARY KEY,
+    work_kind TEXT NOT NULL CHECK (work_kind IN ('attempt', 'conversation_turn')),
+    work_id TEXT NOT NULL,
+    project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
+    agent_id TEXT NOT NULL,
+    runner TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('reported', 'not_reported', 'unclassified')),
+    recorded_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    total_tokens INTEGER CHECK (total_tokens >= 0),
+    input_tokens INTEGER CHECK (input_tokens >= 0),
+    output_tokens INTEGER CHECK (output_tokens >= 0),
+    cached_read_tokens INTEGER CHECK (cached_read_tokens >= 0),
+    cached_write_tokens INTEGER CHECK (cached_write_tokens >= 0),
+    thought_tokens INTEGER CHECK (thought_tokens >= 0)
+);
+CREATE INDEX idx_dashboard_prompt_usage_time ON dashboard_prompt_usage(recorded_at);
+CREATE INDEX idx_dashboard_prompt_usage_project_time ON dashboard_prompt_usage(project_id, recorded_at);
+INSERT OR IGNORE INTO config (key, value) VALUES
+    ('dashboard_token_recording_started_at', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+
+-- Keep genuine ACP Update text separate from generic runner progress. Do not
+-- debounce these messages: adjacent Updates can both contain useful text.
+CREATE TRIGGER dashboard_agent_update_insert AFTER INSERT ON session_events
+WHEN NEW.event_type = 'runner_progress'
+ AND json_extract(CASE WHEN json_valid(NEW.payload) THEN NEW.payload ELSE '{}' END, '$.item_type') = 'agent_message'
+ AND trim(NEW.summary) != ''
+BEGIN
+    INSERT INTO dashboard_events (
+        event_id, event_kind, project_id, project_name, agent_id, agent_name,
+        source_kind, source_label, target_type, target_id, target_title, href,
+        preview, work_kind, work_id
+    ) SELECT 'agent-update:' || NEW.id, 'agent_update', t.project_id, p.name, ls.agent_id, a.name,
+        'agent', COALESCE(a.name, ls.agent_id), 'task', t.id, t.title, '/tasks/' || t.id,
+        substr(trim(replace(replace(NEW.summary, char(10), ' '), char(13), ' ')), 1, 240),
+        'attempt', NEW.attempt_id
+      FROM tasks t JOIN logical_sessions ls ON ls.id = NEW.session_id
+      LEFT JOIN projects p ON p.id = t.project_id LEFT JOIN agents a ON a.id = ls.agent_id
+      WHERE t.id = NEW.task_id AND t.hidden = 0;
+END;
+
+-- Recover recent Update text from authoritative history on upgrade. Exclude
+-- thoughts, tools, and orchestration events even if their summaries are text.
+INSERT INTO dashboard_events (
+    event_id, event_kind, occurred_at, project_id, project_name, agent_id, agent_name,
+    source_kind, source_label, target_type, target_id, target_title, href,
+    preview, work_kind, work_id
+) SELECT 'agent-update:' || se.id, 'agent_update', strftime('%Y-%m-%dT%H:%M:%fZ', se.created_at),
+    t.project_id, p.name, ls.agent_id, a.name, 'agent', COALESCE(a.name, ls.agent_id),
+    'task', t.id, t.title, '/tasks/' || t.id,
+    substr(trim(replace(replace(se.summary, char(10), ' '), char(13), ' ')), 1, 240),
+    'attempt', se.attempt_id
+  FROM (
+    SELECT * FROM session_events WHERE event_type = 'runner_progress'
+      AND json_extract(CASE WHEN json_valid(payload) THEN payload ELSE '{}' END, '$.item_type') = 'agent_message'
+      AND trim(summary) != '' AND created_at >= datetime('now', '-8 days')
+    ORDER BY id DESC LIMIT 20000
+  ) se JOIN tasks t ON t.id = se.task_id AND t.hidden = 0
+  JOIN logical_sessions ls ON ls.id = se.session_id
+  LEFT JOIN projects p ON p.id = t.project_id LEFT JOIN agents a ON a.id = ls.agent_id
+  ORDER BY se.id ASC;
+"#;
+
 fn schema_migrations() -> &'static [(u32, &'static str)] {
     &[
         (1, MIGRATION_V1),
@@ -2736,12 +2802,59 @@ fn schema_migrations() -> &'static [(u32, &'static str)] {
         (45, MIGRATION_V45),
         (46, MIGRATION_V46),
         (47, MIGRATION_V47),
+        (48, MIGRATION_V48),
     ]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dashboard_upgrade_backfills_agent_updates_in_order_without_inventing_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upgrade.db");
+        let db = Database::open(&path).unwrap();
+        db.with_conn(|conn| {
+            // Recreate the pre-upgrade boundary with representative old history.
+            conn.execute_batch("DROP TRIGGER dashboard_agent_update_insert;
+                DROP TABLE dashboard_prompt_usage;
+                DELETE FROM config WHERE key = 'dashboard_token_recording_started_at';
+                UPDATE config SET value = '47' WHERE key = 'schema_version';
+                INSERT INTO agents (id, name, backend, config) VALUES ('agent', 'Agent', 'native', '{}');
+                INSERT INTO tasks (id, title) VALUES ('t', 'Old task');
+                INSERT INTO logical_sessions (id, agent_id, title) VALUES ('s', 'agent', 'Session');
+                INSERT INTO work_attempts (id, task_id, session_id, runner) VALUES ('a', 't', 's', 'codex');").unwrap();
+            for (text, payload) in [
+                ("First update", r#"{"item_type":"agent_message"}"#),
+                ("Second update", r#"{"item_type":"agent_message"}"#),
+                ("Booting runner", "{}"),
+                ("Invalid legacy event", "not json"),
+            ] {
+                conn.execute("INSERT INTO session_events (session_id, attempt_id, task_id, source_type, event_type, summary, payload) VALUES ('s', 'a', 't', 'acp', 'runner_progress', ?1, ?2)", [text, payload]).unwrap();
+            }
+        });
+        drop(db);
+        let db = Arc::new(Database::open(&path).unwrap());
+        let snapshot = crate::dashboard::DashboardManager::new(db)
+            .snapshot(
+                &crate::dashboard::DashboardFilter {
+                    project_id: None,
+                    range: crate::dashboard::DashboardRange::Day,
+                },
+                10,
+            )
+            .unwrap();
+        let previews: Vec<_> = snapshot
+            .feed
+            .events
+            .iter()
+            .map(|event| event.preview.as_str())
+            .collect();
+        assert_eq!(previews, ["Second update", "First update"]);
+        assert_eq!(snapshot.token_usage.total_tokens, None);
+        assert_eq!(snapshot.token_usage.reported_responses, 0);
+    }
 
     #[test]
     fn test_open_memory_db() {
@@ -2756,7 +2869,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "47");
+        assert_eq!(version, "48");
         let visualization_table: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master

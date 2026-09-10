@@ -1,5 +1,7 @@
 use serde::Serialize;
 
+pub mod resources;
+
 /// Detected system hardware information.
 #[derive(Debug, Clone, Serialize)]
 pub struct SystemInfo {

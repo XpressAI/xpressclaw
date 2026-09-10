@@ -400,10 +400,39 @@ export interface DashboardSnapshot {
 	cursor: number;
 	projects: DashboardProject[];
 	counters: DashboardCounters;
+	token_usage: DashboardTokenUsage;
 	series: DashboardSeriesPoint[];
 	active_work: DashboardActiveWork[];
 	attention: DashboardAttentionItem[];
 	feed: DashboardFeedPage;
+}
+
+export interface DashboardTokenUsage {
+	total_tokens: number | null;
+	input_tokens: number | null;
+	output_tokens: number | null;
+	cached_read_tokens: number | null;
+	cached_write_tokens: number | null;
+	thought_tokens: number | null;
+	reported_responses: number;
+	unreported_responses: number;
+	unclassified_responses: number;
+	recording_started_at: string;
+}
+
+export interface ResourceCapacity {
+	total_bytes: number;
+	available_bytes: number;
+	used_bytes: number;
+	used_percent: number;
+}
+
+export interface DashboardResources {
+	sampled_at: string;
+	cpu_percent: number | null;
+	cpu_count: number;
+	memory: ResourceCapacity | null;
+	disks: { locations: string[]; mount_point: string | null; capacity: ResourceCapacity | null }[];
 }
 
 function dashboardParams(projectId: string, range: DashboardRange, extras: Record<string, string> = {}) {
@@ -413,6 +442,7 @@ function dashboardParams(projectId: string, range: DashboardRange, extras: Recor
 }
 
 export const dashboard = {
+	resources: (signal?: AbortSignal) => request<DashboardResources>('/api/dashboard/resources', { signal }),
 	snapshot: (projectId: string, range: DashboardRange, limit = 40) =>
 		request<DashboardSnapshot>(`/api/dashboard/snapshot?${dashboardParams(projectId, range, { limit: String(limit) })}`),
 	feed: (projectId: string, range: DashboardRange, before: number, limit = 40) =>
