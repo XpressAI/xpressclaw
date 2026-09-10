@@ -272,6 +272,27 @@ Automated prereleases use the next numeric build as the patch version. The
 release workflow builds Desktop packages and standalone CLI/server archives
 from the same binaries, then publishes `SHA256SUMS` for every asset.
 
+Stable releases are explicit numeric tags such as `v0.3.0`. Main pushes and
+manual branch builds continue to publish prereleases and never become GitHub's
+latest stable release. To prepare a stable promotion:
+
+1. Select a successful prerelease and record its tag, source commit, and pinned
+   runner revision in `.github/stable-release.json` with the desired version.
+2. Run `node scripts/release-metadata.mjs --set-version 0.3.0` to synchronize the
+   release line. Add release notes in `docs/releases/0.3.0.md`, validate with
+   `node --test scripts/release-*.test.mjs`, and review the release commit.
+3. After CI and review pass, push the matching numeric tag at that commit.
+   The workflow checks the source tag against its recorded commit and ancestry,
+   rebuilds all packages with the exact stable version, retains the source
+   prerelease's native build number and runner images, and publishes the stable
+   release as GitHub's latest after all platform builds and image checks pass.
+
+For local verification, `node scripts/release-metadata.mjs --build 123 --version
+0.3.0` stamps a stable marketing version independently of the native build
+number. Version stamping changes files in place; use an isolated checkout.
+Setting `GITHUB_REF_TYPE=tag GITHUB_REF_NAME=v0.3.0` when running
+`node scripts/release-plan.mjs` previews the stable plan without modifying files.
+
 The installer uses stable archive names:
 
 - `xpressclaw-cli-aarch64-apple-darwin.tar.gz`
