@@ -1,468 +1,1017 @@
 <script lang="ts">
-	import { onDestroy, onMount } from 'svelte';
-	import { agents, tasks } from '$lib/api';
-	import type { Agent, Task, TaskCounts } from '$lib/api';
-	import { timeAgo } from '$lib/utils';
-	import AgentLoading from '$lib/components/AgentLoading.svelte';
-
-	const PAGE_SIZE = 20;
-	const FILTER_STATUSES = {
-		attention: ['waiting_for_input', 'blocked'],
-		active: ['pending', 'in_progress', 'waiting_for_input', 'blocked'],
-		all: [],
-		done: ['completed', 'cancelled'],
-	} as const;
-
-	let taskList = $state<Task[]>([]);
-	let dependencyTasks = $state<Task[]>([]);
-	let agentList = $state<Agent[]>([]);
-	let counts = $state<TaskCounts | null>(null);
-	let loading = $state(true);
-	let page = $state(0);
-	let scrollContainer = $state<HTMLDivElement>();
-	let loadRequest = 0;
-	let showCreate = $state(false);
-	let newTitle = $state('');
-	let newDesc = $state('');
-	let newAgentId = $state('');
-	let newPriority = $state(0);
-	let newDependsOn = $state<string[]>([]);
-	let newSession = $state(false);
-	let filter = $state<'attention' | 'active' | 'all' | 'done'>('active');
-	let searchText = $state('');
-	let searchQuery = $state('');
-	let searchComposing = $state(false);
-	let searchTimer: ReturnType<typeof setTimeout> | undefined;
-	let formError = $state('');
-	let creating = $state(false);
-
-	let totalTasks = $derived(countForFilter(filter, counts));
-	let totalPages = $derived(Math.max(1, Math.ceil(totalTasks / PAGE_SIZE)));
-
-	onMount(async () => {
-		await Promise.all([load(), loadAgents(), loadDependencies()]);
-	});
-	onDestroy(() => clearTimeout(searchTimer));
-
-	async function loadAgents() {
-		agentList = await agents.list().catch(() => []);
-		if (!newAgentId && agentList.length > 0) newAgentId = agentList[0].id;
-	}
-
-	async function loadDependencies() {
-		const result = await tasks.list(undefined, undefined, {
-			limit: 100,
-			statuses: [...FILTER_STATUSES.active],
-		}).catch(() => null);
-		dependencyTasks = result?.tasks ?? [];
-	}
-
-	async function load() {
-		const request = ++loadRequest;
-		loading = true;
-		try {
-			const result = await tasks.list(undefined, undefined, {
-				limit: PAGE_SIZE,
-				offset: page * PAGE_SIZE,
-				statuses: [...FILTER_STATUSES[filter]],
-				sort: searchQuery ? 'recent' : undefined,
-				search: searchQuery || undefined,
-			});
-			if (request !== loadRequest) return;
-			counts = result.counts;
-			if (result.tasks.length === 0 && page > 0 && page * PAGE_SIZE >= countForFilter(filter, result.counts)) {
-				page -= 1;
-				await load();
-				return;
-			}
-			taskList = result.tasks;
-		} catch {
-			if (request === loadRequest) taskList = [];
-		} finally {
-			if (request === loadRequest) loading = false;
-		}
-	}
-
-	function statusCount(key: keyof TaskCounts): number {
-		if (!counts) return 0;
-		return counts[key];
-	}
-
-	function countForFilter(selectedFilter: typeof filter, taskCounts: TaskCounts | null): number {
-		if (!taskCounts) return 0;
-		if (selectedFilter === 'attention') return taskCounts.waiting_for_input + taskCounts.blocked;
-		if (selectedFilter === 'active') {
-			return taskCounts.pending + taskCounts.in_progress + taskCounts.waiting_for_input + taskCounts.blocked;
-		}
-		if (selectedFilter === 'done') return taskCounts.completed + taskCounts.cancelled;
-		return Object.values(taskCounts).reduce((total, count) => total + count, 0);
-	}
-
-	async function selectFilter(nextFilter: typeof filter) {
-		if (filter === nextFilter) return;
-		filter = nextFilter;
-		page = 0;
-		taskList = [];
-		await load();
-		scrollContainer?.scrollTo({ top: 0 });
-	}
-
-	async function goToPage(nextPage: number) {
-		if (loading || nextPage < 0 || nextPage >= totalPages || nextPage === page) return;
-		page = nextPage;
-		taskList = [];
-		await load();
-		scrollContainer?.scrollTo({ top: 0 });
-	}
-
-	function handleSearchInput(event: Event) {
-		searchText = (event.currentTarget as HTMLInputElement).value;
-		if (searchComposing || (event as InputEvent).isComposing) return;
-		scheduleSearch();
-	}
-
-	function scheduleSearch() {
-		clearTimeout(searchTimer);
-		searchTimer = setTimeout(applySearch, 250);
-	}
-
-	function handleSearchKeydown(event: KeyboardEvent) {
-		if (event.key !== 'Enter' || event.isComposing || searchComposing || event.keyCode === 229) return;
-		event.preventDefault();
-		clearTimeout(searchTimer);
-		applySearch();
-	}
-
-	function handleSearchCompositionStart() {
-		searchComposing = true;
-		clearTimeout(searchTimer);
-	}
-
-	function handleSearchCompositionEnd(event: CompositionEvent) {
-		const input = event.currentTarget as HTMLInputElement;
-		clearTimeout(searchTimer);
-		// Some browsers end composition before dispatching the final input event.
-		// Deferring one tick reads the committed value and also keeps the Enter
-		// used to accept an IME candidate from submitting the search.
-		searchTimer = setTimeout(() => {
-			searchComposing = false;
-			searchText = input.value;
-			scheduleSearch();
-		}, 0);
-	}
-
-	function applySearch() {
-		const nextSearch = searchText.trim();
-		if (nextSearch === searchQuery && page === 0) return;
-		searchQuery = nextSearch;
-		page = 0;
-		taskList = [];
-		void load().then(() => scrollContainer?.scrollTo({ top: 0 }));
-	}
-
-	function clearSearch() {
-		clearTimeout(searchTimer);
-		searchComposing = false;
-		searchText = '';
-		searchQuery = '';
-		page = 0;
-		taskList = [];
-		void load().then(() => scrollContainer?.scrollTo({ top: 0 }));
-	}
-
-	/** Existing incomplete tasks that can be selected as dependencies. */
-	let availableDeps = $derived(dependencyTasks);
-
-	function toggleDep(id: string) {
-		if (newDependsOn.includes(id)) {
-			newDependsOn = newDependsOn.filter(d => d !== id);
-		} else {
-			newDependsOn = [...newDependsOn, id];
-		}
-	}
-
-	async function createTask() {
-		if (!newTitle.trim() || !newAgentId || creating) return;
-		creating = true;
-		formError = '';
-		try {
-			// Batch creation records dependencies before the dispatcher can
-			// claim the task, even when the batch contains only one item.
-			await tasks.createBatch({ tasks: [{
-				ref: 'task',
-				title: newTitle.trim(),
-				description: newDesc.trim() || undefined,
-				agent_id: newAgentId,
-				priority: newPriority || undefined,
-				new_session: newDependsOn.length === 0 && newSession,
-				depends_on: newDependsOn.length > 0 ? newDependsOn : undefined
-			}] });
-			newTitle = '';
-			newDesc = '';
-			newPriority = 0;
-			newDependsOn = [];
-			newSession = false;
-			showCreate = false;
-			await load();
-		} catch (e) {
-			formError = e instanceof Error ? e.message : String(e);
-		} finally {
-			creating = false;
-		}
-	}
-
-	async function openCreate() {
-		if (agentList.length === 0) return;
-		formError = '';
-		if (!newAgentId) newAgentId = agentList[0].id;
-		showCreate = !showCreate;
-		if (showCreate) await loadDependencies();
-	}
-
-	async function cancelTask(id: string) {
-		await tasks.updateStatus(id, 'cancelled');
-		await Promise.all([load(), loadDependencies()]);
-	}
-
-	async function deleteTask(id: string) {
-		if (!confirm('Delete this task?')) return;
-		await tasks.delete(id);
-		await Promise.all([load(), loadDependencies()]);
-	}
-
-	function agentName(agentId: string | null): string | null {
-		if (!agentId) return null;
-		const agent = agentList.find((a) => a.id === agentId);
-		return agent?.title || agent?.name || agentId;
-	}
-
-	function statusMeta(status: string): { label: string; dot: string; tone: string; pill: string; glyph: string } {
-		if (status === 'in_progress') return { label: 'Working', dot: 'bg-blue-400 animate-pulse', tone: 'text-blue-500 dark:text-blue-300', pill: 'bg-blue-500/10', glyph: '2' };
-		if (status === 'awaiting_review') return { label: 'Awaiting review', dot: 'bg-violet-400', tone: 'text-violet-600 dark:text-violet-300', pill: 'bg-violet-500/10', glyph: 'R' };
-		if (status === 'waiting_for_subtasks') return { label: 'Waiting on subtasks', dot: 'bg-amber-400', tone: 'text-amber-600 dark:text-amber-300', pill: 'bg-amber-500/10', glyph: '↳' };
-		if (status === 'idle') return { label: 'Not running', dot: 'bg-muted-foreground', tone: 'text-muted-foreground', pill: 'bg-muted', glyph: '–' };
-		if (status === 'pending') return { label: 'Queued', dot: 'bg-amber-400', tone: 'text-amber-600 dark:text-amber-300', pill: 'bg-amber-500/10', glyph: '1' };
-		if (status === 'waiting_for_input') return { label: 'Waiting for you', dot: 'bg-orange-400 animate-pulse', tone: 'text-orange-600 dark:text-orange-300', pill: 'bg-orange-500/10', glyph: '?' };
-		if (status === 'blocked') return { label: 'Blocked', dot: 'bg-red-400', tone: 'text-red-600 dark:text-red-300', pill: 'bg-red-500/10', glyph: '!' };
-		if (status === 'completed') return { label: 'Completed', dot: 'bg-emerald-400', tone: 'text-emerald-700 dark:text-emerald-300', pill: 'bg-emerald-500/10', glyph: '✓' };
-		return { label: 'Cancelled', dot: 'bg-muted-foreground', tone: 'text-muted-foreground', pill: 'bg-muted', glyph: '×' };
-	}
+  import { planningViewport } from "$lib/taskPlanning";
+  import { onMount, onDestroy, tick, untrack } from "svelte";
+  import {
+    agents,
+    projects,
+    tasks,
+    type Agent,
+    type Project,
+    type Task,
+    type PlanningAction,
+  } from "$lib/api";
+  import {
+    lanes,
+    taskLane,
+    timezone,
+    localInput,
+    scheduleTimestamp,
+  } from "$lib/taskPlanning";
+  import TaskCard from "$lib/components/planning/TaskCard.svelte";
+  import TaskActions from "$lib/components/planning/TaskActions.svelte";
+  import TaskTimeline from "$lib/components/planning/TaskTimeline.svelte";
+  import CreateTask from "$lib/components/planning/CreateTask.svelte";
+  let { route = "/tasks" }: { route?: string } = $props();
+  let mounted = $state(false);
+  let appliedRoute: string | undefined;
+  $effect(() => {
+    const next = route;
+    // Workspace metadata refreshes replace the tab object even when its path
+    // stays the same. Only navigation should reapply route-based filters.
+    if (mounted && next !== appliedRoute)
+      untrack(() => {
+        appliedRoute = next;
+        const url = new URL(next, location.origin);
+        const mode = url.searchParams.get("view");
+        if (mode && ["board", "timeline", "list"].includes(mode))
+          view = mode as View;
+        projectId = url.searchParams.get("project") ?? "";
+        agentId = "";
+        reset();
+      });
+  });
+  function closeActions() {
+    const id = selected?.id;
+    selected = null;
+    void tick().then(() => {
+      const button = id
+        ? root.querySelector<HTMLButtonElement>(
+            `[data-planning-card="${CSS.escape(id)}"] button`,
+          )
+        : null;
+      (button ?? root).focus();
+    });
+  }
+  type View = "board" | "timeline" | "list";
+  let root: HTMLDivElement;
+  let scroller: HTMLDivElement;
+  let filters: HTMLDialogElement;
+  let view = $state<View>("list");
+  let projectId = $state("");
+  let agentId = $state("");
+  let status = $state("active");
+  let draftProjectId = $state("");
+  let draftAgentId = $state("");
+  let draftStatus = $state("active");
+  let searchText = $state("");
+  let search = $state("");
+  let composing = false;
+  let timer: ReturnType<typeof setTimeout>;
+  let taskList = $state<Task[]>([]);
+  let agentList = $state<Agent[]>([]);
+  let projectList = $state<Project[]>([]);
+  let counts = $state<Record<string, number>>({});
+  let total = $state(0);
+  let loading = $state(true);
+  let error = $state("");
+  let notice = $state("");
+  let page = $state(0);
+  let selected = $state<Task | null>(null);
+  let scheduleFirst = $state(false);
+  let activateSchedule = $state(false);
+  let actionRequest = 0;
+  let showCreate = $state(false);
+  let createBacklog = $state(false);
+  let narrow = $state(false);
+  let dragging = $state<Task | null>(null);
+  let saving = $state(false);
+  let generation = 0;
+  const pageSize = $derived(view === "list" ? 20 : 100);
+  const pages = $derived(Math.max(1, Math.ceil(total / pageSize)));
+  const columns = $derived(
+    lanes.filter(
+      (l) =>
+        status === "all" ||
+        (status === "active" && l.id !== "done") ||
+        (status === "attention" &&
+          ["input", "blocked", "review"].includes(l.id)) ||
+        status === l.id,
+    ),
+  );
+  const selectedNeighbors = $derived.by(() => {
+    if (!selected) return {};
+    const lane = taskList.filter(
+      (t) =>
+        taskLane(t) === taskLane(selected!) && !t.planning?.disabled_reason,
+    );
+    const index = lane.findIndex((t) => t.id === selected!.id);
+    return { previous: lane[index - 1], next: lane[index + 1] };
+  });
+  onMount(() => {
+    const url = new URL(route, location.origin);
+    const saved =
+      url.searchParams.get("view") ??
+      localStorage.getItem("xpressclaw.tasks.view");
+    if (["board", "timeline", "list"].includes(saved ?? ""))
+      view = saved as View;
+    projectId = url.searchParams.get("project") ?? "";
+    void Promise.all([agents.list(), projects.list()])
+      .then(([a, p]) => {
+        agentList = a;
+        projectList = p;
+      })
+      .catch((e) => (error = String(e)));
+    const resize = new ResizeObserver((entries) => {
+      root.style.setProperty(
+        "--planner-height",
+        `${entries[0].contentRect.height}px`,
+      );
+      const next = entries[0].contentRect.width <= 640;
+      if (next !== narrow) {
+        narrow = next;
+        if (
+          next &&
+          view === "board" &&
+          ["all", "active", "attention"].includes(status)
+        ) {
+          status = "queue";
+          page = 0;
+          void load();
+        }
+      }
+    });
+    resize.observe(root);
+    mounted = true;
+    const poll = setInterval(() => {
+      if (!document.hidden && !dragging && !saving) void load(true);
+    }, 5000);
+    return () => {
+      resize.disconnect();
+      clearInterval(poll);
+    };
+  });
+  onDestroy(() => clearTimeout(timer));
+  async function load(quiet = false) {
+    const request = ++generation;
+    if (!quiet) loading = true;
+    try {
+      const result = await tasks.planning({
+        project_id: projectId,
+        agent_id: agentId,
+        status,
+        search,
+        limit: pageSize,
+        offset: page * pageSize,
+      });
+      if (request !== generation) return;
+      taskList = result.tasks;
+      counts = result.counts;
+      total = result.total;
+      if (page > 0 && page * pageSize >= total) {
+        page = 0;
+        void load();
+      }
+    } catch (e) {
+      if (request === generation)
+        error = e instanceof Error ? e.message : String(e);
+    } finally {
+      if (request === generation) loading = false;
+    }
+  }
+  function projectName(task: Task) {
+    return (
+      projectList.find((p) => p.id === task.project_id)?.name ?? "No project"
+    );
+  }
+  function agentName(task: Task) {
+    const agent = agentList.find((a) => a.id === task.agent_id);
+    return agent?.title || agent?.name || task.agent_id || "Unassigned";
+  }
+  function reset() {
+    page = 0;
+    error = "";
+    void load();
+  }
+  function openFilters() {
+    draftProjectId = projectId;
+    draftAgentId = agentId;
+    draftStatus = status;
+    filters.showModal();
+  }
+  function applyFilters() {
+    projectId = draftProjectId;
+    agentId = draftAgentId;
+    status = draftStatus;
+    reset();
+    filters.close();
+  }
+  function setView(next: View) {
+    view = next;
+    localStorage.setItem("xpressclaw.tasks.view", view);
+    if (
+      narrow &&
+      next === "board" &&
+      ["all", "active", "attention"].includes(status)
+    )
+      status = "queue";
+    reset();
+  }
+  function filterCount(id: string) {
+    return Object.entries(counts)
+      .filter(
+        ([lane]) =>
+          id === "all" ||
+          (id === "active" && lane !== "done") ||
+          (id === "attention" &&
+            ["input", "blocked", "review"].includes(lane)) ||
+          id === lane,
+      )
+      .reduce((sum, [, n]) => sum + n, 0);
+  }
+  function setStatus(next: string) {
+    status = next;
+    reset();
+  }
+  function searchSoon() {
+    if (composing) return;
+    clearTimeout(timer);
+    if (!composing)
+      timer = setTimeout(() => {
+        search = searchText.trim();
+        reset();
+      }, 250);
+  }
+  async function openActions(task: Task, schedule = false, activate = false) {
+    const request = ++actionRequest;
+    try {
+      const latest = await tasks.planningTask(task.id);
+      if (request === actionRequest) {
+        scheduleFirst = schedule;
+        activateSchedule = activate;
+        selected = latest;
+      }
+    } catch (e) {
+      if (request === actionRequest) error = String(e);
+    }
+  }
+  async function mutate(task: Task, action: PlanningAction): Promise<Task> {
+    saving = true;
+    error = "";
+    try {
+      const updated = await tasks.plan(task, action);
+      taskList = taskList.map((t) => (t.id === updated.id ? updated : t));
+      if (selected?.id === updated.id) selected = updated;
+      notice = "Planning saved. Queue and dependency rules still apply.";
+      await load(true);
+      return updated;
+    } catch (e) {
+      await load(true);
+      if (selected?.id === task.id) {
+        try {
+          selected = await tasks.planningTask(task.id);
+        } catch {}
+      }
+      throw e;
+    } finally {
+      saving = false;
+    }
+  }
+  async function tryMove(task: Task, action: PlanningAction) {
+    try {
+      await mutate(task, action);
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+    }
+  }
+  function startDrag(event: DragEvent, task: Task) {
+    if (!task.planning || task.planning.disabled_reason) {
+      event.preventDefault();
+      return;
+    }
+    dragging = task;
+    event.dataTransfer?.setData("text/x-xpressclaw-task", task.id);
+    if (event.dataTransfer) event.dataTransfer.effectAllowed = "move";
+  }
+  function dragged(event: DragEvent) {
+    event.preventDefault();
+    event.stopPropagation();
+    const task = dragging;
+    if (
+      !task ||
+      event.dataTransfer?.getData("text/x-xpressclaw-task") !== task.id
+    )
+      return null;
+    dragging = null;
+    return task;
+  }
+  function dropCard(event: DragEvent, target: Task) {
+    const task = dragged(event);
+    if (!task || task.id === target.id) return;
+    if (taskLane(task) !== taskLane(target)) moveToLane(task, taskLane(target));
+    else void tryMove(task, { action: "reorder", before_id: target.id });
+  }
+  function dropLane(event: DragEvent, lane: string) {
+    const task = dragged(event);
+    if (task) moveToLane(task, lane);
+  }
+  function moveToLane(task: Task, lane: string) {
+    if (lane === "queue") void tryMove(task, { action: "queue" });
+    else if (lane === "backlog") void tryMove(task, { action: "backlog" });
+    else if (lane === "scheduled") void openActions(task, true, true);
+    else
+      error =
+        "This column follows agent activity. Use task details to respond, retry, or review.";
+  }
+  function reorder(task: Task, direction: number) {
+    const lane = taskList.filter(
+      (t) => taskLane(t) === taskLane(task) && !t.planning?.disabled_reason,
+    );
+    const next = lane[lane.findIndex((t) => t.id === task.id) + direction];
+    if (next)
+      void tryMove(
+        task,
+        direction < 0
+          ? { action: "reorder", before_id: next.id }
+          : { action: "reorder", after_id: next.id },
+      );
+  }
+  function dropDate(event: DragEvent, date: string) {
+    const task = dragged(event);
+    if (!task) return;
+    const clock = localInput(task.start_after).slice(11) || "09:00";
+    try {
+      void tryMove(task, {
+        action: "schedule",
+        start_after: scheduleTimestamp(`${date}T${clock}`),
+      });
+    } catch (e) {
+      error = String(e);
+    }
+  }
+  function go(next: number) {
+    page = next;
+    void load();
+    scroller.scrollTo({ top: 0 });
+  }
 </script>
 
-<div bind:this={scrollContainer} data-tasks-scroll class="workspace-scroll-y h-full">
-	<div class="space-y-6 p-4 sm:p-6">
-	<div class="flex items-center justify-between gap-3">
-		<div>
-			<h1 class="text-2xl font-bold">Tasks</h1>
-			{#if counts && searchQuery}
-				<p class="text-sm text-muted-foreground mt-1">
-					{countForFilter('all', counts)} matching {countForFilter('all', counts) === 1 ? 'task' : 'tasks'}
-				</p>
-			{:else if counts}
-				<p class="text-sm text-muted-foreground mt-1">
-					{statusCount('pending')} pending, {statusCount('in_progress')} in progress, {statusCount('completed')} completed
-				</p>
-			{/if}
-		</div>
-		<button
-			onclick={openCreate}
-			disabled={agentList.length === 0}
-			class="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 transition-colors disabled:cursor-not-allowed disabled:opacity-50"
-		>
-			New Task
-		</button>
-	</div>
-
-	{#if agentList.length === 0}
-		<div class="rounded-lg border border-dashed border-border bg-card p-5 text-sm text-muted-foreground">
-			Tasks need an agent so they know which workspace and harness to use. <a href="/setup?mode=add-session" class="font-medium text-primary hover:underline">Create an agent</a> first.
-		</div>
-	{/if}
-
-	{#if showCreate}
-		<div class="rounded-lg border border-border bg-card p-4 space-y-3">
-			<input
-				type="text"
-				placeholder="Task title..."
-				bind:value={newTitle}
-				class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring"
-			/>
-			<textarea
-				placeholder="Description (optional)..."
-				bind:value={newDesc}
-				rows="2"
-				class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring resize-none"
-			></textarea>
-			<div class="flex flex-col gap-3 sm:flex-row">
-				<div class="flex-1">
-					<label class="block text-xs text-muted-foreground mb-1">Agent
-					<select
-						bind:value={newAgentId}
-						class="mt-1 w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-					>
-						{#each agentList as agent}
-							<option value={agent.id}>{agent.title || agent.name}</option>
-						{/each}
-					</select>
-					</label>
-				</div>
-				<div class="w-24">
-					<label class="block text-xs text-muted-foreground mb-1">Priority
-					<select
-						bind:value={newPriority}
-						class="mt-1 w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-					>
-						<option value={0}>Normal</option>
-						<option value={5}>High</option>
-						<option value={10}>Urgent</option>
-					</select>
-					</label>
-				</div>
-			</div>
-			{#if availableDeps.length > 0}
-				<div>
-					<div class="block text-xs text-muted-foreground mb-1">Depends on (optional)</div>
-					<div class="flex flex-wrap gap-1.5 max-h-24 overflow-y-auto">
-						{#each availableDeps as dep}
-							<button
-								type="button"
-								onclick={() => toggleDep(dep.id)}
-								class="rounded-md border px-2 py-1 text-xs transition-colors
-									{newDependsOn.includes(dep.id)
-										? 'border-primary bg-primary/10 text-primary'
-										: 'border-border text-muted-foreground hover:border-primary/50'}"
-							>
-								{dep.title}
-							</button>
-						{/each}
-					</div>
-					{#if newDependsOn.length > 0}
-						<div class="text-xs text-muted-foreground mt-1">
-							This task will wait, then branch from the conversation it depends on.
-						</div>
-					{/if}
-				</div>
-			{/if}
-			<label class="flex items-start gap-2 text-xs text-muted-foreground {newDependsOn.length > 0 ? 'opacity-50' : ''}">
-				<input type="checkbox" bind:checked={newSession} disabled={newDependsOn.length > 0} class="mt-0.5 h-3.5 w-3.5 accent-primary" />
-				<span><strong class="font-medium text-foreground">Start a fresh conversation</strong><br />Otherwise this branches from the agent’s active conversation when supported.</span>
-			</label>
-			{#if formError}<p class="text-xs text-destructive">{formError}</p>{/if}
-			<div class="flex gap-2">
-				<button
-					onclick={createTask}
-					disabled={!newTitle.trim() || !newAgentId || creating}
-					class="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
-				>
-					{creating ? 'Queuing…' : 'Create and queue'}
-				</button>
-				<button
-					onclick={() => (showCreate = false)}
-					class="rounded-md border border-border px-3 py-1.5 text-xs font-medium hover:bg-accent"
-				>
-					Cancel
-				</button>
-			</div>
-		</div>
-	{/if}
-
-	<div class="ai-control relative overflow-hidden">
-		<svg class="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true">
-			<circle cx="11" cy="11" r="7" />
-			<path d="m20 20-3.5-3.5" />
-		</svg>
-		<input
-			type="search"
-			value={searchText}
-			oninput={handleSearchInput}
-			onkeydown={handleSearchKeydown}
-			oncompositionstart={handleSearchCompositionStart}
-			oncompositionend={handleSearchCompositionEnd}
-			maxlength="200"
-			aria-label="Search tasks"
-			placeholder="Search task titles, descriptions, and conversations…"
-			class="w-full bg-transparent py-2.5 pl-9 pr-10 text-sm placeholder:text-muted-foreground focus:outline-none"
-		/>
-		{#if searchText}
-			<button
-				type="button"
-				onclick={clearSearch}
-				aria-label="Clear task search"
-				class="absolute right-2 top-1/2 -translate-y-1/2 rounded-md px-2 py-1 text-lg leading-none text-muted-foreground hover:bg-accent hover:text-foreground"
-			>×</button>
-		{/if}
-	</div>
-
-	<div class="flex w-fit max-w-full gap-1 overflow-x-auto rounded-full bg-[hsl(var(--field))] p-0.5">
-		{#each [
-			{ id: 'attention', label: 'Needs you', count: statusCount('waiting_for_input') + statusCount('blocked') },
-			{ id: 'active', label: 'Active', count: countForFilter('active', counts) },
-			{ id: 'all', label: 'All', count: countForFilter('all', counts) },
-			{ id: 'done', label: 'Done', count: countForFilter('done', counts) }
-		] as item}
-			<button onclick={() => selectFilter(item.id as typeof filter)} class="shrink-0 rounded-full px-3 py-1.5 text-xs font-medium transition-all {filter === item.id ? 'bg-card text-foreground shadow-[var(--shadow-control)]' : 'text-muted-foreground hover:text-foreground'}">
-				{item.label} <span class="ml-1 opacity-70">{item.count}</span>
-			</button>
-		{/each}
-	</div>
-
-	<div data-task-list class="space-y-2">
-		{#if loading && taskList.length === 0}
-			<div class="flex justify-center px-4 py-16"><AgentLoading label="Loading tasks" phase="loading" /></div>
-		{:else}
-			{#each taskList as task (task.id)}
-				{@const displayStatus = task.activity_status ?? task.status}
-				{@const meta = statusMeta(displayStatus)}
-				<a data-task-row data-task-activity-status={displayStatus} href="/tasks/{task.id}" class="group ai-card flex min-h-14 items-start gap-3 px-3 py-3 transition-colors hover:bg-[hsl(var(--hover))]">
-					<span class="relative mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-[11px] font-semibold {meta.tone} shadow-[inset_0_0_0_1.5px_hsl(var(--border-strong))]">
-						{meta.glyph}
-						{#if displayStatus === 'in_progress'}<span class="absolute inset-0 rounded-full border-2 border-transparent border-t-blue-400 animate-spin"></span>{/if}
-					</span>
-					<div class="min-w-0 flex-1">
-						<div class="flex items-start justify-between gap-3">
-							<h2 class="min-w-0 truncate text-sm font-medium">{task.title}</h2>
-							<span class="ai-status-pill shrink-0 {meta.pill} {meta.tone}">{meta.label}</span>
-						</div>
-						{#if task.description}<p class="mt-1 line-clamp-2 text-xs text-muted-foreground">{task.description}</p>{/if}
-						<div class="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-muted-foreground">
-							<span>{agentName(task.agent_id) ?? 'Unassigned'}</span><span>·</span><span>{timeAgo(task.updated_at)}</span>
-							{#if task.blocked_by && task.blocked_by.length > 0}<span class="text-amber-500">· Waiting on {task.blocked_by.length}</span>{/if}
-							{#if task.priority >= 5}<span class="text-orange-400">· High priority</span>{/if}
-						</div>
-					</div>
-					<div class="flex shrink-0 items-center gap-2">
-						{#if !['completed', 'cancelled'].includes(task.status)}<button onclick={(event) => { event.preventDefault(); event.stopPropagation(); cancelTask(task.id); }} class="hidden text-xs text-muted-foreground hover:text-destructive sm:block">Cancel</button>{/if}
-						<button onclick={(event) => { event.preventDefault(); event.stopPropagation(); deleteTask(task.id); }} aria-label="Delete task" class="hidden text-lg leading-none text-muted-foreground hover:text-destructive sm:block">×</button>
-					</div>
-				</a>
-			{:else}
-				<div class="ai-card px-4 py-16 text-center text-sm text-muted-foreground">
-					{searchQuery ? `No tasks match “${searchQuery}”.` : 'No tasks in this view.'}
-				</div>
-			{/each}
-		{/if}
-	</div>
-
-	{#if totalPages > 1}
-		<nav aria-label="Task pages" class="flex items-center justify-between gap-3 pb-2">
-			<button
-				type="button"
-				onclick={() => goToPage(page - 1)}
-				disabled={page === 0 || loading}
-				class="rounded-md border border-border px-3 py-2 text-xs font-medium hover:bg-accent disabled:cursor-not-allowed disabled:opacity-40"
-			>
-				Previous
-			</button>
-			<span class="text-xs text-muted-foreground">Page {page + 1} of {totalPages}</span>
-			<button
-				type="button"
-				onclick={() => goToPage(page + 1)}
-				disabled={page + 1 >= totalPages || loading}
-				class="rounded-md border border-border px-3 py-2 text-xs font-medium hover:bg-accent disabled:cursor-not-allowed disabled:opacity-40"
-			>
-				Next
-			</button>
-		</nav>
-	{/if}
-	</div>
+<svelte:window ondragend={() => (dragging = null)} />
+<div
+  bind:this={root}
+  class="task-planner"
+  tabindex="-1"
+  aria-busy={saving || loading}
+>
+  <header class="planner-header">
+    <div>
+      <h1>Tasks</h1>
+      <p>
+        {total}
+        {search ? "matching " : ""}{total === 1 ? "task" : "tasks"} · {projectId
+          ? projectList.find((p) => p.id === projectId)?.name
+          : "All projects"}
+      </p>
+    </div>
+    <button
+      class="new-desktop primary"
+      onclick={() => (showCreate = true)}
+      disabled={!agentList.length}>New Task</button
+    >
+  </header>
+  <div class="top-controls">
+    <nav aria-label="Task views">
+      {#each [["board", "Board"], ["timeline", "Timeline / Gantt"], ["list", "List"]] as [id, label]}<button
+          aria-pressed={view === id}
+          onclick={() => setView(id as View)}>{label}</button
+        >{/each}
+    </nav>
+    <button onclick={openFilters}
+      >Filters{projectId || agentId ? " · active" : ""}</button
+    >
+  </div>
+  <div class="search">
+    <input
+      type="search"
+      aria-label="Search tasks"
+      placeholder="Search tasks and conversations…"
+      value={searchText}
+      maxlength="200"
+      oninput={(e) => {
+        searchText = e.currentTarget.value;
+        if (!(e instanceof InputEvent && e.isComposing)) searchSoon();
+      }}
+      oncompositionstart={() => {
+        composing = true;
+        clearTimeout(timer);
+      }}
+      oncompositionend={(event) => {
+        const input = event.currentTarget;
+        clearTimeout(timer);
+        timer = setTimeout(() => {
+          composing = false;
+          searchText = input.value;
+          searchSoon();
+        }, 0);
+      }}
+      onkeydown={(e) => {
+        if (
+          e.key === "Enter" &&
+          !e.isComposing &&
+          !composing &&
+          e.keyCode !== 229
+        ) {
+          clearTimeout(timer);
+          search = searchText.trim();
+          reset();
+        }
+      }}
+    />{#if searchText}<button
+        aria-label="Clear task search"
+        onclick={() => {
+          clearTimeout(timer);
+          searchText = "";
+          search = "";
+          reset();
+        }}>×</button
+      >{/if}
+  </div>
+  <div class="status-controls">
+    {#each [["attention", "Needs you"], ["active", "Active"], ["all", "All"], ["done", "Done"]] as [id, label]}<button
+        aria-pressed={status === id}
+        onclick={() => setStatus(id)}>{label} {filterCount(id)}</button
+      >{/each}<label class="lane-filter"
+      >Status<select
+        aria-label={narrow && view === "board" ? "Board lane" : "Task status"}
+        value={status}
+        onchange={(e) => setStatus(e.currentTarget.value)}
+        ><option value="active">All active lanes</option><option value="all"
+          >All lanes</option
+        ><option value="attention">Needs attention</option
+        >{#each lanes as lane}<option value={lane.id}
+            >{lane.label} ({counts[lane.id] ?? 0})</option
+          >{/each}</select
+      ></label
+    >
+  </div>
+  {#if projectId || agentId}<div class="filter-summary">
+      {projectList.find((p) => p.id === projectId)?.name ?? "All projects"} · {(agentList.find(
+        (a) => a.id === agentId,
+      )?.title ??
+        agentId) ||
+        "All agents"}<button
+        onclick={() => {
+          projectId = "";
+          agentId = "";
+          reset();
+        }}>Clear filters</button
+      >
+    </div>{/if}
+  {#if error}<div class="error" role="alert">
+      {error}<button
+        onclick={() => {
+          error = "";
+          void load();
+        }}>Refresh</button
+      >
+    </div>{/if}
+  <span class="sr-only" role="status">{notice}</span>
+  <div
+    bind:this={scroller}
+    class="planner-scroll"
+    data-tasks-scroll
+    aria-busy={loading}
+  >
+    {#if loading && !taskList.length}<p class="empty">
+        Loading tasks…
+      </p>{:else if !taskList.length}<p class="empty">
+        {search ? `No tasks match “${search}”.` : "No tasks in this view."}
+      </p>{/if}
+    {#if view === "board"}<p class="hint">
+        Drag to reorder, move between Backlog and To do, or schedule. Use Actions or Alt + ↑ / ↓
+        from a card for keyboard controls.
+      </p>
+      <div class="board" data-task-board>
+        {#each columns as lane}<section
+            class="lane"
+            class:unavailable={!!dragging &&
+              !["queue", "backlog", "scheduled"].includes(lane.id) &&
+              taskLane(dragging) !== lane.id}
+            data-board-lane={lane.id}
+            aria-label={lane.label}
+            ondragover={(e) => e.preventDefault()}
+            ondrop={(e) => dropLane(e, lane.id)}
+          >
+            <h2>
+              <span style:background={lane.color}></span>{lane.label}<small
+                >{counts[lane.id] ?? 0}</small
+              >
+            </h2>
+            {#if dragging && !["queue", "backlog", "scheduled"].includes(lane.id) && taskLane(dragging) !== lane.id}<p
+                class="hint"
+              >
+                Updated by the task lifecycle
+              </p>{/if}
+            {#if lane.id === "backlog"}<button class="backlog-add" onclick={() => { createBacklog = true; showCreate = true; }}>+ Add to Backlog</button>{/if}
+            <div class="cards">
+              {#each taskList.filter((t) => taskLane(t) === lane.id) as task (task.id)}<TaskCard
+                  {task}
+                  project={projectName(task)}
+                  agent={agentName(task)}
+                  onactions={openActions}
+                  ondrag={startDrag}
+                  ondrop={dropCard}
+                  onreorder={reorder}
+                />{/each}
+            </div>
+            {#if !taskList.some((t) => taskLane(t) === lane.id)}<p
+                class="lane-empty"
+              >
+                No tasks on this page
+              </p>{/if}
+          </section>{/each}
+      </div>{:else if view === "timeline"}<p class="hint">
+        Dates shown in {timezone()}. Drag a start marker to change its date; use
+        Schedule / actions for precise times.
+      </p>
+      <TaskTimeline
+        {taskList}
+        {projectName}
+        {agentName}
+        onactions={(task) => openActions(task, true)}
+        ondrag={startDrag}
+        ondate={dropDate}
+      />{:else}<div class="task-list" data-task-list>
+        {#each taskList as task (task.id)}<div
+            data-task-row
+            data-task-activity-status={task.activity_status ?? task.status}
+          >
+            <TaskCard
+              {task}
+              showDescription
+              project={projectName(task)}
+              agent={agentName(task)}
+              onactions={openActions}
+              ondrag={startDrag}
+              ondrop={dropCard}
+              onreorder={reorder}
+            />
+          </div>{/each}
+      </div>{/if}
+    {#if pages > 1}<nav class="pagination" aria-label="Task pages">
+        <button disabled={page === 0 || loading} onclick={() => go(page - 1)}
+          >Previous</button
+        ><span
+          >Page {page + 1} of {pages} · {page * pageSize + 1}–{Math.min(
+            (page + 1) * pageSize,
+            total,
+          )} of {total}</span
+        ><button
+          disabled={page + 1 >= pages || loading}
+          onclick={() => go(page + 1)}>Next</button
+        >
+      </nav>{/if}
+  </div>
+  <footer role="group" class="mobile-controls" aria-label="Task controls">
+    {#each [["board", "Board"], ["timeline", "Timeline"], ["list", "List"]] as [id, label]}<button
+        aria-pressed={view === id}
+        onclick={() => setView(id as View)}>{label}</button
+      >{/each}<button onclick={openFilters}>Filters</button
+    ><button
+      class="primary"
+      onclick={() => (showCreate = true)}
+      disabled={!agentList.length}>+ Task</button
+    >
+  </footer>
 </div>
+<dialog bind:this={filters} use:planningViewport class="filters-sheet" aria-label="Task filters">
+  <header>
+    <h2>Filter tasks</h2>
+    <button aria-label="Close filters" onclick={() => filters.close()}>×</button
+    >
+  </header>
+  <div>
+    <label
+      >Project<select
+        aria-label="Filter project"
+        bind:value={draftProjectId}
+        onchange={() => (draftAgentId = "")}
+        ><option value="">All projects</option
+        >{#each projectList as project}<option value={project.id}
+            >{project.name}</option
+          >{/each}</select
+      ></label
+    ><label
+      >Agent<select aria-label="Filter agent" bind:value={draftAgentId}
+        ><option value="">All agents</option
+        >{#each agentList.filter((a) => !draftProjectId || a.project_id === draftProjectId) as agent}<option
+            value={agent.id}>{agent.title || agent.name}</option
+          >{/each}</select
+      ></label
+    ><label
+      >Status<select aria-label="Filter status" bind:value={draftStatus}
+        ><option value="active">Active</option><option value="all">All</option
+        ><option value="attention">Needs attention</option
+        >{#each lanes as lane}<option value={lane.id}>{lane.label}</option
+          >{/each}</select
+      ></label
+    >
+  </div>
+  <footer>
+    <button
+      onclick={() => {
+        draftProjectId = "";
+        draftAgentId = "";
+        draftStatus = "active";
+      }}>Reset</button
+    ><button
+      class="primary"
+      onclick={applyFilters}>Apply filters</button
+    >
+  </footer>
+</dialog>
+{#if selected}<TaskActions
+    {scheduleFirst}
+    {activateSchedule}
+    task={selected}
+    {agentList}
+    {...selectedNeighbors}
+    onchange={mutate}
+    onclose={closeActions}
+  />{/if}
+{#if showCreate}<CreateTask
+    {agentList}
+    {projectList}
+    initialAgent={agentId ||
+      agentList.find((a) => a.project_id === projectId)?.id ||
+      ""}
+    initialBacklog={createBacklog}
+    onclose={() => { showCreate = false; createBacklog = false; }}
+    oncreated={() => {
+      notice = "Task created.";
+      reset();
+    }}
+  />{/if}
+
+<style>
+  .task-planner {
+    container: task-planner / inline-size;
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    min-height: 0;
+    min-width: 0;
+    background: hsl(var(--background));
+  }
+  .planner-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 16px;
+    padding: 22px 24px 14px;
+    flex-shrink: 0;
+  }
+  h1 {
+    font-size: 24px;
+    font-weight: 700;
+  }
+  .planner-header p {
+    font-size: 12px;
+    color: hsl(var(--muted-foreground));
+    margin-top: 4px;
+  }
+  button,
+  select,
+  input {
+    min-height: 40px;
+    border: 1px solid hsl(var(--border));
+    background: hsl(var(--card));
+    border-radius: 8px;
+    padding: 8px 12px;
+    font-size: 12px;
+  }
+  button:hover {
+    background: hsl(var(--accent));
+  }
+  button:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+  button[aria-pressed="true"] {
+    background: hsl(var(--primary) / 0.1);
+    color: hsl(var(--primary));
+    border-color: hsl(var(--primary) / 0.3);
+    font-weight: 600;
+  }
+  .primary {
+    background: hsl(var(--primary));
+    color: hsl(var(--primary-foreground));
+  }
+  .primary:hover {
+    background: hsl(var(--primary) / 0.9);
+  }
+  .top-controls {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin: 0 24px 12px;
+    gap: 12px;
+  }
+  .top-controls nav {
+    display: flex;
+    gap: 6px;
+  }
+  .search {
+    position: relative;
+    margin: 0 24px 12px;
+  }
+  .search input {
+    width: 100%;
+    padding-right: 44px;
+  }
+  .search button {
+    position: absolute;
+    right: 0;
+    top: 0;
+    border: 0;
+    background: transparent;
+    font-size: 20px;
+  }
+  .status-controls {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 0 24px 12px;
+    flex-wrap: wrap;
+  }
+  .status-controls > button {
+    min-height: 32px;
+    padding: 6px 10px;
+    font-size: 11px;
+    border-radius: 20px;
+  }
+  .lane-filter {
+    margin-left: auto;
+    font-size: 11px;
+    color: hsl(var(--muted-foreground));
+  }
+  .lane-filter select {
+    margin-left: 8px;
+    min-height: 34px;
+  }
+  .planner-scroll {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    overflow-x: hidden;
+    overscroll-behavior: contain;
+    padding: 0 24px 20px;
+  }
+  .hint {
+    font-size: 11px;
+    color: hsl(var(--muted-foreground));
+    line-height: 1.5;
+    margin-bottom: 12px;
+  }
+  .board {
+    height: max(250px, calc(var(--planner-height, 100dvh) - 320px));
+    overflow-y: hidden;
+    display: flex;
+    align-items: stretch;
+    gap: 12px;
+    overflow-x: auto;
+    padding: 2px 2px 16px;
+    min-height: 340px;
+  }
+  .lane {
+    display: flex;
+    flex-direction: column;
+    flex: 1 0 250px;
+    min-width: 250px;
+    max-width: 340px;
+    border-radius: 12px;
+    background: hsl(var(--muted) / 0.5);
+    border: 1px solid hsl(var(--border) / 0.7);
+    padding: 12px;
+  }
+  .lane h2 {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    font-weight: 650;
+    margin: 0 0 14px;
+  }
+  .lane h2 > span {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+  }
+  .lane h2 > small {
+    margin-left: auto;
+    color: hsl(var(--muted-foreground));
+  }
+  .lane.unavailable {
+    opacity: 0.6;
+  }
+  .cards {
+    overflow-y: auto;
+    min-height: 0;
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .lane-empty {
+    font-size: 11px;
+    color: hsl(var(--muted-foreground));
+    padding: 18px 4px;
+  }
+  .task-list {
+    display: flex;
+    flex-direction: column;
+    gap: 9px;
+  }
+  .task-list :global(article) {
+    padding: 14px 16px;
+  }
+  .task-list :global(.identity) {
+    justify-content: flex-start;
+  }
+  .task-list :global(.title a) {
+    font-size: 14px;
+  }
+  .empty {
+    padding: 48px 16px;
+    text-align: center;
+    color: hsl(var(--muted-foreground));
+    font-size: 13px;
+  }
+  .pagination {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-top: 20px;
+  }
+  .pagination span {
+    font-size: 11px;
+    color: hsl(var(--muted-foreground));
+  }
+  .filter-summary {
+    font-size: 11px;
+    color: hsl(var(--muted-foreground));
+    padding: 0 24px 10px;
+  }
+  .filter-summary button {
+    border: 0;
+    min-height: 28px;
+    padding: 4px 8px;
+    background: transparent;
+    color: hsl(var(--primary));
+  }
+  .error {
+    margin: 0 24px 12px;
+    padding: 12px;
+    border: 1px solid hsl(var(--destructive) / 0.4);
+    border-radius: 8px;
+    color: hsl(var(--destructive));
+    font-size: 12px;
+  }
+  .error button {
+    margin-left: 10px;
+  }
+  .mobile-controls {
+    display: none;
+  }
+  .filters-sheet {
+    width: min(440px, calc(100vw - 24px));
+    margin: auto;
+    padding: 0;
+    border: 1px solid hsl(var(--border));
+    border-radius: 18px;
+    background: hsl(var(--background));
+    color: hsl(var(--foreground));
+    max-height: calc(100dvh - 24px);
+    overflow: auto;
+  }
+  .filters-sheet::backdrop {
+    background: #0006;
+  }
+  .filters-sheet header,
+  .filters-sheet footer {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 16px 20px;
+    gap: 12px;
+  }
+  .filters-sheet h2 {
+    font-weight: 650;
+  }
+  .filters-sheet > div {
+    padding: 0 20px;
+  }
+  .filters-sheet label {
+    display: block;
+    font-size: 12px;
+    margin-bottom: 16px;
+  }
+  .filters-sheet select {
+    width: 100%;
+    display: block;
+    margin-top: 8px;
+  }
+  .filters-sheet footer {
+    padding-bottom: max(16px, env(safe-area-inset-bottom));
+  }
+  .filters-sheet .primary {
+    flex: 1;
+  }
+  @container task-planner (max-width:640px) {
+    .planner-header {
+      padding: 14px 14px 10px;
+    }
+    h1 {
+      font-size: 20px;
+    }
+    .new-desktop,
+    .top-controls {
+      display: none;
+    }
+    .search {
+      margin: 0 14px 8px;
+    }
+    .status-controls {
+      padding: 0 14px 10px;
+      gap: 4px;
+    }
+    .status-controls > button {
+      display: none;
+    }
+    .lane-filter {
+      margin: 0;
+      display: flex;
+      width: 100%;
+      align-items: center;
+    }
+    .lane-filter select {
+      flex: 1;
+      min-height: 44px;
+    }
+    .planner-scroll {
+      padding: 0 14px 14px;
+    }
+    .cards {
+      overflow: visible;
+    }
+    .board {
+      height: auto;
+      overflow: visible;
+      display: block;
+    }
+    .lane {
+      max-width: none;
+      min-width: 0;
+      margin-bottom: 12px;
+    }
+    .hint {
+      display: none;
+      font-size: 10px;
+    }
+    .mobile-controls {
+      display: flex;
+      flex-shrink: 0;
+      gap: 4px;
+      padding: 8px 10px max(8px, env(safe-area-inset-bottom));
+      border-top: 1px solid hsl(var(--border));
+      background: hsl(var(--card));
+    }
+    .mobile-controls button {
+      flex: 1;
+      min-width: 0;
+      min-height: 48px;
+      padding: 8px 4px;
+      font-size: 11px;
+    }
+    .error,
+    .filter-summary {
+      margin-left: 14px;
+      margin-right: 14px;
+    }
+    .pagination span {
+      font-size: 10px;
+    }
+  }
+  @media (max-width: 640px) {
+    input, select { font-size: 16px; }
+    .filters-sheet {
+      width: 100%;
+      max-width: 100vw;
+      top: calc(var(--planning-viewport-top, 0px) + var(--planning-viewport-height, 100dvh));
+      bottom: auto;
+      transform: translateY(-100%);
+      margin: 0;
+      border-radius: 18px 18px 0 0;
+    }
+  }
+</style>

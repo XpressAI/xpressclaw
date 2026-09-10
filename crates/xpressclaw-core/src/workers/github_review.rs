@@ -1483,6 +1483,8 @@ mod tests {
             .unwrap();
         let task = TaskBoard::new(db.clone())
             .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "Publish a PR".into(),
                 description: None,
                 agent_id: Some("project-codex".into()),

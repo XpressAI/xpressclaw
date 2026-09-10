@@ -410,6 +410,7 @@ async fn create_agent_task(
     TaskQueue::new(state.db.clone())
         .enqueue(&task.id, target_id)
         .map_err(bad)?;
+    let task = board.get(&task.id).map_err(bad)?;
     Ok(Json(json!(task)))
 }
 
@@ -633,6 +634,20 @@ mod tests {
         assert_eq!(value["project_id"], "shared");
         assert_eq!(value["parent_task_id"], parent.id);
         assert_eq!(value["blocks_parent"], true);
+        assert_eq!(value["backlog"], false);
+        xpressclaw_core::tasks::planning::TaskPlanner::new(db.clone())
+            .change(
+                value["id"].as_str().unwrap(),
+                &serde_json::from_value(json!({
+                    "action":"priority", "priority":10, "expected_revision":value["revision"]
+                }))
+                .unwrap(),
+            )
+            .expect("Agent task creation must return the revision after enqueueing");
+        assert!(TaskQueue::new(db.clone())
+            .claim("helper")
+            .unwrap()
+            .is_some());
         assert_eq!(value["agent_id"], "helper");
         let queued: i64 = db
             .with_conn(|conn| {

@@ -708,6 +708,8 @@ flows:
         let board = TaskBoard::new(db.clone());
         let task = board
             .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "Fix the interface".into(),
                 agent_id: Some("atlas".into()),
                 ..Default::default()
@@ -874,6 +876,8 @@ flows:
                 conversation_id: None,
                 priority: None,
                 context: None,
+                backlog: false,
+                start_after: None,
             })
             .unwrap();
         TaskQueue::new(db.clone())

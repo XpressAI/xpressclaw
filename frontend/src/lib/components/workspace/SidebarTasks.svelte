@@ -68,6 +68,8 @@
 		if (status === 'queued' || status === 'pending') return 'bg-amber-400';
 		if (status === 'awaiting_review') return 'bg-violet-400';
 		if (status === 'waiting_for_subtasks') return 'bg-amber-400';
+		if (status === 'scheduled') return 'bg-sky-500';
+		if (status === 'backlog') return 'bg-stone-400';
 		if (status === 'idle') return 'bg-muted-foreground';
 		if (status === 'cancelled') return 'bg-muted-foreground';
 		return 'bg-emerald-500';
@@ -79,9 +81,11 @@
 		if (status === 'waiting_for_input') return 'Waiting for you';
 		if (status === 'running' || status === 'in_progress' || status === 'preparing') return 'Working';
 		if (status === 'review') return 'Ready for review';
-		if (status === 'queued' || status === 'pending') return 'Queued';
+		if (status === 'queued' || status === 'pending') return 'To do';
 		if (status === 'awaiting_review') return 'Awaiting review';
 		if (status === 'waiting_for_subtasks') return 'Waiting on subtasks';
+		if (status === 'scheduled') return 'Scheduled';
+		if (status === 'backlog') return 'Backlog';
 		if (status === 'idle') return 'Not running';
 		if (status === 'cancelled') return 'Cancelled';
 		return 'Completed';
@@ -92,6 +96,11 @@
 	}
 </script>
 
+{#if !compact}
+ <div class="mb-3 flex gap-2 px-2 text-[11px] text-muted-foreground" aria-label="Task planning views">
+  <a href="/tasks?view=board" onclick={onnavigate}>Board</a><a href="/tasks?view=timeline" onclick={onnavigate}>Timeline</a><a href="/tasks?view=list" onclick={onnavigate}>List</a>
+ </div>
+{/if}
 {#if compact}
 	<div data-sidebar-mode="tasks" class="flex flex-col items-center gap-1">
 		{#each compactTasks as task (task.id)}

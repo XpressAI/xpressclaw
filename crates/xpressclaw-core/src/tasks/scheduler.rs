@@ -383,6 +383,8 @@ impl ScheduleManager {
             }
         } else {
             let task = match board.create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title,
                 description,
                 agent_id: Some(agent_id.clone()),

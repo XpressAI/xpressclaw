@@ -4907,6 +4907,11 @@ mod tests {
             .transition_attempt(first_attempt_id, "preparing", "Preparing", None, None)
             .unwrap();
 
+        assert!(queue.claim("atlas").unwrap().is_none());
+        SessionManager::new(db.clone())
+            .transition_attempt(first_attempt_id, "completed", "Complete", None, None)
+            .unwrap();
+        queue.complete(first.id, "Complete").unwrap();
         let claimed_later = queue.claim("atlas").unwrap().unwrap();
         assert_eq!(claimed_later.id, later.id);
         let later_prompt =
@@ -4944,6 +4949,11 @@ mod tests {
             )
             .unwrap()
             .unwrap();
+        assert!(queue.claim("atlas").unwrap().is_none());
+        SessionManager::new(db.clone())
+            .transition_attempt(later_attempt_id, "completed", "Complete", None, None)
+            .unwrap();
+        queue.complete(later.id, "Complete").unwrap();
         let claimed_newest = queue.claim("atlas").unwrap().unwrap();
         assert_eq!(claimed_newest.id, newest.id);
         let newest_prompt =
@@ -5139,6 +5149,11 @@ flows:
     }
 
     fn finish_default_completion_gate_attempt(db: &Arc<Database>, task: &Task) -> Vec<Task> {
+        let item = start_default_completion_gate_attempt(db, task);
+        finish_claimed_default_completion_gate_attempt(db, task, &item)
+    }
+
+    fn start_default_completion_gate_attempt(db: &Arc<Database>, task: &Task) -> QueueItem {
         let queue = TaskQueue::new(db.clone());
         let queued = queue.enqueue(&task.id, "atlas").unwrap();
         let item = queue.claim("atlas").unwrap().unwrap();
@@ -5150,6 +5165,15 @@ flows:
         TaskBoard::new(db.clone())
             .update_status(&task.id, "in_progress", Some("atlas"))
             .unwrap();
+        item
+    }
+
+    fn finish_claimed_default_completion_gate_attempt(
+        db: &Arc<Database>,
+        task: &Task,
+        item: &QueueItem,
+    ) -> Vec<Task> {
+        let attempt_id = item.attempt_id.as_deref().unwrap();
         TaskConversation::new(db.clone())
             .complete_final_assistant_attempt(FinalAssistantAttempt {
                 task_id: &task.id,
@@ -5198,6 +5222,9 @@ flows:
         use crate::tasks::board::CreateTask;
 
         let (db, task, instance_id) = setup_default_completion_gate_task();
+        // Delegate while the parent is running; an existing blocking child
+        // must prevent a fresh parent turn from being claimed.
+        let item = start_default_completion_gate_attempt(&db, &task);
         let blocker = TaskBoard::new(db.clone())
             .create(&CreateTask {
                 title: "Blocking child".into(),
@@ -5206,7 +5233,7 @@ flows:
             })
             .unwrap();
 
-        assert!(finish_default_completion_gate_attempt(&db, &task).is_empty());
+        assert!(finish_claimed_default_completion_gate_attempt(&db, &task, &item).is_empty());
 
         assert_eq!(
             TaskBoard::new(db.clone()).get(&blocker.id).unwrap().status,
@@ -7154,6 +7181,8 @@ flows:
             .unwrap();
         let task = TaskBoard::new(db.clone())
             .create(&crate::tasks::board::CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "Reply".to_string(),
                 description: Some("Reply from the native worker".to_string()),
                 agent_id: Some("atlas".to_string()),

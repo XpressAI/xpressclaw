@@ -2673,6 +2673,20 @@ WHERE execution.task_id IS NULL
   AND agent.project_id IS NOT NULL;
 ";
 
+const MIGRATION_V47: &str = r#"
+ALTER TABLE tasks ADD COLUMN start_after TEXT;
+ALTER TABLE tasks ADD COLUMN backlog INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE tasks ADD COLUMN position REAL NOT NULL DEFAULT 0;
+ALTER TABLE tasks ADD COLUMN revision INTEGER NOT NULL DEFAULT 0;
+UPDATE tasks SET position = rowid * 1024.0;
+CREATE INDEX idx_tasks_planning_order ON tasks(priority DESC, position, id);
+CREATE TRIGGER tasks_planning_revision AFTER UPDATE ON tasks
+WHEN NEW.revision = OLD.revision
+BEGIN
+  UPDATE tasks SET revision = OLD.revision + 1 WHERE id = NEW.id;
+END;
+"#;
+
 fn schema_migrations() -> &'static [(u32, &'static str)] {
     &[
         (1, MIGRATION_V1),
@@ -2721,6 +2735,7 @@ fn schema_migrations() -> &'static [(u32, &'static str)] {
         (44, MIGRATION_V44),
         (45, MIGRATION_V45),
         (46, MIGRATION_V46),
+        (47, MIGRATION_V47),
     ]
 }
 
@@ -2741,7 +2756,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "46");
+        assert_eq!(version, "47");
         let visualization_table: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master

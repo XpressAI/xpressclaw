@@ -474,6 +474,8 @@ async fn create_linked_task(
     }
 
     let create_task = CreateTask {
+        backlog: false,
+        start_after: None,
         title: request.title,
         description: request.description,
         agent_id: request.agent_id,

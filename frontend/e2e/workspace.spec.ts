@@ -1058,7 +1058,16 @@ async function mockApi(
 						: '',
 				truncated: false,
 			};
-		} else if (path === '/api/tasks') {
+		} else if (path === '/api/tasks/planning') {
+            const laneFor = (task: {status:string;activity_status?:string}) => ({pending:'queue',in_progress:'working',waiting_for_input:'input',blocked:'blocked',completed:'done',cancelled:'done',idle:'queue',awaiting_review:'review'}[task.activity_status??task.status]??'queue');
+            const terms=(url.searchParams.get('search')??'').toLocaleLowerCase().split(/\s+/).filter(Boolean);
+            const matching=listedTasks.filter(t=>terms.every(term=>(t.title+' '+(t.description??'')).toLocaleLowerCase().includes(term)));
+            const counts:Record<string,number>={};for(const task of matching){const lane=laneFor(task);counts[lane]=(counts[lane]??0)+1;}
+            const selected=url.searchParams.get('status')??'active';
+            const filtered=matching.filter(t=>selected==='all'||selected==='active'&&laneFor(t)!=='done'||selected==='attention'&&['input','blocked','review'].includes(laneFor(t))||laneFor(t)===selected);
+            const offset=Number(url.searchParams.get('offset')??0);const limit=Number(url.searchParams.get('limit')??100);
+            response={tasks:filtered.slice(offset,offset+limit).map(t=>({...t,revision:0,position:0,start_after:null,backlog:false,planning:{lane:laneFor(t),disabled_reason:laneFor(t)==='done'?'Finished':null,queued:t.status==='pending',actual_started_at:null}})),total:filtered.length,counts};
+        } else if (path === '/api/tasks') {
 			if (url.searchParams.has('parent_task_id')) {
 				response = { tasks: options.taskSubtasks ?? [], counts: { ...counts, completed: 0 } };
 			} else {
@@ -2493,7 +2502,7 @@ test('raw HTML stays literal across task messages, activity, results, and previe
 
 	await page.goto('/tasks');
 	await page.getByRole('button', { name: 'Done 1' }).click();
-	const preview = page.locator(`[data-task-row][href="/tasks/${taskId}"]`);
+	const preview = page.locator('[data-task-row]', { has: page.locator(`a[href="/tasks/${taskId}"]`) });
 	await expect(preview).toContainText(taskPrompt);
 	await expect(preview.locator('custom-prompt')).toHaveCount(0);
 });
@@ -4680,8 +4689,8 @@ test('task list scrolls and requests one filtered page at a time', async ({ page
 
 	const secondPageRequest = page.waitForRequest((request) => {
 		const url = new URL(request.url());
-		return url.pathname === '/api/tasks'
-			&& url.searchParams.get('statuses') === 'completed,cancelled'
+		return url.pathname === '/api/tasks/planning'
+			&& url.searchParams.get('status') === 'done'
 			&& url.searchParams.get('offset') === '20';
 	});
 	await page.getByRole('button', { name: 'Next' }).click();
@@ -4692,8 +4701,8 @@ test('task list scrolls and requests one filtered page at a time', async ({ page
 
 	const finalPageRequest = page.waitForRequest((request) => {
 		const url = new URL(request.url());
-		return url.pathname === '/api/tasks'
-			&& url.searchParams.get('statuses') === 'completed,cancelled'
+		return url.pathname === '/api/tasks/planning'
+			&& url.searchParams.get('status') === 'done'
 			&& url.searchParams.get('offset') === '40';
 	});
 	await page.getByRole('button', { name: 'Next' }).click();
@@ -4728,12 +4737,12 @@ test('idle completed turns do not look active and future plan items are deferred
 	});
 
 	await page.goto('/tasks');
-	const row = page.locator(`[data-task-row][href="/tasks/${taskId}"]`);
+	const row = page.locator('[data-task-row]').filter({has:page.locator(`a[href="/tasks/${taskId}"]`)});
 	await expect(row).toHaveAttribute('data-task-activity-status', 'idle');
 	await expect(row.getByText('Not running')).toBeVisible();
 	await expect(row.getByText('Working')).toHaveCount(0);
 
-	await row.click();
+	await row.getByRole('link').first().click();
 	await expect(page.locator('[data-task-activity-status="idle"]').first()).toBeVisible();
 	await expect(page.locator('[data-agent-loading]')).toHaveCount(0);
 	await expect(page.getByText('No worker or required subtask is currently running.')).toBeVisible();
@@ -4747,15 +4756,14 @@ test('task search filters the full history with server-side counts', async ({ pa
 
 	const searchRequest = page.waitForRequest((request) => {
 		const url = new URL(request.url());
-		return url.pathname === '/api/tasks' && url.searchParams.get('search') === 'COMPLETED 42';
+		return url.pathname === '/api/tasks/planning' && url.searchParams.get('search') === 'COMPLETED 42';
 	});
 	await page.getByRole('searchbox', { name: 'Search tasks' }).fill('COMPLETED 42');
 	const searchUrl = new URL((await searchRequest).url());
-	expect(searchUrl.searchParams.get('statuses')).toBe('completed,cancelled');
-	expect(searchUrl.searchParams.get('sort')).toBe('recent');
+	expect(searchUrl.searchParams.get('status')).toBe('done');
 
 	await expect(page.locator('[data-task-list] [data-task-row]')).toHaveCount(1);
-	await expect(page.locator('[data-task-list] [data-task-row]')).toHaveAttribute('href', '/tasks/completed-task-42');
+	await expect(page.locator('[data-task-list] [data-task-row] a').first()).toHaveAttribute('href', '/tasks/completed-task-42');
 	await expect(page.getByText('1 matching task')).toBeVisible();
 	await expect(page.getByRole('button', { name: 'Done 1' })).toBeVisible();
 
@@ -4772,7 +4780,7 @@ test('task search waits for Japanese IME composition to finish', async ({ page }
 	const searches: string[] = [];
 	page.on('request', (request) => {
 		const url = new URL(request.url());
-		if (url.pathname === '/api/tasks' && url.searchParams.has('search')) {
+		if (url.pathname === '/api/tasks/planning' && url.searchParams.has('search')) {
 			searches.push(url.searchParams.get('search') ?? '');
 		}
 	});
@@ -4797,7 +4805,7 @@ test('task search waits for Japanese IME composition to finish', async ({ page }
 
 	const searchRequest = page.waitForRequest((request) => {
 		const url = new URL(request.url());
-		return url.pathname === '/api/tasks' && url.searchParams.get('search') === '検索';
+		return url.pathname === '/api/tasks/planning' && url.searchParams.get('search') === '検索';
 	});
 	await search.evaluate((element) => {
 		const input = element as HTMLInputElement;
@@ -4854,7 +4862,7 @@ test('agent, task, and automation lists remain scrollable on mobile', async ({ b
 	await mobile.locator('aside:visible').getByRole('button', { name: 'Close' }).click();
 
 	await mobile.goto('/tasks');
-	await mobile.getByRole('button', { name: 'Done 45' }).click();
+	await mobile.getByRole('combobox', { name: 'Task status' }).selectOption('done');
 	await expect(mobile.locator('[data-task-list] [data-task-row]')).toHaveCount(20);
 	await expectVerticalScroll(mobile.locator('[data-tasks-scroll]'));
 	await mobile.getByRole('button', { name: 'Open agent switcher' }).click();

@@ -843,6 +843,8 @@ impl WorkflowEngine {
 
         let board = TaskBoard::new(self.db.clone());
         let task = board.create(&CreateTask {
+            backlog: false,
+            start_after: None,
             title: label,
             description: Some(full_prompt),
             agent_id: Some(agent_id.clone()),
@@ -2883,6 +2885,8 @@ flows:
 
         let task = TaskBoard::new(db.clone())
             .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "Remove internal UI notices".into(),
                 description: Some("Keep the interface focused on user actions.".into()),
                 agent_id: Some("atlas".into()),

@@ -377,6 +377,8 @@ mod tests {
 
         let task = board
             .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "Test task".into(),
                 description: Some("A task".into()),
                 agent_id: Some("atlas".into()),
@@ -400,6 +402,8 @@ mod tests {
         let board = TaskBoard::new(db);
         let task = board
             .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "Queue test".into(),
                 description: None,
                 agent_id: Some("atlas".into()),
@@ -450,6 +454,8 @@ mod tests {
         let board = TaskBoard::new(db);
         let task = board
             .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "Dispatch test".into(),
                 description: None,
                 agent_id: Some("atlas".into()),
