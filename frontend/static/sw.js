@@ -61,6 +61,12 @@ function resolveActiveCache() {
 			if (versions.length > 0) {
 				currentCacheName = `${CACHE_PREFIX}${versions[0]}`;
 				currentCache = await caches.open(currentCacheName);
+				// Restore the second-newest release as the previous cache so
+				// clients on the prior release can still read their chunks.
+				if (versions.length > 1) {
+					previousCacheName = `${CACHE_PREFIX}${versions[1]}`;
+					previousCache = await caches.open(previousCacheName);
+				}
 				return currentCache;
 			}
 			currentCacheName = UNKNOWN_CACHE;
@@ -84,8 +90,11 @@ function resolveActiveCache() {
 			// the previous release, so already-open clients keep loading
 			// their lazy chunks across a deployment. Deriving it from
 			// CacheStorage also covers worker restarts, where in-memory state
-			// was lost.
-			const previous = keys.find((key) => key !== cacheName && releaseVersionFromKey(key) !== null);
+			// was lost. Sort by numeric version: cache keys come back in
+			// creation order, which is not release order.
+			const previous = keys
+				.filter((key) => key !== cacheName && releaseVersionFromKey(key) !== null)
+				.sort((a, b) => releaseVersionFromKey(b) - releaseVersionFromKey(a))[0];
 			previousCacheName = previous ?? null;
 			previousCache = previous ? await caches.open(previous) : null;
 
