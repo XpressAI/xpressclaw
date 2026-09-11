@@ -4,7 +4,33 @@
 // and page navigations always go straight to the network. Only immutable,
 // content-hashed SvelteKit build assets are cached, so updates apply as soon
 // as the server ships new hashed asset URLs.
-const CACHE_NAME = 'xpressclaw-static-v1';
+//
+// The cache is keyed by the SvelteKit build version from /_app/version.json
+// (which is itself never cached), so each deploy rotates to a fresh cache and
+// activation deletes the previous release's entries instead of accumulating
+// every historical asset until the storage quota is exhausted.
+
+let activeCachePromise = null;
+
+function activeCache() {
+	if (!activeCachePromise) {
+		activeCachePromise = (async () => {
+			let version = 'unknown';
+			try {
+				const response = await fetch('/_app/version.json', { cache: 'no-store' });
+				if (response.ok) {
+					const data = await response.json();
+					if (typeof data.version === 'string' && data.version) version = data.version;
+				}
+			} catch {
+				// Offline or unreachable: cache under a fallback name that the
+				// next activation reconciles and replaces.
+			}
+			return caches.open(`xpressclaw-static-${version}`);
+		})().catch(async () => caches.open('xpressclaw-static-unknown'));
+	}
+	return activeCachePromise;
+}
 
 self.addEventListener('install', () => {
 	self.skipWaiting();
@@ -13,8 +39,9 @@ self.addEventListener('install', () => {
 self.addEventListener('activate', (event) => {
 	event.waitUntil(
 		(async () => {
+			const cache = await activeCache();
 			const keys = await caches.keys();
-			await Promise.all(keys.filter((key) => key !== CACHE_NAME).map((key) => caches.delete(key)));
+			await Promise.all(keys.filter((key) => key !== cache.name).map((key) => caches.delete(key)));
 			await self.clients.claim();
 		})()
 	);
@@ -32,12 +59,16 @@ self.addEventListener('fetch', (event) => {
 
 	event.respondWith(
 		(async () => {
-			const cache = await caches.open(CACHE_NAME);
+			const cache = await activeCache();
 			const cached = await cache.match(request);
 			if (cached) return cached;
 			try {
 				const response = await fetch(request);
-				if (response.ok) {
+				const contentType = response.headers.get('content-type') || '';
+				if (
+					response.ok &&
+					!contentType.toLowerCase().startsWith('text/html')
+				) {
 					try {
 						// Await the write so the fetch event stays alive until the
 						// cache entry is complete; otherwise the worker may be
