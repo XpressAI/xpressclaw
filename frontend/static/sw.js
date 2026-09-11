@@ -27,6 +27,7 @@ let currentCache = null;
 let currentCacheName = null;
 let previousCache = null;
 let previousCacheName = null;
+let reconciledVersion = null;
 
 function releaseVersionFromKey(key) {
 	if (!key.startsWith(CACHE_PREFIX)) return null;
@@ -75,7 +76,9 @@ function resolveActiveCache() {
 		}
 
 		const cacheName = `${CACHE_PREFIX}${version}`;
-		if (currentCache && currentCacheName === cacheName) return currentCache;
+		if (currentCache && currentCacheName === cacheName && reconciledVersion === cacheName) {
+			return currentCache;
+		}
 
 		currentCache = await caches.open(cacheName);
 		currentCacheName = cacheName;
@@ -100,7 +103,11 @@ function resolveActiveCache() {
 
 			const retained = new Set([currentCacheName, previousCacheName].filter((name) => name !== null));
 			await Promise.all(keys.filter((key) => !retained.has(key)).map((key) => caches.delete(key)));
+			reconciledVersion = cacheName;
 		} catch {
+			// Leave reconciledVersion unset so a later probe for the same
+			// version retries restoration instead of short-circuiting with a
+			// missing previous cache.
 			previousCache = null;
 			previousCacheName = null;
 		}
