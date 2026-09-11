@@ -1166,7 +1166,7 @@
 {/snippet}
 
 {#if !serverConnected}
-	<div data-connection-status role="status" aria-live="polite" class="pointer-events-none fixed inset-x-0 top-14 z-[200] flex justify-center px-3">
+	<div data-connection-status role="status" aria-live="polite" class="pointer-events-none fixed inset-x-0 top-[calc(3.5rem+env(safe-area-inset-top))] z-[200] flex justify-center px-3">
 		<div class="flex max-w-md items-center gap-3 rounded-xl border border-amber-500/30 bg-card/95 px-4 py-3 shadow-xl backdrop-blur">
 			<svg class="h-5 w-5 shrink-0 animate-pulse text-amber-500" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M8.288 15.038a5.25 5.25 0 017.424 0M5.106 11.856c3.807-3.808 9.98-3.808 13.788 0M1.924 8.674c5.565-5.565 14.587-5.565 20.152 0M12 20.25h.008v.008H12v-.008z" /></svg>
 			<div>

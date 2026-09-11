@@ -71,10 +71,6 @@ function resolveActiveCache() {
 		const cacheName = `${CACHE_PREFIX}${version}`;
 		if (currentCache && currentCacheName === cacheName) return currentCache;
 
-		// Rotate: retain the previous release's cache so already-open clients
-		// can keep loading their lazy chunks until they reload.
-		previousCache = currentCache;
-		previousCacheName = currentCacheName;
 		currentCache = await caches.open(cacheName);
 		currentCacheName = cacheName;
 
@@ -84,12 +80,20 @@ function resolveActiveCache() {
 		// their storage key, so compare against the constructed names.
 		try {
 			const keys = await caches.keys();
-			const retained = new Set(
-				[currentCacheName, previousCacheName].filter((name) => name !== null)
-			);
+			// Retain the newest stored release other than the current one as
+			// the previous release, so already-open clients keep loading
+			// their lazy chunks across a deployment. Deriving it from
+			// CacheStorage also covers worker restarts, where in-memory state
+			// was lost.
+			const previous = keys.find((key) => key !== cacheName && releaseVersionFromKey(key) !== null);
+			previousCacheName = previous ?? null;
+			previousCache = previous ? await caches.open(previous) : null;
+
+			const retained = new Set([currentCacheName, previousCacheName].filter((name) => name !== null));
 			await Promise.all(keys.filter((key) => !retained.has(key)).map((key) => caches.delete(key)));
 		} catch {
-			// Best-effort cleanup.
+			previousCache = null;
+			previousCacheName = null;
 		}
 		return currentCache;
 	})().catch(async () => {
