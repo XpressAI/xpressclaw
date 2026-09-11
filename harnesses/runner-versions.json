@@ -4,7 +4,7 @@
   "runners": {
     "codex": {
       "auto_update": true,
-      "version": "1.10.0",
+      "version": "1.11.0",
       "acp_command": [
         "codex-acp"
       ],
@@ -18,12 +18,12 @@
         }
       ],
       "build_args": {
-        "CODEX_ACP_VERSION": "1.10.0"
+        "CODEX_ACP_VERSION": "1.11.0"
       }
     },
     "claude": {
       "auto_update": true,
-      "version": "0.75.1",
+      "version": "0.76.0",
       "acp_command": [
         "claude-agent-acp"
       ],
@@ -37,7 +37,7 @@
         }
       ],
       "build_args": {
-        "CLAUDE_ACP_VERSION": "0.75.1"
+        "CLAUDE_ACP_VERSION": "0.76.0"
       }
     },
     "deepseek-harness": {
@@ -194,12 +194,12 @@
         "AGENT_BINARY": "pi-acp",
         "AGENT_EXTRA_PACKAGES": "@earendil-works/pi-coding-agent@0.85.1",
         "AGENT_EXTRA_BINARY": "pi",
-        "PI_MCP_PACKAGE": "pi-mcp-adapter@2.32.1"
+        "PI_MCP_PACKAGE": "pi-mcp-adapter@2.33.0"
       }
     },
     "qwen": {
       "auto_update": true,
-      "version": "0.23.1",
+      "version": "0.23.3",
       "acp_command": [
         "qwen",
         "--acp",
@@ -216,7 +216,7 @@
       ],
       "build_args": {
         "AGENT_KIND": "qwen",
-        "AGENT_PACKAGE": "@qwen-code/qwen-code@0.23.1",
+        "AGENT_PACKAGE": "@qwen-code/qwen-code@0.23.3",
         "AGENT_BINARY": "qwen"
       }
     },
@@ -290,7 +290,7 @@
     },
     "grok": {
       "auto_update": true,
-      "version": "1.0.24",
+      "version": "1.0.29",
       "acp_command": [
         "grok",
         "agent",
@@ -307,13 +307,13 @@
       ],
       "build_args": {
         "AGENT_KIND": "grok",
-        "AGENT_PACKAGE": "@xai-official/grok@1.0.24",
+        "AGENT_PACKAGE": "@xai-official/grok@1.0.29",
         "AGENT_BINARY": "grok"
       }
     },
     "kilo": {
       "auto_update": true,
-      "version": "7.5.16",
+      "version": "7.6.2",
       "acp_command": [
         "kilo",
         "acp"
@@ -329,7 +329,7 @@
       ],
       "build_args": {
         "AGENT_KIND": "kilo",
-        "AGENT_PACKAGE": "@kilocode/cli@7.5.16",
+        "AGENT_PACKAGE": "@kilocode/cli@7.6.2",
         "AGENT_BINARY": "kilo"
       }
     },
