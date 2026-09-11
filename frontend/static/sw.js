@@ -38,10 +38,15 @@ self.addEventListener('fetch', (event) => {
 			try {
 				const response = await fetch(request);
 				if (response.ok) {
-					// Await the write so the fetch event stays alive until the
-					// cache entry is complete; otherwise the worker may be
-					// terminated mid-write and leave a truncated entry.
-					await cache.put(request, response.clone());
+					try {
+						// Await the write so the fetch event stays alive until the
+						// cache entry is complete; otherwise the worker may be
+						// terminated mid-write and leave a truncated entry.
+						await cache.put(request, response.clone());
+					} catch {
+						// Caching is best-effort (quota, private mode): a failed
+						// write must not fail an otherwise successful response.
+					}
 				}
 				return response;
 			} catch (error) {

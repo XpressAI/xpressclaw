@@ -170,7 +170,7 @@
 
 <svelte:head><title>Sign in · XpressClaw</title></svelte:head>
 
-<main class="grid min-h-screen place-items-center bg-background p-5 pt-[calc(env(safe-area-inset-top)+1.25rem)] text-foreground">
+<main class="grid min-h-screen place-items-center bg-background p-5 pt-[calc(env(safe-area-inset-top)+1.25rem)] pl-[calc(env(safe-area-inset-left)+1.25rem)] pr-[calc(env(safe-area-inset-right)+1.25rem)] pb-[calc(env(safe-area-inset-bottom)+1.25rem)] text-foreground">
 	<div class="w-full max-w-md">
 		<div class="mb-7 flex items-center justify-center gap-3" aria-label="XpressClaw">
 			<div class="grid size-10 place-items-center rounded-xl bg-primary text-primary-foreground shadow-lg shadow-primary/20">
