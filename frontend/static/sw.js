@@ -24,9 +24,22 @@ function activeCache() {
 				}
 			} catch {
 				// Offline or unreachable: cache under a fallback name that the
-				// next activation reconciles and replaces.
+				// next successful version probe reconciles and replaces.
 			}
-			return caches.open(`xpressclaw-static-${version}`);
+			const cache = await caches.open(`xpressclaw-static-${version}`);
+			// The static /sw.js bytes rarely change, so the browser may never
+			// re-run install/activate for a new deployment. Reconcile here so
+			// stale release caches are pruned whenever a new version is first
+			// observed, regardless of worker lifecycle.
+			try {
+				const keys = await caches.keys();
+				await Promise.all(
+					keys.filter((key) => key !== cache.name).map((key) => caches.delete(key))
+				);
+			} catch {
+				// Best-effort cleanup.
+			}
+			return cache;
 		})().catch(async () => caches.open('xpressclaw-static-unknown'));
 	}
 	return activeCachePromise;
