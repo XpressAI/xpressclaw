@@ -37,7 +37,12 @@ self.addEventListener('fetch', (event) => {
 			if (cached) return cached;
 			try {
 				const response = await fetch(request);
-				if (response.ok) cache.put(request, response.clone());
+				if (response.ok) {
+					// Await the write so the fetch event stays alive until the
+					// cache entry is complete; otherwise the worker may be
+					// terminated mid-write and leave a truncated entry.
+					await cache.put(request, response.clone());
+				}
 				return response;
 			} catch (error) {
 				if (cached) return cached;
