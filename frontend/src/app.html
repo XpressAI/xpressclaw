@@ -2,8 +2,15 @@
 <html lang="en">
 	<head>
 		<meta charset="utf-8" />
-		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 		<meta name="color-scheme" content="light dark" />
+		<meta name="theme-color" media="(prefers-color-scheme: light)" content="#f9f9fa" />
+		<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#0b0d11" />
+		<meta name="description" content="XpressClaw control plane for agents, tasks, and workflows." />
+		<meta name="mobile-web-app-capable" content="yes" />
+		<meta name="apple-mobile-web-app-capable" content="yes" />
+		<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+		<meta name="apple-mobile-web-app-title" content="XpressClaw" />
 		<script>
 			(() => {
 				let preference = 'system';
@@ -19,6 +26,7 @@
 		</script>
 		<link rel="icon" href="%sveltekit.assets%/favicon.svg" />
 		<link rel="apple-touch-icon" href="%sveltekit.assets%/icon.png" />
+		<link rel="manifest" href="%sveltekit.assets%/manifest.webmanifest" />
 		<title>xpressclaw</title>
 		%sveltekit.head%
 	</head>

@@ -943,7 +943,7 @@
 	});
 </script>
 
-<div class="flex h-[100dvh] min-w-0 overflow-hidden">
+<div class="flex h-[100dvh] min-w-0 overflow-hidden pt-[env(safe-area-inset-top)]">
 	<aside data-workspace-sidebar class="hidden shrink-0 flex-col border-r border-border/60 transition-[width] duration-200 lg:flex {sidebarCollapsed ? 'w-14' : 'w-64'}" style="background: hsl(var(--sidebar))">
 		<div class="flex h-11 shrink-0 items-center {sidebarCollapsed ? 'justify-center' : 'gap-2 px-3'}">
 			<a href="/dashboard" class="flex min-w-0 items-center gap-2 rounded-md outline-none transition hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/50" aria-label="Open Control center" title="Control center">
