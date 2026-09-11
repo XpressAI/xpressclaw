@@ -10,37 +10,50 @@
 // activation deletes the previous release's entries instead of accumulating
 // every historical asset until the storage quota is exhausted.
 
+// Re-probe the build version periodically rather than memoizing for the
+// worker's whole lifetime: deployments often leave /sw.js unchanged, so a
+// long-lived worker would otherwise keep caching new chunks under a stale
+// version (and never recover from an offline "unknown" first probe).
+const VERSION_PROBE_TTL_MS = 60_000;
+
 let activeCachePromise = null;
+let activeCacheProbedAt = 0;
+
+function resolveActiveCache() {
+	return (async () => {
+		let version = 'unknown';
+		try {
+			const response = await fetch('/_app/version.json', { cache: 'no-store' });
+			if (response.ok) {
+				const data = await response.json();
+				if (typeof data.version === 'string' && data.version) version = data.version;
+			}
+		} catch {
+			// Offline or unreachable: cache under a fallback name that the
+			// next successful version probe reconciles and replaces.
+		}
+		const cache = await caches.open(`xpressclaw-static-${version}`);
+		// The static /sw.js bytes rarely change, so the browser may never
+		// re-run install/activate for a new deployment. Reconcile here so
+		// stale release caches are pruned whenever a new version is first
+		// observed, regardless of worker lifecycle.
+		try {
+			const keys = await caches.keys();
+			await Promise.all(
+				keys.filter((key) => key !== cache.name).map((key) => caches.delete(key))
+			);
+		} catch {
+			// Best-effort cleanup.
+		}
+		return cache;
+	})().catch(async () => caches.open('xpressclaw-static-unknown'));
+}
 
 function activeCache() {
-	if (!activeCachePromise) {
-		activeCachePromise = (async () => {
-			let version = 'unknown';
-			try {
-				const response = await fetch('/_app/version.json', { cache: 'no-store' });
-				if (response.ok) {
-					const data = await response.json();
-					if (typeof data.version === 'string' && data.version) version = data.version;
-				}
-			} catch {
-				// Offline or unreachable: cache under a fallback name that the
-				// next successful version probe reconciles and replaces.
-			}
-			const cache = await caches.open(`xpressclaw-static-${version}`);
-			// The static /sw.js bytes rarely change, so the browser may never
-			// re-run install/activate for a new deployment. Reconcile here so
-			// stale release caches are pruned whenever a new version is first
-			// observed, regardless of worker lifecycle.
-			try {
-				const keys = await caches.keys();
-				await Promise.all(
-					keys.filter((key) => key !== cache.name).map((key) => caches.delete(key))
-				);
-			} catch {
-				// Best-effort cleanup.
-			}
-			return cache;
-		})().catch(async () => caches.open('xpressclaw-static-unknown'));
+	const now = Date.now();
+	if (!activeCachePromise || now - activeCacheProbedAt > VERSION_PROBE_TTL_MS) {
+		activeCacheProbedAt = now;
+		activeCachePromise = resolveActiveCache();
 	}
 	return activeCachePromise;
 }
