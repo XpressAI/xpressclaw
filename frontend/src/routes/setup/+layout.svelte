@@ -4,7 +4,7 @@
 	let { children } = $props();
 </script>
 
-<div class="flex min-h-screen items-center justify-center bg-background p-4">
+<div class="flex min-h-screen items-center justify-center bg-background p-4 pt-[calc(env(safe-area-inset-top)+1rem)] pl-[calc(env(safe-area-inset-left)+1rem)] pr-[calc(env(safe-area-inset-right)+1rem)] pb-[calc(env(safe-area-inset-bottom)+1rem)]">
 	<div class="w-full max-w-2xl">
 		<!-- Header -->
 		<div class="mb-8 text-center">

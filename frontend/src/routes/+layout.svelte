@@ -82,6 +82,16 @@
 
 	onMount(() => {
 		initializeTheme();
+		if (
+			!('__TAURI_INTERNALS__' in window) &&
+			'serviceWorker' in navigator &&
+			window.isSecureContext
+		) {
+			// Register the PWA service worker for install prompts and static
+			// asset caching. The worker never touches API, SSE, or navigation
+			// requests, so live control-plane traffic is unaffected.
+			void navigator.serviceWorker.register('/sw.js').catch(() => undefined);
+		}
 		// The login page owns its bootstrap request so it can render the
 		// credential mode and attempt Desktop keychain login exactly once.
 		if (loginRoute) {

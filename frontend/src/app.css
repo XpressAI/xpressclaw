@@ -411,3 +411,15 @@
 	overscroll-behavior-y: contain;
 	-webkit-overflow-scrolling: touch;
 }
+
+/* iOS Safari (and Android Chrome) auto-zoom into focused inputs whose font
+   size is below 16px, which shifts the whole viewport while typing. Force a
+   16px floor on form controls for touch pointers so focusing an input never
+   rescales the page. */
+@media (pointer: coarse) {
+	input,
+	textarea,
+	select {
+		font-size: 16px !important;
+	}
+}

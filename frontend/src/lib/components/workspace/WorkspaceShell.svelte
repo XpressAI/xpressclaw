@@ -943,7 +943,7 @@
 	});
 </script>
 
-<div class="flex h-[100dvh] min-w-0 overflow-hidden">
+<div class="flex h-[100dvh] min-w-0 overflow-hidden pt-[env(safe-area-inset-top)] lg:pb-[env(safe-area-inset-bottom)] pl-[env(safe-area-inset-left)] pr-[env(safe-area-inset-right)]">
 	<aside data-workspace-sidebar class="hidden shrink-0 flex-col border-r border-border/60 transition-[width] duration-200 lg:flex {sidebarCollapsed ? 'w-14' : 'w-64'}" style="background: hsl(var(--sidebar))">
 		<div class="flex h-11 shrink-0 items-center {sidebarCollapsed ? 'justify-center' : 'gap-2 px-3'}">
 			<a href="/dashboard" class="flex min-w-0 items-center gap-2 rounded-md outline-none transition hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/50" aria-label="Open Control center" title="Control center">
@@ -1140,7 +1140,7 @@
 	</dialog>
 {/if}
 
-<nav aria-label="Workspace navigation" class="fixed inset-x-0 bottom-0 z-40 grid h-[calc(4rem+env(safe-area-inset-bottom))] grid-cols-5 border-t border-border bg-background/95 pb-[env(safe-area-inset-bottom)] backdrop-blur lg:hidden">
+<nav aria-label="Workspace navigation" class="fixed inset-x-0 bottom-0 z-40 grid h-[calc(4rem+env(safe-area-inset-bottom))] grid-cols-5 border-t border-border bg-background/95 pb-[env(safe-area-inset-bottom)] pl-[env(safe-area-inset-left)] pr-[env(safe-area-inset-right)] backdrop-blur lg:hidden">
 	<button type="button" onclick={() => mobileMenuOpen = true} aria-label="Browse workspace" aria-haspopup="dialog" aria-expanded={mobileMenuOpen} aria-controls={navigationId} class="flex flex-col items-center justify-center gap-1 text-[10px] text-muted-foreground hover:text-foreground">
 		<svg class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" d="M4 6h16M4 12h16M4 18h16" /></svg><span>Browse</span>
 	</button>
@@ -1166,7 +1166,7 @@
 {/snippet}
 
 {#if !serverConnected}
-	<div data-connection-status role="status" aria-live="polite" class="pointer-events-none fixed inset-x-0 top-14 z-[200] flex justify-center px-3">
+	<div data-connection-status role="status" aria-live="polite" class="pointer-events-none fixed inset-x-0 top-[calc(3.5rem+env(safe-area-inset-top))] z-[200] flex justify-center px-3">
 		<div class="flex max-w-md items-center gap-3 rounded-xl border border-amber-500/30 bg-card/95 px-4 py-3 shadow-xl backdrop-blur">
 			<svg class="h-5 w-5 shrink-0 animate-pulse text-amber-500" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M8.288 15.038a5.25 5.25 0 017.424 0M5.106 11.856c3.807-3.808 9.98-3.808 13.788 0M1.924 8.674c5.565-5.565 14.587-5.565 20.152 0M12 20.25h.008v.008H12v-.008z" /></svg>
 			<div>
