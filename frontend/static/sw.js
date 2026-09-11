@@ -39,17 +39,17 @@ function resolveActiveCache() {
 			if (lastResolvedCache) return lastResolvedCache;
 			return caches.open('xpressclaw-static-unknown');
 		}
-		const cache = await caches.open(`xpressclaw-static-${version}`);
+		const cacheName = `xpressclaw-static-${version}`;
+		const cache = await caches.open(cacheName);
 		// The static /sw.js bytes rarely change, so the browser may never
 		// re-run install/activate for a new deployment. Reconcile here — but
 		// only after a valid version response — so stale release caches are
 		// pruned whenever a new version is first observed, regardless of
-		// worker lifecycle.
+		// worker lifecycle. Cache objects do not expose their storage key, so
+		// compare against the constructed name.
 		try {
 			const keys = await caches.keys();
-			await Promise.all(
-				keys.filter((key) => key !== cache.name).map((key) => caches.delete(key))
-			);
+			await Promise.all(keys.filter((key) => key !== cacheName).map((key) => caches.delete(key)));
 		} catch {
 			// Best-effort cleanup.
 		}
