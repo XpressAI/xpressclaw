@@ -72,14 +72,11 @@ self.addEventListener('install', () => {
 });
 
 self.addEventListener('activate', (event) => {
-	event.waitUntil(
-		(async () => {
-			const cache = await activeCache();
-			const keys = await caches.keys();
-			await Promise.all(keys.filter((key) => key !== cache.name).map((key) => caches.delete(key)));
-			await self.clients.claim();
-		})()
-	);
+	// Reconciliation (including cache pruning) happens inside
+	// resolveActiveCache() and only after a successful version probe; doing
+	// it unconditionally here could delete a populated release cache when
+	// the worker activates while /_app/version.json is unreachable.
+	event.waitUntil(self.clients.claim());
 });
 
 self.addEventListener('fetch', (event) => {
