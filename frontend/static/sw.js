@@ -146,16 +146,23 @@ self.addEventListener('fetch', (event) => {
 
 	event.respondWith(
 		(async () => {
-			const cache = await activeCache();
-			let cached = await cache.match(request);
+			// Cache access is best-effort: if CacheStorage is unavailable
+			// (storage disabled, quota errors), still serve from the network.
+			let cache = null;
+			try {
+				cache = await activeCache();
+			} catch {
+				cache = null;
+			}
+			let cached = cache ? await cache.match(request).catch(() => null) : null;
 			// Clients still running the previous release request their own
 			// hashed chunks; serve them from the retained previous cache.
-			if (!cached && previousCache) cached = await previousCache.match(request);
+			if (!cached && previousCache) cached = await previousCache.match(request).catch(() => null);
 			if (cached) return cached;
 			try {
 				const response = await fetch(request);
 				const contentType = response.headers.get('content-type') || '';
-				if (response.ok && !contentType.toLowerCase().startsWith('text/html')) {
+				if (cache && response.ok && !contentType.toLowerCase().startsWith('text/html')) {
 					try {
 						// Await the write so the fetch event stays alive until the
 						// cache entry is complete; otherwise the worker may be
