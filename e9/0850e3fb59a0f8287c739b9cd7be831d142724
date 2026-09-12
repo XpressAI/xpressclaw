@@ -1,0 +1,41 @@
+Replaced the native HTML5 tab drag from ad5a952 with @dnd-kit.
+
+Why not the smaller fixes:
+- draggable="false" on the child buttons looks like the obvious fix and does
+  nothing. Per the HTML spec the source node is 'the first element, going up the
+  ancestor chain, starting at the node that the user tried to drag, that has
+  draggable set to true' - a false descendant does not stop the walk.
+- A delay/threshold is impossible with native DnD. The spec says explicitly that
+  thresholds 'remain platform-dependent'. That is the whole reason this bug is
+  macOS-only: WebKit (Safari, and Tauri's WKWebView) starts a drag from a press
+  on a text node, Chromium wants travel first. Owning the gesture via pointer
+  events is the only way to get a threshold.
+
+Things that cost time and will again:
+- createSortable alone does NOT reorder. Without onDragOver updating state, the
+  source's index stays at initialIndex forever and drag-end sees no change -
+  even though operation.target is correctly populated. The move() helper from
+  @dnd-kit/helpers in onDragOver is what keeps dnd-kit's indices in step,
+  because it reads them back from the rendered order.
+- Mid-drag the strip holds two extra elements: a position:fixed overlay with
+  [data-dnd-dragging] and a [data-dnd-placeholder] marking the landing slot.
+  Any selector matching tabs must exclude them or hit strict-mode violations.
+  They also linger through the drop animation, so tests must wait them out.
+- DragDropProvider injects role=status live regions. That broke an unrelated
+  runner-image test whose getByRole('status') suddenly matched 3 elements.
+- Playwright's dragTo cannot drive this: it moves too directly to clear the
+  activation distance. Tests need mouse.down, a short move to arm, then a
+  stepped move. See dragTab in workspace.spec.ts.
+- Two providers, not one: both strips render the same tab ids simultaneously
+  (the inactive one is CSS-hidden, still in the DOM) and ids must be unique
+  within a provider.
+
+Deliberate behaviour changes, flagged to the user:
+- Dropping into trailing empty strip space no longer appends. Sortable inserts
+  at the hovered tab's index; restoring append needs a droppable on the strip.
+- dnd-kit sets role=button on the tab container, so the close button is now a
+  button nested inside a role=button. Works, but it is an a11y smell.
+
+NOT VERIFIED: the bug is WebKit-only and this container has Chromium on Linux
+only. 163 e2e tests pass and a regression test covers label/close clicks, but
+the actual macOS fix is unconfirmed. The user must check on their Mac.
