@@ -4055,7 +4055,10 @@ test('built-in harness images can be updated to the latest published digest', as
 	await expect(page.locator('#runner-image')).toHaveValue(
 		`ghcr.io/xpressai/xpressclaw-runner-codex@sha256:${'a'.repeat(64)}`,
 	);
-	const status = page.getByRole('status');
+	// Drag-and-drop keeps its own live regions, so target this message's own.
+	const status = page
+		.getByRole('status')
+		.filter({ has: page.getByRole('button', { name: 'Dismiss harness update message' }) });
 	await expect(status).toContainText('Updated to the latest published harness 9.9.9');
 	await status.getByRole('button', { name: 'Dismiss harness update message' }).click();
 	await expect(status).toHaveCount(0);
@@ -4409,10 +4412,47 @@ async function seedWorkspace(page: Page, workspace: Record<string, unknown>) {
 	await mockApi(page, { preserveWorkspace: true });
 }
 
+/**
+ * Tab titles in strip order.
+ *
+ * Mid-drag the strip also holds the overlay copy that tracks the cursor; it is
+ * excluded so the order reads as the landing preview, which is where the
+ * placeholder sits.
+ */
 async function tabTitles(scope: Locator): Promise<string[]> {
-	return scope.locator('[data-workspace-tab]').evaluateAll((elements) =>
+	return scope.locator('[data-workspace-tab]:not([data-dnd-dragging])').evaluateAll((elements) =>
 		elements.map((element) => element.getAttribute('data-workspace-tab-title') ?? ''),
 	);
+}
+
+/**
+ * Drag a tab with real pointer travel.
+ *
+ * Tabs activate on pointer distance rather than native drag events, so a drag
+ * has to clear the activation threshold before it travels; Playwright's dragTo
+ * moves too directly to engage the sensor.
+ */
+async function dragTab(page: Page, source: Locator, target: Locator, land: 'start' | 'end' = 'end') {
+	const from = await source.boundingBox();
+	const to = await target.boundingBox();
+	if (!from || !to) throw new Error('drag source or target has no bounding box');
+	const originX = from.x + from.width / 2;
+	const originY = from.y + from.height / 2;
+	await page.mouse.move(originX, originY);
+	await page.mouse.down();
+	await page.mouse.move(originX + 12, originY, { steps: 5 });
+	await page.mouse.move(land === 'start' ? to.x + 6 : to.x + to.width - 6, to.y + to.height / 2, { steps: 15 });
+	return async () => {
+		await page.mouse.up();
+		// The drop animation keeps the overlay and placeholder around for a beat,
+		// and both carry the tab's own attributes.
+		await expect(page.locator('[data-dnd-dragging], [data-dnd-placeholder]')).toHaveCount(0);
+	};
+}
+
+async function dragTabAndDrop(page: Page, source: Locator, target: Locator, land: 'start' | 'end' = 'end') {
+	const drop = await dragTab(page, source, target, land);
+	await drop();
 }
 
 test('dragging a tab reorders it inside its pane and survives a reload', async ({ page }) => {
@@ -4427,7 +4467,7 @@ test('dragging a tab reorders it inside its pane and survives a reload', async (
 	await expect(tabs).toHaveCount(3);
 	expect(await tabTitles(pane)).toEqual(['New work', 'Projects', 'Settings']);
 
-	await tabs.nth(0).dragTo(tabs.nth(2), { targetPosition: { x: 4, y: 8 } });
+	await dragTabAndDrop(page, tabs.nth(0), tabs.nth(1));
 
 	await expect.poll(() => tabTitles(pane)).toEqual(['Projects', 'New work', 'Settings']);
 	await expect(page).toHaveURL('/projects');
@@ -4452,9 +4492,11 @@ test('dragging a tab onto another pane moves it there and focuses it', async ({ 
 	await expect(panes).toHaveCount(2);
 	expect(await tabTitles(panes.nth(1))).toEqual(['Settings']);
 
-	await panes.nth(0).locator('[data-workspace-tab][data-workspace-tab-title="Projects"]').dragTo(
+	await dragTabAndDrop(
+		page,
+		panes.nth(0).locator('[data-workspace-tab][data-workspace-tab-title="Projects"]'),
 		panes.nth(1).locator('[data-workspace-tab][data-workspace-tab-title="Settings"]'),
-		{ targetPosition: { x: 4, y: 8 } },
+		'start',
 	);
 
 	await expect.poll(() => tabTitles(panes.nth(0))).toEqual(['New work']);
@@ -4477,17 +4519,15 @@ test('dragging the last tab out of a pane closes the emptied pane', async ({ pag
 	const panes = page.locator('[data-workspace-pane]');
 	await expect(panes).toHaveCount(2);
 
-	// Land on the empty strip space past the left pane's tabs, which appends.
-	const targetStrip = panes.nth(0).locator('[data-workspace-tab-strip]');
-	const stripBounds = await targetStrip.boundingBox();
-	expect(stripBounds).not.toBeNull();
-	await panes.nth(1).locator('[data-workspace-tab][data-workspace-tab-title="Settings"]').dragTo(
-		targetStrip,
-		{ targetPosition: { x: stripBounds!.width - 6, y: 8 } },
+	// Land on the left pane's last tab, taking over that slot.
+	await dragTabAndDrop(
+		page,
+		panes.nth(1).locator('[data-workspace-tab][data-workspace-tab-title="Settings"]'),
+		panes.nth(0).locator('[data-workspace-tab][data-workspace-tab-title="Projects"]'),
 	);
 
 	await expect(panes).toHaveCount(1);
-	await expect.poll(() => tabTitles(panes.nth(0))).toEqual(['New work', 'Projects', 'Settings']);
+	await expect.poll(() => tabTitles(panes.nth(0))).toEqual(['New work', 'Settings', 'Projects']);
 	await expect(panes.nth(0).locator('[data-workspace-tab][data-workspace-tab-active="true"]'))
 		.toHaveAttribute('data-workspace-tab-title', 'Settings');
 	await expect(page).toHaveURL('/settings');
@@ -4501,32 +4541,40 @@ test('dragging a tab previews where it will land', async ({ page }) => {
 	await page.goto('/projects');
 
 	const pane = page.locator('[data-workspace-pane]').first();
-	await expect(pane.locator('[data-workspace-tab]')).toHaveCount(3);
-	await page.evaluate(() => {
-		const tabs = [...document.querySelectorAll<HTMLElement>('[data-workspace-pane] [data-workspace-tab]')];
-		const dataTransfer = new DataTransfer();
-		tabs[0].dispatchEvent(new DragEvent('dragstart', { bubbles: true, dataTransfer }));
-		const bounds = tabs[2].getBoundingClientRect();
-		tabs[2].dispatchEvent(new DragEvent('dragover', {
-			bubbles: true,
-			cancelable: true,
-			dataTransfer,
-			clientX: bounds.left + 2,
-			clientY: bounds.top + bounds.height / 2,
-		}));
-	});
+	const tabs = pane.locator('[data-workspace-tab]');
+	await expect(tabs).toHaveCount(3);
 
-	await expect(pane.locator('[data-workspace-tab-strip]')).toHaveAttribute('data-workspace-drop-index', '2');
-	await expect(pane.locator('[data-workspace-tab][data-workspace-tab-title="Settings"] [data-tab-drop-indicator]')).toBeVisible();
-	await expect(pane.locator('[data-workspace-tab][data-workspace-tab-dragging="true"]'))
+	// Tabs reorder under the pointer, so the landing spot is the live order
+	// rather than a separate indicator.
+	const drop = await dragTab(page, tabs.nth(0), tabs.nth(1));
+	// The placeholder holds the slot the tab will land in.
+	await expect(pane.locator('[data-workspace-tab][data-dnd-placeholder]'))
 		.toHaveAttribute('data-workspace-tab-title', 'New work');
+	await expect.poll(() => tabTitles(pane)).toEqual(['Projects', 'New work', 'Settings']);
 
-	await page.evaluate(() => {
-		document.querySelector('[data-workspace-pane] [data-workspace-tab]')
-			?.dispatchEvent(new DragEvent('dragend', { bubbles: true }));
+	await drop();
+
+	// The in-flight copy is gone and the previewed order is what was committed.
+	await expect(tabs).toHaveCount(3);
+	await expect(pane.locator('[data-dnd-dragging], [data-dnd-placeholder]')).toHaveCount(0);
+	await expect.poll(() => tabTitles(pane)).toEqual(['Projects', 'New work', 'Settings']);
+});
+
+test('abandoning a tab drag restores the original order', async ({ page }) => {
+	await seedWorkspace(page, {
+		focusedPaneId: 'seed-pane',
+		panes: [{ id: 'seed-pane', activeTabId: TAB_PROJECTS.id, width: 1, tabs: [TAB_NEW_WORK, TAB_PROJECTS, TAB_SETTINGS] }],
 	});
+	await page.goto('/projects');
 
-	await expect(pane.locator('[data-tab-drop-indicator]')).toHaveCount(0);
+	const pane = page.locator('[data-workspace-pane]').first();
+	const tabs = pane.locator('[data-workspace-tab]');
+	await expect(tabs).toHaveCount(3);
+
+	await dragTab(page, tabs.nth(0), tabs.nth(1));
+	await page.keyboard.press('Escape');
+	await page.mouse.up();
+
 	await expect.poll(() => tabTitles(pane)).toEqual(['New work', 'Projects', 'Settings']);
 });
 
@@ -4593,7 +4641,7 @@ test('the compact tab strip reorders tabs by drag on narrow screens', async ({ p
 	const tabs = strip.locator('[data-workspace-tab]');
 	await expect(tabs).toHaveCount(3);
 
-	await tabs.nth(0).dragTo(tabs.nth(2), { targetPosition: { x: 4, y: 8 } });
+	await dragTabAndDrop(page, tabs.nth(0), tabs.nth(1));
 
 	await expect.poll(() => tabTitles(strip)).toEqual(['Projects', 'New work', 'Settings']);
 	await expect(page).toHaveURL('/projects');
@@ -4612,33 +4660,17 @@ test('the compact strip previews appending into a pane that is not last', async 
 
 	const strip = page.locator('[data-workspace-tab-strip]:visible');
 	await expect(strip.locator('[data-workspace-tab]')).toHaveCount(3);
-	await expect(strip.locator('[data-tab-drop-indicator]')).toHaveCount(0);
 
-	// Drag the right pane's tab onto the right half of the left pane's last tab,
-	// which appends into a pane that is not the final one in the strip.
-	const dragEvent = (type: string, overTabTitle: string, sourceTabTitle: string) => page.evaluate(({ type, overTabTitle, sourceTabTitle }) => {
-		const compact = document.querySelector('[aria-label="Open tabs"]')!;
-		const tabs = [...compact.querySelectorAll<HTMLElement>('[data-workspace-tab]')];
-		const source = tabs.find((tab) => tab.dataset.workspaceTabTitle === sourceTabTitle)!;
-		const over = tabs.find((tab) => tab.dataset.workspaceTabTitle === overTabTitle)!;
-		const bounds = over.getBoundingClientRect();
-		source.dispatchEvent(new DragEvent('dragstart', { bubbles: true, dataTransfer: new DataTransfer() }));
-		over.dispatchEvent(new DragEvent(type, {
-			bubbles: true,
-			cancelable: true,
-			dataTransfer: new DataTransfer(),
-			clientX: bounds.right - 2,
-			clientY: bounds.top + bounds.height / 2,
-		}));
-	}, { type, overTabTitle, sourceTabTitle });
+	// Drag the right pane's tab onto the left pane's last tab, moving it into a
+	// pane that is not the final one in the strip.
+	await dragTabAndDrop(
+		page,
+		strip.locator('[data-workspace-tab][data-workspace-tab-title="Settings"]'),
+		strip.locator('[data-workspace-tab][data-workspace-tab-title="Projects"]'),
+	);
 
-	await dragEvent('dragover', 'Projects', 'Settings');
-	await expect(strip.locator('[data-tab-drop-indicator]')).toHaveCount(1);
-	await expect(strip.locator('[data-workspace-tab-title="Projects"] + [data-tab-drop-indicator]')).toHaveCount(1);
-
-	await dragEvent('drop', 'Projects', 'Settings');
 	await expect(page.locator('[data-workspace-pane]')).toHaveCount(1);
-	await expect.poll(() => tabTitles(strip)).toEqual(['New work', 'Projects', 'Settings']);
+	await expect.poll(() => tabTitles(strip)).toEqual(['New work', 'Settings', 'Projects']);
 	await expect(page).toHaveURL('/settings');
 });
 
@@ -6080,4 +6112,33 @@ test('unassigned tasks can be edited and assigned without enabling later unassig
 	await editor.getByRole('button', { name: 'Cancel', exact: true }).click();
 	await expect(editor).toBeHidden();
 	expect(taskUpdateRequests).toHaveLength(2);
+});
+
+
+
+test('clicking a tab label or its close control never starts a drag', async ({ page }) => {
+	await seedWorkspace(page, {
+		focusedPaneId: 'seed-pane',
+		panes: [{ id: 'seed-pane', activeTabId: TAB_PROJECTS.id, width: 1, tabs: [TAB_NEW_WORK, TAB_PROJECTS, TAB_SETTINGS] }],
+	});
+	await page.goto('/projects');
+
+	const pane = page.locator('[data-workspace-pane]').first();
+	const tabs = pane.locator('[data-workspace-tab]');
+	await expect(tabs).toHaveCount(3);
+
+	// Pressing directly on the label text must activate, not drag.
+	await pane.locator('[data-workspace-tab][data-workspace-tab-title="Settings"]').getByText('Settings').click();
+	await expect(page).toHaveURL('/settings');
+	await expect(pane.locator('[data-workspace-tab][data-workspace-tab-active="true"]'))
+		.toHaveAttribute('data-workspace-tab-title', 'Settings');
+	expect(await tabTitles(pane)).toEqual(['New work', 'Projects', 'Settings']);
+
+	// The active tab's close control must close it, not drag it.
+	await pane.locator('[data-workspace-tab][data-workspace-tab-title="Settings"] button[aria-label="Close Settings"]').click();
+	await expect.poll(() => tabTitles(pane)).toEqual(['New work', 'Projects']);
+
+	// And an inactive tab's close control still closes it.
+	await pane.locator('[data-workspace-tab][data-workspace-tab-title="New work"] button[aria-label="Close New work"]').click();
+	await expect.poll(() => tabTitles(pane)).toEqual(['Projects']);
 });

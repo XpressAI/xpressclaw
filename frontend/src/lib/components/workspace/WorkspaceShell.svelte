@@ -17,7 +17,6 @@
 		projectPath,
 		sameWorkspaceTab,
 		statusPriority,
-		tabDropIndex,
 		validWorkspacePane,
 		workspaceId,
 		workspacePath,
@@ -27,10 +26,15 @@
 		type WorkspaceOpenSplitDetail,
 		type ProjectSection,
 		type WorkspaceTab,
-		type WorkspaceTabDrag,
 		type WorkspaceTabKind,
 	} from '$lib/workspace';
+	import { DragDropProvider } from '@dnd-kit/svelte';
+	import type { DragEndEvent, DragOverEvent } from '@dnd-kit/dom';
+	import { move } from '@dnd-kit/helpers';
+	import { isSortable } from '@dnd-kit/svelte/sortable';
+	import { tabDragSensors } from '$lib/tabDrag';
 	import ContextMenu from '../ContextMenu.svelte';
+	import SortableTab from './SortableTab.svelte';
 	import SidebarSettings from './SidebarSettings.svelte';
 	import SidebarTasks from './SidebarTasks.svelte';
 	import SidebarAutomations from './SidebarAutomations.svelte';
@@ -76,7 +80,6 @@
 	let workflowList = $state<Workflow[]>([]);
 	let scheduleList = $state<Schedule[]>([]);
 	let contextMenu = $state<WorkspaceContextMenu | null>(null);
-	let tabDrag = $state<WorkspaceTabDrag | null>(null);
 	let projectMutationVersion = 0;
 	const projectMutations = new Map<string, { version: number; mutation: ProjectMutation }>();
 
@@ -531,58 +534,70 @@
 		}
 	}
 
-	function beginTabDrag(event: DragEvent, paneId: string, tab: WorkspaceTab) {
-		if (!event.dataTransfer) return;
-		event.dataTransfer.effectAllowed = 'move';
-		event.dataTransfer.setData('text/plain', tabKey(paneId, tab.id));
-		tabDrag = { source: { paneId, tabId: tab.id }, target: null };
+	// dnd-kit reports the settled position on its source, so a single drag-end
+	// handler covers reordering inside a pane and moving between panes. The
+	// group is the pane id, which is what makes cross-pane drops fall out for
+	// free rather than needing their own drop targets.
+	// Tabs reorder live while dragging, which is also what keeps dnd-kit's own
+	// indices in step: it reads them back from the rendered order. Drag end then
+	// only has to settle focus and persistence.
+	let dragSnapshot: WorkspacePaneState[] | null = null;
+
+	function handleTabDragStart() {
+		dragSnapshot = panes.map((pane) => ({ ...pane, tabs: [...pane.tabs] }));
 	}
 
-	function dragOverTab(event: DragEvent, paneId: string, index: number) {
-		if (!tabDrag) return;
-		event.preventDefault();
-		if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
-		if (tabDrag.target?.paneId === paneId && tabDrag.target.index === index) return;
-		tabDrag = { ...tabDrag, target: { paneId, index } };
+	function handleTabDragOver(event: DragOverEvent) {
+		const groups: Record<string, string[]> = {};
+		for (const pane of panes) groups[pane.id] = pane.tabs.map((tab) => tab.id);
+		const next = move(groups, event);
+		const byId = new Map(panes.flatMap((pane) => pane.tabs).map((tab) => [tab.id, tab]));
+		panes = panes.map((pane) => {
+			const ids = next[pane.id];
+			if (!ids) return pane;
+			const tabs = ids
+				.map((id) => byId.get(id))
+				.filter((tab): tab is WorkspaceTab => Boolean(tab));
+			return { ...pane, tabs };
+		});
 	}
 
-	function leaveTabDrop(paneId: string) {
-		if (tabDrag?.target?.paneId !== paneId) return;
-		tabDrag = { ...tabDrag, target: null };
-	}
+	function handleTabDragEnd(event: DragEndEvent) {
+		const { source } = event.operation;
+		const snapshot = dragSnapshot;
+		dragSnapshot = null;
+		if (event.canceled) {
+			if (snapshot) panes = snapshot;
+			return;
+		}
+		if (!isSortable(source)) return;
+		const tabId = String(source.id);
+		const fromPaneId = snapshot?.find((pane) => pane.tabs.some((tab) => tab.id === tabId))?.id;
+		const toPane = panes.find((pane) => pane.tabs.some((tab) => tab.id === tabId));
+		if (!toPane) return;
 
-	function dropTab(event: DragEvent, paneId: string, index: number) {
-		const source = tabDrag?.source;
-		tabDrag = null;
-		if (!source) return;
-		event.preventDefault();
-		moveTab(source.paneId, source.tabId, paneId, index);
-	}
+		// A reorder inside one pane leaves focus and the active tab alone; only a
+		// move between panes activates the tab and follows it, matching moveTab.
+		if (fromPaneId === toPane.id) {
+			panes = panes.filter((pane) => pane.tabs.length > 0);
+			persistWorkspace();
+			return;
+		}
 
-	function endTabDrag() {
-		tabDrag = null;
-	}
-
-	// Empty space in the compact strip sits past the last pane's tabs, so it appends there.
-	function compactStripDragOver(event: DragEvent) {
-		if (!tabDrag || (event.target as HTMLElement | null)?.closest('[data-workspace-tab]')) return;
-		const lastPane = panes[panes.length - 1];
-		if (!lastPane) return;
-		dragOverTab(event, lastPane.id, lastPane.tabs.length);
-	}
-
-	function compactStripDragLeave(event: DragEvent) {
-		if (!tabDrag?.target) return;
-		const strip = event.currentTarget as HTMLElement | null;
-		if (strip && event.relatedTarget instanceof Node && strip.contains(event.relatedTarget)) return;
-		tabDrag = { ...tabDrag, target: null };
-	}
-
-	function compactStripDrop(event: DragEvent) {
-		if (!tabDrag || (event.target as HTMLElement | null)?.closest('[data-workspace-tab]')) return;
-		const lastPane = panes[panes.length - 1];
-		if (!lastPane) return;
-		dropTab(event, lastPane.id, lastPane.tabs.length);
+		const moved = { ...toPane.tabs.find((tab) => tab.id === tabId)!, lastActiveAt: nextTabRecency() };
+		panes = enforceTabLimit(panes
+			.filter((pane) => pane.tabs.length > 0)
+			.map((pane) => pane.id === toPane.id
+				? { ...pane, tabs: pane.tabs.map((tab) => tab.id === tabId ? moved : tab), activeTabId: tabId }
+				: pane.activeTabId === tabId
+					? { ...pane, activeTabId: pane.tabs[0]?.id ?? pane.activeTabId }
+					: pane));
+		focusedPaneId = toPane.id;
+		persistWorkspace();
+		if (currentRoute() !== moved.path) {
+			lastSyncedPath = moved.path;
+			goto(moved.path, { replaceState: true, keepFocus: true, noScroll: true });
+		}
 	}
 
 	function showProjectContextMenu(event: MouseEvent, agent: Agent) {
@@ -1034,49 +1049,35 @@
 		</div>
 
 		{#if workspacePath($page.url.pathname)}
-			<div
-				bind:this={compactTabStrip}
-				data-workspace-tab-strip
-				ondragover={compactStripDragOver}
-				ondragleave={compactStripDragLeave}
-				ondrop={compactStripDrop}
-				role="group"
-				aria-label="Open tabs"
-				class="flex h-9 shrink-0 items-stretch overflow-x-auto border-b border-border bg-[hsl(var(--field))] lg:hidden scrollbar-hide"
-			>
-				{#each openTabs as item (item.tab.id)}
-					{@const isActive = item.paneId === focusedPaneId && item.tab.id === focusedPane?.activeTabId}
-					{@const isDragged = Boolean(tabDrag) && tabDrag?.source.paneId === item.paneId && tabDrag?.source.tabId === item.tab.id}
-					{@const itemDropIndex = tabDrag && tabDrag.target && tabDrag.target.paneId === item.paneId ? tabDrag.target.index : null}
-					<!-- svelte-ignore a11y_no_static_element_interactions -->
-					<div
-						data-workspace-tab
-						data-workspace-tab-title={item.tab.title}
-						data-workspace-tab-active={isActive}
-						data-workspace-tab-dragging={isDragged}
-						draggable="true"
-						ondragstart={(event) => beginTabDrag(event, item.paneId, item.tab)}
-						ondragover={(event) => dragOverTab(event, item.paneId, tabDropIndex(event, item.index))}
-						ondrop={(event) => dropTab(event, item.paneId, tabDropIndex(event, item.index))}
-						ondragend={endTabDrag}
-						oncontextmenu={(event) => showTabContextMenu(event, item.paneId, item.tab)}
-						class="group relative flex max-w-52 shrink-0 cursor-grab items-center border-r border-border/70 transition-colors active:cursor-grabbing {isDragged ? 'opacity-40' : ''} {isActive ? 'bg-card font-semibold text-primary shadow-[inset_0_0_0_1px_hsl(var(--border-strong))]' : 'text-muted-foreground hover:bg-[hsl(var(--hover))] hover:text-foreground'}"
-					>
-						<button type="button" onclick={() => activateTab(item.paneId, item.tab)} aria-current={isActive ? 'page' : undefined} class="flex min-w-0 flex-1 items-center gap-2 py-2 pl-3 text-xs">
-							{#if item.tab.status}<span class="h-1.5 w-1.5 shrink-0 rounded-full {statusDot(item.tab.status)}"></span>{/if}<span class="truncate">{item.tab.title}</span>
-						</button>
-						<button type="button" onclick={() => closeTab(item.paneId, item.tab)} class="mr-1 flex h-6 w-6 shrink-0 items-center justify-center rounded text-sm text-muted-foreground/60 hover:bg-accent hover:text-foreground" aria-label="Close {item.tab.title}">×</button>
-						{#if itemDropIndex === item.index}<span data-tab-drop-indicator class="pointer-events-none absolute inset-y-0 left-0 z-10 w-0.5 bg-primary" aria-hidden="true"></span>{/if}
-						{#if isActive}<span data-active-tab-indicator class="pointer-events-none absolute inset-x-2 bottom-0 h-0.5 rounded-full bg-primary" aria-hidden="true"></span>{/if}
-					</div>
-					<!-- An append target is one past the pane's last tab, so the bar belongs after that item. -->
-					{#if item.isLast && itemDropIndex === item.index + 1}
-						<span data-tab-drop-indicator class="w-0.5 shrink-0 self-stretch bg-primary" aria-hidden="true"></span>
-					{/if}
-				{/each}
-			</div>
+			<!-- The compact strip gets its own provider: it renders the same tab ids
+			     as the pane strips, and ids only have to be unique within a provider. -->
+			<DragDropProvider sensors={tabDragSensors} onDragStart={handleTabDragStart} onDragOver={handleTabDragOver} onDragEnd={handleTabDragEnd}>
+				<div
+					bind:this={compactTabStrip}
+					data-workspace-tab-strip
+					role="group"
+					aria-label="Open tabs"
+					class="flex h-9 shrink-0 items-stretch overflow-x-auto border-b border-border bg-[hsl(var(--field))] lg:hidden scrollbar-hide"
+				>
+					{#each openTabs as item (item.tab.id)}
+						<SortableTab
+							tab={item.tab}
+							index={item.index}
+							group={item.paneId}
+							isActive={item.paneId === focusedPaneId && item.tab.id === focusedPane?.activeTabId}
+							widthClass="max-w-52"
+							closeClass="text-muted-foreground/60"
+							onactivate={() => activateTab(item.paneId, item.tab)}
+							onclose={() => closeTab(item.paneId, item.tab)}
+							oncontext={(event) => showTabContextMenu(event, item.paneId, item.tab)}
+						/>
+					{/each}
+				</div>
+			</DragDropProvider>
 
 			<div bind:this={workspaceEl} class="flex min-h-0 flex-1 overflow-hidden">
+				<!-- One provider spans every pane so a tab can be dragged across them. -->
+				<DragDropProvider sensors={tabDragSensors} onDragStart={handleTabDragStart} onDragOver={handleTabDragOver} onDragEnd={handleTabDragEnd}>
 				{#each panes as pane, index (pane.id)}
 					<div data-workspace-pane class="min-w-0 flex-col overflow-hidden {pane.id === focusedPaneId ? 'flex' : 'hidden'} lg:flex" style:flex={`${pane.width} 1 0%`}>
 						<WorkspacePane
@@ -1084,23 +1085,18 @@
 							focused={pane.id === focusedPaneId}
 							compact={panes.length > 1}
 							canSplit={canCreatePane()}
-							drag={tabDrag}
 							onfocus={() => focusPane(pane.id)}
 							onactivate={(tab) => activateTab(pane.id, tab)}
 							onclose={(tab) => closeTab(pane.id, tab)}
 							oncontext={(event, tab) => showTabContextMenu(event, pane.id, tab)}
 							onsplit={() => splitPane(pane.id)}
-							ontabdragstart={(event, tab) => beginTabDrag(event, pane.id, tab)}
-							ontabdragover={(event, index) => dragOverTab(event, pane.id, index)}
-							ontabdragleave={() => leaveTabDrop(pane.id)}
-							ontabdrop={(event, index) => dropTab(event, pane.id, index)}
-							ontabdragend={endTabDrag}
 						/>
 					</div>
 					{#if index < panes.length - 1}
 						<button type="button" onpointerdown={(event) => startResize(index, event)} class="relative z-20 hidden w-1 shrink-0 cursor-col-resize border-x border-border/60 bg-card/50 hover:bg-primary/30 lg:block" aria-label="Resize panes"></button>
 					{/if}
 				{/each}
+				</DragDropProvider>
 			</div>
 		{:else}
 			<div class="min-h-0 flex-1 overflow-auto">{@render children()}</div>
