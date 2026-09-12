@@ -168,18 +168,30 @@ async fn setup_status(State(state): State<AppState>) -> Json<Value> {
 /// Check if Docker/Podman is available.
 async fn check_docker() -> Json<Value> {
     use xpressclaw_core::docker::manager::DockerManager;
+    use xpressclaw_core::docker::ssh_forwarding::ssh_agent_forwarding;
     let installed = DockerManager::is_docker_desktop_installed();
     match DockerManager::connect().await {
-        Ok(runtime) => Json(json!({
-            "available": true,
-            "installed": installed,
-            "can_start": false,
-            "runtime": runtime.runtime(),
-            "version": runtime.runtime_version(),
-            "socket": runtime.host_engine_socket().map(|path| path.display().to_string()),
-            "rootless": runtime.is_rootless(),
-            "error": null,
-        })),
+        Ok(runtime) => {
+            // Report the same capability the native worker acts on, so the UI
+            // states what this host will do instead of inferring it from the
+            // browser's platform.
+            let forwarding = ssh_agent_forwarding(
+                cfg!(target_os = "macos"),
+                runtime.runtime(),
+                runtime.is_docker_desktop(),
+            );
+            Json(json!({
+                "available": true,
+                "installed": installed,
+                "can_start": false,
+                "runtime": runtime.runtime(),
+                "version": runtime.runtime_version(),
+                "socket": runtime.host_engine_socket().map(|path| path.display().to_string()),
+                "rootless": runtime.is_rootless(),
+                "ssh_agent_forwarding_unsupported_reason": forwarding.unsupported_reason(),
+                "error": null,
+            }))
+        }
         Err(error) => Json(json!({
             "available": false,
             "installed": installed,
@@ -188,6 +200,7 @@ async fn check_docker() -> Json<Value> {
             "version": null,
             "socket": null,
             "rootless": null,
+            "ssh_agent_forwarding_unsupported_reason": null,
             "error": error.to_string(),
         })),
     }

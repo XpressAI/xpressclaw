@@ -1008,6 +1008,8 @@ export interface DockerStatus {
 	version: string | null;
 	socket: string | null;
 	rootless: boolean | null;
+	/** Set when this host cannot carry a host SSH agent into a runner. */
+	ssh_agent_forwarding_unsupported_reason: string | null;
 	error: string | null;
 }
 
