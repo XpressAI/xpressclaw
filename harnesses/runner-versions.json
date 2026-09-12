@@ -91,7 +91,7 @@
     },
     "junie": {
       "auto_update": true,
-      "version": "3123.7.0",
+      "version": "3218.3.0",
       "acp_command": [
         "junie",
         "--acp=true"
@@ -108,8 +108,8 @@
         "AGENT_KIND": "junie",
         "AGENT_BINARY": "junie",
         "AGENT_PATH": "junie-app/bin/junie",
-        "AGENT_ARCHIVE_AMD64": "https://github.com/JetBrains/junie-acp-release/releases/download/3123.7/junie-release-3123.7-linux-amd64.zip",
-        "AGENT_ARCHIVE_ARM64": "https://github.com/JetBrains/junie-acp-release/releases/download/3123.7/junie-release-3123.7-linux-aarch64.zip",
+        "AGENT_ARCHIVE_AMD64": "https://github.com/JetBrains/junie-acp-release/releases/download/3218.3/junie-release-3218.3-linux-amd64.zip",
+        "AGENT_ARCHIVE_ARM64": "https://github.com/JetBrains/junie-acp-release/releases/download/3218.3/junie-release-3218.3-linux-aarch64.zip",
         "AGENT_SHA256_AMD64": "",
         "AGENT_SHA256_ARM64": ""
       }
@@ -244,7 +244,7 @@
     },
     "cursor": {
       "auto_update": true,
-      "version": "2026.09.02",
+      "version": "2026.09.08",
       "acp_command": [
         "cursor-agent",
         "acp"
@@ -261,8 +261,8 @@
         "AGENT_KIND": "cursor",
         "AGENT_BINARY": "cursor-agent",
         "AGENT_PATH": "dist-package/cursor-agent",
-        "AGENT_ARCHIVE_AMD64": "https://downloads.cursor.com/lab/2026.09.02-c22c1a3/linux/x64/agent-cli-package.tar.gz",
-        "AGENT_ARCHIVE_ARM64": "https://downloads.cursor.com/lab/2026.09.02-c22c1a3/linux/arm64/agent-cli-package.tar.gz",
+        "AGENT_ARCHIVE_AMD64": "https://downloads.cursor.com/lab/2026.09.08-6caf4ff/linux/x64/agent-cli-package.tar.gz",
+        "AGENT_ARCHIVE_ARM64": "https://downloads.cursor.com/lab/2026.09.08-6caf4ff/linux/arm64/agent-cli-package.tar.gz",
         "AGENT_SHA256_AMD64": "",
         "AGENT_SHA256_ARM64": ""
       }
@@ -290,7 +290,7 @@
     },
     "grok": {
       "auto_update": true,
-      "version": "1.0.29",
+      "version": "1.0.30",
       "acp_command": [
         "grok",
         "agent",
@@ -307,7 +307,7 @@
       ],
       "build_args": {
         "AGENT_KIND": "grok",
-        "AGENT_PACKAGE": "@xai-official/grok@1.0.29",
+        "AGENT_PACKAGE": "@xai-official/grok@1.0.30",
         "AGENT_BINARY": "grok"
       }
     },
