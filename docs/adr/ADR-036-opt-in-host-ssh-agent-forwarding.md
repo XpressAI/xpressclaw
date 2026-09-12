@@ -50,6 +50,14 @@ Setup inspects only Git metadata to flag workspaces with SSH remotes. Both
 setup and Agent settings keep this access off by default and state that enabling
 it shares host SSH files and any detected agent.
 
+When the instance runs on macOS with Podman, enabling host SSH access in setup
+or Agent settings opens an advisory dialog. It explains the upstream
+[Podman SSH-agent forwarding limitation](https://github.com/podman-container-tools/podman/issues/23785)
+and recommends Docker Desktop. Users can keep access disabled or explicitly
+enable it anyway to test future Podman releases. The warning does not reject
+saved configuration or change the runtime forwarding behavior. Compatibility
+is determined from the instance host and runtime, not the client browser's OS.
+
 ## Consequences
 
 Users can explicitly give a trusted harness the same SSH access it would have

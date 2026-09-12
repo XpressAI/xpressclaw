@@ -3,6 +3,7 @@
 	import { agents, mcpServers, sessions, setup } from '$lib/api';
 	import { canonicalHarnessKind, harnessName, inferHarnessKindFromBackend, openExternal } from '$lib/utils';
 	import DirectoryPicker from '$lib/components/DirectoryPicker.svelte';
+	import HostSshAccess from '$lib/components/HostSshAccess.svelte';
 	import type { AcpAgentCatalogEntry, AcpConfigOption, AcpModeState, LiveConfig, McpServerDefinition, McpVerificationResult, NativeRunnerConfig } from '$lib/api';
 
 	interface Props {
@@ -577,20 +578,7 @@
 	</div>
 
 	<div class="ai-card p-5">
-		<div class="flex items-start gap-3">
-			<input id="ssh-agent-forwarding" type="checkbox" bind:checked={sshAgentForwarding} class="mt-0.5 h-4 w-4 rounded border-input" />
-			<div>
-				<label for="ssh-agent-forwarding" class="text-sm font-medium">Share my host SSH access</label>
-				<p class="mt-1 text-xs leading-relaxed text-muted-foreground">
-					Give this runner the same access to <code>~/.ssh</code> as a coding agent running directly on this computer. Leave this off to keep those files out of the runner.
-				</p>
-				{#if sshAgentForwarding}
-					<p class="mt-2 rounded-md border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-amber-600">
-						The harness can read and change files in <code>~/.ssh</code> and use unlocked SSH-agent keys when available. Enable this only for harnesses and tasks you trust.
-					</p>
-				{/if}
-			</div>
-		</div>
+		<HostSshAccess bind:enabled={sshAgentForwarding} />
 	</div>
 
 	<div class="ai-card p-5">

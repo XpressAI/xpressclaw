@@ -399,6 +399,9 @@ async function mockApi(
 		sharedProjectState?: SharedProjectState;
 		preserveWorkspace?: boolean;
 		agentRunnerKind?: string;
+		hostOs?: string;
+		containerRuntime?: 'docker' | 'podman';
+		sshAgentForwarding?: boolean;
 		runnerImageUpdateRequests?: string[];
 		runnerReadiness?: Record<string, unknown>;
 		visualizationDocuments?: Record<string, string>;
@@ -627,7 +630,9 @@ async function mockApi(
 			}
 			response = { status: 'ok', version: '0.2.0', build: 'dev', git_hash: 'test' };
 		} else if (path === '/api/setup/check-docker') {
-			response = { available: true, installed: true, can_start: false };
+			response = { available: true, installed: true, can_start: false, runtime: options.containerRuntime ?? 'docker' };
+		} else if (path === '/api/setup/system-info') {
+			response = { os: options.hostOs ?? 'linux', working_directory: '/workspace' };
 		} else if (path === '/api/setup/status') {
 			response = { setup_complete: true };
 		} else if (path === '/api/setup/mcp-servers') {
@@ -959,7 +964,7 @@ async function mockApi(
 						environment: {},
 						command: [],
 						subscription_auth: true,
-						ssh_agent_forwarding: false,
+						ssh_agent_forwarding: options.sshAgentForwarding ?? false,
 						container_engine: 'none',
 					},
 					tools: [],
@@ -4043,6 +4048,41 @@ test('DeepSeek Harness is preserved in Agent runner settings', async ({ page }) 
 	await expect(page.locator('#runner-image')).toHaveValue(
 		'ghcr.io/xpressai/xpressclaw-runner-deepseek-harness-docker:latest',
 	);
+});
+
+test('macOS Podman SSH warning allows an explicit opt-in to be saved in Agent settings', async ({ page }) => {
+	await mockApi(page, { hostOs: 'macos', containerRuntime: 'podman' });
+	let saved: { runner: { ssh_agent_forwarding: boolean } } | null = null;
+	await page.route(`**/api/agents/${agentId}/config`, async (route) => {
+		saved = route.request().postDataJSON();
+		await route.fulfill({ json: { agent: saved } });
+	});
+	await page.goto(`/agents/${agentId}?tab=runner`);
+	const checkbox = page.getByLabel('Share my host SSH access', { exact: true });
+	const dialog = page.getByRole('dialog', { name: 'SSH forwarding with Podman on macOS' });
+	await expect(checkbox).toBeEnabled();
+	await checkbox.click();
+	await expect(dialog).toBeVisible();
+	await dialog.getByRole('button', { name: 'Keep disabled' }).click();
+	await page.getByRole('button', { name: 'Save Changes' }).click();
+	await expect.poll(() => saved?.runner.ssh_agent_forwarding).toBe(false);
+	await checkbox.click();
+	await dialog.getByRole('button', { name: 'Enable anyway' }).click();
+	await page.getByRole('button', { name: 'Save Changes' }).click();
+	await expect.poll(() => saved?.runner.ssh_agent_forwarding).toBe(true);
+	await expect(checkbox).toBeChecked();
+	await expect(dialog).not.toBeVisible();
+});
+
+test('saved SSH forwarding on macOS Podman stays enabled without reopening the warning', async ({ page }) => {
+	await mockApi(page, { hostOs: 'macos', containerRuntime: 'podman', sshAgentForwarding: true });
+	await page.goto(`/agents/${agentId}?tab=runner`);
+	const checkbox = page.getByLabel('Share my host SSH access', { exact: true });
+	await expect(checkbox).toBeEnabled();
+	await expect(checkbox).toBeChecked();
+	await expect(page.getByRole('dialog', { name: 'SSH forwarding with Podman on macOS' })).not.toBeVisible();
+	await checkbox.uncheck();
+	await expect(checkbox).not.toBeChecked();
 });
 
 test('built-in harness images can be updated to the latest published digest', async ({ page }) => {
