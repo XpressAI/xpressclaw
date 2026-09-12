@@ -187,6 +187,7 @@
 				version: null,
 				socket: null,
 				rootless: null,
+				ssh_agent_forwarding_unsupported_reason: null,
 				error: 'Could not check the container runtime'
 			};
 		}
@@ -425,7 +426,8 @@
 		</section>
 
 		<section class="rounded-xl border border-border bg-muted/20 p-4">
-			<HostSshAccess bind:enabled={sshAgentForwarding} />
+			<HostSshAccess bind:enabled={sshAgentForwarding}
+				agentForwardingUnsupportedReason={dockerStatus?.ssh_agent_forwarding_unsupported_reason ?? null} />
 		</section>
 
 		<section class="rounded-xl border border-border bg-muted/20 p-4">

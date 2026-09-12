@@ -21,6 +21,7 @@
 	let model = $state('');
 	let subscriptionAuth = $state(true);
 	let sshAgentForwarding = $state(false);
+	let sshAgentForwardingUnsupportedReason = $state<string | null>(null);
 	let containerEngine = $state<'none' | 'host'>('none');
 	let commandText = $state('');
 	let configOptions = $state<AcpConfigOption[]>([]);
@@ -185,14 +186,17 @@
 
 	onMount(async () => {
 		try {
-			const [events, catalog, agents] = await Promise.all([
+			const [events, catalog, agents, docker] = await Promise.all([
 				sessions.events(agentId).catch(() => []),
 				mcpServers.list().catch(() => ({ servers: [] })),
-				setup.agentCatalog().catch(() => ({ agents: [] }))
+				setup.agentCatalog().catch(() => ({ agents: [] })),
+				setup.checkDocker().catch(() => null)
 			]);
 			applyAdvertisedControls(events);
 			serverCatalog = catalog.servers;
 			agentCatalog = agents.agents;
+			sshAgentForwardingUnsupportedReason =
+				docker?.ssh_agent_forwarding_unsupported_reason ?? null;
 		} catch {
 			configOptions = [];
 			serverCatalog = [];
@@ -578,7 +582,8 @@
 	</div>
 
 	<div class="ai-card p-5">
-		<HostSshAccess bind:enabled={sshAgentForwarding} />
+		<HostSshAccess bind:enabled={sshAgentForwarding}
+			agentForwardingUnsupportedReason={sshAgentForwardingUnsupportedReason} />
 	</div>
 
 	<div class="ai-card p-5">
