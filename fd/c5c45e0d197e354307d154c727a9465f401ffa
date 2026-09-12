@@ -1,0 +1,14 @@
+ADR-018 implementation: desired-state reconciler.
+
+Key files:
+- agents/reconciler.rs: the 10s loop (reconcile_images/agents/tasks)
+- agents/state.rs: DesiredStatus + ObservedStatus enums
+- agents/registry.rs: set_desired_status, record_attempt, reset_restart_count
+- docker/manager.rs: has_image, is_container_running, container_uptime_secs
+- routes/agents.rs: start/stop only set desired, list/get query Docker live
+- db.rs: migration v14 adds desired_status/restart_count/last_attempt_at
+
+Old AgentStatus kept (not deprecated yet) for backward compat.
+Old update_status kept for transition — reconciler uses it to maintain
+the old status column alongside the new desired_status.
+Frontend update is next step.

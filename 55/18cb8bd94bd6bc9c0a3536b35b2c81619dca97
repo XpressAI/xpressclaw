@@ -1,0 +1,1 @@
+Skills now embedded in the binary via rust-embed and extracted to ~/.xpressclaw/skills/ on startup. Solves the path problem: templates/skills/ is a source tree path that doesn't exist when running the installed app. Extract uses won't-overwrite semantics so user modifications are preserved. Both the skills API and the conversation system prompt read from the data directory.

@@ -1,0 +1,13 @@
+Why 'phase 1' vs 'phase 2' split in task 10: real OCI pull is both code (manifest fetch + blob verify + caching) and content (a pi WASM has to exist on GHCR). Splitting lets the code land now so the desktop app is testable end-to-end, and the real pi image lands as a separate commit when someone compiles pi through c2w and uploads. The interface (HarnessImageResolver::resolve) doesn't change between phases — phase 2 just swaps the fallback branch for a real network pull.
+
+Why 'AgentConfig::image: Option<String>' instead of deriving from 'backend': backend names refer to agent frameworks (claude-sdk, codex, pi). Each framework could be distributed as multiple WASM images (stable/canary/custom-fork). Decoupling image from backend lets a user pick 'pi harness backend, custom fork image' without introducing a registry of (backend -> image) mappings. Option<String> means 'use the default for this backend' (which today is the bundled noop because no backend has a real pinned image yet).
+
+Why reconciler gets Arc<dyn Harness> by parameter instead of reaching into AppState: xpressclaw-core has no AppState — AppState lives in xpressclaw-server. Giving the core reconciler a handle via parameter keeps the dependency direction clean. The server is the one place that knows about both AppState and the reconciler start() function.
+
+Why the reconciler writes AgentStatus::Error on launch failure but NOT on stop failure: failed launches are user-visible (the agent never reaches 'running'), so the error state matters for UI. Failed stops are typically transient (the workload terminated between the is_running check and the stop call), logging is enough. If stop failures prove common we revisit.
+
+Why workspaces live under data_dir/workspaces instead of each agent picking its own path: consistency with the host-side config. Per-agent workspace at workspaces/<agent_id>/ mirrors the guest-side view (/workspace), so when a user wants to dig in ('what did my agent write?'), they know exactly where to look.
+
+Why HarnessImageResolver writes the bundled WASM to disk instead of passing bytes in-memory: the downstream path (C2wInstance::launch) takes a file path, not bytes — it needs to re-read on each relaunch for hot-reload scenarios. Caching the compiled WASM to disk also dodges recompilation cost on restarts. The cache dir is under data_dir/harness-cache/ so it's discoverable and purgable.
+
+What's deliberately untested on this commit: the actual 'spin up the desktop app, create an agent, see it run' flow. That requires a fully-set-up xpressclaw install (database, config, etc.) which isn't feasible in cargo test. User will validate in the Tauri app after rebuilding.

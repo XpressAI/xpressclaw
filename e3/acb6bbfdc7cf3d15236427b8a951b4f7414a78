@@ -1,0 +1,80 @@
+Non-obvious choices in this commit:
+
+**Why the `feat!` (breaking-change) prefix.**
+Removing Docker breaks every pre-ADR-023 install whose agents depended
+on Docker. Per ADR-023 decision 4 this is intentional — Docker users
+stay on the previous release until they're ready to migrate to c2w.
+Using `feat!` makes that visible in the commit log without having to
+read the body.
+
+**Why Runtime (runtime.rs) was deleted outright, not stubbed.**
+The struct had zero external callers across the workspace. Grepping
+`xpressclaw_core::runtime::Runtime` returned nothing. It was dead code
+that grew around Docker. Keeping a stub would have been ceremony with
+no payoff — the Harness trait + PiHarness+C2wHarness now occupy the
+same architectural slot.
+
+**Why reconciler.rs was 93% rewritten, not deleted.**
+`server.rs` calls `reconciler::start()` as a background task on
+startup. Removing that call would break server startup. Instead, the
+reconciler keeps its entry point and the Ollama-model reconciliation
+(which is provider-side, not container-side) and drops everything
+Docker-dependent. When task 10 lands the pi harness with real agent
+launching, the agent/app/task reconciliation logic comes back on top
+of `Arc<dyn Harness>`.
+
+**Why `tasks::dispatcher::load_task` early-returns Requeue instead of
+being deleted.**
+The dispatcher state machine has other states (BuildPrompt, CallAgent,
+ProcessResponse, Evaluate) that stay valid — they just never run
+during the spike because LoadTask's early return short-circuits the
+loop. Keeping the state machine intact means task 10 can restore
+dispatch by just filling in the missing harness lookup. Cleaner than
+gutting and rewriting.
+
+**Why the `check_docker` endpoint returns `removed: true` instead of
+being removed from the router.**
+The frontend setup wizard still calls it today (task 12 removes the
+UI step). Returning a shaped response lets the wizard step render
+without crashing, and makes the "Docker is gone" state discoverable
+for any future client code that probes this endpoint.
+
+**Why app container endpoints return 503 instead of being removed.**
+The frontend has an "Agent Apps" UI (ADR-017) that hits /apps/* with
+list, get, create, delete, etc. Keeping the endpoints mounted with
+database-backed list/create/delete still works (apps remain DB
+records) — only the launch/logs/proxy paths that needed Docker are
+disabled. Users can register apps; they just can't run them yet. A
+later ADR adds c2w-based app launching.
+
+**Why `ContainerSpec`/`ContainerInfo`/`VolumeMount` moved rather than
+being renamed.**
+The types are generic — they describe "launch spec for a workload",
+not "docker container config." Renaming them mid-spike would churn
+every import in the workspace for no functional benefit. They live in
+`harness/types.rs` now and read fine with their existing names for
+anyone encountering them in call sites.
+
+**What's actually broken right now on the spike branch.**
+- No agents launch (task 10 delivers the launch path).
+- No tasks dispatch (same reason — dispatcher needs a harness handle).
+- App containers don't run (ADR-017 post-spike work).
+- Setup wizard still shows Docker step (task 12 UI cleanup).
+
+Everything that doesn't depend on launching a workload — LLM sidecar,
+xclaw bridge, memory, tasks board, budget — works unchanged. The
+budget / transparent-downgrade flow from task 6 is fully functional
+against cloud providers via /v1/chat/completions.
+
+**Why I didn't touch the frontend.**
+The frontend Docker step is task 12 scope. This commit is already
+-2657 net lines; adding Svelte refactoring would make it unreviewable.
+Back-end responses to the existing frontend calls are compatible
+(endpoints respond, just with "removed" flags / 503s).
+
+**Why `pub use types::{ContainerInfo, ContainerSpec, VolumeMount}`
+from harness/mod.rs.**
+Every caller that was importing from `docker::manager` got a find-
+and-replace to `harness::types`. Re-exporting at the harness module
+level means new callers can just `use crate::harness::*` to get both
+the trait and its supporting types in one line.

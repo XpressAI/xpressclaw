@@ -1,0 +1,5 @@
+Follow-up to the review of 19e11fb. The MAX_PATH point is the reason this is split from the parent commit rather than squashed: \?\ is not cosmetic, it is the opt-out from the 260-char limit, and Rust std does not re-add it (unlike the Docker case in native.rs, where the stripped path is handed to bollard and never to std::fs). Stripping before read_dir()/join().is_file() would have traded a display bug for a deep-directory failure.
+
+Boundary is now explicit: canonicalize() result stays verbatim for all fs work; display_path/display_workspace are the only things serialized. Covered every outbound value - path, parent, roots, per-entry paths, project-environment workspace, and both not-a-directory error strings, since those are user-facing too.
+
+Still open, deliberately not done here: the unit tests are #[cfg(all(test, windows))] so Linux CI never compiles them. Fix would be a plain &str -> &str parsing fn tested unconditionally with cfg only on the PathBuf wrapper. Also still unverified end-to-end - clippy is green but the release build was skipped at the user's request, so nobody has yet seen the endpoint return a clean C:\ path.

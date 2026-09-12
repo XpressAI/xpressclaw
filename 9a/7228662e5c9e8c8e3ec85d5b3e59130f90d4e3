@@ -1,0 +1,1 @@
+Titlebar: tried decorations:false, then Overlay, then -webkit-app-region:drag. None work because the Tauri window loads http://localhost:8935 (external URL) — drag region features only work with embedded frontendDist. Reverted to native decorations with hiddenTitle:true.

@@ -1,0 +1,7 @@
+Fahreza asked for a configure button next to the detach button with view configs like the refresh rate. Gear button grouped with detach/reattach (ml-auto moved from the individual buttons to a wrapper div; the gear shows in the rail AND the detached window). The strip has two things:
+
+1. Refresh rate: the FRAME_GAP_MS=400 const became frameGapMs state (400/1000/3000/10000ms select) driving scheduleNextFrame, persisted as localStorage 'androidFrameGapMs', read in onMount (SSR-safe, validated >0). The 10s battery-saver option addresses fahreza's original laptop-heat complaint about the frame loop.
+
+2. Device target: serial + tcp inputs backed by GET/POST /api/setup/android-target (Phase A's route -> xpressclaw.yaml android section + apply_config). Loaded when the panel opens; Save posts, surfaces the server's 400 on a bad tcp address, then re-runs checkStatus() so the frame loop immediately points at the new device. This replaced an interim 'Agent control' row that showed android-connector state — that iteration died with the connector (see the Phase B note); the panel now configures the ONE config the whole stack shares (server routes, MCP tools, CLI default, emulator preflight).
+
+Component stays self-contained (raw fetch, no $lib/api import) per its design. Two a11y warnings disappeared with the deleted connector form (117 -> 115 total, all pre-existing elsewhere).

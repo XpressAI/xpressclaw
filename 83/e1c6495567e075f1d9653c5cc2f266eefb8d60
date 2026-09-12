@@ -1,0 +1,1 @@
+Windows release was failing because Command::new("npm") doesn't find npm.cmd on Windows. build.rs silently fell back to 'no frontend', producing a binary where FrontendAssets was a bare struct without RustEmbed derive, causing compile errors (no get/iter methods). Fix: npm() helper returns npm.cmd on Windows, panic on failure instead of silent fallback.
