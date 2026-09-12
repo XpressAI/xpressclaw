@@ -1,0 +1,37 @@
+Rewrite of PR #234, which had shipped a browser modal for a backend bug.
+
+Evidence that drove this:
+- native.rs ssh_agent_mount_source() branched on (docker_desktop, macos) and
+  fell through to a raw host-socket mount for every non-Docker-Desktop macOS
+  runtime. podman machine only virtiofs-shares $HOME (confirmed in podman
+  machine-init docs), and macOS launchd ssh-agent lives under /private/tmp,
+  so the source is absent in the VM. For 1Password/Secretive sockets the path
+  IS under $HOME, but virtiofs does not proxy connect() either way - that is
+  exactly what podman#23785 reports.
+- The damage is not just a missing agent: prepare_forwarded_ssh_config()
+  writes 'Host *\n IdentityAgent /tmp/xpressclaw-ssh-agent.sock', so a dead
+  socket breaks ssh for ALL hosts, including key-file auth that works fine.
+  ~/.ssh itself mounts fine under podman (it is under $HOME).
+- ADR-036 already promised forwarding 'without blocking the runner when one
+  is not [available]'. The old code violated its own ADR; this restores it.
+
+Rejected alternatives:
+- Keep the modal (the PR's approach). It tells users to switch container
+  runtime for a feature that mostly works, and puts runtime knowledge in the
+  browser while the backend holds the same knowledge in Rust - guaranteed
+  drift. A user cannot consent their way out of a dead socket.
+- Treat all non-Docker-Desktop macOS runtimes as unsupported. OrbStack and
+  Colima were not investigated; narrowing to runtime == podman avoids
+  regressing setups we have no evidence about. If someone later confirms
+  Colima/OrbStack behaviour, extend ssh_agent_forwarding() - that is now the
+  single place to change.
+
+NOT VERIFIED: no Rust toolchain in this container, so cargo build/test/clippy
+and rustfmt never ran. The 4 unit tests in docker/ssh_forwarding.rs are
+unexecuted. CI runs clippy with -D warnings; check formatting of the match
+block in build_spec and the const string continuation before merging.
+
+Also worth knowing: the PR's own e2e spec failed 6/6 on its own branch here.
+That turned out to be environmental (I had symlinked node_modules from the
+main checkout; vite's fs.allow 403s on @fs paths outside the project root).
+Copying node_modules fixed it. Do not chase that as a product bug.
