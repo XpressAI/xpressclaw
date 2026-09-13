@@ -399,6 +399,8 @@ async function mockApi(
 		sharedProjectState?: SharedProjectState;
 		preserveWorkspace?: boolean;
 		agentRunnerKind?: string;
+		sshAgentForwardingUnsupportedReason?: string;
+		sshAgentForwarding?: boolean;
 		runnerImageUpdateRequests?: string[];
 		runnerReadiness?: Record<string, unknown>;
 		visualizationDocuments?: Record<string, string>;
@@ -627,7 +629,14 @@ async function mockApi(
 			}
 			response = { status: 'ok', version: '0.2.0', build: 'dev', git_hash: 'test' };
 		} else if (path === '/api/setup/check-docker') {
-			response = { available: true, installed: true, can_start: false };
+			response = {
+				available: true,
+				installed: true,
+				can_start: false,
+				runtime: 'docker',
+				ssh_agent_forwarding_unsupported_reason:
+					options.sshAgentForwardingUnsupportedReason ?? null
+			};
 		} else if (path === '/api/setup/status') {
 			response = { setup_complete: true };
 		} else if (path === '/api/setup/mcp-servers') {
@@ -959,7 +968,7 @@ async function mockApi(
 						environment: {},
 						command: [],
 						subscription_auth: true,
-						ssh_agent_forwarding: false,
+						ssh_agent_forwarding: options.sshAgentForwarding ?? false,
 						container_engine: 'none',
 					},
 					tools: [],
@@ -4043,6 +4052,38 @@ test('DeepSeek Harness is preserved in Agent runner settings', async ({ page }) 
 	await expect(page.locator('#runner-image')).toHaveValue(
 		'ghcr.io/xpressai/xpressclaw-runner-deepseek-harness-docker:latest',
 	);
+});
+
+const SSH_FORWARDING_UNSUPPORTED =
+	'Podman on macOS cannot forward a host SSH agent into a container, because virtiofs does not proxy Unix socket connections into the Podman machine VM';
+
+test('an unsupported host SSH agent is explained but still configurable in Agent settings', async ({ page }) => {
+	await mockApi(page, { sshAgentForwardingUnsupportedReason: SSH_FORWARDING_UNSUPPORTED });
+	let saved: { runner: { ssh_agent_forwarding: boolean } } | null = null;
+	await page.route(`**/api/agents/${agentId}/config`, async (route) => {
+		saved = route.request().postDataJSON();
+		await route.fulfill({ json: { agent: saved } });
+	});
+	await page.goto(`/agents/${agentId}?tab=runner`);
+	const checkbox = page.getByLabel('Share my host SSH access', { exact: true });
+	await expect(checkbox).toBeEnabled();
+	await expect(page.getByText(SSH_FORWARDING_UNSUPPORTED, { exact: false })).toBeVisible();
+	await expect(page.getByRole('dialog')).toHaveCount(0);
+	await checkbox.check();
+	await page.getByRole('button', { name: 'Save Changes' }).click();
+	await expect.poll(() => saved?.runner.ssh_agent_forwarding).toBe(true);
+	await expect(checkbox).toBeChecked();
+});
+
+test('a supported host shows no SSH forwarding limitation in Agent settings', async ({ page }) => {
+	await mockApi(page, { sshAgentForwarding: true });
+	await page.goto(`/agents/${agentId}?tab=runner`);
+	const checkbox = page.getByLabel('Share my host SSH access', { exact: true });
+	await expect(checkbox).toBeEnabled();
+	await expect(checkbox).toBeChecked();
+	await expect(page.getByText('cannot forward a host SSH agent', { exact: false })).toHaveCount(0);
+	await checkbox.uncheck();
+	await expect(checkbox).not.toBeChecked();
 });
 
 test('built-in harness images can be updated to the latest published digest', async ({ page }) => {

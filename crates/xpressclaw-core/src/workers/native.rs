@@ -38,6 +38,7 @@ use crate::db::Database;
 use crate::docker::manager::{
     container_spec_fingerprint, ContainerSpec, DockerManager, SelinuxRelabel, VolumeMount,
 };
+use crate::docker::ssh_forwarding::ssh_agent_forwarding;
 use crate::error::{Error, Result};
 use crate::external_tools::path_for_external_tool;
 use crate::message_artifacts::{bound_published_file_name, prepare_message_artifacts};
@@ -73,7 +74,6 @@ static GIT_WORKTREE_REDIRECT_LOCK: StdMutex<()> = StdMutex::new(());
 const BUNDLED_CONTROL_MCP_COMMAND: &str = "/usr/local/bin/node";
 const CODEX_INITIAL_AGENT_MODE: &str = "INITIAL_AGENT_MODE";
 const CODEX_FULL_ACCESS_MODE: &str = "agent-full-access";
-const DOCKER_DESKTOP_SSH_AGENT_SOURCE: &str = "/run/host-services/ssh-auth.sock";
 const SSH_AGENT_SOCKET_TARGET: &str = "/tmp/xpressclaw-ssh-agent.sock";
 const SSH_DEFAULT_CONFIG_TARGET: &str = "/home/node/.ssh/config";
 const SSH_HOME_TARGET: &str = "/home/node/.ssh";
@@ -3086,28 +3086,45 @@ fn build_spec(
             mount_host_ssh_directory(&host_ssh, &mut volumes);
         }
         if let Some(access) = discover_host_ssh_agent() {
-            let retained_known_hosts =
-                prepare_retained_ssh_known_hosts(&config.system.data_dir, &agent.name)?;
-            let forwarded_config = access
-                .config
-                .as_deref()
-                .map(|contents| {
-                    prepare_forwarded_ssh_config(&config.system.data_dir, &agent.name, contents)
-                })
-                .transpose()?;
-            let socket_mount_source = ssh_agent_mount_source(
-                &access.socket,
-                docker.is_docker_desktop(),
+            let forwarding = ssh_agent_forwarding(
                 cfg!(target_os = "macos"),
+                docker.runtime(),
+                docker.is_docker_desktop(),
             );
-            apply_ssh_agent_forwarding(
-                &access,
-                &socket_mount_source,
-                &retained_known_hosts,
-                forwarded_config.as_deref(),
-                &mut volumes,
-                &mut environment,
-            );
+            // Pointing SSH_AUTH_SOCK and IdentityAgent at a socket the runtime
+            // cannot carry aims every ssh call in the runner at a dead socket.
+            // Leaving the agent out keeps the mounted ~/.ssh key files usable,
+            // which is what ADR-036 promises when no agent is available.
+            match forwarding.mount_source(&access.socket) {
+                None => warn!(
+                    "not forwarding a host SSH agent to agent '{}': {}",
+                    agent.name,
+                    forwarding.unsupported_reason().unwrap_or_default()
+                ),
+                Some(socket_mount_source) => {
+                    let retained_known_hosts =
+                        prepare_retained_ssh_known_hosts(&config.system.data_dir, &agent.name)?;
+                    let forwarded_config = access
+                        .config
+                        .as_deref()
+                        .map(|contents| {
+                            prepare_forwarded_ssh_config(
+                                &config.system.data_dir,
+                                &agent.name,
+                                contents,
+                            )
+                        })
+                        .transpose()?;
+                    apply_ssh_agent_forwarding(
+                        &access,
+                        &socket_mount_source,
+                        &retained_known_hosts,
+                        forwarded_config.as_deref(),
+                        &mut volumes,
+                        &mut environment,
+                    );
+                }
+            }
         }
     }
     apply_codex_mode_default(kind, &agent.runner, &mut environment);
@@ -4027,14 +4044,6 @@ fn mount_host_ssh_directory(host_ssh: &Path, volumes: &mut Vec<VolumeMount>) {
         read_only: false,
         selinux_relabel: SelinuxRelabel::Shared,
     });
-}
-
-fn ssh_agent_mount_source(host_socket: &Path, docker_desktop: bool, macos_host: bool) -> PathBuf {
-    if docker_desktop && macos_host {
-        PathBuf::from(DOCKER_DESKTOP_SSH_AGENT_SOURCE)
-    } else {
-        host_socket.to_path_buf()
-    }
 }
 
 fn auth_mounts(kind: &str) -> Vec<VolumeMount> {
@@ -6381,24 +6390,6 @@ flows:
 
         drop(listener);
         std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn docker_desktop_on_macos_uses_its_ssh_agent_bridge() {
-        let host_socket = Path::new("/private/tmp/com.apple.launchd.example/Listeners");
-
-        assert_eq!(
-            ssh_agent_mount_source(host_socket, true, true),
-            PathBuf::from(DOCKER_DESKTOP_SSH_AGENT_SOURCE)
-        );
-        assert_eq!(
-            ssh_agent_mount_source(host_socket, false, true),
-            host_socket
-        );
-        assert_eq!(
-            ssh_agent_mount_source(host_socket, true, false),
-            host_socket
-        );
     }
 
     #[cfg(unix)]
