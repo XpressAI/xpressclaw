@@ -546,6 +546,27 @@
 	// Stand-in tabs the deletion handler created for panes the preview emptied.
 	let dragFallbackTabIds = new Set<string>();
 
+	/**
+	 * Drop stand-in tabs the deletion handler added only because the preview had
+	 * moved a pane's last tab elsewhere. Panes may be left empty; both drag
+	 * outcomes run their own empty-pane cleanup afterwards.
+	 */
+	function dropDragFallbacks() {
+		if (dragFallbackTabIds.size === 0) return;
+		panes = panes.map((pane) => {
+			const tabs = pane.tabs.filter((tab) => !dragFallbackTabIds.has(tab.id));
+			if (tabs.length === pane.tabs.length) return pane;
+			return {
+				...pane,
+				tabs,
+				activeTabId: tabs.some((tab) => tab.id === pane.activeTabId)
+					? pane.activeTabId
+					: tabs[0]?.id ?? pane.activeTabId,
+			};
+		});
+		dragFallbackTabIds = new Set();
+	}
+
 	function handleTabDragStart() {
 		dragFallbackTabIds = new Set();
 		dragSnapshot = panes.map((pane) => ({ ...pane, tabs: [...pane.tabs] }));
@@ -678,20 +699,7 @@
 				const restored = movedToPane(origin.paneId, tabId, origin.index);
 				if (restored) applyTabGroups(restored);
 			}
-			// A pane the drag emptied may have been given a stand-in tab by the
-			// deletion handler. Now that the dragged tab is back, that stand-in
-			// only exists because of the preview, so it goes.
-			if (dragFallbackTabIds.size > 0) {
-				panes = panes.map((pane) => {
-					const tabs = pane.tabs.filter((tab) => !dragFallbackTabIds.has(tab.id));
-					if (tabs.length === 0 || tabs.length === pane.tabs.length) return pane;
-					return {
-						...pane,
-						tabs,
-						activeTabId: tabs.some((tab) => tab.id === pane.activeTabId) ? pane.activeTabId : tabs[0].id,
-					};
-				});
-			}
+			dropDragFallbacks();
 			// The preview left the source pane's selection pointing at a tab that
 			// was not there, which the deletion handler then normalised away.
 			if (origin) {
@@ -715,6 +723,14 @@
 			// A mid-drag persist writes the preview, so the restore has to be
 			// written too or a reload brings the abandoned arrangement back.
 			persistWorkspace();
+			// A deletion that read the preview may also have navigated, so the
+			// route has to come back with the selection.
+			const focused = panes.find((pane) => pane.id === focusedPaneId) ?? panes[0];
+			const focusedTabAgain = focused ? activeTabFor(focused) : null;
+			if (focusedTabAgain && currentRoute() !== focusedTabAgain.path) {
+				lastSyncedPath = focusedTabAgain.path;
+				goto(focusedTabAgain.path, { replaceState: true, keepFocus: true, noScroll: true });
+			}
 			return;
 		}
 		// Settle the whole landing position here rather than trusting the
@@ -723,6 +739,9 @@
 		// did run this recomputes the same position and changes nothing.
 		const positioned = movedToPane(release.paneId, tabId, release.index);
 		if (positioned) applyTabGroups(positioned);
+		// A completed drop has to discard preview-created stand-ins too, before
+		// the empty-pane cleanup below decides which panes survive.
+		dropDragFallbacks();
 		const fromPaneId = origin?.paneId;
 		const toPane = panes.find((pane) => pane.tabs.some((tab) => tab.id === tabId));
 		if (!toPane) return;

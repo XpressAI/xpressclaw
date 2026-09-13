@@ -6526,3 +6526,80 @@ test('abandoning a drag restores which tab was active in the source pane', async
 	await expect(panes.nth(0).locator('[data-workspace-tab][data-workspace-tab-active="true"]'))
 		.toHaveAttribute('data-workspace-tab-title', 'New work');
 });
+
+test('completing a drag also drops a stand-in tab the preview caused', async ({ page }) => {
+	const projectTab = { id: 'seed-tab-project', path: '/projects/doomed', kind: 'project', title: 'Doomed', resourceId: 'doomed', status: null, lastActiveAt: 2 };
+	await seedWorkspace(page, {
+		focusedPaneId: 'pane-left',
+		panes: [
+			{ id: 'pane-left', activeTabId: TAB_NEW_WORK.id, width: 1, tabs: [TAB_NEW_WORK, projectTab] },
+			{ id: 'pane-right', activeTabId: TAB_SETTINGS.id, width: 1, tabs: [TAB_SETTINGS] },
+		],
+	});
+	await page.goto('/');
+
+	const panes = page.locator('[data-workspace-pane]');
+	await expect(panes).toHaveCount(2);
+
+	const drop = await dragTab(
+		page,
+		panes.nth(0).locator('[data-workspace-tab][data-workspace-tab-id="seed-tab-home"]'),
+		panes.nth(1).locator('[data-workspace-tab][data-workspace-tab-title="Settings"]'),
+		'start',
+	);
+	await expect.poll(() => tabTitles(panes.nth(1))).toContain('New work');
+
+	// The source pane now holds only the doomed project, so deleting it installs
+	// a stand-in that exists purely because of the preview.
+	await page.evaluate(() => {
+		window.dispatchEvent(new CustomEvent('xpressclaw:project-mutation', {
+			detail: { kind: 'deleted', projectId: 'doomed' },
+		}));
+	});
+
+	// Completing the drag, rather than abandoning it, must discard it too.
+	await drop();
+
+	await expect(panes).toHaveCount(1);
+	await expect.poll(() => tabTitles(panes.nth(0))).toEqual(['New work', 'Settings']);
+});
+
+test('abandoning a drag restores the route as well as the selection', async ({ page }) => {
+	const projectTab = { id: 'seed-tab-project', path: '/projects/doomed', kind: 'project', title: 'Doomed', resourceId: 'doomed', status: null, lastActiveAt: 3 };
+	await seedWorkspace(page, {
+		focusedPaneId: 'pane-left',
+		panes: [
+			{ id: 'pane-left', activeTabId: TAB_NEW_WORK.id, width: 1, tabs: [TAB_NEW_WORK, projectTab] },
+			{ id: 'pane-right', activeTabId: TAB_SETTINGS.id, width: 1, tabs: [TAB_SETTINGS] },
+		],
+	});
+	await page.goto('/');
+	await expect(page).toHaveURL('/');
+
+	const panes = page.locator('[data-workspace-pane]');
+	await dragTab(
+		page,
+		panes.nth(0).locator('[data-workspace-tab][data-workspace-tab-id="seed-tab-home"]'),
+		panes.nth(1).locator('[data-workspace-tab][data-workspace-tab-title="Settings"]'),
+		'start',
+	);
+	await expect.poll(() => tabTitles(panes.nth(1))).toContain('New work');
+
+	// With New work previewed away, the focused pane reads as the doomed
+	// project, so deleting it navigates to the projects fallback.
+	await page.evaluate(() => {
+		window.dispatchEvent(new CustomEvent('xpressclaw:project-mutation', {
+			detail: { kind: 'deleted', projectId: 'doomed' },
+		}));
+	});
+
+	await page.mouse.move(640, 500, { steps: 15 });
+	await settleFrames(page);
+	await page.mouse.up();
+	await expect(page.locator('[data-dnd-dragging], [data-dnd-placeholder]')).toHaveCount(0);
+
+	// The restored selection and the URL have to agree again.
+	await expect(panes.nth(0).locator('[data-workspace-tab][data-workspace-tab-active="true"]'))
+		.toHaveAttribute('data-workspace-tab-title', 'New work');
+	await expect(page).toHaveURL('/');
+});
