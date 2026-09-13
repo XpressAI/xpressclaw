@@ -548,31 +548,13 @@
 		dragSnapshot = panes.map((pane) => ({ ...pane, tabs: [...pane.tabs] }));
 	}
 
-	function handleTabDragOver(event: DragOverEvent) {
-		const { source, target } = event.operation;
-		if (!isSortable(source)) return;
-
+	function tabGroups(): Record<string, string[]> {
 		const groups: Record<string, string[]> = {};
 		for (const pane of panes) groups[pane.id] = pane.tabs.map((tab) => tab.id);
+		return groups;
+	}
 
-		// Empty strip space past the last tab appends into that pane. It is a
-		// plain droppable rather than a sortable, so move() cannot place it.
-		const stripPaneId = target && !isSortable(target) && target.type === 'workspace-tab-strip'
-			? (target.data as { paneId?: string } | undefined)?.paneId
-			: undefined;
-		let next: Record<string, string[]>;
-		if (stripPaneId && groups[stripPaneId]) {
-			const tabId = String(source.id);
-			if (groups[stripPaneId].at(-1) === tabId) return;
-			next = {};
-			for (const [paneId, ids] of Object.entries(groups)) {
-				const without = ids.filter((id) => id !== tabId);
-				next[paneId] = paneId === stripPaneId ? [...without, tabId] : without;
-			}
-		} else {
-			next = move(groups, event);
-		}
-
+	function applyTabGroups(next: Record<string, string[]>) {
 		const byId = new Map(panes.flatMap((pane) => pane.tabs).map((tab) => [tab.id, tab]));
 		panes = panes.map((pane) => {
 			const ids = next[pane.id];
@@ -584,6 +566,37 @@
 		});
 	}
 
+	/**
+	 * Append into the pane whose empty strip space is under the pointer.
+	 *
+	 * The strip is a plain droppable rather than a sortable, so move() cannot
+	 * place a tab there. Returns null when the drop is not over strip space or
+	 * the tab already sits last in that pane, which makes this safe to run again
+	 * at drag end for a drag released faster than dragover could settle.
+	 */
+	function appendedToStripSpace(event: DragOverEvent | DragEndEvent): Record<string, string[]> | null {
+		const { source, target } = event.operation;
+		if (!isSortable(source)) return null;
+		if (!target || isSortable(target) || target.type !== 'workspace-tab-strip') return null;
+		const stripPaneId = (target.data as { paneId?: string } | undefined)?.paneId;
+		const groups = tabGroups();
+		if (!stripPaneId || !groups[stripPaneId]) return null;
+		const tabId = String(source.id);
+		if (groups[stripPaneId].at(-1) === tabId) return null;
+		const next: Record<string, string[]> = {};
+		for (const [paneId, ids] of Object.entries(groups)) {
+			const without = ids.filter((id) => id !== tabId);
+			next[paneId] = paneId === stripPaneId ? [...without, tabId] : without;
+		}
+		return next;
+	}
+
+	function handleTabDragOver(event: DragOverEvent) {
+		const { source } = event.operation;
+		if (!isSortable(source)) return;
+		applyTabGroups(appendedToStripSpace(event) ?? move(tabGroups(), event));
+	}
+
 	function handleTabDragEnd(event: DragEndEvent) {
 		const { source } = event.operation;
 		const snapshot = dragSnapshot;
@@ -593,6 +606,10 @@
 			return;
 		}
 		if (!isSortable(source)) return;
+		// A drag released faster than dragover could settle still has to land,
+		// and this repeats harmlessly when dragover already applied it.
+		const pending = appendedToStripSpace(event);
+		if (pending) applyTabGroups(pending);
 		const tabId = String(source.id);
 		const fromPaneId = snapshot?.find((pane) => pane.tabs.some((tab) => tab.id === tabId))?.id;
 		const toPane = panes.find((pane) => pane.tabs.some((tab) => tab.id === tabId));
