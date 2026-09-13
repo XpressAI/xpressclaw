@@ -1,0 +1,29 @@
+Two more valid Codex P2s, both regressions against the ORIGINAL moveTab
+behaviour that the dnd-kit rewrite quietly dropped. Worth noting the pattern:
+every finding in this PR after the first has been 'the rewrite lost something
+moveTab did'. When replacing a handler, diff its post-conditions, not just its
+happy path.
+
+1. Cancel restored the entire snapshot. If panes changed mid-drag the restore
+   undid that too - handleProjectMutation removing a deleted project's tab was
+   the concrete case, and cancelling resurrected it permanently. Now cancel
+   repositions ONLY the dragged tab via movedToPane + applyTabGroups. That is
+   safe because applyTabGroups maps ids through byId built from CURRENT panes,
+   so an id that no longer exists is silently dropped - it cannot resurrect a
+   tab even if the restore names it.
+2. The source pane activated tabs[0]. moveTab uses
+   remaining[Math.min(fromTabIndex, remaining.length - 1)]. Restored by
+   recording the dragged tab's original index in  from the snapshot.
+
+Test-writing traps hit here:
+- A project tab needs path '/projects/<id>' to decorate as kind 'project'.
+  '/agents/<id>' decorates as kind 'agent' titled 'Agent', so the deletion
+  filter (tab.kind === 'project') never matched and my mid-drag assertion
+  passed vacuously. describeWorkspacePath OVERWRITES the seeded kind/title, so
+  seeding a kind directly does not work.
+- Both new tests were confirmed to FAIL without their fix. The resurrection one
+  shows 'Project' reappearing; the active-tab one picks 'New work' instead of
+  'Projects'. Three tests in this PR would have been vacuous without that check.
+
+All CI green on de51553 including Frontend, so the geometry fix holds.
+Still NOT VERIFIED on WebKit.
