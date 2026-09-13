@@ -32,6 +32,8 @@ When enabled, XpressClaw:
 - uses Docker Desktop's `/run/host-services/ssh-auth.sock` bridge when the
   selected daemon identifies itself as Docker Desktop on macOS, while other
   runtimes mount the detected socket directly;
+- skips agent forwarding entirely, keeping the `~/.ssh` mount, when the host
+  and runtime cannot carry a socket into a runner at all;
 - points Git's SSH transport at the forwarded socket when present, and in that
   case keeps new host keys in private Agent-scoped storage so they
   survive container recreation, and uses the host known-host set as an
@@ -49,6 +51,26 @@ When enabled, XpressClaw:
 Setup inspects only Git metadata to flag workspaces with SSH remotes. Both
 setup and Agent settings keep this access off by default and state that enabling
 it shares host SSH files and any detected agent.
+
+Whether a host agent can reach a runner at all is a property of the host and
+its container runtime, so one function in `docker::ssh_forwarding` answers it
+for every caller. On macOS under Podman the answer is no: `podman machine`
+shares only the user's home directory into its VM, and virtiofs carries file
+contents rather than proxying `connect()`, so no host agent socket is reachable
+from inside a container ([podman#23785](https://github.com/containers/podman/issues/23785)).
+
+When forwarding is impossible, XpressClaw mounts `~/.ssh` and stops there. It
+does not set `SSH_AUTH_SOCK` and does not overlay `IdentityAgent`, because
+aiming those at a socket the runtime cannot carry would point every `ssh` call
+in the runner at a dead socket and break key-file access that otherwise works.
+This is the same graceful degradation already applied when no host agent is
+running.
+
+Setup and Agent settings report that reason from the server rather than
+inferring one from the client browser's platform, and state it before the
+choice is made instead of interrupting afterwards. The option itself always
+stays configurable: key-file access is still useful, and a user must be able to
+enable it once a future runtime release fixes forwarding.
 
 ## Consequences
 

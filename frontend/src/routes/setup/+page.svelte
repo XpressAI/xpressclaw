@@ -5,6 +5,7 @@
 	import { setup } from '$lib/api';
 	import { openExternal } from '$lib/utils';
 	import DirectoryPicker from '$lib/components/DirectoryPicker.svelte';
+	import HostSshAccess from '$lib/components/HostSshAccess.svelte';
 	import type { AcpAgentCatalogEntry, DockerStatus, ProjectEnvironmentSuggestion } from '$lib/api';
 
 	const customRunner: AcpAgentCatalogEntry = {
@@ -186,6 +187,7 @@
 				version: null,
 				socket: null,
 				rootless: null,
+				ssh_agent_forwarding_unsupported_reason: null,
 				error: 'Could not check the container runtime'
 			};
 		}
@@ -424,18 +426,8 @@
 		</section>
 
 		<section class="rounded-xl border border-border bg-muted/20 p-4">
-			<label class="flex cursor-pointer items-start gap-3">
-				<input type="checkbox" bind:checked={sshAgentForwarding} class="mt-0.5 rounded border-border" />
-				<span>
-					<span class="block text-sm font-medium text-foreground">Share my host SSH access</span>
-					<span class="mt-0.5 block text-xs leading-relaxed text-muted-foreground">Give this runner the same access to <code>~/.ssh</code> as a coding agent running directly on this computer. Leave this off to keep those files out of the runner.</span>
-				</span>
-			</label>
-			{#if sshAgentForwarding}
-				<p class="mt-3 rounded-md border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-amber-600">
-					The harness can read and change files in <code>~/.ssh</code> and use unlocked SSH-agent keys when available. Enable this only for harnesses and tasks you trust.
-				</p>
-			{/if}
+			<HostSshAccess bind:enabled={sshAgentForwarding}
+				agentForwardingUnsupportedReason={dockerStatus?.ssh_agent_forwarding_unsupported_reason ?? null} />
 		</section>
 
 		<section class="rounded-xl border border-border bg-muted/20 p-4">
