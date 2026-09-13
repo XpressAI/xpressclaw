@@ -1,0 +1,25 @@
+Generalises 7b1e4dd after a valid Codex P1: recomputing only trailing-space
+drops at dragend left every other landing spot trusting the preview. Same
+defect class as the CI bug, different drop location - a cross-pane drop onto a
+tab could silently stay in the source pane when no collision pass ran.
+
+releaseTarget now returns an insertion index counted from neighbours whose
+midpoint the pointer has passed. The dragged tab must be excluded in THREE
+forms or the index is off by one: [data-dnd-dragging] (the copy tracking the
+cursor), [data-dnd-placeholder] (its preview slot), and the original element
+still rendered in place when no preview ran. That last one is the subtle case
+and only occurs on the broken path. Added data-workspace-tab-id to SortableTab
+to make that exclusion by identity rather than by guessing at dnd attributes.
+
+dragover is now purely visual. When a preview did run, the dragend recompute
+lands on the same position and movedToPane returns null, so it is a no-op.
+
+Verification worth repeating: disabled handleTabDragOver entirely so no
+collision pass could contribute, then ran every drag test. 8 passed, and the
+only 2 failures were mid-drag PREVIEW assertions the experiment itself had
+disabled (workspace.spec.ts lines 4612 and 6258) - no commit-behaviour test
+failed. That is what proves the drop no longer depends on dnd-kit resolving a
+target. Check WHICH assertion failed before concluding; a raw pass/fail count
+would have looked like a regression here.
+
+Still NOT VERIFIED on WebKit.
