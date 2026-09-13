@@ -4466,6 +4466,19 @@ async function tabTitles(scope: Locator): Promise<string[]> {
 	);
 }
 
+/** Wait for the page to paint, so frame-driven work has a chance to run. */
+async function settleFrames(page: Page, frames = 2): Promise<void> {
+	await page.evaluate(
+		(count) =>
+			new Promise<void>((resolve) => {
+				let remaining = count;
+				const step = () => (remaining-- > 0 ? requestAnimationFrame(step) : resolve());
+				step();
+			}),
+		frames,
+	);
+}
+
 /**
  * Drag a tab with real pointer travel.
  *
@@ -4483,6 +4496,10 @@ async function dragTab(page: Page, source: Locator, target: Locator, land: 'star
 	await page.mouse.down();
 	await page.mouse.move(originX + 12, originY, { steps: 5 });
 	await page.mouse.move(land === 'start' ? to.x + 6 : to.x + to.width - 6, to.y + to.height / 2, { steps: 15 });
+	// Playwright dispatches its moves back to back, so without giving the page a
+	// rendered frame the button can come up before the drag has resolved a target
+	// for the final position. A real pointer interleaves moves with frames.
+	await settleFrames(page);
 	return async () => {
 		await page.mouse.up();
 		// The drop animation keeps the overlay and placeholder around for a beat,
@@ -6212,4 +6229,38 @@ test('a tab can be dropped into the empty strip of a freshly split pane', async 
 	await expect.poll(() => tabTitles(panes.nth(1))).toEqual(['Projects', 'Settings']);
 	await expect.poll(() => tabTitles(panes.nth(0))).toEqual(['New work', 'Projects']);
 	await expect(page).toHaveURL('/settings');
+});
+
+
+
+test('releasing a tab outside every strip abandons the drag', async ({ page }) => {
+	await seedWorkspace(page, {
+		focusedPaneId: 'seed-pane',
+		panes: [{ id: 'seed-pane', activeTabId: TAB_PROJECTS.id, width: 1, tabs: [TAB_NEW_WORK, TAB_PROJECTS, TAB_SETTINGS] }],
+	});
+	await page.goto('/projects');
+
+	const pane = page.locator('[data-workspace-pane]').first();
+	const tabs = pane.locator('[data-workspace-tab]');
+	await expect(tabs).toHaveCount(3);
+
+	const origin = await tabs.nth(0).boundingBox();
+	const over = await tabs.nth(2).boundingBox();
+	if (!origin || !over) throw new Error('tab has no bounding box');
+
+	await page.mouse.move(origin.x + origin.width / 2, origin.y + origin.height / 2);
+	await page.mouse.down();
+	await page.mouse.move(origin.x + origin.width / 2 + 12, origin.y + origin.height / 2, { steps: 5 });
+	await page.mouse.move(over.x + over.width / 2, over.y + over.height / 2, { steps: 10 });
+	await settleFrames(page);
+	// The preview has moved the tab, so this proves the release is what reverts.
+	await expect.poll(() => tabTitles(pane)).toEqual(['Projects', 'Settings', 'New work']);
+
+	// Let go over the content area, which is not a drop target.
+	await page.mouse.move(640, 500, { steps: 15 });
+	await settleFrames(page);
+	await page.mouse.up();
+
+	await expect.poll(() => tabTitles(pane)).toEqual(['New work', 'Projects', 'Settings']);
+	await expect(page).toHaveURL('/projects');
 });

@@ -598,10 +598,13 @@
 	}
 
 	function handleTabDragEnd(event: DragEndEvent) {
-		const { source } = event.operation;
+		const { source, target } = event.operation;
 		const snapshot = dragSnapshot;
 		dragSnapshot = null;
-		if (event.canceled) {
+		// Tabs reorder live, so a release outside every strip has to abandon the
+		// drag the way Escape does. Letting go over nothing is not a drop, and
+		// the preview must not become a commit just because the button came up.
+		if (event.canceled || !target) {
 			if (snapshot) panes = snapshot;
 			return;
 		}
