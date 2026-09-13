@@ -543,8 +543,11 @@
 	// indices in step: it reads them back from the rendered order. Drag end then
 	// only has to settle focus and persistence.
 	let dragSnapshot: WorkspacePaneState[] | null = null;
+	// Stand-in tabs the deletion handler created for panes the preview emptied.
+	let dragFallbackTabIds = new Set<string>();
 
 	function handleTabDragStart() {
+		dragFallbackTabIds = new Set();
 		dragSnapshot = panes.map((pane) => ({ ...pane, tabs: [...pane.tabs] }));
 	}
 
@@ -659,7 +662,7 @@
 		const tabId = String(source.id);
 		const origin = snapshot?.flatMap((pane) => {
 			const index = pane.tabs.findIndex((tab) => tab.id === tabId);
-			return index < 0 ? [] : [{ paneId: pane.id, index }];
+			return index < 0 ? [] : [{ paneId: pane.id, index, activeTabId: pane.activeTabId }];
 		})[0];
 		const release = releaseTarget(dragPoint(event), tabId);
 		// Tabs reorder live, so a release outside every strip has to abandon the
@@ -674,6 +677,28 @@
 			if (origin) {
 				const restored = movedToPane(origin.paneId, tabId, origin.index);
 				if (restored) applyTabGroups(restored);
+			}
+			// A pane the drag emptied may have been given a stand-in tab by the
+			// deletion handler. Now that the dragged tab is back, that stand-in
+			// only exists because of the preview, so it goes.
+			if (dragFallbackTabIds.size > 0) {
+				panes = panes.map((pane) => {
+					const tabs = pane.tabs.filter((tab) => !dragFallbackTabIds.has(tab.id));
+					if (tabs.length === 0 || tabs.length === pane.tabs.length) return pane;
+					return {
+						...pane,
+						tabs,
+						activeTabId: tabs.some((tab) => tab.id === pane.activeTabId) ? pane.activeTabId : tabs[0].id,
+					};
+				});
+			}
+			// The preview left the source pane's selection pointing at a tab that
+			// was not there, which the deletion handler then normalised away.
+			if (origin) {
+				panes = panes.map((pane) => pane.id === origin.paneId
+					&& pane.tabs.some((tab) => tab.id === origin.activeTabId)
+					? { ...pane, activeTabId: origin.activeTabId }
+					: pane);
 			}
 			// Taking the tab back can empty the pane it was previewing into, when
 			// that pane's own tabs were removed mid-drag: the deletion handler saw
@@ -949,6 +974,9 @@
 				};
 			}
 			const fallback = { ...createWorkspaceTab('/projects'), lastActiveAt: nextTabRecency() };
+			// Only needed because a drag is previewing this pane's tab elsewhere;
+			// abandoning that drag takes the stand-in away again.
+			if (dragSnapshot) dragFallbackTabIds.add(fallback.id);
 			return { ...pane, tabs: [fallback], activeTabId: fallback.id };
 		});
 		persistWorkspace();

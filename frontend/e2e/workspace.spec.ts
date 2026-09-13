@@ -6441,3 +6441,88 @@ test('abandoning a drag removes a pane left empty by a deletion mid-drag', async
 	await expect(panes).toHaveCount(1);
 	await expect.poll(() => tabTitles(panes.nth(0))).toEqual(['New work', 'Settings']);
 });
+
+test('abandoning a drag restores the source pane selection and drops its stand-in tab', async ({ page }) => {
+	const projectTab = { id: 'seed-tab-project', path: '/projects/doomed', kind: 'project', title: 'Doomed', resourceId: 'doomed', status: null, lastActiveAt: 2 };
+	await seedWorkspace(page, {
+		focusedPaneId: 'pane-left',
+		// New work is active and shares its pane with only the doomed project.
+		panes: [
+			{ id: 'pane-left', activeTabId: TAB_NEW_WORK.id, width: 1, tabs: [TAB_NEW_WORK, projectTab] },
+			{ id: 'pane-right', activeTabId: TAB_SETTINGS.id, width: 1, tabs: [TAB_SETTINGS] },
+		],
+	});
+	await page.goto('/');
+
+	const panes = page.locator('[data-workspace-pane]');
+	await expect(panes).toHaveCount(2);
+
+	// Preview New work out of its pane, leaving only the doomed project behind.
+	await dragTab(
+		page,
+		panes.nth(0).locator('[data-workspace-tab][data-workspace-tab-id="seed-tab-home"]'),
+		panes.nth(1).locator('[data-workspace-tab][data-workspace-tab-title="Settings"]'),
+		'start',
+	);
+	await expect.poll(() => tabTitles(panes.nth(1))).toContain('New work');
+
+	// Deleting the project empties the source pane, so it gets a stand-in tab.
+	await page.evaluate(() => {
+		window.dispatchEvent(new CustomEvent('xpressclaw:project-mutation', {
+			detail: { kind: 'deleted', projectId: 'doomed' },
+		}));
+	});
+
+	await page.mouse.move(640, 500, { steps: 15 });
+	await settleFrames(page);
+	await page.mouse.up();
+	await expect(page.locator('[data-dnd-dragging], [data-dnd-placeholder]')).toHaveCount(0);
+
+	// The stand-in only existed because of the preview, so it goes with it, and
+	// the pane is selected on the tab that was active before the drag.
+	await expect.poll(() => tabTitles(panes.nth(0))).toEqual(['New work']);
+	await expect(panes.nth(0).locator('[data-workspace-tab][data-workspace-tab-active="true"]'))
+		.toHaveAttribute('data-workspace-tab-title', 'New work');
+});
+
+test('abandoning a drag restores which tab was active in the source pane', async ({ page }) => {
+	const projectTab = { id: 'seed-tab-project', path: '/projects/doomed', kind: 'project', title: 'Doomed', resourceId: 'doomed', status: null, lastActiveAt: 3 };
+	await seedWorkspace(page, {
+		focusedPaneId: 'pane-left',
+		// Settings stays behind, so the selection has somewhere wrong to land.
+		panes: [
+			{ id: 'pane-left', activeTabId: TAB_NEW_WORK.id, width: 1, tabs: [TAB_NEW_WORK, TAB_SETTINGS, projectTab] },
+			{ id: 'pane-right', activeTabId: TAB_PROJECTS.id, width: 1, tabs: [TAB_PROJECTS] },
+		],
+	});
+	await page.goto('/');
+
+	const panes = page.locator('[data-workspace-pane]');
+	await expect(panes).toHaveCount(2);
+
+	// Preview the active tab out, leaving its pane's selection pointing at a
+	// tab that is no longer there.
+	await dragTab(
+		page,
+		panes.nth(0).locator('[data-workspace-tab][data-workspace-tab-id="seed-tab-home"]'),
+		panes.nth(1).locator('[data-workspace-tab][data-workspace-tab-title="Projects"]'),
+		'start',
+	);
+	await expect.poll(() => tabTitles(panes.nth(1))).toContain('New work');
+
+	// The deletion handler normalises that dangling selection to Settings.
+	await page.evaluate(() => {
+		window.dispatchEvent(new CustomEvent('xpressclaw:project-mutation', {
+			detail: { kind: 'deleted', projectId: 'doomed' },
+		}));
+	});
+
+	await page.mouse.move(640, 500, { steps: 15 });
+	await settleFrames(page);
+	await page.mouse.up();
+	await expect(page.locator('[data-dnd-dragging], [data-dnd-placeholder]')).toHaveCount(0);
+
+	await expect.poll(() => tabTitles(panes.nth(0))).toEqual(['New work', 'Settings']);
+	await expect(panes.nth(0).locator('[data-workspace-tab][data-workspace-tab-active="true"]'))
+		.toHaveAttribute('data-workspace-tab-title', 'New work');
+});
