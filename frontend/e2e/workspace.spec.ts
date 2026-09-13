@@ -4519,15 +4519,15 @@ test('dragging the last tab out of a pane closes the emptied pane', async ({ pag
 	const panes = page.locator('[data-workspace-pane]');
 	await expect(panes).toHaveCount(2);
 
-	// Land on the left pane's last tab, taking over that slot.
+	// Land on the empty strip space past the left pane's tabs, which appends.
 	await dragTabAndDrop(
 		page,
 		panes.nth(1).locator('[data-workspace-tab][data-workspace-tab-title="Settings"]'),
-		panes.nth(0).locator('[data-workspace-tab][data-workspace-tab-title="Projects"]'),
+		panes.nth(0).locator('[data-workspace-tab-strip]'),
 	);
 
 	await expect(panes).toHaveCount(1);
-	await expect.poll(() => tabTitles(panes.nth(0))).toEqual(['New work', 'Settings', 'Projects']);
+	await expect.poll(() => tabTitles(panes.nth(0))).toEqual(['New work', 'Projects', 'Settings']);
 	await expect(panes.nth(0).locator('[data-workspace-tab][data-workspace-tab-active="true"]'))
 		.toHaveAttribute('data-workspace-tab-title', 'Settings');
 	await expect(page).toHaveURL('/settings');
@@ -4647,7 +4647,7 @@ test('the compact tab strip reorders tabs by drag on narrow screens', async ({ p
 	await expect(page).toHaveURL('/projects');
 });
 
-test('the compact strip previews appending into a pane that is not last', async ({ page }) => {
+test('the compact strip appends into the last pane on empty space', async ({ page }) => {
 	await page.setViewportSize({ width: 900, height: 700 });
 	await seedWorkspace(page, {
 		focusedPaneId: 'pane-left',
@@ -4661,17 +4661,17 @@ test('the compact strip previews appending into a pane that is not last', async 
 	const strip = page.locator('[data-workspace-tab-strip]:visible');
 	await expect(strip.locator('[data-workspace-tab]')).toHaveCount(3);
 
-	// Drag the right pane's tab onto the left pane's last tab, moving it into a
-	// pane that is not the final one in the strip.
+	// Every pane's tabs share this strip, so its trailing space belongs to the
+	// last pane, matching where a tab dropped there lands.
 	await dragTabAndDrop(
 		page,
-		strip.locator('[data-workspace-tab][data-workspace-tab-title="Settings"]'),
-		strip.locator('[data-workspace-tab][data-workspace-tab-title="Projects"]'),
+		strip.locator('[data-workspace-tab][data-workspace-tab-title="New work"]'),
+		strip,
 	);
 
-	await expect(page.locator('[data-workspace-pane]')).toHaveCount(1);
-	await expect.poll(() => tabTitles(strip)).toEqual(['New work', 'Settings', 'Projects']);
-	await expect(page).toHaveURL('/settings');
+	await expect.poll(() => tabTitles(strip)).toEqual(['Projects', 'Settings', 'New work']);
+	await expect(page.locator('[data-workspace-pane]')).toHaveCount(2);
+	await expect(page).toHaveURL('/');
 });
 
 test('task pages show five recent tasks per project in the sidebar', async ({ page }) => {
@@ -6141,4 +6141,34 @@ test('clicking a tab label or its close control never starts a drag', async ({ p
 	// And an inactive tab's close control still closes it.
 	await pane.locator('[data-workspace-tab][data-workspace-tab-title="New work"] button[aria-label="Close New work"]').click();
 	await expect.poll(() => tabTitles(pane)).toEqual(['Projects']);
+});
+
+
+test('a tab can be dropped into the empty strip of a freshly split pane', async ({ page }) => {
+	await seedWorkspace(page, {
+		focusedPaneId: 'seed-pane',
+		panes: [{ id: 'seed-pane', activeTabId: TAB_PROJECTS.id, width: 1, tabs: [TAB_NEW_WORK, TAB_PROJECTS, TAB_SETTINGS] }],
+	});
+	await page.goto('/projects');
+
+	const panes = page.locator('[data-workspace-pane]');
+	await expect(panes).toHaveCount(1);
+
+	// Splitting copies the active tab into a new pane, which then holds a single
+	// tab beside a full-width strip.
+	await page.getByRole('button', { name: 'Split active tab right' }).first().click();
+	await expect(panes).toHaveCount(2);
+	await expect.poll(() => tabTitles(panes.nth(1))).toEqual(['Projects']);
+
+	// That empty run has to accept a drop, otherwise filling a split pane means
+	// hitting the one tab already in it.
+	await dragTabAndDrop(
+		page,
+		panes.nth(0).locator('[data-workspace-tab][data-workspace-tab-title="Settings"]'),
+		panes.nth(1).locator('[data-workspace-tab-strip]'),
+	);
+
+	await expect.poll(() => tabTitles(panes.nth(1))).toEqual(['Projects', 'Settings']);
+	await expect.poll(() => tabTitles(panes.nth(0))).toEqual(['New work', 'Projects']);
+	await expect(page).toHaveURL('/settings');
 });

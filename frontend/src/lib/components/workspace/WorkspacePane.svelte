@@ -1,6 +1,7 @@
 <script lang="ts">
 	import type { WorkspacePaneState, WorkspaceTab } from '$lib/workspace';
 	import SortableTab from './SortableTab.svelte';
+	import TabStripDropZone from './TabStripDropZone.svelte';
 	import WorkspaceContent from './WorkspaceContent.svelte';
 
 	let {
@@ -48,8 +49,9 @@
 	aria-label="Workspace pane"
 >
 	<div class="hidden h-9 shrink-0 items-stretch border-b border-border bg-[hsl(var(--field))] lg:flex">
-		<div
-			bind:this={tabStrip}
+		<TabStripDropZone
+			paneId={pane.id}
+			bind:element={tabStrip}
 			data-workspace-tab-strip
 			data-workspace-pane-id={pane.id}
 			role="group"
@@ -67,7 +69,7 @@
 					oncontext={(event) => oncontext(event, tab)}
 				/>
 			{/each}
-		</div>
+		</TabStripDropZone>
 		<button type="button" onclick={onsplit} disabled={!canSplit} class="flex h-9 w-9 shrink-0 items-center justify-center border-l border-border/70 text-muted-foreground hover:bg-accent hover:text-foreground disabled:cursor-not-allowed disabled:opacity-25" title={canSplit ? 'Split active tab right' : 'No room for another pane'} aria-label="Split active tab right">
 			<svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><rect x="3.5" y="4" width="17" height="16" rx="2"/><path d="M12 4v16"/></svg>
 		</button>

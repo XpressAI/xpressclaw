@@ -35,6 +35,7 @@
 	import { tabDragSensors } from '$lib/tabDrag';
 	import ContextMenu from '../ContextMenu.svelte';
 	import SortableTab from './SortableTab.svelte';
+	import TabStripDropZone from './TabStripDropZone.svelte';
 	import SidebarSettings from './SidebarSettings.svelte';
 	import SidebarTasks from './SidebarTasks.svelte';
 	import SidebarAutomations from './SidebarAutomations.svelte';
@@ -548,9 +549,30 @@
 	}
 
 	function handleTabDragOver(event: DragOverEvent) {
+		const { source, target } = event.operation;
+		if (!isSortable(source)) return;
+
 		const groups: Record<string, string[]> = {};
 		for (const pane of panes) groups[pane.id] = pane.tabs.map((tab) => tab.id);
-		const next = move(groups, event);
+
+		// Empty strip space past the last tab appends into that pane. It is a
+		// plain droppable rather than a sortable, so move() cannot place it.
+		const stripPaneId = target && !isSortable(target) && target.type === 'workspace-tab-strip'
+			? (target.data as { paneId?: string } | undefined)?.paneId
+			: undefined;
+		let next: Record<string, string[]>;
+		if (stripPaneId && groups[stripPaneId]) {
+			const tabId = String(source.id);
+			if (groups[stripPaneId].at(-1) === tabId) return;
+			next = {};
+			for (const [paneId, ids] of Object.entries(groups)) {
+				const without = ids.filter((id) => id !== tabId);
+				next[paneId] = paneId === stripPaneId ? [...without, tabId] : without;
+			}
+		} else {
+			next = move(groups, event);
+		}
+
 		const byId = new Map(panes.flatMap((pane) => pane.tabs).map((tab) => [tab.id, tab]));
 		panes = panes.map((pane) => {
 			const ids = next[pane.id];
@@ -1052,8 +1074,9 @@
 			<!-- The compact strip gets its own provider: it renders the same tab ids
 			     as the pane strips, and ids only have to be unique within a provider. -->
 			<DragDropProvider sensors={tabDragSensors} onDragStart={handleTabDragStart} onDragOver={handleTabDragOver} onDragEnd={handleTabDragEnd}>
-				<div
-					bind:this={compactTabStrip}
+				<TabStripDropZone
+					paneId={panes[panes.length - 1]?.id ?? ''}
+					bind:element={compactTabStrip}
 					data-workspace-tab-strip
 					role="group"
 					aria-label="Open tabs"
@@ -1072,7 +1095,7 @@
 							oncontext={(event) => showTabContextMenu(event, item.paneId, item.tab)}
 						/>
 					{/each}
-				</div>
+				</TabStripDropZone>
 			</DragDropProvider>
 
 			<div bind:this={workspaceEl} class="flex min-h-0 flex-1 overflow-hidden">
