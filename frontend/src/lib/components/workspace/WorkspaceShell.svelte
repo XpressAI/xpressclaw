@@ -657,12 +657,24 @@
 		dragSnapshot = null;
 		if (!isSortable(source)) return;
 		const tabId = String(source.id);
+		const origin = snapshot?.flatMap((pane) => {
+			const index = pane.tabs.findIndex((tab) => tab.id === tabId);
+			return index < 0 ? [] : [{ paneId: pane.id, index }];
+		})[0];
 		const release = releaseTarget(dragPoint(event), tabId);
 		// Tabs reorder live, so a release outside every strip has to abandon the
 		// drag the way Escape does. Letting go over nothing is not a drop, and
 		// the preview must not become a commit just because the button came up.
 		if (event.canceled || !release) {
-			if (snapshot) panes = snapshot;
+			// Put the dragged tab back without reinstating the rest of the
+			// snapshot. The workspace can change while a drag is in flight, and
+			// restoring wholesale would resurrect tabs closed or removed
+			// meanwhile. applyTabGroups keeps only ids that still exist, so this
+			// cannot bring one back either.
+			if (origin) {
+				const restored = movedToPane(origin.paneId, tabId, origin.index);
+				if (restored) applyTabGroups(restored);
+			}
 			return;
 		}
 		// Settle the whole landing position here rather than trusting the
@@ -671,7 +683,7 @@
 		// did run this recomputes the same position and changes nothing.
 		const positioned = movedToPane(release.paneId, tabId, release.index);
 		if (positioned) applyTabGroups(positioned);
-		const fromPaneId = snapshot?.find((pane) => pane.tabs.some((tab) => tab.id === tabId))?.id;
+		const fromPaneId = origin?.paneId;
 		const toPane = panes.find((pane) => pane.tabs.some((tab) => tab.id === tabId));
 		if (!toPane) return;
 
@@ -688,8 +700,10 @@
 			.filter((pane) => pane.tabs.length > 0)
 			.map((pane) => pane.id === toPane.id
 				? { ...pane, tabs: pane.tabs.map((tab) => tab.id === tabId ? moved : tab), activeTabId: tabId }
+				// The pane that lost the tab keeps the neighbour at that slot, or
+				// the one before it, rather than jumping to its first tab.
 				: pane.activeTabId === tabId
-					? { ...pane, activeTabId: pane.tabs[0]?.id ?? pane.activeTabId }
+					? { ...pane, activeTabId: pane.tabs[Math.min(origin?.index ?? 0, pane.tabs.length - 1)]?.id ?? pane.activeTabId }
 					: pane));
 		focusedPaneId = toPane.id;
 		persistWorkspace();

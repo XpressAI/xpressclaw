@@ -6295,3 +6295,68 @@ test('the compact strip drops a tab into the pane that owns the tab under it', a
 	// pane-right is emptied by the move, so only pane-left survives.
 	await expect(page.locator('[data-workspace-pane]')).toHaveCount(1);
 });
+
+test('the pane a tab leaves keeps the neighbour at that position active', async ({ page }) => {
+	await seedWorkspace(page, {
+		focusedPaneId: 'pane-left',
+		panes: [
+			// The active tab sits last, so activating the first tab would be wrong.
+			{ id: 'pane-left', activeTabId: TAB_SETTINGS.id, width: 1, tabs: [TAB_NEW_WORK, TAB_PROJECTS, TAB_SETTINGS] },
+			{ id: 'pane-right', activeTabId: 'seed-tab-tasks', width: 1, tabs: [{ id: 'seed-tab-tasks', path: '/tasks', kind: 'tasks', title: 'Tasks', resourceId: null, status: null, lastActiveAt: 4 }] },
+		],
+	});
+	await page.goto('/settings');
+
+	const panes = page.locator('[data-workspace-pane]');
+	await expect(panes).toHaveCount(2);
+
+	await dragTabAndDrop(
+		page,
+		panes.nth(0).locator('[data-workspace-tab][data-workspace-tab-title="Settings"]'),
+		panes.nth(1).locator('[data-workspace-tab-strip]'),
+	);
+
+	await expect.poll(() => tabTitles(panes.nth(0))).toEqual(['New work', 'Projects']);
+	// Settings was at index 2; the source pane falls back to the preceding tab.
+	await expect(panes.nth(0).locator('[data-workspace-tab][data-workspace-tab-active="true"]'))
+		.toHaveAttribute('data-workspace-tab-title', 'Projects');
+});
+
+test('abandoning a drag does not resurrect a tab closed while it was in flight', async ({ page }) => {
+	const projectTab = { id: 'seed-tab-project', path: '/projects/doomed', kind: 'project', title: 'Doomed', resourceId: 'doomed', status: null, lastActiveAt: 2 };
+	await seedWorkspace(page, {
+		focusedPaneId: 'seed-pane',
+		panes: [{ id: 'seed-pane', activeTabId: TAB_NEW_WORK.id, width: 1, tabs: [TAB_NEW_WORK, projectTab, TAB_SETTINGS] }],
+	});
+	await page.goto('/');
+
+	const pane = page.locator('[data-workspace-pane]').first();
+	const tabs = pane.locator('[data-workspace-tab]');
+	await expect(tabs).toHaveCount(3);
+
+	const origin = await tabs.nth(0).boundingBox();
+	const over = await tabs.nth(2).boundingBox();
+	if (!origin || !over) throw new Error('tab has no bounding box');
+
+	await page.mouse.move(origin.x + origin.width / 2, origin.y + origin.height / 2);
+	await page.mouse.down();
+	await page.mouse.move(origin.x + origin.width / 2 + 12, origin.y + origin.height / 2, { steps: 5 });
+	await page.mouse.move(over.x + over.width / 2, over.y + over.height / 2, { steps: 10 });
+	await settleFrames(page);
+
+	// The project is deleted elsewhere while the drag is still held.
+	await page.evaluate(() => {
+		window.dispatchEvent(new CustomEvent('xpressclaw:project-mutation', {
+			detail: { kind: 'deleted', projectId: 'doomed' },
+		}));
+	});
+	await expect.poll(() => tabTitles(pane)).not.toContain('Doomed');
+
+	// Abandon the drag by releasing outside every strip.
+	await page.mouse.move(640, 500, { steps: 15 });
+	await settleFrames(page);
+	await page.mouse.up();
+
+	// The dragged tab returns to its slot, and the deleted tab stays gone.
+	await expect.poll(() => tabTitles(pane)).toEqual(['New work', 'Settings']);
+});
