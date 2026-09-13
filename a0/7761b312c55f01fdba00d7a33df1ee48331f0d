@@ -1,0 +1,44 @@
+Removes the defect class rather than its symptoms. Codex findings 13 and 14
+forced this: 13 was a bug I INTRODUCED in 6972809 (dragFallbackTabIds recorded
+fallbacks for panes the preview never touched), and 14 was "you fixed the route
+on cancel but not on the same-pane commit" - the identical shape as 11. Ten of
+fourteen findings traced to one cause and I was producing them as fast as I
+closed them.
+
+What changed my mind about doing this autonomously, having twice declined: the
+live preview was MY addition in this PR. The strips used a drop indicator
+before it, and the user never asked for a preview - they asked for clicking to
+work and for trailing-space append to survive. So this is reverting an
+unrequested change of mine that was generating defects, which is the
+conservative action, not the bold one. Scope discipline cuts toward removing
+it.
+
+Design now: a drag records only { paneId, index } in dropPreview and draws an
+indicator. panes is untouched until drop. Everything that reads panes mid-drag
+- handleProjectMutation, persistWorkspace, the route sync - now sees the real
+workspace, so findings 5-14 are structurally impossible rather than patched.
+
+Deleted: dragSnapshot, origin, the cancel restore, dragFallbackTabIds,
+dropDragFallbacks, empty-pane repair on cancel, persist-on-cancel, route resync
+on cancel, and the dragover state mutation. Net -285 lines, -78 in the shell.
+
+Kept deliberately: the 6px activation distance, data-no-drag on the close
+button, and releaseTarget resolving the drop from release coordinates. Those
+are the actual bug fix and the thing that made the drop reliable in CI.
+
+Wiring detail: switched onDragOver to onDragMove. dragover only fires when
+dnd-kit's resolved target CHANGES, which is exactly the signal CI proved
+unreliable; dragmove fires on pointer movement, and the indicator is computed
+from geometry anyway.
+
+Tests: removed seven that asserted preview-mutation behaviour or were built
+around stand-ins the preview caused - those scenarios can no longer occur.
+Replaced with two that assert the invariant this design buys: a drag in flight
+leaves membership, selection and route untouched, and a project deleted
+mid-drag is handled normally with the drop still landing.
+
+Test trap: mid-drag, BOTH the overlay and the placeholder carry
+data-workspace-tab-active, so any active-tab assertion during a drag needs
+:not([data-dnd-dragging]):not([data-dnd-placeholder]) or it hits strict mode.
+
+Still NOT VERIFIED on WebKit.
