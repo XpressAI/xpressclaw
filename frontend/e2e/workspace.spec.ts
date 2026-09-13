@@ -6360,3 +6360,84 @@ test('abandoning a drag does not resurrect a tab closed while it was in flight',
 	// The dragged tab returns to its slot, and the deleted tab stays gone.
 	await expect.poll(() => tabTitles(pane)).toEqual(['New work', 'Settings']);
 });
+
+test('abandoning a drag persists the restored order', async ({ page }) => {
+	const projectTab = { id: 'seed-tab-project', path: '/projects/doomed', kind: 'project', title: 'Doomed', resourceId: 'doomed', status: null, lastActiveAt: 2 };
+	await seedWorkspace(page, {
+		focusedPaneId: 'seed-pane',
+		panes: [{ id: 'seed-pane', activeTabId: TAB_NEW_WORK.id, width: 1, tabs: [TAB_NEW_WORK, projectTab, TAB_SETTINGS] }],
+	});
+	await page.goto('/');
+
+	const pane = page.locator('[data-workspace-pane]').first();
+	const tabs = pane.locator('[data-workspace-tab]');
+	await expect(tabs).toHaveCount(3);
+
+	const origin = await tabs.nth(0).boundingBox();
+	const over = await tabs.nth(2).boundingBox();
+	if (!origin || !over) throw new Error('tab has no bounding box');
+
+	await page.mouse.move(origin.x + origin.width / 2, origin.y + origin.height / 2);
+	await page.mouse.down();
+	await page.mouse.move(origin.x + origin.width / 2 + 12, origin.y + origin.height / 2, { steps: 5 });
+	await page.mouse.move(over.x + over.width / 2, over.y + over.height / 2, { steps: 10 });
+	await settleFrames(page);
+
+	// A deletion mid-drag persists the workspace, capturing the preview order.
+	await page.evaluate(() => {
+		window.dispatchEvent(new CustomEvent('xpressclaw:project-mutation', {
+			detail: { kind: 'deleted', projectId: 'doomed' },
+		}));
+	});
+	await expect.poll(() => tabTitles(pane)).toHaveLength(2);
+
+	await page.mouse.move(640, 500, { steps: 15 });
+	await settleFrames(page);
+	await page.mouse.up();
+	await expect.poll(() => tabTitles(pane)).toEqual(['New work', 'Settings']);
+
+	// The abandoned arrangement must not come back from storage.
+	await page.reload();
+	await expect.poll(() => tabTitles(page.locator('[data-workspace-pane]').first()))
+		.toEqual(['New work', 'Settings']);
+});
+
+test('abandoning a drag removes a pane left empty by a deletion mid-drag', async ({ page }) => {
+	const projectTab = { id: 'seed-tab-project', path: '/projects/doomed', kind: 'project', title: 'Doomed', resourceId: 'doomed', status: null, lastActiveAt: 2 };
+	await seedWorkspace(page, {
+		focusedPaneId: 'pane-left',
+		panes: [
+			{ id: 'pane-left', activeTabId: TAB_NEW_WORK.id, width: 1, tabs: [TAB_NEW_WORK, TAB_SETTINGS] },
+			{ id: 'pane-right', activeTabId: projectTab.id, width: 1, tabs: [projectTab] },
+		],
+	});
+	await page.goto('/');
+
+	const panes = page.locator('[data-workspace-pane]');
+	await expect(panes).toHaveCount(2);
+
+	// Preview the dragged tab into the right pane, so that pane holds two tabs.
+	await dragTab(
+		page,
+		panes.nth(0).locator('[data-workspace-tab][data-workspace-tab-title="New work"]'),
+		panes.nth(1).locator('[data-workspace-tab][data-workspace-tab-id="seed-tab-project"]'),
+		'start',
+	);
+	await expect.poll(() => tabTitles(panes.nth(1))).toContain('New work');
+
+	// Deleting the project now leaves the right pane holding only the preview,
+	// so the deletion handler installs no fallback of its own.
+	await page.evaluate(() => {
+		window.dispatchEvent(new CustomEvent('xpressclaw:project-mutation', {
+			detail: { kind: 'deleted', projectId: 'doomed' },
+		}));
+	});
+
+	// Abandoning takes the preview back out, which would strand an empty pane.
+	await page.mouse.move(640, 500, { steps: 15 });
+	await settleFrames(page);
+	await page.mouse.up();
+
+	await expect(panes).toHaveCount(1);
+	await expect.poll(() => tabTitles(panes.nth(0))).toEqual(['New work', 'Settings']);
+});

@@ -675,6 +675,21 @@
 				const restored = movedToPane(origin.paneId, tabId, origin.index);
 				if (restored) applyTabGroups(restored);
 			}
+			// Taking the tab back can empty the pane it was previewing into, when
+			// that pane's own tabs were removed mid-drag: the deletion handler saw
+			// the preview and so skipped its fallback. A workspace always holds at
+			// least one tab.
+			if (panes.every((pane) => pane.tabs.length === 0)) {
+				const home = { ...createWorkspaceTab('/'), lastActiveAt: nextTabRecency() };
+				panes = [{ ...panes[0], tabs: [home], activeTabId: home.id }];
+				focusedPaneId = panes[0].id;
+			} else {
+				panes = panes.filter((pane) => pane.tabs.length > 0);
+				if (!panes.some((pane) => pane.id === focusedPaneId)) focusedPaneId = panes[0].id;
+			}
+			// A mid-drag persist writes the preview, so the restore has to be
+			// written too or a reload brings the abandoned arrangement back.
+			persistWorkspace();
 			return;
 		}
 		// Settle the whole landing position here rather than trusting the
