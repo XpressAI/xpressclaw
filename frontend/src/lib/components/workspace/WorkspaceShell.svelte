@@ -567,70 +567,87 @@
 	}
 
 	/**
-	 * Append into the pane whose empty strip space is under the pointer.
+	 * Where a release actually landed, measured from the pointer.
 	 *
-	 * The strip is a plain droppable rather than a sortable, so move() cannot
-	 * place a tab there. Returns null when the drop is not over strip space or
-	 * the tab already sits last in that pane, which makes this safe to run again
-	 * at drag end for a drag released faster than dragover could settle.
+	 * The resolved drop target cannot be trusted for this: it is recomputed on a
+	 * collision pass that does not always run for the last stretch of a drag, so
+	 * a release over one pane's strip can still report the tab the drag started
+	 * from. Reading the pointer against live rectangles is what the user saw.
 	 */
-	function appendedToStripSpace(event: DragOverEvent | DragEndEvent): Record<string, string[]> | null {
-		const { source, target } = event.operation;
-		if (!isSortable(source)) return null;
-		if (!target || isSortable(target) || target.type !== 'workspace-tab-strip') return null;
-		const stripPaneId = (target.data as { paneId?: string } | undefined)?.paneId;
+	function releaseTarget(point: { x: number; y: number } | undefined): { paneId: string; pastLastTab: boolean } | null {
+		if (!point) return null;
+		// Both strips are always rendered and one is hidden by a breakpoint, and
+		// the compact strip carries the last pane's id, so they can collide.
+		// Matching on measured geometry picks whichever one the pointer is
+		// actually over, because a hidden strip has no area.
+		for (const strip of document.querySelectorAll<HTMLElement>('[data-workspace-tab-strip]')) {
+			const paneId = strip.dataset.workspacePaneId;
+			const bounds = strip.getBoundingClientRect();
+			if (!paneId || bounds.width === 0 || !containsPoint(bounds, point)) continue;
+			// Only the run past the last tab appends. Anywhere among the tabs is
+			// an ordinary sort, and they shift under the pointer mid-drag, so a
+			// gap between two of them must not read as the end of the strip. The
+			// copy tracking the cursor is excluded: it is always under the
+			// pointer, so it would otherwise mask the real last tab.
+			const tabs = [...strip.querySelectorAll<HTMLElement>('[data-workspace-tab]:not([data-dnd-dragging])')];
+			const lastEdge = Math.max(bounds.left, ...tabs.map((tab) => tab.getBoundingClientRect().right));
+			return { paneId, pastLastTab: point.x >= lastEdge };
+		}
+		return null;
+	}
+
+	function containsPoint(bounds: DOMRect, point: { x: number; y: number }): boolean {
+		return point.x >= bounds.left && point.x < bounds.right
+			&& point.y >= bounds.top && point.y < bounds.bottom;
+	}
+
+	/** Move `tabId` to the end of `paneId`, or null when it is already there. */
+	function appendedToPane(paneId: string, tabId: string): Record<string, string[]> | null {
 		const groups = tabGroups();
-		if (!stripPaneId || !groups[stripPaneId]) return null;
-		const tabId = String(source.id);
-		if (groups[stripPaneId].at(-1) === tabId) return null;
+		if (!groups[paneId] || groups[paneId].at(-1) === tabId) return null;
 		const next: Record<string, string[]> = {};
-		for (const [paneId, ids] of Object.entries(groups)) {
+		for (const [candidate, ids] of Object.entries(groups)) {
 			const without = ids.filter((id) => id !== tabId);
-			next[paneId] = paneId === stripPaneId ? [...without, tabId] : without;
+			next[candidate] = candidate === paneId ? [...without, tabId] : without;
 		}
 		return next;
 	}
 
-	// TEMPORARY: record what dnd-kit resolved, to explain a CI-only failure.
-	function recordDragDiag(phase: string, event: DragOverEvent | DragEndEvent) {
-		const scope = window as unknown as { __tabDragDiag?: unknown[] };
-		scope.__tabDragDiag ??= [];
-		const target = event.operation.target as { id?: unknown; type?: unknown } | null;
-		const position = (event.operation as { position?: { current?: { x: number; y: number } } }).position;
-		scope.__tabDragDiag.push({
-			phase,
-			targetId: target ? String(target.id) : null,
-			targetType: target ? String(target.type) : null,
-			x: position?.current?.x,
-			y: position?.current?.y,
-		});
+	function dragPoint(event: DragOverEvent | DragEndEvent): { x: number; y: number } | undefined {
+		return (event.operation as { position?: { current?: { x: number; y: number } } }).position?.current;
 	}
 
 	function handleTabDragOver(event: DragOverEvent) {
-		recordDragDiag('over', event);
 		const { source } = event.operation;
 		if (!isSortable(source)) return;
-		applyTabGroups(appendedToStripSpace(event) ?? move(tabGroups(), event));
+		const release = releaseTarget(dragPoint(event));
+		const appended = release && release.pastLastTab
+			? appendedToPane(release.paneId, String(source.id))
+			: null;
+		applyTabGroups(appended ?? move(tabGroups(), event));
 	}
 
 	function handleTabDragEnd(event: DragEndEvent) {
-		const { source, target } = event.operation;
-		recordDragDiag(event.canceled ? 'end-canceled' : 'end', event);
+		const { source } = event.operation;
 		const snapshot = dragSnapshot;
 		dragSnapshot = null;
+		if (!isSortable(source)) return;
+		const release = releaseTarget(dragPoint(event));
 		// Tabs reorder live, so a release outside every strip has to abandon the
 		// drag the way Escape does. Letting go over nothing is not a drop, and
 		// the preview must not become a commit just because the button came up.
-		if (event.canceled || !target) {
+		if (event.canceled || !release) {
 			if (snapshot) panes = snapshot;
 			return;
 		}
-		if (!isSortable(source)) return;
-		// A drag released faster than dragover could settle still has to land,
-		// and this repeats harmlessly when dragover already applied it.
-		const pending = appendedToStripSpace(event);
-		if (pending) applyTabGroups(pending);
 		const tabId = String(source.id);
+		// Empty strip space appends. Doing this here rather than relying on the
+		// drag-over preview is what makes the drop follow the pointer even when
+		// no collision pass ran for the final stretch of the drag.
+		if (release.pastLastTab) {
+			const appended = appendedToPane(release.paneId, tabId);
+			if (appended) applyTabGroups(appended);
+		}
 		const fromPaneId = snapshot?.find((pane) => pane.tabs.some((tab) => tab.id === tabId))?.id;
 		const toPane = panes.find((pane) => pane.tabs.some((tab) => tab.id === tabId));
 		if (!toPane) return;
@@ -1114,7 +1131,6 @@
 				<TabStripDropZone
 					paneId={panes[panes.length - 1]?.id ?? ''}
 					bind:element={compactTabStrip}
-					data-workspace-tab-strip
 					role="group"
 					aria-label="Open tabs"
 					class="flex h-9 shrink-0 items-stretch overflow-x-auto border-b border-border bg-[hsl(var(--field))] lg:hidden scrollbar-hide"

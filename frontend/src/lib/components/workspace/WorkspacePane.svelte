@@ -52,8 +52,6 @@
 		<TabStripDropZone
 			paneId={pane.id}
 			bind:element={tabStrip}
-			data-workspace-tab-strip
-			data-workspace-pane-id={pane.id}
 			role="group"
 			aria-label="Pane tabs"
 			class="flex min-w-0 flex-1 overflow-x-auto scrollbar-hide"

@@ -4579,29 +4579,11 @@ test('dragging the last tab out of a pane closes the emptied pane', async ({ pag
 
 	// Land on the empty strip space past the left pane's tabs, which appends.
 	const strip = panes.nth(0).locator('[data-workspace-tab-strip]');
-	// TEMPORARY: this passes locally and fails every time in CI, so report the
-	// geometry the drag actually used. Remove once the cause is known.
-	const stripBox = await strip.boundingBox();
-	console.log('DIAG viewport', JSON.stringify(page.viewportSize()));
-	console.log('DIAG stripBox', JSON.stringify(stripBox));
-	console.log('DIAG paneTabs', JSON.stringify(await panes.nth(0).locator('[data-workspace-tab]').evaluateAll((els) =>
-		els.map((el) => ({ t: el.getAttribute('data-workspace-tab-title'), r: el.getBoundingClientRect().right })))));
-	if (stripBox) {
-		const x = stripBox.x + stripBox.width - 6;
-		const y = stripBox.y + stripBox.height / 2;
-		console.log('DIAG releasePoint', x, y, 'elementAtPoint', await page.evaluate(([px, py]) => {
-			const el = document.elementFromPoint(px, py);
-			return el ? `${el.tagName}.${el.className?.toString().slice(0, 40)} tab=${el.closest('[data-workspace-tab]')?.getAttribute('data-workspace-tab-title') ?? 'none'} strip=${Boolean(el.closest('[data-workspace-tab-strip]'))}` : 'null';
-		}, [x, y]));
-	}
-
 	await dragTabAndDrop(
 		page,
 		panes.nth(1).locator('[data-workspace-tab][data-workspace-tab-title="Settings"]'),
 		strip,
 	);
-	console.log('DIAG afterDrop panes', await panes.count(), JSON.stringify(await tabTitles(panes.nth(0))));
-	console.log('DIAG dndEvents', JSON.stringify(await page.evaluate(() => (window as unknown as { __tabDragDiag?: unknown[] }).__tabDragDiag ?? 'none')));
 
 	await expect(panes).toHaveCount(1);
 	await expect.poll(() => tabTitles(panes.nth(0))).toEqual(['New work', 'Projects', 'Settings']);
@@ -6283,3 +6265,4 @@ test('releasing a tab outside every strip abandons the drag', async ({ page }) =
 	await expect.poll(() => tabTitles(pane)).toEqual(['New work', 'Projects', 'Settings']);
 	await expect(page).toHaveURL('/projects');
 });
+

@@ -34,6 +34,6 @@
 	});
 </script>
 
-<div bind:this={element} {@attach dropZone.attach} {...rest}>
+<div bind:this={element} {@attach dropZone.attach} data-workspace-tab-strip data-workspace-pane-id={paneId} {...rest}>
 	{@render children()}
 </div>
