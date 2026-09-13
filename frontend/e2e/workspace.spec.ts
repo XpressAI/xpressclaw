@@ -4601,6 +4601,7 @@ test('dragging the last tab out of a pane closes the emptied pane', async ({ pag
 		strip,
 	);
 	console.log('DIAG afterDrop panes', await panes.count(), JSON.stringify(await tabTitles(panes.nth(0))));
+	console.log('DIAG dndEvents', JSON.stringify(await page.evaluate(() => (window as unknown as { __tabDragDiag?: unknown[] }).__tabDragDiag ?? 'none')));
 
 	await expect(panes).toHaveCount(1);
 	await expect.poll(() => tabTitles(panes.nth(0))).toEqual(['New work', 'Projects', 'Settings']);

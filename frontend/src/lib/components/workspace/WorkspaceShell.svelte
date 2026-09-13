@@ -591,7 +591,23 @@
 		return next;
 	}
 
+	// TEMPORARY: record what dnd-kit resolved, to explain a CI-only failure.
+	function recordDragDiag(phase: string, event: DragOverEvent | DragEndEvent) {
+		const scope = window as unknown as { __tabDragDiag?: unknown[] };
+		scope.__tabDragDiag ??= [];
+		const target = event.operation.target as { id?: unknown; type?: unknown } | null;
+		const position = (event.operation as { position?: { current?: { x: number; y: number } } }).position;
+		scope.__tabDragDiag.push({
+			phase,
+			targetId: target ? String(target.id) : null,
+			targetType: target ? String(target.type) : null,
+			x: position?.current?.x,
+			y: position?.current?.y,
+		});
+	}
+
 	function handleTabDragOver(event: DragOverEvent) {
+		recordDragDiag('over', event);
 		const { source } = event.operation;
 		if (!isSortable(source)) return;
 		applyTabGroups(appendedToStripSpace(event) ?? move(tabGroups(), event));
@@ -599,6 +615,7 @@
 
 	function handleTabDragEnd(event: DragEndEvent) {
 		const { source, target } = event.operation;
+		recordDragDiag(event.canceled ? 'end-canceled' : 'end', event);
 		const snapshot = dragSnapshot;
 		dragSnapshot = null;
 		// Tabs reorder live, so a release outside every strip has to abandon the
