@@ -1,0 +1,35 @@
+Restores drop-on-empty-strip-space appending, lost when e90850e moved tabs to
+dnd-kit. User flagged it: a pane created by 'Split active tab right' holds one
+tab and a wide empty strip, so losing that target makes split panes awkward.
+
+How: each strip is a createDroppable with type 'workspace-tab-strip' carrying
+its paneId in data. handleTabDragOver checks for it before falling through to
+move(), because move() only understands sortable-to-sortable and cannot express
+'append past the end'.
+
+Two settings matter and are easy to get wrong:
+- collisionPriority: CollisionPriority.Lowest. The strip contains the tabs, so
+  without this it can win collisions against the tab under the pointer and every
+  hover would read as an append.
+- collisionDetector: pointerIntersection. Shape-based detection on a full-width
+  strip overlaps everything.
+
+Compact strip: its drop zone targets panes[panes.length-1] because that strip
+flattens every pane's tabs, so trailing space can only sensibly mean the last
+pane. This matches the old compactStripDragOver. The consequence is that
+appending to the END of a non-last pane from the compact strip is no longer
+expressible - there is no empty space between one pane's tabs and the next
+pane's in a flattened strip. The old code resolved that with a 'right half of
+the last tab' heuristic that sortable semantics have no equivalent for. I
+retargeted that test rather than fake the behaviour; pane strips (the case the
+user cared about) fully support trailing append.
+
+Trap that cost time and will again: splitPane CLONES the active tab with a
+fresh workspaceId('tab') into the new pane - see splitPane, not
+moveTabToNewSplit. So after a split the same TITLE legitimately appears in two
+panes with different ids. I read that as a duplication bug and nearly 'fixed'
+intended split-view semantics. Assert on ids, or expect the repeated title.
+
+Still NOT VERIFIED on WebKit - same limitation as e90850e. 164 e2e tests pass
+in Chromium on Linux, including a split-then-drop-into-empty-strip regression
+test, but the macOS behaviour this whole line of work targets is unconfirmed.
