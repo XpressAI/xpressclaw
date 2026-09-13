@@ -6266,3 +6266,32 @@ test('releasing a tab outside every strip abandons the drag', async ({ page }) =
 	await expect(page).toHaveURL('/projects');
 });
 
+
+test('the compact strip drops a tab into the pane that owns the tab under it', async ({ page }) => {
+	await page.setViewportSize({ width: 900, height: 700 });
+	await seedWorkspace(page, {
+		focusedPaneId: 'pane-left',
+		panes: [
+			{ id: 'pane-left', activeTabId: TAB_NEW_WORK.id, width: 1, tabs: [TAB_NEW_WORK, TAB_PROJECTS] },
+			{ id: 'pane-right', activeTabId: TAB_SETTINGS.id, width: 1, tabs: [TAB_SETTINGS] },
+		],
+	});
+	await page.goto('/');
+
+	const strip = page.locator('[data-workspace-tab-strip]:visible');
+	await expect(strip.locator('[data-workspace-tab]')).toHaveCount(3);
+
+	// Every pane's tabs share this strip, and the strip itself is labelled with
+	// the last pane. Dropping onto a tab must still land in that tab's own pane
+	// rather than the one the strip is labelled with.
+	await dragTabAndDrop(
+		page,
+		strip.locator('[data-workspace-tab][data-workspace-tab-title="Settings"]'),
+		strip.locator('[data-workspace-tab][data-workspace-tab-title="New work"]'),
+		'start',
+	);
+
+	await expect.poll(() => tabTitles(strip)).toEqual(['Settings', 'New work', 'Projects']);
+	// pane-right is emptied by the move, so only pane-left survives.
+	await expect(page.locator('[data-workspace-pane]')).toHaveCount(1);
+});

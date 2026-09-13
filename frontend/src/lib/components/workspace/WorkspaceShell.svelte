@@ -584,24 +584,37 @@
 		// Matching on measured geometry picks whichever one the pointer is
 		// actually over, because a hidden strip has no area.
 		for (const strip of document.querySelectorAll<HTMLElement>('[data-workspace-tab-strip]')) {
-			const paneId = strip.dataset.workspacePaneId;
 			const bounds = strip.getBoundingClientRect();
-			if (!paneId || bounds.width === 0 || !containsPoint(bounds, point)) continue;
-			// Count the neighbours the pointer has passed the middle of. The
-			// dragged tab is not its own neighbour, in any of the three forms it
-			// can take: the copy tracking the cursor, the placeholder standing in
-			// for it, and the original still in place when no preview has run.
-			const index = [...strip.querySelectorAll<HTMLElement>('[data-workspace-tab]')]
+			if (bounds.width === 0 || !containsPoint(bounds, point)) continue;
+			// The dragged tab is not its own neighbour, in any of the three forms
+			// it can take: the copy tracking the cursor, the placeholder standing
+			// in for it, and the original still in place when no preview has run.
+			const neighbours = [...strip.querySelectorAll<HTMLElement>('[data-workspace-tab]')]
 				.filter((tab) => !tab.hasAttribute('data-dnd-dragging')
 					&& !tab.hasAttribute('data-dnd-placeholder')
-					&& tab.dataset.workspaceTabId !== tabId)
-				.filter((tab) => {
-					const rect = tab.getBoundingClientRect();
-					return point.x >= rect.left + rect.width / 2;
-				}).length;
+					&& tab.dataset.workspaceTabId !== tabId);
+			// The compact strip holds every pane's tabs, so its own pane id only
+			// describes its trailing space. A drop onto a tab belongs to whichever
+			// pane owns that tab.
+			const hovered = neighbours.find((tab) => containsPoint(tab.getBoundingClientRect(), point));
+			const paneId = (hovered ? paneIdForTab(hovered.dataset.workspaceTabId) : undefined)
+				?? strip.dataset.workspacePaneId;
+			if (!paneId) continue;
+			// Count only that pane's neighbours the pointer has passed the middle
+			// of, so a shared strip does not mix indices across panes.
+			const index = neighbours.filter((tab) => {
+				if (paneIdForTab(tab.dataset.workspaceTabId) !== paneId) return false;
+				const rect = tab.getBoundingClientRect();
+				return point.x >= rect.left + rect.width / 2;
+			}).length;
 			return { paneId, index };
 		}
 		return null;
+	}
+
+	function paneIdForTab(tabId: string | undefined): string | undefined {
+		if (!tabId) return undefined;
+		return panes.find((pane) => pane.tabs.some((tab) => tab.id === tabId))?.id;
 	}
 
 	function containsPoint(bounds: DOMRect, point: { x: number; y: number }): boolean {
@@ -620,8 +633,9 @@
 		const destination = next[paneId];
 		const at = Math.min(Math.max(index, 0), destination.length);
 		next[paneId] = [...destination.slice(0, at), tabId, ...destination.slice(at)];
-		const unchanged = Object.entries(groups)
-			.every(([candidate, ids]) => ids.join(' ') === next[candidate].join(' '));
+		const unchanged = Object.entries(groups).every(([candidate, ids]) =>
+			ids.length === next[candidate].length
+			&& ids.every((id, position) => id === next[candidate][position]));
 		return unchanged ? null : next;
 	}
 
