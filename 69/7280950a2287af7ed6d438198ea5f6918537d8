@@ -1,0 +1,37 @@
+Codex findings 9 and 10, both valid, both the same root as 5-8: the live
+preview mutates panes, which handleProjectMutation also reads, normalises and
+persists. Six of the last eight findings come from that one design choice.
+
+1. Preview leaves the source pane's activeTabId pointing at an absent tab.
+   handleProjectMutation normalises it to another tab. Cancel restored
+   membership but not selection. Now records activeTabId in the origin snapshot
+   entry and restores it if that tab still exists.
+2. handleProjectMutation gives a stand-in /projects tab to a pane it would
+   empty, and a pane counts as empty while its only tab previews elsewhere.
+   Cancel returned the tab and kept the stand-in, creating a Projects tab from
+   nothing. Stand-ins created while dragSnapshot is set are tracked in
+   dragFallbackTabIds and removed on cancel.
+
+Test lesson that nearly produced a vacuous test AGAIN: my first test covered
+both fixes at once and passed with the active-tab fix REVERTED, because the
+pane ended with a single tab so the selection normalised correctly anyway. A
+test only isolates a selection bug if the pane keeps 2+ tabs, giving the
+selection somewhere wrong to land. Split into two tests; each now verified to
+fail with only its own fix reverted.
+
+Also: manual mouse.up() in a test needs the same
+'[data-dnd-dragging], [data-dnd-placeholder]' count-0 wait that dragTabAndDrop
+does, or active-tab assertions hit strict-mode violations on drop-animation
+artifacts.
+
+ARCHITECTURAL NOTE for whoever picks this up. I considered replacing the
+state-mutating preview with a geometry-driven drop indicator, which would
+delete this whole defect class along with dragSnapshot, the restore, the
+empty-pane repair, persist-on-cancel and both cancellation regressions. I did
+NOT do it, for two reasons. First, measured: with handleTabDragOver disabled,
+dnd-kit applies NO transform to neighbouring tabs (they stay at x=256/346/428),
+so the preview cannot simply be deleted - an indicator would have to be built.
+Second, a third architecture mid-review discards the review context and invites
+fresh findings on unreviewed code. Flagged on the PR for a human to weigh.
+
+All CI green on aede24a. Still NOT VERIFIED on WebKit.
