@@ -1,0 +1,35 @@
+Two fixes; one corrects a wrong diagnosis I committed in 0cf0c70.
+
+1. Codex P2 (valid, verified before accepting): tabs reorder live, so releasing
+   outside every strip committed the preview. Old code only moved on a valid
+   drop. Verified by probe: drag tab0 over tab2 previews
+   [Projects,Settings,New work], release over the content area kept it instead
+   of reverting. Fix: treat dragend with null target like Escape. Checked first
+   that successful drops always carry a non-null target (tab drops report the
+   tab sortable, strip drops report the strip droppable), so this cannot
+   swallow real drops.
+
+2. The CI-only Frontend failure was NOT what 0cf0c70 claimed. That commit added
+   a dragend fallback for appendedToStripSpace, but the fallback reads
+   event.operation.target, which is equally stale when collision detection never
+   ran for the final position. CI still failed on 0cf0c70 with an identical
+   trace. The fallback is idempotent and harmless so it stays, but it was never
+   the fix.
+
+   Real cause: Playwright dispatches mouse.move steps back to back and the
+   helper called mouse.up() immediately after, so on a slow runner zero frames
+   elapsed and dnd-kit's frame-driven collision pass never ran at the final
+   position. Fixed by awaiting two requestAnimationFrames before release. A real
+   pointer interleaves moves with frames, so this is not a magic sleep.
+
+Diagnostic dead ends, so they are not retried:
+- CPU throttling via CDP Emulation.setCPUThrottlingRate at rate 20: passed 3/3.
+- CI=true (retries 2, github reporter, tracing): passed.
+- --workers=2 full suite: passed.
+None reproduced it. The real local/CI gap was that CI builds the PR MERGE
+commit: it ran 170 tests to my 164 because main had gained #234's
+ssh-forwarding.spec.ts. Merging main locally closed the count gap. Always
+compare test counts between local and CI before theorising about timing.
+
+Still NOT VERIFIED on WebKit. 171 tests pass locally at --workers=2 with CI=true,
+but CI is the judge for the frame-timing fix since I could not reproduce it.
