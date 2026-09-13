@@ -14,6 +14,7 @@
 		onclose,
 		oncontext,
 		onsplit,
+		dropIndex = null,
 	}: {
 		pane: WorkspacePaneState;
 		focused: boolean;
@@ -24,6 +25,7 @@
 		onclose: (tab: WorkspaceTab) => void;
 		oncontext: (event: MouseEvent, tab: WorkspaceTab) => void;
 		onsplit: () => void;
+		dropIndex?: number | null;
 	} = $props();
 
 	let tabStrip = $state<HTMLDivElement>();
@@ -62,11 +64,13 @@
 					{index}
 					group={pane.id}
 					isActive={tab.id === pane.activeTabId}
+					dropBefore={dropIndex === index}
 					onactivate={() => onactivate(tab)}
 					onclose={() => onclose(tab)}
 					oncontext={(event) => oncontext(event, tab)}
 				/>
 			{/each}
+			{#if dropIndex === pane.tabs.length}<span data-tab-drop-indicator class="w-0.5 shrink-0 self-stretch bg-primary" aria-hidden="true"></span>{/if}
 		</TabStripDropZone>
 		<button type="button" onclick={onsplit} disabled={!canSplit} class="flex h-9 w-9 shrink-0 items-center justify-center border-l border-border/70 text-muted-foreground hover:bg-accent hover:text-foreground disabled:cursor-not-allowed disabled:opacity-25" title={canSplit ? 'Split active tab right' : 'No room for another pane'} aria-label="Split active tab right">
 			<svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><rect x="3.5" y="4" width="17" height="16" rx="2"/><path d="M12 4v16"/></svg>

@@ -29,8 +29,7 @@
 		type WorkspaceTabKind,
 	} from '$lib/workspace';
 	import { DragDropProvider } from '@dnd-kit/svelte';
-	import type { DragEndEvent, DragOverEvent } from '@dnd-kit/dom';
-	import { move } from '@dnd-kit/helpers';
+	import type { DragEndEvent, DragMoveEvent } from '@dnd-kit/dom';
 	import { isSortable } from '@dnd-kit/svelte/sortable';
 	import { tabDragSensors } from '$lib/tabDrag';
 	import ContextMenu from '../ContextMenu.svelte';
@@ -542,35 +541,10 @@
 	// Tabs reorder live while dragging, which is also what keeps dnd-kit's own
 	// indices in step: it reads them back from the rendered order. Drag end then
 	// only has to settle focus and persistence.
-	let dragSnapshot: WorkspacePaneState[] | null = null;
-	// Stand-in tabs the deletion handler created for panes the preview emptied.
-	let dragFallbackTabIds = new Set<string>();
-
-	/**
-	 * Drop stand-in tabs the deletion handler added only because the preview had
-	 * moved a pane's last tab elsewhere. Panes may be left empty; both drag
-	 * outcomes run their own empty-pane cleanup afterwards.
-	 */
-	function dropDragFallbacks() {
-		if (dragFallbackTabIds.size === 0) return;
-		panes = panes.map((pane) => {
-			const tabs = pane.tabs.filter((tab) => !dragFallbackTabIds.has(tab.id));
-			if (tabs.length === pane.tabs.length) return pane;
-			return {
-				...pane,
-				tabs,
-				activeTabId: tabs.some((tab) => tab.id === pane.activeTabId)
-					? pane.activeTabId
-					: tabs[0]?.id ?? pane.activeTabId,
-			};
-		});
-		dragFallbackTabIds = new Set();
-	}
-
-	function handleTabDragStart() {
-		dragFallbackTabIds = new Set();
-		dragSnapshot = panes.map((pane) => ({ ...pane, tabs: [...pane.tabs] }));
-	}
+	// Where the dragged tab would land. Only an indicator is drawn from this;
+	// the pane list is untouched until the drop, so nothing else in the
+	// workspace can observe, persist or navigate from a drag in flight.
+	let dropPreview = $state<{ paneId: string; index: number } | null>(null);
 
 	function tabGroups(): Record<string, string[]> {
 		const groups: Record<string, string[]> = {};
@@ -663,93 +637,39 @@
 		return unchanged ? null : next;
 	}
 
-	function dragPoint(event: DragOverEvent | DragEndEvent): { x: number; y: number } | undefined {
+	function dragPoint(event: DragMoveEvent | DragEndEvent): { x: number; y: number } | undefined {
 		return (event.operation as { position?: { current?: { x: number; y: number } } }).position?.current;
 	}
 
-	function handleTabDragOver(event: DragOverEvent) {
+	function handleTabDragMove(event: DragMoveEvent) {
 		const { source } = event.operation;
 		if (!isSortable(source)) return;
-		const release = releaseTarget(dragPoint(event), String(source.id));
-		const positioned = release ? movedToPane(release.paneId, String(source.id), release.index) : null;
-		applyTabGroups(positioned ?? move(tabGroups(), event));
+		dropPreview = releaseTarget(dragPoint(event), String(source.id));
 	}
 
 	function handleTabDragEnd(event: DragEndEvent) {
 		const { source } = event.operation;
-		const snapshot = dragSnapshot;
-		dragSnapshot = null;
+		const landing = dropPreview;
+		dropPreview = null;
 		if (!isSortable(source)) return;
 		const tabId = String(source.id);
-		const origin = snapshot?.flatMap((pane) => {
-			const index = pane.tabs.findIndex((tab) => tab.id === tabId);
-			return index < 0 ? [] : [{ paneId: pane.id, index, activeTabId: pane.activeTabId }];
-		})[0];
-		const release = releaseTarget(dragPoint(event), tabId);
-		// Tabs reorder live, so a release outside every strip has to abandon the
-		// drag the way Escape does. Letting go over nothing is not a drop, and
-		// the preview must not become a commit just because the button came up.
-		if (event.canceled || !release) {
-			// Put the dragged tab back without reinstating the rest of the
-			// snapshot. The workspace can change while a drag is in flight, and
-			// restoring wholesale would resurrect tabs closed or removed
-			// meanwhile. applyTabGroups keeps only ids that still exist, so this
-			// cannot bring one back either.
-			if (origin) {
-				const restored = movedToPane(origin.paneId, tabId, origin.index);
-				if (restored) applyTabGroups(restored);
-			}
-			dropDragFallbacks();
-			// The preview left the source pane's selection pointing at a tab that
-			// was not there, which the deletion handler then normalised away.
-			if (origin) {
-				panes = panes.map((pane) => pane.id === origin.paneId
-					&& pane.tabs.some((tab) => tab.id === origin.activeTabId)
-					? { ...pane, activeTabId: origin.activeTabId }
-					: pane);
-			}
-			// Taking the tab back can empty the pane it was previewing into, when
-			// that pane's own tabs were removed mid-drag: the deletion handler saw
-			// the preview and so skipped its fallback. A workspace always holds at
-			// least one tab.
-			if (panes.every((pane) => pane.tabs.length === 0)) {
-				const home = { ...createWorkspaceTab('/'), lastActiveAt: nextTabRecency() };
-				panes = [{ ...panes[0], tabs: [home], activeTabId: home.id }];
-				focusedPaneId = panes[0].id;
-			} else {
-				panes = panes.filter((pane) => pane.tabs.length > 0);
-				if (!panes.some((pane) => pane.id === focusedPaneId)) focusedPaneId = panes[0].id;
-			}
-			// A mid-drag persist writes the preview, so the restore has to be
-			// written too or a reload brings the abandoned arrangement back.
-			persistWorkspace();
-			// A deletion that read the preview may also have navigated, so the
-			// route has to come back with the selection.
-			const focused = panes.find((pane) => pane.id === focusedPaneId) ?? panes[0];
-			const focusedTabAgain = focused ? activeTabFor(focused) : null;
-			if (focusedTabAgain && currentRoute() !== focusedTabAgain.path) {
-				lastSyncedPath = focusedTabAgain.path;
-				goto(focusedTabAgain.path, { replaceState: true, keepFocus: true, noScroll: true });
-			}
-			return;
-		}
-		// Settle the whole landing position here rather than trusting the
-		// drag-over preview, so the drop follows the pointer even when no
-		// collision pass ran for the final stretch of the drag. When a preview
-		// did run this recomputes the same position and changes nothing.
+		const release = releaseTarget(dragPoint(event), tabId) ?? landing;
+		// Nothing moved while the drag was in flight, so abandoning it is simply
+		// declining to move anything now.
+		if (event.canceled || !release) return;
+
+		const from = panes.find((pane) => pane.tabs.some((tab) => tab.id === tabId));
+		const fromIndex = from?.tabs.findIndex((tab) => tab.id === tabId) ?? 0;
 		const positioned = movedToPane(release.paneId, tabId, release.index);
-		if (positioned) applyTabGroups(positioned);
-		// A completed drop has to discard preview-created stand-ins too, before
-		// the empty-pane cleanup below decides which panes survive.
-		dropDragFallbacks();
-		const fromPaneId = origin?.paneId;
+		if (!positioned) return;
+		applyTabGroups(positioned);
+
 		const toPane = panes.find((pane) => pane.tabs.some((tab) => tab.id === tabId));
 		if (!toPane) return;
 
 		// A reorder inside one pane leaves focus and the active tab alone; only a
 		// move between panes activates the tab and follows it, matching moveTab.
-		if (fromPaneId === toPane.id) {
-			panes = panes.filter((pane) => pane.tabs.length > 0);
+		if (from?.id === toPane.id) {
 			persistWorkspace();
 			return;
 		}
@@ -762,7 +682,7 @@
 				// The pane that lost the tab keeps the neighbour at that slot, or
 				// the one before it, rather than jumping to its first tab.
 				: pane.activeTabId === tabId
-					? { ...pane, activeTabId: pane.tabs[Math.min(origin?.index ?? 0, pane.tabs.length - 1)]?.id ?? pane.activeTabId }
+					? { ...pane, activeTabId: pane.tabs[Math.min(fromIndex, pane.tabs.length - 1)]?.id ?? pane.activeTabId }
 					: pane));
 		focusedPaneId = toPane.id;
 		persistWorkspace();
@@ -993,9 +913,6 @@
 				};
 			}
 			const fallback = { ...createWorkspaceTab('/projects'), lastActiveAt: nextTabRecency() };
-			// Only needed because a drag is previewing this pane's tab elsewhere;
-			// abandoning that drag takes the stand-in away again.
-			if (dragSnapshot) dragFallbackTabIds.add(fallback.id);
 			return { ...pane, tabs: [fallback], activeTabId: fallback.id };
 		});
 		persistWorkspace();
@@ -1226,7 +1143,7 @@
 		{#if workspacePath($page.url.pathname)}
 			<!-- The compact strip gets its own provider: it renders the same tab ids
 			     as the pane strips, and ids only have to be unique within a provider. -->
-			<DragDropProvider sensors={tabDragSensors} onDragStart={handleTabDragStart} onDragOver={handleTabDragOver} onDragEnd={handleTabDragEnd}>
+			<DragDropProvider sensors={tabDragSensors} onDragMove={handleTabDragMove} onDragEnd={handleTabDragEnd}>
 				<TabStripDropZone
 					paneId={panes[panes.length - 1]?.id ?? ''}
 					bind:element={compactTabStrip}
@@ -1240,19 +1157,23 @@
 							index={item.index}
 							group={item.paneId}
 							isActive={item.paneId === focusedPaneId && item.tab.id === focusedPane?.activeTabId}
+							dropBefore={dropPreview?.paneId === item.paneId && dropPreview.index === item.index}
 							widthClass="max-w-52"
 							closeClass="text-muted-foreground/60"
 							onactivate={() => activateTab(item.paneId, item.tab)}
 							onclose={() => closeTab(item.paneId, item.tab)}
 							oncontext={(event) => showTabContextMenu(event, item.paneId, item.tab)}
 						/>
+						{#if item.isLast && dropPreview?.paneId === item.paneId && dropPreview.index === item.index + 1}
+							<span data-tab-drop-indicator class="w-0.5 shrink-0 self-stretch bg-primary" aria-hidden="true"></span>
+						{/if}
 					{/each}
 				</TabStripDropZone>
 			</DragDropProvider>
 
 			<div bind:this={workspaceEl} class="flex min-h-0 flex-1 overflow-hidden">
 				<!-- One provider spans every pane so a tab can be dragged across them. -->
-				<DragDropProvider sensors={tabDragSensors} onDragStart={handleTabDragStart} onDragOver={handleTabDragOver} onDragEnd={handleTabDragEnd}>
+				<DragDropProvider sensors={tabDragSensors} onDragMove={handleTabDragMove} onDragEnd={handleTabDragEnd}>
 				{#each panes as pane, index (pane.id)}
 					<div data-workspace-pane class="min-w-0 flex-col overflow-hidden {pane.id === focusedPaneId ? 'flex' : 'hidden'} lg:flex" style:flex={`${pane.width} 1 0%`}>
 						<WorkspacePane
@@ -1260,6 +1181,7 @@
 							focused={pane.id === focusedPaneId}
 							compact={panes.length > 1}
 							canSplit={canCreatePane()}
+							dropIndex={dropPreview?.paneId === pane.id ? dropPreview.index : null}
 							onfocus={() => focusPane(pane.id)}
 							onactivate={(tab) => activateTab(pane.id, tab)}
 							onclose={(tab) => closeTab(pane.id, tab)}

@@ -10,6 +10,7 @@
 		index,
 		group,
 		isActive,
+		dropBefore = false,
 		widthClass = 'max-w-56',
 		closeClass = 'text-muted-foreground/50 opacity-0 group-hover:opacity-100',
 		onactivate,
@@ -20,6 +21,7 @@
 		index: number;
 		group: string;
 		isActive: boolean;
+		dropBefore?: boolean;
 		widthClass?: string;
 		closeClass?: string;
 		onactivate: () => void;
@@ -75,5 +77,6 @@
 		class="mr-1 flex h-6 w-6 shrink-0 items-center justify-center rounded text-sm hover:bg-accent hover:text-foreground {closeClass} {isActive ? 'opacity-80' : ''}"
 		aria-label="Close {tab.title}"
 	>×</button>
+	{#if dropBefore}<span data-tab-drop-indicator class="pointer-events-none absolute inset-y-0 left-0 z-10 w-0.5 bg-primary" aria-hidden="true"></span>{/if}
 	{#if isActive}<span data-active-tab-indicator class="pointer-events-none absolute inset-x-2 bottom-0 h-0.5 rounded-full bg-primary" aria-hidden="true"></span>{/if}
 </div>
