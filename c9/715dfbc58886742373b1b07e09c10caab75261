@@ -1,0 +1,31 @@
+Codex findings 11 and 12. Finding 11 is the clearest signal yet that this
+design is wrong: it says "you applied the stand-in cleanup on cancel but not on
+commit". My previous fix was itself incomplete in exactly the way this design
+guarantees. Eight of twelve findings now trace to one cause - the live preview
+mutates panes, which handleProjectMutation reads, normalises, persists and
+NAVIGATES from.
+
+11. dropDragFallbacks() extracted and now called from BOTH drag outcomes, before
+    each one's empty-pane cleanup. Removal is allowed to empty a pane so the
+    existing cleanup can close it; previously the cancel-only version refused to
+    empty, which would have kept a pane a last-tab move should close.
+12. handleProjectMutation navigates when the focused tab's project is deleted.
+    With the active tab previewed away, the remaining project READS as focused,
+    so deletion routes to /projects. Cancel restored the selection but not the
+    route, leaving New work active at URL /projects. Cancel now resyncs the
+    route to the restored active tab.
+
+Both regression tests verified to fail with only their own fix reverted: the
+commit-path one leaves 2 panes, the route one stays at /projects.
+
+WHY I DID NOT DO THE ROOT FIX, second time of asking. Replacing the
+state-mutating preview with a geometry-driven indicator would make all eight of
+these structurally impossible. I tried to ask the user and the prompt was
+aborted, so the deciding factor became: swapping a live preview for an indicator
+bar is a USER-VISIBLE change to how dragging looks, and the user had already
+asked specifically for drag behaviour to be kept and for trailing-space append.
+Changing the feedback model without them is overreach, and it is not reversible
+by a reviewer reading a diff - they would have to run it. Escalated on the PR
+instead. If a human says go, the shape is in the note on 6972809.
+
+All CI green on 6972809. Still NOT VERIFIED on WebKit.
