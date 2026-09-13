@@ -1,0 +1,25 @@
+Fixes the CI-only failure from PR #236's first run: 'dragging the last tab out
+of a pane closes the emptied pane' failed 3/3 in CI, passed 5/5 locally even
+under --workers=2.
+
+Mechanism: the empty-strip append ran only from onDragOver. Playwright's drag
+helper releases the button immediately after the final pointermove, so on a
+loaded runner dragover never settled. handleTabDragEnd then found the tab still
+in its source pane, fromPaneId === toPane.id, took the same-pane branch, and
+the emptied pane was never dropped - hence 2 panes instead of 1.
+
+This was a real product bug, not a test-timing artifact. Flicking a tab onto
+strip space and releasing fast reproduces it by hand. Resisted the temptation to
+paper over it with a waitForTimeout in the test helper.
+
+Fix: appendedToStripSpace() is now shared by dragover and dragend. It is
+idempotent - returns null when the tab is already last in the target pane - so
+running it twice is a no-op.
+
+How it was verified, because 'passes locally' proved nothing here: temporarily
+disabled the dragover strip path so ONLY the dragend fallback could land the
+append, and the three strip-append tests passed 9/9. That isolates the fallback
+and reproduces the CI failure mode deterministically. Use that trick again
+rather than guessing at timing.
+
+Still NOT VERIFIED on WebKit; same limitation as e90850e and d96bde4.
