@@ -1,0 +1,43 @@
+Root cause of the CI-only tab-drop failure, found by instrumenting rather than
+guessing. I was wrong twice before this: blamed the dragend fallback (0cf0c70)
+then frame timing (c59a72f). Neither was it.
+
+Evidence that settled it. Temporary diagnostics printed geometry and the target
+dnd-kit resolved. Geometry was IDENTICAL local vs CI - viewport 1280x720, strip
+x=256 w=474, release point 724,17.5, elementFromPoint reporting the strip with
+tab=none in both. Only the resolved target differed:
+
+  local: over seed-tab-settings x=811 / over tab-strip:pane-left x=724
+         / end tab-strip:pane-left x=724
+  CI:    over seed-tab-settings x=818 / end seed-tab-settings x=724
+
+CI fires only ONE dragover for the whole drag. operation.position stays current
+(x=724 at end) but the target is never recomputed. The collision pass does not
+run late, it does not run again at all - which is why every wait-longer fix
+failed. Do not reach for a timing explanation when a failure is 100%
+deterministic on one machine and 0% on another.
+
+Fix: read operation.position.current against live strip/tab rects at dragend.
+That is what the user saw, and it also answers Codex's second P2 (null-target
+check trusting a frame-driven value) - same root cause, one fix.
+
+Two traps hit while implementing, both worth remembering:
+- First cut treated 'in strip but not over a tab' as append. That broke
+  tab-to-tab reordering, because tabs shift under the pointer mid-drag and a
+  transient gap read as the end of the strip. Correct predicate is 'past the
+  last tab's right edge'.
+- Looking strips up by data-workspace-pane-id returned the WRONG element.
+  Both strips are always in the DOM with one hidden by a breakpoint, and the
+  compact strip uses panes[last].id, so querySelector returned the hidden
+  zero-area compact strip and containsPoint always failed. Iterate all strips
+  and match on measured geometry; a hidden strip has zero width.
+
+Verification that actually proves something: disabled handleTabDragOver
+entirely so no collision pass could contribute, and the three strip-append
+tests still passed 3/3. That reproduces the CI condition deterministically.
+'171 tests pass locally' proved nothing here and never did.
+
+Page console.log is NOT forwarded to Playwright output. Stash diagnostics on
+window and read them via page.evaluate from the test.
+
+Still NOT VERIFIED on WebKit.
