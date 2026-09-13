@@ -55,6 +55,7 @@
 <div
 	{@attach sortable.attach}
 	data-workspace-tab
+	data-workspace-tab-id={tab.id}
 	data-workspace-tab-title={tab.title}
 	data-workspace-tab-active={isActive}
 	data-workspace-tab-dragging={sortable.isDragging}

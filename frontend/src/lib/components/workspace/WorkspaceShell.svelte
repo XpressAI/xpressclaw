@@ -574,7 +574,10 @@
 	 * a release over one pane's strip can still report the tab the drag started
 	 * from. Reading the pointer against live rectangles is what the user saw.
 	 */
-	function releaseTarget(point: { x: number; y: number } | undefined): { paneId: string; pastLastTab: boolean } | null {
+	function releaseTarget(
+		point: { x: number; y: number } | undefined,
+		tabId: string,
+	): { paneId: string; index: number } | null {
 		if (!point) return null;
 		// Both strips are always rendered and one is hidden by a breakpoint, and
 		// the compact strip carries the last pane's id, so they can collide.
@@ -584,14 +587,19 @@
 			const paneId = strip.dataset.workspacePaneId;
 			const bounds = strip.getBoundingClientRect();
 			if (!paneId || bounds.width === 0 || !containsPoint(bounds, point)) continue;
-			// Only the run past the last tab appends. Anywhere among the tabs is
-			// an ordinary sort, and they shift under the pointer mid-drag, so a
-			// gap between two of them must not read as the end of the strip. The
-			// copy tracking the cursor is excluded: it is always under the
-			// pointer, so it would otherwise mask the real last tab.
-			const tabs = [...strip.querySelectorAll<HTMLElement>('[data-workspace-tab]:not([data-dnd-dragging])')];
-			const lastEdge = Math.max(bounds.left, ...tabs.map((tab) => tab.getBoundingClientRect().right));
-			return { paneId, pastLastTab: point.x >= lastEdge };
+			// Count the neighbours the pointer has passed the middle of. The
+			// dragged tab is not its own neighbour, in any of the three forms it
+			// can take: the copy tracking the cursor, the placeholder standing in
+			// for it, and the original still in place when no preview has run.
+			const index = [...strip.querySelectorAll<HTMLElement>('[data-workspace-tab]')]
+				.filter((tab) => !tab.hasAttribute('data-dnd-dragging')
+					&& !tab.hasAttribute('data-dnd-placeholder')
+					&& tab.dataset.workspaceTabId !== tabId)
+				.filter((tab) => {
+					const rect = tab.getBoundingClientRect();
+					return point.x >= rect.left + rect.width / 2;
+				}).length;
+			return { paneId, index };
 		}
 		return null;
 	}
@@ -602,15 +610,19 @@
 	}
 
 	/** Move `tabId` to the end of `paneId`, or null when it is already there. */
-	function appendedToPane(paneId: string, tabId: string): Record<string, string[]> | null {
+	function movedToPane(paneId: string, tabId: string, index: number): Record<string, string[]> | null {
 		const groups = tabGroups();
-		if (!groups[paneId] || groups[paneId].at(-1) === tabId) return null;
+		if (!groups[paneId]) return null;
 		const next: Record<string, string[]> = {};
 		for (const [candidate, ids] of Object.entries(groups)) {
-			const without = ids.filter((id) => id !== tabId);
-			next[candidate] = candidate === paneId ? [...without, tabId] : without;
+			next[candidate] = ids.filter((id) => id !== tabId);
 		}
-		return next;
+		const destination = next[paneId];
+		const at = Math.min(Math.max(index, 0), destination.length);
+		next[paneId] = [...destination.slice(0, at), tabId, ...destination.slice(at)];
+		const unchanged = Object.entries(groups)
+			.every(([candidate, ids]) => ids.join(' ') === next[candidate].join(' '));
+		return unchanged ? null : next;
 	}
 
 	function dragPoint(event: DragOverEvent | DragEndEvent): { x: number; y: number } | undefined {
@@ -620,11 +632,9 @@
 	function handleTabDragOver(event: DragOverEvent) {
 		const { source } = event.operation;
 		if (!isSortable(source)) return;
-		const release = releaseTarget(dragPoint(event));
-		const appended = release && release.pastLastTab
-			? appendedToPane(release.paneId, String(source.id))
-			: null;
-		applyTabGroups(appended ?? move(tabGroups(), event));
+		const release = releaseTarget(dragPoint(event), String(source.id));
+		const positioned = release ? movedToPane(release.paneId, String(source.id), release.index) : null;
+		applyTabGroups(positioned ?? move(tabGroups(), event));
 	}
 
 	function handleTabDragEnd(event: DragEndEvent) {
@@ -632,7 +642,8 @@
 		const snapshot = dragSnapshot;
 		dragSnapshot = null;
 		if (!isSortable(source)) return;
-		const release = releaseTarget(dragPoint(event));
+		const tabId = String(source.id);
+		const release = releaseTarget(dragPoint(event), tabId);
 		// Tabs reorder live, so a release outside every strip has to abandon the
 		// drag the way Escape does. Letting go over nothing is not a drop, and
 		// the preview must not become a commit just because the button came up.
@@ -640,14 +651,12 @@
 			if (snapshot) panes = snapshot;
 			return;
 		}
-		const tabId = String(source.id);
-		// Empty strip space appends. Doing this here rather than relying on the
-		// drag-over preview is what makes the drop follow the pointer even when
-		// no collision pass ran for the final stretch of the drag.
-		if (release.pastLastTab) {
-			const appended = appendedToPane(release.paneId, tabId);
-			if (appended) applyTabGroups(appended);
-		}
+		// Settle the whole landing position here rather than trusting the
+		// drag-over preview, so the drop follows the pointer even when no
+		// collision pass ran for the final stretch of the drag. When a preview
+		// did run this recomputes the same position and changes nothing.
+		const positioned = movedToPane(release.paneId, tabId, release.index);
+		if (positioned) applyTabGroups(positioned);
 		const fromPaneId = snapshot?.find((pane) => pane.tabs.some((tab) => tab.id === tabId))?.id;
 		const toPane = panes.find((pane) => pane.tabs.some((tab) => tab.id === tabId));
 		if (!toPane) return;
