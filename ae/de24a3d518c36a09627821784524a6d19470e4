@@ -1,0 +1,23 @@
+Two more Codex P2s, both on the cancellation path added in 46fef69, and both
+valid. The premise I had wrong: I assumed nothing persists during a drag, so
+cancelling in memory was enough. handleProjectMutation calls persistWorkspace,
+so a deletion mid-drag writes the PREVIEWED order to storage.
+
+1. Cancel now persists what it restored. Without it a reload resurrects the
+   abandoned arrangement even though memory looked correct.
+2. Cancel now drops panes it empties. The subtle part: handleProjectMutation
+   installs a fallback tab for a pane it would empty, but it counts the dragged
+   tab that is previewing into that pane, so it installs nothing. Taking the
+   tab back out on cancel then strands a blank pane. Falls back to a home tab
+   if every pane would be empty, matching closeTab's guard.
+
+Both regression tests confirmed to fail without their fix: the persist one
+reloads to ["Settings","New work"], the empty-pane one leaves 2 panes.
+
+Test trap worth remembering: a seeded tab title does NOT survive decorateTab.
+A project tab seeded as "Doomed" renders as "Project", so selecting by
+data-workspace-tab-title silently matches nothing and the test times out on
+boundingBox. Select by data-workspace-tab-id instead - that attribute was added
+in a19089e for the drag geometry and doubles as a stable test hook.
+
+All CI green on 46fef69. Still NOT VERIFIED on WebKit.
