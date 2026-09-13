@@ -1,0 +1,27 @@
+Two more valid Codex findings on top of a19089e.
+
+P1, compact strip pane resolution: the compact strip renders EVERY pane's tabs
+but carries one data-workspace-pane-id, set to panes[last]. Resolving a drop
+from that id sent a tab released over a non-final pane's tab into the last
+pane, and counted its insertion index across all panes' tabs. Now a drop onto a
+tab belongs to whichever pane owns that tab (paneIdForTab), and the index
+counts only that pane's neighbours; the strip's own id is used only for
+trailing space, which is the one case it actually describes.
+
+Regression test proven to catch it, not just to pass: temporarily reverted the
+pane resolution and the new test failed with Settings landing at the END
+(dumped into the last pane), then passed once restored. Always check a new
+regression test fails without its fix - three of the tests in this PR would
+otherwise have been vacuous.
+
+P2, literal NUL bytes: movedToPane compared orders with ids.join('\0') and I
+had written actual 0x00 bytes into the source. rg reported 'binary file
+matches' and suppressed output, hiding WorkspaceShell.svelte from searches.
+Now compares element by element. Check with: tr -dc '\000' < file | wc -c.
+Worth knowing that an Edit can silently introduce a control character that
+typecheck, build and 171 tests all accept.
+
+Frontend CI went green on a19089e, confirming the geometry fix resolved the
+original CI-only failure.
+
+Still NOT VERIFIED on WebKit.
