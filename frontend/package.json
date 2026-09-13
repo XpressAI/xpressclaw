@@ -27,6 +27,9 @@
     "vite": "^6.2.0"
   },
   "dependencies": {
+    "@dnd-kit/dom": "^0.5.0",
+    "@dnd-kit/helpers": "^0.5.0",
+    "@dnd-kit/svelte": "^0.5.0",
     "@lucide/svelte": "^0.515.0",
     "@tauri-apps/api": "2.10.1",
     "@tauri-apps/plugin-clipboard-manager": "2.3.2",
