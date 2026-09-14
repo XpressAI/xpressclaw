@@ -53,14 +53,17 @@ export function planRelease({ workspaceVersion, tags, tag, stableRelease }) {
 			source_sha: stableRelease.source_sha
 		};
 	}
+	// Prereleases count only within the workspace's own major.minor line and
+	// start that line at .0, so a bump begins at X.Y.0 and then advances
+	// X.Y.1, X.Y.2, and so on. Tags from other lines and from the historic
+	// beta-N and -build.N schemes never carry a build number across a bump.
+	const [major, minor] = workspaceVersion.split('.');
+	const linePattern = new RegExp(`^v${major}\\.${minor}\\.(\\d+)$`);
 	const builds = tags.flatMap((existingTag) => {
-		const match =
-			existingTag.match(/^beta-(\d+)$/) ??
-			existingTag.match(/^v.*-build\.(\d+)$/) ??
-			existingTag.match(/^v\d+\.\d+\.(\d+)$/);
+		const match = existingTag.match(linePattern);
 		return match ? [Number(match[1])] : [];
 	});
-	const build = Math.max(0, ...builds) + 1;
+	const build = builds.length === 0 ? 0 : Math.max(...builds) + 1;
 	if (!Number.isSafeInteger(build) || build > 65535)
 		throw new Error('Build number exceeds the Windows package patch limit');
 	const version = `${workspaceVersion.split('.').slice(0, 2).join('.')}.${build}`;
