@@ -1,0 +1,42 @@
+User asked: mark the current prerelease 0.4.0 and reset the build so the next
+is 0.4.1, 0.4.2. Two changes were required, not one.
+
+1. Bump via `node scripts/release-metadata.mjs --set-version 0.4.0`. Do NOT
+   hand-edit: it stamps 15 mirrored files (Cargo.toml, Cargo.lock x4 crates,
+   tauri.conf.json, package.json, package-lock.json root+packages[''], and
+   serverInfo.version in 6 python + 2 mjs MCP files) and CI's --check verifies
+   exactly that set. Renaming the GitHub release alone would have shipped
+   binaries whose Tauri bundleVersion / CLI --version / metadata still said
+   0.3.130 - a half-implementation.
+
+2. release-plan.mjs planRelease: the counter was GLOBAL across every tag ever
+   cut (beta-N, v*-build.N, vX.Y.N), so a bump alone would have produced
+   v0.4.131. Now scoped to the workspace major.minor and a fresh line starts
+   at 0. Verified end-to-end with `node scripts/release-plan.mjs` against the
+   real tags: version=0.4.0 build=0 tag=v0.4.0.
+
+CONSEQUENCE TO KNOW: the existing stable scheme is stable=vX.Y.0 sourced from
+a prior-line prerelease (0.3.0 stable came from v0.2.123; workspace = last
+stable). Prerelease v0.4.0 therefore CONSUMES the tag the old scheme would use
+for the stable 0.4 release, and planRelease's stable path rejects a stable
+that is not newer than its source prerelease. Under current rules the next
+stable becomes v0.5.0 sourced from some v0.4.N, unless the stable rule is
+changed. Flagged to the user; not my call.
+
+Test coupling exposed by the bump: the git-fixture planning test copies the
+LIVE Cargo.toml but hardcodes stable tag v0.3.0, so it only passed while the
+workspace happened to be 0.3.0. Fixed by stamping the fixture to 0.3.0 first
+(the stamping test already does this), which decouples it from the live
+version rather than re-pinning literals to 0.4.0 for the next bump to break.
+
+Trap that cost a round: String.prototype.replace treats $` in the REPLACEMENT
+as "everything before the match" - my edit inlined the entire file into a
+regex. Use split(old).join(neu) or a replacer function for literal text.
+
+The three dirty crates/xpressclaw-tauri/gen/schemas/*.json were already
+modified when the session resumed, are not mine, and were deliberately not
+staged.
+
+v0.3.128/129/130 are my own test builds of this unmerged branch (not on
+main). They do not affect the 0.4 counter but are clutter; deleting releases
+needs gh release delete, which this environment's gh tool cannot do.
