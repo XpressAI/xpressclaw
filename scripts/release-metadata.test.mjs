@@ -208,16 +208,33 @@ test('invalid explicit versions and incomplete overrides do not change metadata'
 	}
 });
 
-test('main builds remain prereleases and advance past all historic build tag formats', () => {
+test('prereleases count only within their own line and start each line at .0', () => {
+	// A bumped line begins at X.Y.0 even though older lines and the historic
+	// beta-N and -build.N tags exist, so no build number carries across a bump.
 	assert.deepEqual(
 		planRelease({
-			workspaceVersion: '0.3.0',
-			tags: ['beta-30', 'v0.2.0-build.45', 'v0.2.123', 'v0.3.0', 'irrelevant']
+			workspaceVersion: '0.4.0',
+			tags: ['beta-30', 'v0.2.0-build.45', 'v0.2.123', 'v0.3.0', 'v0.3.130', 'irrelevant']
 		}),
 		{
-			version: '0.3.124',
-			build: '124',
-			tag: 'v0.3.124',
+			version: '0.4.0',
+			build: '0',
+			tag: 'v0.4.0',
+			prerelease: 'true',
+			source_tag: ''
+		}
+	);
+	// Within a line the next build follows the highest existing tag, whatever
+	// order the tags are listed in and whatever other lines are present.
+	assert.deepEqual(
+		planRelease({
+			workspaceVersion: '0.4.0',
+			tags: ['v0.4.2', 'v0.3.130', 'v0.4.0']
+		}),
+		{
+			version: '0.4.3',
+			build: '3',
+			tag: 'v0.4.3',
 			prerelease: 'true',
 			source_tag: ''
 		}
@@ -271,6 +288,9 @@ test('stable promotion rejects unconfigured tags, mismatched versions, and incom
 
 test('release planning verifies the source tag before trusting the pinned image revision', (t) => {
 	const dir = fixture(t);
+	// Pin the fixture to the stable line this test describes, so it does not
+	// depend on whatever version the live workspace happens to be at.
+	stamp(dir, '--set-version', '0.3.0');
 	const git = (...args) =>
 		execFileSync('git', args, { cwd: dir, encoding: 'utf8' }).trim();
 	git('init', '-q');
