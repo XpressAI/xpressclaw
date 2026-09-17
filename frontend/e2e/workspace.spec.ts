@@ -2367,6 +2367,138 @@ test('project conversations coordinate files and project-wide linked work', asyn
 	}]);
 });
 
+for (const surface of ['conversation', 'task'] as const) {
+	test(`Markdown list links and inline formatting render safely in ${surface} messages`, async ({ page }, testInfo) => {
+		const execution = 'window.__rawHtmlExecuted = true';
+		const content = [
+			'- [PR #123](https://github.com/example/repo/pull/123)',
+			'- [**PR #124**](https://github.com/example/repo/pull/124)',
+			'  - [`Nested PR`](https://example.com/nested)',
+			'- Bare URL: https://example.com/bare?first=1&second=2',
+			'- **Bold item** with *emphasis*, ~~obsolete~~, and `inline_code`.',
+			'',
+			'1. [Ordered PR](https://github.com/example/repo/pull/125)',
+			'2. [`PR #126`](https://github.com/example/repo/pull/126)',
+			'   1. [Nested ordered PR](https://example.com/nested-ordered)',
+			'',
+			'[Another link](https://example.com/after)',
+			'',
+			'- Entities: &lt;tag&gt; &amp; &#65; and \\*literal stars\\*.',
+			'- `[literal link](https://example.com/inline-code)`',
+			`- <img src="missing-image" onerror="${execution}">`,
+			`- <a href="https://example.com/raw" onclick="${execution}">raw link</a>`,
+			'- [Unsafe script](javascript:alert(1))',
+			'- [Obfuscated script](java&#x73;cript:alert(1))',
+			'- [Unsafe data](data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==)',
+			'',
+			'```html',
+			'[fenced link](https://example.com/fenced-code)',
+			`<script>${execution}</script>`,
+			'```',
+		].join('\n');
+		await page.addInitScript(() => {
+			(window as typeof window & { __rawHtmlExecuted?: boolean }).__rawHtmlExecuted = false;
+		});
+		await mockApi(page, surface === 'conversation' ? {
+			conversations: [{
+				id: conversationId, project_id: projectId, title: 'Markdown list links', icon: null,
+				created_at: timestamp(1), updated_at: timestamp(20), last_message_at: timestamp(20),
+				participants: [
+					{ participant_type: 'user', participant_id: 'local', joined_at: timestamp(1) },
+					{ participant_type: 'agent', participant_id: agentId, joined_at: timestamp(2) },
+				],
+			}],
+			conversationMessages: ['user', 'agent'].map((sender_type, index) => ({
+				id: index + 1, conversation_id: conversationId, sender_type,
+				sender_id: sender_type === 'user' ? 'local' : agentId,
+				sender_name: sender_type === 'user' ? 'You' : 'Browser-tested workspace',
+				content, message_type: 'message', linked_task_id: null, metadata: {}, attachments: [],
+				created_at: timestamp(10 + index),
+			})),
+		} : {
+			taskDescription: content,
+			taskMessages: [{ id: 1, task_id: taskId, role: 'assistant', content, attachments: [], timestamp: timestamp(25) }],
+			// TaskView omits results that exactly duplicate an assistant message.
+			attemptResult: `Task result\n\n${content}`,
+		});
+		await page.goto(surface === 'conversation' ? `/conversations/${conversationId}` : `/tasks/${taskId}`);
+
+		const userContent = page.locator('[data-message-role="user"] .prose-chat');
+		const agentContent = page.locator('[data-message-role="assistant"] .prose-chat');
+		const renderedMessages = [
+			{ element: userContent, externalLinks: false },
+			{ element: agentContent, externalLinks: true },
+			...(surface === 'task' ? [{ element: page.locator('[data-task-result-content]'), externalLinks: true }] : []),
+		];
+		for (const { element, externalLinks } of renderedMessages) {
+			const links = [
+				['PR #123', 'https://github.com/example/repo/pull/123'],
+				['PR #124', 'https://github.com/example/repo/pull/124'],
+				['Nested PR', 'https://example.com/nested'],
+				['https://example.com/bare?first=1&second=2', 'https://example.com/bare?first=1&second=2'],
+				['Ordered PR', 'https://github.com/example/repo/pull/125'],
+				['PR #126', 'https://github.com/example/repo/pull/126'],
+				['Nested ordered PR', 'https://example.com/nested-ordered'],
+				['Another link', 'https://example.com/after'],
+			];
+			for (const [name, href] of links) {
+				const link = element.getByRole('link', { name, exact: true });
+				await expect(link).toHaveAttribute('href', href);
+				if (externalLinks) {
+					await expect(link).toHaveAttribute('target', '_blank');
+					await expect(link).toHaveAttribute('rel', 'noopener noreferrer');
+				} else {
+					await expect(link).not.toHaveAttribute('target');
+					await expect(link).not.toHaveAttribute('rel');
+				}
+			}
+			await expect(element.locator('a[href]')).toHaveCount(links.length);
+			await expect(element.locator('li > p')).toHaveCount(0);
+			await expect(element.locator('ul ul a code')).toHaveText('Nested PR');
+			await expect(element.locator('ol ol a')).toHaveText('Nested ordered PR');
+			await expect(element.locator('ul > li > a > strong')).toHaveText('PR #124');
+			await expect(element.locator('ol > li > a > code')).toHaveText('PR #126');
+			await expect(element.locator('li > strong')).toHaveText('Bold item');
+			await expect(element.locator('li > em')).toHaveText('emphasis');
+			await expect(element.locator('li > del')).toHaveText('obsolete');
+			await expect(element.locator('li > code')).toHaveText(['inline_code', '[literal link](https://example.com/inline-code)']);
+			await expect(element.locator('p > a')).toHaveText('Another link');
+			await expect(element).toContainText('Entities: &lt;tag&gt; &amp; &#65; and *literal stars*.');
+			await expect(element).toContainText(`<img src="missing-image" onerror="${execution}">`);
+			await expect(element).toContainText(`<a href="https://example.com/raw" onclick="${execution}">raw link</a>`);
+			await expect(element.locator('pre code')).toHaveText(`[fenced link](https://example.com/fenced-code)\n<script>${execution}</script>\n`);
+			await expect(element.locator('code a, script, img, [onclick], [onerror]')).toHaveCount(0);
+			for (const name of ['Unsafe script', 'Obfuscated script', 'Unsafe data']) {
+				const unsafeLink = element.locator('a', { hasText: name });
+				await expect(unsafeLink).toHaveCount(1);
+				await expect(unsafeLink).not.toHaveAttribute('href');
+				await expect(unsafeLink).not.toHaveAttribute('target');
+			}
+		}
+		await expect.poll(() => page.evaluate(() => (
+			window as typeof window & { __rawHtmlExecuted?: boolean }
+		).__rawHtmlExecuted)).toBe(false);
+
+		const prUrl = 'https://github.com/example/repo/pull/123';
+		await page.context().route(prUrl, (route) => route.fulfill({
+			contentType: 'text/html', body: '<!doctype html><title>Pull request</title>',
+		}));
+		const popupPromise = page.waitForEvent('popup');
+		await agentContent.getByRole('link', { name: 'PR #123', exact: true }).click();
+		const popup = await popupPromise;
+		await expect(popup).toHaveURL(prUrl);
+		expect(await popup.evaluate(() => window.opener)).toBeNull();
+		await popup.close();
+
+		await agentContent.locator('ul').first().scrollIntoViewIfNeeded();
+		await page.screenshot({ path: testInfo.outputPath(`markdown-lists-${surface}-desktop.png`) });
+		await page.setViewportSize({ width: 390, height: 844 });
+		await agentContent.locator('ul').first().scrollIntoViewIfNeeded();
+		await expect(agentContent.getByRole('link', { name: 'PR #123', exact: true })).toBeVisible();
+		await page.screenshot({ path: testInfo.outputPath(`markdown-lists-${surface}-phone.png`) });
+	});
+}
+
 test('raw HTML in user and agent conversation messages stays visible and inert', async ({ page }) => {
 	const userRawHtml = '<script>alert("wee");</script>';
 	const userReservedTags = '<think>literal user thinking</think> <tool_call name="demo">{"ok":true}</tool_call>';
