@@ -74,10 +74,14 @@ const markdown = new Marked({
 		html({ text }) {
 			return escapeHtml(text);
 		},
-		text({ text }) {
+		text(token) {
+			// Tight list items wrap their inline content in a text token.
+			if ('tokens' in token && token.tokens) {
+				return this.parser.parseInline(token.tokens);
+			}
 			// Preserve entity spellings from the stored source instead of letting
 			// the browser decode them as HTML character references.
-			return escapeHtml(text);
+			return escapeHtml(token.text);
 		},
 	},
 });
