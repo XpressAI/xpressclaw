@@ -1,0 +1,42 @@
+Second follow-up on the tab-drag work. User report on v0.4.0: (1) clicking a
+tab still misbehaves, on CHROME on macOS - not Safari; (2) tabs cannot be
+scrolled on iPhone.
+
+CORRECTION OF PREMISE: every earlier note says "NOT VERIFIED on WebKit" and
+frames the original bug as WebKit-only. That was my inference from the first
+report, never the user's statement. The user was on Chrome/Mac throughout. The
+draggable-on-container mechanism was still real, but the platform story was
+wrong, and it is why I never questioned Chromium-only test coverage.
+
+(2) is a regression I introduced in #236 and it is fixed here. Cause: a static
+Distance(6) constraint fires within the browser's pre-pan pointermove window;
+dnd-kit then preventDefaults touchmove. Bisect on the real harness: main before
+#236 scrolls (scrollLeft 105 -> 121, dragging 0); after, dragging 1 / scroll 0.
+
+(1) is NOT reproduced and NOT fixed. On the real harness, on Chromium and on
+WebKit, a press on the label activates and a press on the close control
+closes, including with 2 px trackpad-style drift between down and up. Asked
+the user for Settings -> build hash (/api/health git_hash; v0.4.0 = 5248158)
+and the exact behaviour. Possibilities left: the loaded frontend is not
+0.4.0's (an older server on the port - the desktop sidecar launches with
+--port and I could not confirm it refuses an already-bound port), or a macOS
+Chrome input path I cannot emulate.
+
+Traps that cost most of this session, all now in project memory:
+- Thin route mocks trigger the "Container runtime is not running" modal
+  (fixed inset-0 z-[100]) which swallows every click/wheel/touch. Symptom:
+  elementFromPoint returns that DIV. Three "reproductions" were this artifact,
+  including a bogus "drift kills clicks" and a bogus pre-#236 bisect. Use
+  seedWorkspace()/mockApi().
+- Synthetic PointerEvents do not drive dnd-kit activation and cannot pan; the
+  first touch test passed vacuously against the broken sensor. Real touch =
+  CDP Input.dispatchTouchEvent on a Chromium touch profile.
+- `cd frontend` from inside frontend short-circuits the rest of an && chain;
+  three edits/runs silently never executed. Use absolute paths.
+- Playwright wipes test-results/ per run; capture a failure's identity before
+  running another project.
+- The new test must be gated on testInfo.project.use.hasTouch, not just
+  browserName, or the desktop chromium project runs it at 1280 px and fails.
+
+Chromium 177/177 (the 1 failure was this gate), WebKit tab-strip 11 pass,
+touch-chromium 1 pass.
