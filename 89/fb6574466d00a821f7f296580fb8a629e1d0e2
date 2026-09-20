@@ -1,0 +1,1 @@
+Predictable follow-up to 4392ea8: adding a webkit Playwright project while CI installs only chromium would fail the Frontend job at browser launch. Fixed before the red X rather than after. If WebKit CI time ever becomes a problem, gate the project on an env var instead of dropping it - WebKit coverage of gesture code is the point.
