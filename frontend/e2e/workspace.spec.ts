@@ -6521,3 +6521,40 @@ test('a project deleted mid-drag is handled normally and the drop still lands', 
 	await expect(panes).toHaveCount(1);
 	await expect.poll(() => tabTitles(panes.nth(0))).toEqual(['New work', 'Settings']);
 });
+
+test('a touch swipe scrolls the compact tab strip instead of picking up a tab', async ({ page, browserName }, testInfo) => {
+	// Only meaningful on a touch profile at phone width, where the compact strip
+	// is the visible one and overflows; real touch input needs CDP, so Chromium.
+	test.skip(!testInfo.project.use.hasTouch || browserName !== 'chromium', 'needs the touch-chromium project');
+	// Enough tabs, with titles wide enough, that the strip overflows a
+	// phone-width viewport while staying under the open-tab cap.
+	const tabs = Array.from({ length: 8 }, (_, i) => ({
+		id: `seed-tab-${i}`, path: i === 0 ? '/' : `/projects/p${i}`, kind: i === 0 ? 'home' : 'project',
+		title: `Long project title number ${i}`, resourceId: i === 0 ? null : `p${i}`, status: null, lastActiveAt: i + 1,
+	}));
+	await seedWorkspace(page, { focusedPaneId: 'seed-pane', panes: [{ id: 'seed-pane', activeTabId: tabs[0].id, width: 1, tabs }] });
+	await page.goto('/');
+
+	const strip = page.locator('[data-workspace-tab-strip]:visible');
+	await expect(strip.locator('[data-workspace-tab]')).toHaveCount(8);
+	await expect.poll(() => strip.evaluate((el) => el.scrollWidth > el.clientWidth)).toBe(true);
+
+	// A real flick across a tab, injected as touch input so the browser runs
+	// its own scroll-versus-gesture arbitration. Synthetic pointer events never
+	// reach the drag sensor's activation path and cannot pan natively.
+	const tab = strip.locator('[data-workspace-tab]').nth(2);
+	const b = (await tab.boundingBox())!;
+	const y = b.y + b.height / 2, from = b.x + b.width / 2;
+	const cdp = await page.context().newCDPSession(page);
+	await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: from, y }] });
+	for (let step = 1; step <= 12; step += 1) {
+		await cdp.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: from - step * 10, y }] });
+		await page.waitForTimeout(8);
+	}
+	// While the finger is still down, the flick must not have picked up a tab.
+	await expect(page.locator('[data-dnd-dragging]')).toHaveCount(0);
+	await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+
+	await expect.poll(() => strip.evaluate((el) => el.scrollLeft)).toBeGreaterThan(0);
+	await expect(page.locator('[data-dnd-dragging]')).toHaveCount(0);
+});
