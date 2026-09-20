@@ -1,0 +1,21 @@
+Codex findings on 89fb657, both P2 and both verified on the real harness before
+changing anything.
+
+1. Executable override leaking into WebKit. Reproduced: with
+   PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH pointed at the real chrome binary, the
+   webkit project logged "<launching> .../chrome-linux64/chrome" and died. After
+   scoping the override into a chromiumLaunch object spread only into the two
+   Chromium projects: webkit passes with the override set, and chromium and
+   touch-chromium with a bogus /nonexistent/chrome path both fail naming that
+   path, which proves the override still reaches them. Without the env var the
+   spread is {} so the default path is byte-for-byte the old behaviour; all
+   three suites re-run green (177/11+1 skip/1).
+
+2. docs/development.md still said `npx playwright install chromium`. Now
+   `chromium webkit`, matching ci.yml. Only two places in the repo name the
+   install command; both now agree. Also updated project memory so the next
+   container setup installs both.
+
+Chromium cannot run as root without --no-sandbox in this container, so the
+"real chrome path on the chromium project" run is not a usable positive proof
+here; the bogus-path negative proof is what shows the override is honoured.
