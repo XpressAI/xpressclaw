@@ -238,7 +238,7 @@ cargo test -p xpressclaw-core -p xpressclaw-server -p xpressclaw-cli
 # Frontend
 npm --prefix frontend run check
 cd frontend
-npx playwright install chromium
+npx playwright install chromium webkit
 npm run test:e2e
 cd ..
 

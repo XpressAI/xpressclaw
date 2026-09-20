@@ -1,6 +1,10 @@
 import { defineConfig, devices } from '@playwright/test';
 
-const executablePath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH;
+// The executable override is Chromium-specific. It is spread into the Chromium
+// projects only; putting it in the top-level `use` would hand the Chromium
+// binary to the WebKit browser type, which fails at launch.
+const chromiumExecutablePath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH;
+const chromiumLaunch = chromiumExecutablePath ? { launchOptions: { executablePath: chromiumExecutablePath } } : {};
 
 export default defineConfig({
 	testDir: './e2e',
@@ -11,12 +15,11 @@ export default defineConfig({
 	use: {
 		baseURL: 'http://127.0.0.1:4173',
 		trace: 'retain-on-failure',
-		launchOptions: executablePath ? { executablePath } : {},
 	},
 	projects: [
 		{
 			name: 'chromium',
-			use: { ...devices['Desktop Chrome'] },
+			use: { ...devices['Desktop Chrome'], ...chromiumLaunch },
 		},
 		// Safari and the desktop app's WKWebView are supported engines, and
 		// gesture handling is where engines differ most, so the tab-strip suite
@@ -34,7 +37,7 @@ export default defineConfig({
 		// scrolling faithfully enough to catch a drag sensor that blocks it.
 		{
 			name: 'touch-chromium',
-			use: { ...devices['iPhone 14'], browserName: 'chromium' },
+			use: { ...devices['iPhone 14'], browserName: 'chromium', ...chromiumLaunch },
 			testMatch: /workspace\.spec\.ts/,
 			grep: /touch swipe/,
 		},
