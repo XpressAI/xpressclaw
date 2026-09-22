@@ -23,7 +23,7 @@
     },
     "claude": {
       "auto_update": true,
-      "version": "0.79.0",
+      "version": "0.80.0",
       "acp_command": [
         "claude-agent-acp"
       ],
@@ -37,7 +37,7 @@
         }
       ],
       "build_args": {
-        "CLAUDE_ACP_VERSION": "0.79.0"
+        "CLAUDE_ACP_VERSION": "0.80.0"
       }
     },
     "deepseek-harness": {
