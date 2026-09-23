@@ -4,7 +4,7 @@
   "runners": {
     "codex": {
       "auto_update": true,
-      "version": "1.12.0",
+      "version": "1.13.0",
       "acp_command": [
         "codex-acp"
       ],
@@ -18,12 +18,12 @@
         }
       ],
       "build_args": {
-        "CODEX_ACP_VERSION": "1.12.0"
+        "CODEX_ACP_VERSION": "1.13.0"
       }
     },
     "claude": {
       "auto_update": true,
-      "version": "0.80.0",
+      "version": "0.81.0",
       "acp_command": [
         "claude-agent-acp"
       ],
@@ -37,7 +37,7 @@
         }
       ],
       "build_args": {
-        "CLAUDE_ACP_VERSION": "0.80.0"
+        "CLAUDE_ACP_VERSION": "0.81.0"
       }
     },
     "deepseek-harness": {
@@ -69,7 +69,7 @@
     },
     "github-copilot": {
       "auto_update": true,
-      "version": "1.0.87",
+      "version": "1.0.88",
       "acp_command": [
         "copilot",
         "--acp"
@@ -85,13 +85,13 @@
       ],
       "build_args": {
         "AGENT_KIND": "github-copilot",
-        "AGENT_PACKAGE": "@github/copilot@1.0.87",
+        "AGENT_PACKAGE": "@github/copilot@1.0.88",
         "AGENT_BINARY": "copilot"
       }
     },
     "junie": {
       "auto_update": true,
-      "version": "3331.4.0",
+      "version": "3419.7.0",
       "acp_command": [
         "junie",
         "--acp=true"
@@ -108,15 +108,15 @@
         "AGENT_KIND": "junie",
         "AGENT_BINARY": "junie",
         "AGENT_PATH": "junie-app/bin/junie",
-        "AGENT_ARCHIVE_AMD64": "https://github.com/JetBrains/junie-acp-release/releases/download/3331.4/junie-release-3331.4-linux-amd64.zip",
-        "AGENT_ARCHIVE_ARM64": "https://github.com/JetBrains/junie-acp-release/releases/download/3331.4/junie-release-3331.4-linux-aarch64.zip",
+        "AGENT_ARCHIVE_AMD64": "https://github.com/JetBrains/junie-acp-release/releases/download/3419.7/junie-release-3419.7-linux-amd64.zip",
+        "AGENT_ARCHIVE_ARM64": "https://github.com/JetBrains/junie-acp-release/releases/download/3419.7/junie-release-3419.7-linux-aarch64.zip",
         "AGENT_SHA256_AMD64": "",
         "AGENT_SHA256_ARM64": ""
       }
     },
     "kimi": {
       "auto_update": true,
-      "version": "1.51.0",
+      "version": "1.52.0",
       "acp_command": [
         "kimi",
         "acp"
@@ -133,10 +133,10 @@
         "AGENT_KIND": "kimi",
         "AGENT_BINARY": "kimi",
         "AGENT_PATH": "kimi",
-        "AGENT_ARCHIVE_AMD64": "https://github.com/MoonshotAI/kimi-cli/releases/download/1.51.0/kimi-1.51.0-x86_64-unknown-linux-gnu.tar.gz",
-        "AGENT_ARCHIVE_ARM64": "https://github.com/MoonshotAI/kimi-cli/releases/download/1.51.0/kimi-1.51.0-aarch64-unknown-linux-gnu.tar.gz",
-        "AGENT_SHA256_AMD64": "538f81a212fcfdbd0a7f73e06973d925b8ecdeb842a0b914857691d77abf2afb",
-        "AGENT_SHA256_ARM64": "329edc376ebd4dba9e359b49c27ce6c0ae23c43e7488349c2f1ae29a6d76273e"
+        "AGENT_ARCHIVE_AMD64": "https://github.com/MoonshotAI/kimi-cli/releases/download/1.52.0/kimi-1.52.0-x86_64-unknown-linux-gnu.tar.gz",
+        "AGENT_ARCHIVE_ARM64": "https://github.com/MoonshotAI/kimi-cli/releases/download/1.52.0/kimi-1.52.0-aarch64-unknown-linux-gnu.tar.gz",
+        "AGENT_SHA256_AMD64": "a676204f7804ed5dae87652a9d66f578e0718d5026c9cb1bfa32b9a5eace4208",
+        "AGENT_SHA256_ARM64": "9e06eea96273600aed485b1f0bedda95b7084db4f22cf28614fe20138933507a"
       }
     },
     "opencode": {
@@ -192,14 +192,14 @@
         "AGENT_KIND": "pi",
         "AGENT_PACKAGE": "pi-acp@0.0.33",
         "AGENT_BINARY": "pi-acp",
-        "AGENT_EXTRA_PACKAGES": "@earendil-works/pi-coding-agent@0.87.0",
+        "AGENT_EXTRA_PACKAGES": "@earendil-works/pi-coding-agent@0.87.1",
         "AGENT_EXTRA_BINARY": "pi",
-        "PI_MCP_PACKAGE": "pi-mcp-adapter@2.36.0"
+        "PI_MCP_PACKAGE": "pi-mcp-adapter@2.37.0"
       }
     },
     "qwen": {
       "auto_update": true,
-      "version": "0.24.3",
+      "version": "0.24.4",
       "acp_command": [
         "qwen",
         "--acp",
@@ -216,13 +216,13 @@
       ],
       "build_args": {
         "AGENT_KIND": "qwen",
-        "AGENT_PACKAGE": "@qwen-code/qwen-code@0.24.3",
+        "AGENT_PACKAGE": "@qwen-code/qwen-code@0.24.4",
         "AGENT_BINARY": "qwen"
       }
     },
     "cline": {
       "auto_update": true,
-      "version": "3.0.63",
+      "version": "3.0.64",
       "acp_command": [
         "cline",
         "--acp"
@@ -238,7 +238,7 @@
       ],
       "build_args": {
         "AGENT_KIND": "cline",
-        "AGENT_PACKAGE": "cline@3.0.63",
+        "AGENT_PACKAGE": "cline@3.0.64",
         "AGENT_BINARY": "cline"
       }
     },
@@ -290,7 +290,7 @@
     },
     "grok": {
       "auto_update": true,
-      "version": "1.0.40",
+      "version": "1.0.41",
       "acp_command": [
         "grok",
         "agent",
@@ -307,13 +307,13 @@
       ],
       "build_args": {
         "AGENT_KIND": "grok",
-        "AGENT_PACKAGE": "@xai-official/grok@1.0.40",
+        "AGENT_PACKAGE": "@xai-official/grok@1.0.41",
         "AGENT_BINARY": "grok"
       }
     },
     "kilo": {
       "auto_update": true,
-      "version": "7.7.6",
+      "version": "7.7.7",
       "acp_command": [
         "kilo",
         "acp"
@@ -329,13 +329,13 @@
       ],
       "build_args": {
         "AGENT_KIND": "kilo",
-        "AGENT_PACKAGE": "@kilocode/cli@7.7.6",
+        "AGENT_PACKAGE": "@kilocode/cli@7.7.7",
         "AGENT_BINARY": "kilo"
       }
     },
     "mistral-vibe": {
       "auto_update": true,
-      "version": "2.25.5",
+      "version": "2.25.7",
       "acp_command": [
         "vibe-acp"
       ],
@@ -351,10 +351,10 @@
         "AGENT_KIND": "mistral-vibe",
         "AGENT_BINARY": "vibe-acp",
         "AGENT_PATH": "vibe-acp",
-        "AGENT_ARCHIVE_AMD64": "https://github.com/mistralai/mistral-vibe/releases/download/v2.25.5/vibe-acp-linux-x86_64-2.25.5.tar.gz",
-        "AGENT_ARCHIVE_ARM64": "https://github.com/mistralai/mistral-vibe/releases/download/v2.25.5/vibe-acp-linux-aarch64-2.25.5.tar.gz",
-        "AGENT_SHA256_AMD64": "a2d1126a6dbfd5def562cf74b424d659f46c155c220f53f2bddc9ccbaa152ec6",
-        "AGENT_SHA256_ARM64": "06348a0635a34b9c2d2056231d37eb79a25fe27a8d97d01e55957364500c682c"
+        "AGENT_ARCHIVE_AMD64": "https://github.com/mistralai/mistral-vibe/releases/download/v2.25.7/vibe-acp-linux-x86_64-2.25.7.tar.gz",
+        "AGENT_ARCHIVE_ARM64": "https://github.com/mistralai/mistral-vibe/releases/download/v2.25.7/vibe-acp-linux-aarch64-2.25.7.tar.gz",
+        "AGENT_SHA256_AMD64": "912d4c3068529ff4773c3bca89268ed401dab5f0f90628100eb88eb0d1a0b189",
+        "AGENT_SHA256_ARM64": "8ecef7e8bcfc3ba38d62d0e6411e40e50c8137f79c161fc4a5bef2d4b65d54de"
       }
     }
   }
