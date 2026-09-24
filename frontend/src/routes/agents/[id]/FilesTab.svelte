@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import { tick } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { workspaces, environments } from '$lib/api';
 	import type { GitChange, WorkspaceEntry, WorkspaceFile, WorkspaceGitDiff, WorkspaceGitStatus, WorkspaceStatus } from '$lib/api';
@@ -23,7 +24,7 @@
 	let showTerminal = $state(false);
 	let source = $state<'workspace' | 'container'>('workspace');
 	let containerDirty = $state(false);
-	let containerBrowser = $state<{ refresh: () => void }>();
+	let containerBrowser = $state<{ refresh: () => void; openPath: (path: string) => Promise<boolean> }>();
 	let showTree = $state(true);
 	let initialized = $state(false);
 	let syncedRoute = '';
@@ -49,13 +50,14 @@
 		void applyRoute(requestedRoute);
 	});
 
-	function routeState(value: string): { path: string; showTree: boolean; terminal: string | null } {
+	function routeState(value: string): { path: string; showTree: boolean; terminal: string | null; source: 'workspace' | 'container' } {
 		const search = value.includes('?') ? value.slice(value.indexOf('?')) : window.location.search;
 		const params = new URLSearchParams(search);
 		return {
 			path: params.get('path') ?? '',
 			showTree: params.get('tree') !== 'collapsed',
 			terminal: params.get('terminal'),
+			source: params.get('source') === 'container' ? 'container' : 'workspace',
 		};
 	}
 
@@ -63,6 +65,8 @@
 		const url = new URL(value || window.location.href, window.location.origin);
 		if (path) url.searchParams.set('path', path);
 		else url.searchParams.delete('path');
+		if (source === 'container') url.searchParams.set('source', 'container');
+		else url.searchParams.delete('source');
 		if (treeVisible) url.searchParams.delete('tree');
 		else url.searchParams.set('tree', 'collapsed');
 		return `${url.pathname}${url.search}${url.hash}`;
@@ -74,6 +78,17 @@
 		const requested = routeState(requestedRoute);
 		if (requested.terminal) showTerminal = true;
 		showTree = requested.showTree;
+
+		if (requested.source === 'container') {
+			const result = await applyContainerRoute(requested.path);
+			if (result === 'opened' || result === 'stale' || route !== requestedRoute) return;
+			showTree = previousShowTree;
+			const restoredRoute = routeForFileState(requestedRoute, previousPath, previousShowTree);
+			syncedRoute = restoredRoute;
+			await goto(restoredRoute, { replaceState: true, keepFocus: true, noScroll: true });
+			return;
+		}
+
 		if (requested.path === selectedPath) {
 			fileOpenSequence += 1;
 			loadingFile = false;
@@ -89,6 +104,21 @@
 		const restoredRoute = routeForFileState(requestedRoute, previousPath, previousShowTree);
 		syncedRoute = restoredRoute;
 		await goto(restoredRoute, { replaceState: true, keepFocus: true, noScroll: true });
+	}
+
+	async function applyContainerRoute(path: string): Promise<FileOpenResult> {
+		if (containerDirty && !window.confirm('Discard the unsaved changes in the current file?')) {
+			return 'cancelled';
+		}
+		containerDirty = false;
+		if (source !== 'container') source = 'container';
+		await tick();
+		if (!path) {
+			containerBrowser?.refresh();
+			return 'opened';
+		}
+		const opened = await containerBrowser?.openPath(path);
+		return opened === false ? 'failed' : 'opened';
 	}
 
 	function clearFileSelection(): FileOpenResult {
@@ -117,8 +147,8 @@
 			status = workspaceStatus;
 			directories = { '': rootDirectory.entries };
 			git = gitStatus;
-			const initialPath = routeState(route).path;
-			if (initialPath) await openFile(initialPath, true, false);
+			const initial = routeState(route);
+			if (initial.source !== 'container' && initial.path) await openFile(initial.path, true, false);
 		} catch (cause) {
 			error = cause instanceof Error ? cause.message : String(cause);
 		} finally {

@@ -16,7 +16,22 @@
  $effect(() => onDirtyChange(dirty));
  onDestroy(() => onDirtyChange(false));
  onMount(() => { void browse('/tmp'); });
- export function refresh() { void browse(directory); }
+  export function refresh() { void browse(directory); }
+  /** Open a specific absolute container path: a file directly, a directory via browse. */
+  export async function openPath(path: string): Promise<boolean> {
+   if (!mayNavigate()) return false;
+   const request = ++sequence; busy = true; error = '';
+   try {
+    const result = await environments.readFile(agentId, path);
+    if (request !== sequence) return true;
+    file = result; content = result.content;
+    return true;
+   } catch {
+    // Directories (and unreadable entries) fall back to a tree listing.
+    await browse(path);
+    return true;
+   } finally { if (request === sequence) busy = false; }
+  }
  function mayNavigate() { return !dirty || window.confirm('Discard the unsaved changes in the current file?'); }
  async function browse(path: string) {
   if (!mayNavigate()) return;

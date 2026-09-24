@@ -99,6 +99,7 @@ pub fn routes() -> Router<AppState> {
         .route("/{agent_id}", get(workspace_status))
         .route("/{agent_id}/tree", get(list_directory))
         .route("/{agent_id}/file", get(read_file).put(write_file))
+        .route("/{agent_id}/resolve-link", get(resolve_link))
         .route("/{agent_id}/git/status", get(git_status))
         .route("/{agent_id}/git/diff", get(git_diff))
         .route(
@@ -1050,6 +1051,91 @@ async fn workspace_root(state: &AppState, agent_id: &str) -> ApiResult<PathBuf> 
     Ok(inspection.active_root().to_path_buf())
 }
 
+/// Resolve an absolute filesystem path from rendered Agent message links to a
+/// scoped view target. Host files are only ever exposed when the path is
+/// inside the Agent's mounted workspace (the container's mount boundary and
+/// the outer authorization boundary). Everything else is reported as a
+/// container path: reading it then goes through the Agent's own container,
+/// which never touches the host filesystem.
+async fn resolve_link(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+    Query(query): Query<WorkspacePathQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    require_same_origin(&headers)?;
+    let (_, bootstrap) = agent_workspace(state, &agent_id)?;
+    // Resolve against the bootstrap workspace, not the active repository
+    // root: the whole bootstrap workspace is what is mounted into the
+    // container, so every contained file is legitimately viewable.
+    let raw = query.path.trim();
+    if raw.is_empty() || raw.contains('\0') {
+        return Err(api_error(StatusCode::BAD_REQUEST, "a path is required"));
+    }
+    match scoped_workspace_relative_path(&bootstrap, raw) {
+        Some(relative) => Ok(Json(json!({
+            "kind": "workspace",
+            "path": relative_path_string(&relative),
+        }))),
+        None => Ok(Json(json!({
+            "kind": "container",
+            "path": raw,
+        }))),
+    }
+}
+
+/// Map an absolute path to a workspace-relative path when it is contained in
+/// the canonicalized workspace root. The longest existing ancestor is
+/// canonicalized so symlinks cannot escape the workspace; the remaining tail
+/// must not traverse upwards. Non-existent files inside the workspace still
+/// resolve so links to files an Agent described (but has not written) work.
+fn scoped_workspace_relative_path(root: &FsPath, raw: &str) -> Option<PathBuf> {
+    let root = root.canonicalize().ok()?;
+    let path = FsPath::new(raw);
+    if !path.is_absolute() {
+        return None;
+    }
+
+    // Find the longest existing ancestor. Canonicalization resolves symlinks
+    // in the existing prefix, so a link pointing outside the workspace fails
+    // the containment check below instead of escaping it.
+    let components: Vec<Component> = path.components().collect();
+    let mut probe = path.to_path_buf();
+    let mut split_at = components.len();
+    let existing = loop {
+        match std::fs::canonicalize(&probe) {
+            Ok(canonical) => break canonical,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let Some(parent) = probe.parent() else {
+                    return None;
+                };
+                if parent == probe {
+                    return None;
+                }
+                split_at -= 1;
+                probe = parent.to_path_buf();
+            }
+            Err(_) => return None,
+        }
+    };
+
+    // The canonicalized existing ancestor must sit inside the workspace.
+    let existing_relative = existing.strip_prefix(&root).ok()?;
+
+    // Remaining (not-yet-existing) components may only be normal segments.
+    let mut relative = existing_relative.to_path_buf();
+    for component in &components[split_at..] {
+        match component {
+            Component::Normal(value) => relative.push(value),
+            _ => return None,
+        }
+    }
+    if relative.as_os_str().is_empty() {
+        return None;
+    }
+    Some(relative)
+}
+
 fn agent_workspace(
     state: &AppState,
     agent_id: &str,
@@ -1589,6 +1675,60 @@ mod tests {
         assert!(normalize_relative_path("../secret").is_err());
         assert!(normalize_relative_path("src/../../secret").is_err());
         assert!(normalize_relative_path("/etc/passwd").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scoped_link_resolution_stays_inside_the_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(workspace.path().join("docs/arch")).unwrap();
+        std::fs::write(workspace.path().join("docs/arch/model.md"), "x").unwrap();
+        let root = workspace.path().canonicalize().unwrap();
+
+        // Existing file inside the workspace resolves relatively.
+        let existing = root.join("docs/arch/model.md");
+        assert_eq!(
+            scoped_workspace_relative_path(&root, existing.to_str().unwrap()),
+            Some(FsPath::new("docs/arch/model.md").to_path_buf())
+        );
+
+        // Non-existent file inside an existing directory still resolves.
+        let missing = root.join("docs/arch/pending.md");
+        assert_eq!(
+            scoped_workspace_relative_path(&root, missing.to_str().unwrap()),
+            Some(FsPath::new("docs/arch/pending.md").to_path_buf())
+        );
+
+        // A symlinked directory inside the workspace that points outside is
+        // rejected (canonicalization resolves it outside the root).
+        std::fs::write(outside.path().join("secret.md"), "nope").unwrap();
+        std::os::unix::fs::symlink(outside.path(), workspace.path().join("shared")).unwrap();
+        let escaped = root.join("shared/secret.md");
+        assert_eq!(
+            scoped_workspace_relative_path(&root, escaped.to_str().unwrap()),
+            None
+        );
+
+        // Paths outside the workspace and traversal tails are rejected.
+        assert_eq!(
+            scoped_workspace_relative_path(&root, outside.path().join("secret.md").to_str().unwrap()),
+            None
+        );
+        assert_eq!(
+            scoped_workspace_relative_path(&root, "/etc/passwd"),
+            None
+        );
+        let trailing = root.join("docs/arch/../../escape.md");
+        // The existing prefix resolves, but the traversal tail is rejected.
+        assert_eq!(
+            scoped_workspace_relative_path(&root, trailing.to_str().unwrap()),
+            None
+        );
+
+        // Relative input and the bare workspace root resolve to nothing.
+        assert_eq!(scoped_workspace_relative_path(&root, "docs/arch"), None);
+        assert_eq!(scoped_workspace_relative_path(&root, root.to_str().unwrap()), None);
     }
 
     #[test]

@@ -106,8 +106,43 @@ function openLinksInNewWindow(html: string): string {
 	const template = document.createElement('template');
 	template.innerHTML = html;
 	for (const link of template.content.querySelectorAll<HTMLAnchorElement>('a[href]')) {
+		if (link.dataset.filePath !== undefined) continue;
 		link.target = '_blank';
 		link.rel = 'noopener noreferrer';
+	}
+	return template.innerHTML;
+}
+
+// First path segments that belong to the SPA's own routes. A markdown link
+// pointing at one of them is app navigation, not a filesystem path.
+const APP_ROUTE_SEGMENTS = new Set([
+	'dashboard',
+	'projects',
+	'conversations',
+	'agents',
+	'tasks',
+	'automations',
+	'schedules',
+	'workflows',
+	'settings',
+	'setup',
+	'login'
+]);
+
+// Absolute-path links emitted by Agents ("see [guide](/home/…/model.md))")
+// navigate to a garbage SPA route when clicked. Mark them so AiMessage can
+// intercept the click and resolve them through the server's scoped
+// workspace/container APIs instead. App-internal routes stay untouched.
+function markFilesystemLinks(html: string): string {
+	const template = document.createElement('template');
+	template.innerHTML = html;
+	for (const link of template.content.querySelectorAll<HTMLAnchorElement>('a[href]')) {
+		const href = link.getAttribute('href') ?? '';
+		if (!href.startsWith('/')) continue;
+		const segment = href.slice(1).split(/[/?#]/, 1)[0];
+		if (APP_ROUTE_SEGMENTS.has(segment)) continue;
+		link.dataset.filePath = href;
+		link.title = 'Open in files';
 	}
 	return template.innerHTML;
 }
@@ -186,6 +221,8 @@ export function renderContent(content: string, options: RenderContentOptions = {
 		ADD_TAGS: ['details', 'summary'],
 		ADD_ATTR: ['open'],
 	});
+
+	result = markFilesystemLinks(result);
 
 	return options.openLinksInNewWindow ? openLinksInNewWindow(result) : result;
 }

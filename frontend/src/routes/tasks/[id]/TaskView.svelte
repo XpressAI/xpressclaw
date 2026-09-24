@@ -1293,6 +1293,25 @@
 		return path ? `${base}&path=${encodeURIComponent(path)}` : base;
 	}
 
+	async function openLinkedFile(path: string) {
+		const agentId = task?.agent_id;
+		if (!agentId) {
+			void navigator.clipboard?.writeText(path).catch(() => undefined);
+			return;
+		}
+		try {
+			const resolution = await workspaces.resolveLink(agentId, path);
+			const url = resolution.kind === 'workspace'
+				? workspaceFileUrl(agentId, resolution.path)
+				: `${workspaceFileUrl(agentId)}&source=container&path=${encodeURIComponent(resolution.path)}`;
+			await goto(url);
+		} catch {
+			// Resolution is unavailable (agent removed, offline): copy instead
+			// of navigating the SPA to a garbage route.
+			void navigator.clipboard?.writeText(path).catch(() => undefined);
+		}
+	}
+
 	function openChangedFile(event: MouseEvent, agentId: string, path: string) {
 		if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
 		event.preventDefault();
@@ -1685,6 +1704,7 @@
 										visualizationUrl={item.messageId === undefined ? undefined : (artifact) => tasks.visualizationUrl(taskId, item.messageId!, artifact.id)}
 										visualizationFollowUpTarget="this Task"
 										onvisualizationfollowup={sendVisualizationFollowUp}
+										onfilelink={(path) => void openLinkedFile(path)}
 									>
 										<ImageAttachmentPreviews attachments={item.attachments} message />
 									</AiMessage>

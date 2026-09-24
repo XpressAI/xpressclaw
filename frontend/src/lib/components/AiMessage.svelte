@@ -23,6 +23,7 @@
 		visualizationUrl,
 		visualizationFollowUpTarget = 'this thread',
 		onvisualizationfollowup,
+		onfilelink,
 		ondelete,
 		deleting = false,
 		children,
@@ -41,6 +42,7 @@
 		visualizationUrl?: (artifact: MessageVisualization) => string;
 		visualizationFollowUpTarget?: string;
 		onvisualizationfollowup?: (prompt: string, title?: string) => Promise<void>;
+		onfilelink?: (path: string) => void;
 		ondelete?: () => void;
 		deleting?: boolean;
 		children?: Snippet;
@@ -99,6 +101,24 @@
 		clearSelectionActions();
 	}
 
+	function handleContentClick(event: MouseEvent) {
+		const target = event.target as HTMLElement | null;
+		const anchor = target?.closest?.('a[data-file-path]');
+		if (!anchor) return;
+		// Preserve modifier-click behavior (open the raw href).
+		if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+		event.preventDefault();
+		const path = anchor.getAttribute('data-file-path');
+		if (!path) return;
+		if (onfilelink) {
+			onfilelink(path);
+			return;
+		}
+		// No resolver available: copying the path is safer than navigating
+		// the SPA to a garbage route.
+		void navigator.clipboard?.writeText(path).catch(() => undefined);
+	}
+
 	async function copyMessage() {
 		try {
 			await navigator.clipboard.writeText(content);
@@ -135,9 +155,13 @@
 				>{deleting ? 'Deleting…' : 'Delete'}</button>
 			{/if}
 		</div>
+		<!-- svelte-ignore a11y_click_events_have_key_events -->
+		<!-- svelte-ignore a11y_no_static_element_interactions -->
+		<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
 		<div
 			bind:this={contentElement}
 			use:watchSelection
+			onclick={handleContentClick}
 			class="relative rounded-lg rounded-[10px] px-3.5 py-2.5 text-sm
 				{isSystem ? 'bg-muted/55 text-xs italic text-muted-foreground shadow-[var(--shadow-hairline)]' :
 				fromUser ? 'rounded-tr-[4px] bg-primary text-primary-foreground shadow-sm' :
