@@ -1,4 +1,5 @@
 <script lang="ts">
+	import DictationButton from '$lib/components/DictationButton.svelte';
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
 	import yaml from 'js-yaml';
@@ -608,6 +609,13 @@
 							<ImageAttachmentPreviews attachments={imagePreviews} onremove={(index) => (imageAttachments = imageAttachments.filter((_, itemIndex) => itemIndex !== index))} />
 
 							<div class="flex min-h-10 items-center gap-2 px-3 pb-2">
+								{#if composerMode === 'agent' || workflowGoalInput}
+									{#key composerMode + selectedWorkflow}<DictationButton disabled={sending} ontranscript={(text) => {
+										const draft = message.trimEnd() ? `${message.trimEnd()} ${text}` : text;
+										if (composerMode === 'workflow' && workflowGoalInput) setWorkflowInputValue('goal', workflowGoalInput, draft);
+										else message = draft;
+									}} />{/key}
+								{/if}
 								{#if composerMode === 'agent'}
 									<input bind:this={imageInput} type="file" accept={IMAGE_FILE_ACCEPT} multiple onchange={handleImageInput} class="hidden" />
 									<button type="button" onclick={() => imageInput?.click()} disabled={sending || Boolean(selectedConversation) || imageAttachments.length >= MAX_IMAGE_ATTACHMENTS} aria-label="Attach images" title={selectedConversation ? 'Attach files in the conversation before creating linked work' : 'Attach images (you can also paste)'}

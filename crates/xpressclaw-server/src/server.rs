@@ -675,6 +675,7 @@ mod tests {
             "/api/agents",
             "/api/dashboard/stream?range=1h",
             "/api/dashboard/resources",
+            "/api/settings/speech",
             "/api/conversations/example/attachments/example",
             "/api/tasks/example/messages/1/attachments/example",
             "/api/settings/collaboration/agent/git/example/repository/info/refs?service=git-receive-pack",
@@ -737,6 +738,27 @@ mod tests {
         let app =
             create_router(state).layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 43101))));
         let (cookie, csrf) = login_session(&app, &token).await;
+        for (method, path) in [
+            ("PUT", "/api/settings/speech"),
+            ("POST", "/api/speech/transcriptions"),
+            ("POST", "/api/speech/synthesize"),
+        ] {
+            for (session, expected) in [
+                (None, StatusCode::UNAUTHORIZED),
+                (Some(&cookie), StatusCode::FORBIDDEN),
+            ] {
+                let mut request = Request::builder().method(method).uri(path);
+                if let Some(session) = session {
+                    request = request.header(header::COOKIE, session);
+                }
+                let response = app
+                    .clone()
+                    .oneshot(request.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), expected, "{method} {path}");
+            }
+        }
         let body = serde_json::json!({ "name": "Protected project" }).to_string();
 
         let missing = app

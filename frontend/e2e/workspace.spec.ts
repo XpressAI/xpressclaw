@@ -5355,6 +5355,7 @@ test('automation and settings pages show context-specific sidebar lists', async 
 	await expect(settingsSidebar).toBeVisible();
 	await expect(settingsSidebar.locator('[data-sidebar-setting]')).toHaveText([
 		'P Profile',
+		'S Speech',
 		'↕ Project sync',
 		'C Local collaboration',
 		'M MCP servers',
@@ -5376,7 +5377,7 @@ test('automation and settings pages show context-specific sidebar lists', async 
 	await page.locator('aside:visible').getByRole('button', { name: 'Close', exact: true }).click();
 	await page.locator('nav a[href="/settings"]:visible').click();
 	await page.getByRole('button', { name: 'Open agent switcher' }).click();
-	await expect(page.locator('aside:visible [data-sidebar-mode="settings"] [data-sidebar-setting]')).toHaveCount(5);
+	await expect(page.locator('aside:visible [data-sidebar-mode="settings"] [data-sidebar-setting]')).toHaveCount(6);
 	await expect(page.getByRole('navigation', { name: 'Settings sections' })).toHaveCount(0);
 	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 });

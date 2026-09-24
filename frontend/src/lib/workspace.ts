@@ -17,6 +17,7 @@ export type WorkspaceTabKind =
 	| 'settings-collaboration'
 	| 'settings-mcp'
 	| 'settings-sync'
+	| 'settings-speech'
 	| 'settings-server';
 
 export interface WorkspaceTab {
@@ -123,12 +124,13 @@ export function describeWorkspacePath(route: string): Omit<WorkspaceTab, 'id' | 
 	if (pathname === '/settings/collaboration') return { path: route, kind: 'settings-collaboration', title: 'Settings', resourceId: null };
 	if (pathname === '/settings/mcp') return { path: route, kind: 'settings-mcp', title: 'Settings', resourceId: null };
 	if (pathname === '/settings/sync') return { path: route, kind: 'settings-sync', title: 'Settings', resourceId: null };
+	if (pathname === '/settings/speech') return { path: route, kind: 'settings-speech', title: 'Settings', resourceId: null };
 	return { path: '/settings', kind: 'settings', title: 'Settings', resourceId: null };
 }
 
 export function sameWorkspaceTab(tab: WorkspaceTab, route: string): boolean {
 	const next = describeWorkspacePath(route);
-	const settingsKinds: WorkspaceTabKind[] = ['settings', 'settings-collaboration', 'settings-mcp', 'settings-sync', 'settings-server'];
+	const settingsKinds: WorkspaceTabKind[] = ['settings', 'settings-collaboration', 'settings-mcp', 'settings-sync', 'settings-speech', 'settings-server'];
 	const automationKinds: WorkspaceTabKind[] = ['automations', 'schedules', 'workflows'];
 	if (settingsKinds.includes(tab.kind) && settingsKinds.includes(next.kind)) return true;
 	if (automationKinds.includes(tab.kind) && automationKinds.includes(next.kind)) return true;
