@@ -198,7 +198,8 @@
       }
     },
     "qwen": {
-      "auto_update": true,
+      "auto_update": false,
+      "pin_reason": "0.24.4 times out during ACP initialization under linux/arm64 QEMU; keep the published 0.24.3 until a newer version passes the runner smoke test",
       "version": "0.24.3",
       "acp_command": [
         "qwen",

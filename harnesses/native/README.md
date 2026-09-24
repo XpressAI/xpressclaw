@@ -73,6 +73,15 @@ bidirectional stdio. Tasks are sent with `session/prompt`, while fresh and
 continued work use ACP session lifecycle methods. Agent commands and versions
 follow the official ACP Registry.
 
+Every image build checks ACP initialization without making a model request.
+The probe allows 60 seconds for a response and logs initialization and shutdown
+separately, including a bounded stderr tail on failure. It stops the entire
+POSIX process group so wrapper processes cannot leave children holding the
+probe's pipes open. Shutdown gets a five-second grace period before `SIGKILL`
+and at most five more seconds for the pipes to close. CI runs regression tests
+for this cleanup before building the image matrix and caps each image job at
+30 minutes.
+
 ## Codex presentation artifacts
 
 The Codex images include the separate `xpressclaw-presentations` skill and a
