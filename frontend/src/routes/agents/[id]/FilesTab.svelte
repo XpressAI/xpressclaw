@@ -108,17 +108,16 @@
 			return;
 		}
 
-		// A previously-applied container route must be reset so the workspace
-		// file below actually renders instead of the container browser.
-		if (source === 'container') {
-			if (containerDirty && !window.confirm('Discard the unsaved changes in the current file?')) {
-				await rollback();
-				return;
-			}
-			source = 'workspace';
+		// Leaving container mode waits for the workspace read to succeed:
+		// flipping `source` early would unmount ContainerFiles, and a
+		// rollback would recreate it at /tmp instead of the prior view.
+		const leavingContainer = source === 'container';
+		if (leavingContainer && containerDirty && !window.confirm('Discard the unsaved changes in the current file?')) {
+			await rollback();
+			return;
 		}
 
-		if (requested.path === selectedPath) {
+		if (!leavingContainer && requested.path === selectedPath) {
 			fileOpenSequence += 1;
 			loadingFile = false;
 			syncedRoute = requestedRoute;
@@ -130,6 +129,7 @@
 			: clearFileSelection();
 		if (result === 'stale' || route !== requestedRoute) return;
 		if (result === 'opened') {
+			source = 'workspace';
 			syncedRoute = requestedRoute;
 			return;
 		}

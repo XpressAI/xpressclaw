@@ -1076,8 +1076,10 @@ async fn resolve_link(
 ) -> ApiResult<Json<Value>> {
     require_same_origin(&headers)?;
     let (agent, bootstrap) = agent_workspace(&state, &agent_id)?;
-    let raw = query.path.trim();
-    if raw.is_empty() || raw.contains('\0') {
+    // Only whitespace-check with trim(): filenames may legitimately end in
+    // whitespace, and trimming would silently resolve a different file.
+    let raw = query.path;
+    if raw.trim().is_empty() || raw.contains('\0') {
         return Err(api_error(StatusCode::BAD_REQUEST, "a path is required"));
     }
 
@@ -1087,7 +1089,7 @@ async fn resolve_link(
         .await?
         .active_root()
         .to_path_buf();
-    if let Some((relative, directory)) = scoped_workspace_relative_path(&active_root, raw) {
+    if let Some((relative, directory)) = scoped_workspace_relative_path(&active_root, &raw) {
         return Ok(Json(json!({
             "kind": "workspace",
             "path": relative_path_string(&relative),
@@ -1100,7 +1102,7 @@ async fn resolve_link(
     // API at their mount-relative location instead of a host-relative one.
     // The bootstrap itself is what is mounted, so anchor the path at the
     // bootstrap's container mount root (not the active repository's).
-    if let Some((relative, _)) = scoped_workspace_relative_path(&bootstrap, raw) {
+    if let Some((relative, _)) = scoped_workspace_relative_path(&bootstrap, &raw) {
         let container_path = container_root_for(&agent, &bootstrap, &bootstrap)?.join(&relative);
         return Ok(Json(json!({
             "kind": "container",
