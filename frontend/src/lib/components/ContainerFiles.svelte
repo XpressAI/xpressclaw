@@ -17,25 +17,32 @@
  onDestroy(() => onDirtyChange(false));
  onMount(() => { void browse('/tmp'); });
   export function refresh() { void browse(directory); }
-  /** Open a specific absolute container path: a file directly, a directory via browse. */
-  export async function openPath(path: string): Promise<boolean> {
-   if (!mayNavigate()) return false;
-   const request = ++sequence; busy = true; error = '';
-   try {
-    const result = await environments.readFile(agentId, path);
-    if (request !== sequence) return true;
-    if (!commitFile(result)) return false;
-    return true;
-   } catch {
-    // A newer navigation superseded this read: drop it instead of letting
-    // the directory fallback clobber the newer view.
-    if (request !== sequence) return true;
-    // Directories (and unreadable entries) fall back to a tree listing;
-    // propagate browse's result so a declined dirty-file prompt does not
-    // report a navigation that never happened.
-    return await browse(path);
-   } finally { if (request === sequence) busy = false; }
-  }
+   /** Open a specific absolute container path: a file directly, a directory via browse. */
+   export async function openPath(path: string): Promise<boolean> {
+    if (!mayNavigate()) return false;
+    const request = ++sequence; busy = true; error = '';
+    try {
+     const result = await environments.readFile(agentId, path);
+     if (request !== sequence) return true;
+     if (!commitFile(result)) return false;
+     return true;
+    } catch {
+     // A newer navigation superseded this read: drop it instead of letting
+     // the directory fallback clobber the newer view.
+     if (request !== sequence) return true;
+     // Directories (and unreadable entries) fall back to a tree listing;
+     // propagate browse's result so a declined dirty-file prompt does not
+     // report a navigation that never happened.
+     const browsed = await browse(path);
+     if (!browsed && request === sequence) {
+      // The navigation ultimately failed while the original dirty file is
+      // still showing; the discard approval no longer applies to a future,
+      // unrelated navigation.
+      confirmedDiscardContent = null;
+     }
+     return browsed;
+    } finally { if (request === sequence) busy = false; }
+   }
   // Content whose dirty state the user already accepted discarding for the
   // in-flight navigation; only a *changed* buffer needs a second prompt.
   let confirmedDiscardContent: string | null = null;
@@ -63,22 +70,25 @@
      directory = result.path; location = result.path; entries = result.entries; truncated = result.truncated; file = null; content = '';
      confirmedDiscardContent = null;
      return true;
-    } catch (cause) {
+     } catch (cause) {
     // A superseded request's failure belongs to the navigation that replaced
     // it; report success so callers do not roll back the newer view.
     if (request !== sequence) return true;
     error = String(cause);
+    // The navigation failed while the original dirty file may still be
+    // showing; the discard approval no longer applies.
+    confirmedDiscardContent = null;
     return false;
    }
    finally { if (request === sequence) busy = false; }
   }
-  async function open(path: string) {
-   if (!mayNavigate()) return;
-   const request = ++sequence; busy = true; error = '';
-   try { const result = await environments.readFile(agentId, path); if (request !== sequence) return; commitFile(result); }
-   catch (cause) { if (request === sequence) error = String(cause); }
-   finally { if (request === sequence) busy = false; }
-  }
+   async function open(path: string) {
+    if (!mayNavigate()) return;
+    const request = ++sequence; busy = true; error = '';
+    try { const result = await environments.readFile(agentId, path); if (request !== sequence) return; commitFile(result); }
+    catch (cause) { if (request === sequence) { error = String(cause); confirmedDiscardContent = null; } }
+    finally { if (request === sequence) busy = false; }
+   }
  async function save() {
   if (!file || !dirty || busy) return;
   busy = true; error = '';

@@ -361,6 +361,13 @@
 		}
 		if (source === 'workspace') editorValue = selectedFile?.content ?? '';
 		containerDirty = false;
+		// A deep link may still be awaiting openFile; invalidate it (and any
+		// pending route application) so a late completion cannot write the
+		// deep-linked file under the manually selected route.
+		fileOpenSequence += 1;
+		routeApplySequence += 1;
+		activeApplyRoute = null;
+		loadingFile = false;
 		source = select.value as typeof source;
 		// The manually selected source is now the applied state a later
 		// rollback must restore.
