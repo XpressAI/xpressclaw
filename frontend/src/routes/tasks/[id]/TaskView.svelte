@@ -5,7 +5,7 @@
 	import TaskPlanningActions from '$lib/components/planning/TaskActions.svelte';
 	import { dateLabel, planningViewport } from '$lib/taskPlanning';
 	import { goto } from '$app/navigation';
-	import { tasks, agents, sessions, workspaces } from '$lib/api';
+	import { tasks, agents, sessions, workspaces, type WorkspaceLinkResolution } from '$lib/api';
 	import type { AcpCommand, AcpConfigOption, AcpModeState, Task, TaskMessage, Agent, WorkAttempt, SessionEvent, ImageAttachmentUpload, GitChange, WorkspaceGitStatus, MessageVisualization } from '$lib/api';
 	import { timeAgo } from '$lib/utils';
 	import { serverTimestampMs } from '$lib/serverTime';
@@ -1301,15 +1301,26 @@
 		}
 		try {
 			const resolution = await workspaces.resolveLink(agentId, path);
-			const url = resolution.kind === 'workspace'
-				? workspaceFileUrl(agentId, resolution.path)
-				: `${workspaceFileUrl(agentId)}&source=container&path=${encodeURIComponent(resolution.path)}`;
-			await goto(url);
+			await goto(await fileLinkUrl(agentId, resolution));
 		} catch {
 			// Resolution is unavailable (agent removed, offline): copy instead
 			// of navigating the SPA to a garbage route.
 			void navigator.clipboard?.writeText(path).catch(() => undefined);
 		}
+	}
+
+	async function fileLinkUrl(agentId: string, resolution: WorkspaceLinkResolution): Promise<string> {
+		if (resolution.kind === 'container') {
+			return `${workspaceFileUrl(agentId)}&source=container&path=${encodeURIComponent(resolution.path)}`;
+		}
+		if (resolution.directory) {
+			// The workspace file API only opens files; browse workspace
+			// directories through the container view at their mount point.
+			const status = await workspaces.status(agentId);
+			const mountRoot = (status.container_root ?? '/workspace').replace(/\/+$/, '');
+			return `${workspaceFileUrl(agentId)}&source=container&path=${encodeURIComponent(`${mountRoot}/${resolution.path}`)}`;
+		}
+		return workspaceFileUrl(agentId, resolution.path);
 	}
 
 	function handleResultFileClick(event: MouseEvent) {

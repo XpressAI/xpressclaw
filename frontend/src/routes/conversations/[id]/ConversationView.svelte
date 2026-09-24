@@ -71,9 +71,18 @@
 		try {
 			const resolution = await workspaces.resolveLink(agentId, path);
 			const base = `/agents/${encodeURIComponent(agentId)}?tab=files`;
-			const url = resolution.kind === 'workspace'
-				? `${base}&path=${encodeURIComponent(resolution.path)}`
-				: `${base}&source=container&path=${encodeURIComponent(resolution.path)}`;
+			let url: string;
+			if (resolution.kind === 'container') {
+				url = `${base}&source=container&path=${encodeURIComponent(resolution.path)}`;
+			} else if (resolution.directory) {
+				// The workspace file API only opens files; browse workspace
+				// directories through the container view at their mount point.
+				const status = await workspaces.status(agentId);
+				const mountRoot = (status.container_root ?? '/workspace').replace(/\/+$/, '');
+				url = `${base}&source=container&path=${encodeURIComponent(`${mountRoot}/${resolution.path}`)}`;
+			} else {
+				url = `${base}&path=${encodeURIComponent(resolution.path)}`;
+			}
 			await goto(url);
 		} catch {
 			void navigator.clipboard?.writeText(path).catch(() => undefined);

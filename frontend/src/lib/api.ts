@@ -654,7 +654,7 @@ export const sessions = {
 // -- Project workspaces --
 
 export type WorkspaceLinkResolution =
-	| { kind: 'workspace'; path: string }
+	| { kind: 'workspace'; path: string; directory?: boolean }
 	| { kind: 'container'; path: string };
 
 export interface WorkspaceStatus {

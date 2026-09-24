@@ -27,6 +27,9 @@
     file = result; content = result.content;
     return true;
    } catch {
+    // A newer navigation superseded this read: drop it instead of letting
+    // the directory fallback clobber the newer view.
+    if (request !== sequence) return true;
     // Directories (and unreadable entries) fall back to a tree listing;
     // propagate browse's result so a declined dirty-file prompt does not
     // report a navigation that never happened.

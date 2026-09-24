@@ -72,20 +72,26 @@
 		return `${url.pathname}${url.search}${url.hash}`;
 	}
 
-	async function applyRoute(requestedRoute: string) {
-		const previousPath = selectedPath;
-		const previousShowTree = showTree;
-		const requested = routeState(requestedRoute);
-		if (requested.terminal) showTerminal = true;
-		showTree = requested.showTree;
+ 	async function applyRoute(requestedRoute: string) {
+ 		const previousShowTree = showTree;
+		// The last applied route (or the page URL) is the only faithful
+		// rollback target: workspace state (selectedPath) knows nothing about
+		// an active container view and vice versa.
+		const rollbackRoute = syncedRoute || window.location.href;
+ 		const requested = routeState(requestedRoute);
+ 		if (requested.terminal) showTerminal = true;
+ 		showTree = requested.showTree;
+
+		async function rollback(): Promise<void> {
+			syncedRoute = rollbackRoute;
+			await goto(rollbackRoute, { replaceState: true, keepFocus: true, noScroll: true });
+		}
 
 		if (requested.source === 'container') {
 			const result = await applyContainerRoute(requested.path);
 			if (result === 'opened' || result === 'stale' || route !== requestedRoute) return;
 			showTree = previousShowTree;
-			const restoredRoute = routeForFileState(requestedRoute, previousPath, previousShowTree);
-			syncedRoute = restoredRoute;
-			await goto(restoredRoute, { replaceState: true, keepFocus: true, noScroll: true });
+			await rollback();
 			return;
 		}
 
@@ -93,9 +99,7 @@
 		// file below actually renders instead of the container browser.
 		if (source === 'container') {
 			if (containerDirty && !window.confirm('Discard the unsaved changes in the current file?')) {
-				const restored = routeForFileState(requestedRoute, previousPath, previousShowTree);
-				syncedRoute = restored;
-				await goto(restored, { replaceState: true, keepFocus: true, noScroll: true });
+				await rollback();
 				return;
 			}
 			containerDirty = false;
@@ -114,9 +118,7 @@
 		if (result === 'opened' || result === 'stale' || route !== requestedRoute) return;
 
 		showTree = previousShowTree;
-		const restoredRoute = routeForFileState(requestedRoute, previousPath, previousShowTree);
-		syncedRoute = restoredRoute;
-		await goto(restoredRoute, { replaceState: true, keepFocus: true, noScroll: true });
+		await rollback();
 	}
 
 	async function applyContainerRoute(path: string): Promise<FileOpenResult> {

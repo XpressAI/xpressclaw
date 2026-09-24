@@ -1087,10 +1087,11 @@ async fn resolve_link(
         .await?
         .active_root()
         .to_path_buf();
-    if let Some(relative) = scoped_workspace_relative_path(&active_root, raw) {
+    if let Some((relative, directory)) = scoped_workspace_relative_path(&active_root, raw) {
         return Ok(Json(json!({
             "kind": "workspace",
             "path": relative_path_string(&relative),
+            "directory": directory,
         })));
     }
 
@@ -1099,7 +1100,7 @@ async fn resolve_link(
     // API at their mount-relative location instead of a host-relative one.
     // The bootstrap itself is what is mounted, so anchor the path at the
     // bootstrap's container mount root (not the active repository's).
-    if let Some(relative) = scoped_workspace_relative_path(&bootstrap, raw) {
+    if let Some((relative, _)) = scoped_workspace_relative_path(&bootstrap, raw) {
         let container_path = container_root_for(&agent, &bootstrap, &bootstrap)?.join(&relative);
         return Ok(Json(json!({
             "kind": "container",
@@ -1116,12 +1117,13 @@ async fn resolve_link(
 }
 
 /// Map an absolute path to a workspace-relative path when it is contained in
-/// the canonicalized workspace root. Walks downward from the root,
-/// canonicalizing each existing segment, so symlinks cannot escape the
-/// workspace and `..` components are rejected outright. Non-existent files
-/// inside the workspace still resolve so links to files an Agent described
-/// (but has not written) work.
-fn scoped_workspace_relative_path(root: &FsPath, raw: &str) -> Option<PathBuf> {
+/// the canonicalized workspace root, along with whether the fully-existing
+/// target is a directory (non-existent tails are file-like). Walks downward
+/// from the root, canonicalizing each existing segment, so symlinks cannot
+/// escape the workspace and `..` components are rejected outright.
+/// Non-existent files inside the workspace still resolve so links to files an
+/// Agent described (but has not written) work.
+fn scoped_workspace_relative_path(root: &FsPath, raw: &str) -> Option<(PathBuf, bool)> {
     let root = root.canonicalize().ok()?;
     let path = FsPath::new(raw);
     if !path.is_absolute() {
@@ -1171,7 +1173,7 @@ fn scoped_workspace_relative_path(root: &FsPath, raw: &str) -> Option<PathBuf> {
     if relative.as_os_str().is_empty() {
         return None;
     }
-    Some(relative)
+    Some((relative, !tail_started && existing.is_dir()))
 }
 
 fn agent_workspace(
@@ -1728,14 +1730,20 @@ mod tests {
         let existing = root.join("docs/arch/model.md");
         assert_eq!(
             scoped_workspace_relative_path(&root, existing.to_str().unwrap()),
-            Some(FsPath::new("docs/arch/model.md").to_path_buf())
+            Some((FsPath::new("docs/arch/model.md").to_path_buf(), false))
+        );
+
+        // Existing directories are reported as such.
+        assert_eq!(
+            scoped_workspace_relative_path(&root, root.join("docs/arch").to_str().unwrap()),
+            Some((FsPath::new("docs/arch").to_path_buf(), true))
         );
 
         // Non-existent file inside an existing directory still resolves.
         let missing = root.join("docs/arch/pending.md");
         assert_eq!(
             scoped_workspace_relative_path(&root, missing.to_str().unwrap()),
-            Some(FsPath::new("docs/arch/pending.md").to_path_buf())
+            Some((FsPath::new("docs/arch/pending.md").to_path_buf(), false))
         );
 
         // A symlinked directory inside the workspace that points outside is
