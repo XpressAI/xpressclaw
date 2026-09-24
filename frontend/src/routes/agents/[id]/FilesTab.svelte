@@ -51,9 +51,17 @@
 		});
 	});
 
+	// Serialize route applications: an effect re-run for the route already
+	// being applied (e.g. re-triggered while applyRoute awaits a confirm
+	// dialog) would capture mutated state and clobber the first run's
+	// rollback.
+	let routeApplySequence = 0;
+	let activeApplyRoute: string | null = null;
+
 	$effect(() => {
 		const requestedRoute = route;
 		if (!initialized || requestedRoute === syncedRoute) return;
+		if (activeApplyRoute === requestedRoute) return;
 		// applyRoute owns syncedRoute: it must remain the last *applied* route
 		// until the new one succeeds, or rollbacks would restore the rejected
 		// route instead of the view the user kept.
@@ -83,68 +91,76 @@
 	}
 
  	async function applyRoute(requestedRoute: string) {
+ 		const run = ++routeApplySequence;
+ 		activeApplyRoute = requestedRoute;
+ 		const superseded = () => run !== routeApplySequence;
+ 		try {
  		const previousShowTree = showTree;
-		const previousSource = source;
-		// The last applied route (or the page URL) is the only faithful
-		// rollback target: workspace state (selectedPath) knows nothing about
-		// an active container view and vice versa.
-		const rollbackRoute = syncedRoute || window.location.href;
+ 		const previousSource = source;
+ 		// The last applied route (or the page URL) is the only faithful
+ 		// rollback target: workspace state (selectedPath) knows nothing about
+ 		// an active container view and vice versa.
+ 		const rollbackRoute = syncedRoute || window.location.href;
  		const requested = routeState(requestedRoute);
  		if (requested.terminal) showTerminal = true;
  		showTree = requested.showTree;
 
-		async function rollback(): Promise<void> {
-			source = previousSource;
-			showTree = previousShowTree;
-			syncedRoute = rollbackRoute;
-			await goto(rollbackRoute, { replaceState: true, keepFocus: true, noScroll: true });
-		}
+ 		async function rollback(): Promise<void> {
+ 			if (superseded()) return;
+ 			source = previousSource;
+ 			showTree = previousShowTree;
+ 			syncedRoute = rollbackRoute;
+ 			await goto(rollbackRoute, { replaceState: true, keepFocus: true, noScroll: true });
+ 		}
 
-		if (requested.source === 'container') {
-			const result = await applyContainerRoute(requested.path);
-			if (result === 'stale' || route !== requestedRoute) return;
-			if (result === 'opened') {
-				syncedRoute = requestedRoute;
-				return;
-			}
-			await rollback();
-			return;
-		}
+ 		if (requested.source === 'container') {
+ 			const result = await applyContainerRoute(requested.path);
+ 			if (result === 'stale' || route !== requestedRoute || superseded()) return;
+ 			if (result === 'opened') {
+ 				syncedRoute = requestedRoute;
+ 				return;
+ 			}
+ 			await rollback();
+ 			return;
+ 		}
 
-		// Leaving container mode waits for the workspace read to succeed:
-		// flipping `source` early would unmount ContainerFiles, and a
-		// rollback would recreate it at /tmp instead of the prior view.
-		const leavingContainer = source === 'container';
-		if (leavingContainer && containerDirty && !window.confirm('Discard the unsaved changes in the current file?')) {
-			await rollback();
-			return;
-		}
+ 		// Leaving container mode waits for the workspace read to succeed:
+ 		// flipping `source` early would unmount ContainerFiles, and a
+ 		// rollback would recreate it at /tmp instead of the prior view.
+ 		const leavingContainer = source === 'container';
+ 		if (leavingContainer && containerDirty && !window.confirm('Discard the unsaved changes in the current file?')) {
+ 			await rollback();
+ 			return;
+ 		}
 
-		if (!leavingContainer && requested.path === selectedPath) {
-			fileOpenSequence += 1;
-			loadingFile = false;
-			syncedRoute = requestedRoute;
-			return;
-		}
+ 		if (!leavingContainer && requested.path === selectedPath) {
+ 			fileOpenSequence += 1;
+ 			loadingFile = false;
+ 			syncedRoute = requestedRoute;
+ 			return;
+ 		}
 
-		const result = requested.path
-			? await openFile(requested.path, false, false)
-			: clearFileSelection();
-		if (result === 'stale' || route !== requestedRoute) return;
-		if (result === 'opened') {
-			// The container editor stayed mounted during the asynchronous read;
-			// edits made in the meantime still need an explicit discard.
-			if (leavingContainer && containerDirty && !window.confirm('Discard the unsaved changes in the current file?')) {
-				await rollback();
-				return;
-			}
-			source = 'workspace';
-			syncedRoute = requestedRoute;
-			return;
-		}
+ 		const result = requested.path
+ 			? await openFile(requested.path, false, false)
+ 			: clearFileSelection();
+ 		if (result === 'stale' || route !== requestedRoute || superseded()) return;
+ 		if (result === 'opened') {
+ 			// The container editor stayed mounted during the asynchronous read;
+ 			// edits made in the meantime still need an explicit discard.
+ 			if (leavingContainer && containerDirty && !window.confirm('Discard the unsaved changes in the current file?')) {
+ 				await rollback();
+ 				return;
+ 			}
+ 			source = 'workspace';
+ 			syncedRoute = requestedRoute;
+ 			return;
+ 		}
 
-		await rollback();
-	}
+ 		await rollback();
+ 		} finally {
+ 			if (run === routeApplySequence) activeApplyRoute = null;
+ 		}
+ 	}
 
 	async function applyContainerRoute(path: string): Promise<FileOpenResult> {
 		if (source !== 'container') source = 'container';
