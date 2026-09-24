@@ -28,7 +28,11 @@
 	// for rollback; only applied state is a faithful restore target.
 	let appliedSource: 'workspace' | 'container' = 'workspace';
 	let containerDirty = $state(false);
-	let containerBrowser = $state<{ refresh: () => void; openPath: (path: string) => Promise<boolean> }>();
+	// Container buffer whose discard the user accepted for the in-flight
+	// navigation; only a *changed* buffer needs a second prompt after the
+	// workspace read completes.
+	let confirmedContainerContent: string | null = null;
+	let containerBrowser = $state<{ refresh: () => void; openPath: (path: string) => Promise<boolean>; dirtyContent: () => string | null }>();
 	let showTree = $state(true);
 	let initialized = $state(false);
 	let syncedRoute = '';
@@ -119,6 +123,13 @@
  		}
 
  		if (requested.source === 'container') {
+ 			// Tree- or terminal-only route changes must not reopen (and
+ 			// re-confirm) the deep-linked container file.
+ 			const applied = routeState(syncedRoute || '');
+ 			if (appliedSource === 'container' && applied.source === 'container' && applied.path === requested.path) {
+ 				syncedRoute = requestedRoute;
+ 				return;
+ 			}
  			const result = await applyContainerRoute(requested.path);
  			if (result === 'stale' || route !== requestedRoute || superseded()) return;
  			if (result === 'opened') {
@@ -134,10 +145,11 @@
  		// flipping `source` early would unmount ContainerFiles, and a
  		// rollback would recreate it at /tmp instead of the prior view.
  		const leavingContainer = source === 'container';
- 		if (leavingContainer && containerDirty && !window.confirm('Discard the unsaved changes in the current file?')) {
+ 		if (leavingContainer && containerDirty && containerBrowser?.dirtyContent() !== confirmedContainerContent && !window.confirm('Discard the unsaved changes in the current file?')) {
  			await rollback();
  			return;
  		}
+ 		if (leavingContainer && containerDirty) confirmedContainerContent = containerBrowser?.dirtyContent() ?? null;
 
  		if (!leavingContainer && requested.path === selectedPath) {
  			fileOpenSequence += 1;
@@ -150,14 +162,15 @@
  			? await openFile(requested.path, false, false)
  			: clearFileSelection();
  		if (result === 'stale' || route !== requestedRoute || superseded()) return;
- 		if (result === 'opened') {
+  		if (result === 'opened') {
  			// The container editor stayed mounted during the asynchronous read;
- 			// edits made in the meantime still need an explicit discard.
- 			if (leavingContainer && containerDirty && !window.confirm('Discard the unsaved changes in the current file?')) {
+ 			// only a buffer that changed in the meantime needs another prompt.
+ 			if (leavingContainer && containerDirty && containerBrowser?.dirtyContent() !== confirmedContainerContent && !window.confirm('Discard the unsaved changes in the current file?')) {
  				await rollback();
  				return;
  			}
-  			source = 'workspace';
+ 			confirmedContainerContent = null;
+ 			source = 'workspace';
  			appliedSource = 'workspace';
  			syncedRoute = requestedRoute;
  			return;

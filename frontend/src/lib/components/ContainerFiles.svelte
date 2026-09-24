@@ -17,6 +17,8 @@
  onDestroy(() => onDirtyChange(false));
  onMount(() => { void browse('/tmp'); });
   export function refresh() { void browse(directory); }
+  /** The current buffer when dirty, for callers snapshotting a discard approval. */
+  export function dirtyContent(): string | null { return dirty ? content : null; }
    /** Open a specific absolute container path: a file directly, a directory via browse. */
    export async function openPath(path: string): Promise<boolean> {
     if (!mayNavigate()) return false;
@@ -54,23 +56,29 @@
    confirmedDiscardContent = content;
    return true;
   }
-  /** Commit a freshly read file, re-prompting only for edits made while the read was in flight. */
-  function commitFile(result: WorkspaceFile): boolean {
-   if (dirty && content !== confirmedDiscardContent && !window.confirm('Discard the unsaved changes in the current file?')) return false;
-   confirmedDiscardContent = null;
-   file = result; content = result.content;
-   return true;
-  }
-  async function browse(path: string): Promise<boolean> {
-   if (!mayNavigate()) return false;
-   const request = ++sequence; busy = true; error = '';
-    try {
-     const result = await environments.tree(agentId, path);
-     if (request !== sequence) return true;
-     directory = result.path; location = result.path; entries = result.entries; truncated = result.truncated; file = null; content = '';
-     confirmedDiscardContent = null;
-     return true;
-     } catch (cause) {
+   /** Commit a freshly read file, re-prompting only for edits made while the read was in flight. */
+   function commitFile(result: WorkspaceFile): boolean {
+    if (dirty && content !== confirmedDiscardContent && !window.confirm('Discard the unsaved changes in the current file?')) return false;
+    confirmedDiscardContent = null;
+    file = result; content = result.content;
+    return true;
+   }
+   /** Commit a directory listing, re-prompting for edits made while the tree request was in flight. */
+   function commitDirectory(result: { path: string; entries: WorkspaceEntry[]; truncated: boolean }): boolean {
+    if (dirty && content !== confirmedDiscardContent && !window.confirm('Discard the unsaved changes in the current file?')) return false;
+    confirmedDiscardContent = null;
+    directory = result.path; location = result.path; entries = result.entries; truncated = result.truncated; file = null; content = '';
+    return true;
+   }
+   async function browse(path: string): Promise<boolean> {
+    if (!mayNavigate()) return false;
+    const request = ++sequence; busy = true; error = '';
+     try {
+      const result = await environments.tree(agentId, path);
+      if (request !== sequence) return true;
+      if (!commitDirectory(result)) return false;
+      return true;
+      } catch (cause) {
     // A superseded request's failure belongs to the navigation that replaced
     // it; report success so callers do not roll back the newer view.
     if (request !== sequence) return true;
