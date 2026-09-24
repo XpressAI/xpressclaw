@@ -83,10 +83,11 @@
 			} else {
 				url = `${base}&path=${encodeURIComponent(resolution.path)}`;
 			}
-			// Modifier-clicks request a new browsing context for the resolved
-			// route. Open without the noopener feature — it makes window.open
-			// return null even on success — and sever the opener manually.
-			if (click && (click.metaKey || click.ctrlKey || click.shiftKey)) {
+			// Modifier-clicks and middle-clicks (auxclick, button 1) request a
+			// new browsing context for the resolved route. Open without the
+			// noopener feature — it makes window.open return null even on
+			// success — and sever the opener manually.
+			if (click && (click.metaKey || click.ctrlKey || click.shiftKey || click.button === 1)) {
 				const opened = window.open(url, '_blank');
 				if (opened) {
 					opened.opener = null;
