@@ -136,14 +136,18 @@ const APP_ROUTE_SEGMENTS = new Set([
 // SPA routes are navigation, not files.
 function filesystemPathFromHref(href: string): string | null {
 	if (!href.startsWith('/')) return null;
-	const segment = href.slice(1).split(/[/?#]/, 1)[0];
-	if (!segment || APP_ROUTE_SEGMENTS.has(segment)) return null;
+	let pathname: string;
 	try {
-		return decodeURIComponent(new URL(href, 'file:///').pathname);
+		pathname = decodeURIComponent(new URL(href, 'file:///').pathname);
 	} catch {
 		// Malformed percent sequences: use the raw path portion as-is.
-		return href.split(/[?#]/, 1)[0];
+		pathname = href.split(/[?#]/, 1)[0];
 	}
+	// Classify the decoded first segment: a percent-encoded app route such
+	// as /%61gents/foo is still app navigation.
+	const segment = pathname.slice(1).split('/', 1)[0];
+	if (!segment || APP_ROUTE_SEGMENTS.has(segment)) return null;
+	return pathname;
 }
 
 // Absolute-path links emitted by Agents ("see [guide](/home/…/model.md))")

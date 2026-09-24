@@ -1299,30 +1299,30 @@
 			void navigator.clipboard?.writeText(path).catch(() => undefined);
 			return;
 		}
+		// Modifier- and middle-clicks must open the window synchronously while
+		// the user activation is live; network awaits afterwards would let the
+		// browser block the popup. Open a placeholder now and navigate it once
+		// the resolved URL is known.
+		let placeholder: Window | null = null;
+		if (click && (click.metaKey || click.ctrlKey || click.shiftKey || click.button === 1)) {
+			placeholder = window.open('', '_blank');
+			if (placeholder) placeholder.opener = null;
+		}
 		try {
 			const resolution = await workspaces.resolveLink(agentId, path);
 			const url = await fileLinkUrl(agentId, resolution);
-			await openFileLink(url, click);
-		} catch {
-			// Resolution is unavailable (agent removed, offline): copy instead
-			// of navigating the SPA to a garbage route.
-			void navigator.clipboard?.writeText(path).catch(() => undefined);
-		}
-	}
-
-	async function openFileLink(url: string, click?: MouseEvent): Promise<void> {
-		// Modifier-clicks and middle-clicks (auxclick, button 1) request a new
-		// browsing context for the resolved route. Open without the noopener
-		// feature — it makes window.open return null even on success — and
-		// sever the opener manually.
-		if (click && (click.metaKey || click.ctrlKey || click.shiftKey || click.button === 1)) {
-			const opened = window.open(url, '_blank');
-			if (opened) {
-				opened.opener = null;
+			if (placeholder) {
+				if (placeholder.closed) return;
+				placeholder.location.href = url;
 				return;
 			}
+			await goto(url);
+		} catch {
+			// Resolution is unavailable (agent removed, offline): close the
+			// placeholder and copy instead of navigating to a garbage route.
+			placeholder?.close();
+			void navigator.clipboard?.writeText(path).catch(() => undefined);
 		}
-		await goto(url);
 	}
 
 	async function fileLinkUrl(agentId: string, resolution: WorkspaceLinkResolution): Promise<string> {
