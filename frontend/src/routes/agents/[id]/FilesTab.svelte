@@ -148,7 +148,14 @@
 			directories = { '': rootDirectory.entries };
 			git = gitStatus;
 			const initial = routeState(route);
-			if (initial.source !== 'container' && initial.path) await openFile(initial.path, true, false);
+			if (initial.source === 'container') {
+				// +page.svelte does not thread the URL through as `route`, so
+				// the applyRoute effect never sees the initial container deep
+				// link; apply it directly during initialization.
+				await applyContainerRoute(initial.path);
+			} else if (initial.path) {
+				await openFile(initial.path, true, false);
+			}
 		} catch (cause) {
 			error = cause instanceof Error ? cause.message : String(cause);
 		} finally {

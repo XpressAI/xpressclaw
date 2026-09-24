@@ -57,7 +57,10 @@
 
 	function fileLinkAgentId(message: ConversationMessage): string | null {
 		if (message.sender_type === 'agent') {
-			return participantAgentIds.includes(message.sender_id) ? message.sender_id : null;
+			// Historical messages outlive membership changes; the resolver
+			// itself validates that the Agent still exists and scopes its
+			// files, so agent-authored links always use their sender.
+			return message.sender_id;
 		}
 		// Person-authored links resolve against the sole participating Agent,
 		// when there is exactly one; otherwise there is no unambiguous scope.
