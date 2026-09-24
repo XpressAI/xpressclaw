@@ -1089,6 +1089,25 @@ async fn resolve_link(
         .await?
         .active_root()
         .to_path_buf();
+
+    // A link to the workspace root itself has an empty relative path, which
+    // the scoped checks below reject; map it straight to its container mount
+    // (sandboxed runners see the root at /workspace, not the host path).
+    if let Ok(canonical) = std::fs::canonicalize(&raw) {
+        let mount = if canonical == active_root {
+            Some(container_root_for(&agent, &active_root, &bootstrap)?)
+        } else if canonical == bootstrap {
+            Some(container_root_for(&agent, &bootstrap, &bootstrap)?)
+        } else {
+            None
+        };
+        if let Some(mount) = mount {
+            return Ok(Json(json!({
+                "kind": "container",
+                "path": mount.display().to_string().replace('\\', "/"),
+            })));
+        }
+    }
     if let Some((relative, directory)) = scoped_workspace_relative_path(&active_root, &raw) {
         return Ok(Json(json!({
             "kind": "workspace",
