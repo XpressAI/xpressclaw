@@ -295,6 +295,41 @@ for (const prose of [true, false]) {
 	});
 }
 
+for (const [stage, tail] of [
+	['tag name', '<tool_call'],
+	['opening tag', '<tool_call name="private_tool'],
+	['arguments', `<tool_call name="private_tool">{"argument":"${'private tool argument. '.repeat(250)}`],
+	['closing tag', '<tool_call name="private_tool">{"argument":"private tool argument"}</tool_ca'],
+] as const) {
+	for (const prose of [true, false]) {
+		test(`read aloud excludes unfinished task tool calls at ${stage} ${prose ? 'from spoken prose' : 'when no prose remains'}`, async ({ page }) => {
+			const reply = [
+				prose ? 'The **public** answer.' : '',
+				'<think>Private completed reasoning.</think>',
+				'<tool_call name="completed_tool">{"argument":"completed private argument"}</tool_call>',
+				prose ? 'The public conclusion.' : '',
+				tail,
+			].join('\n\n');
+			await mockApi(page, { reply });
+			await mockMedia(page);
+			const inputs: string[] = [];
+			await page.route('**/api/speech/synthesize', async (route) => {
+				inputs.push(route.request().postDataJSON().input);
+				await route.fulfill({ contentType: 'audio/mpeg', body: Buffer.from('test-audio') });
+			});
+			await page.goto('/tasks/voice-task');
+			const message = page.locator('[data-message-role="assistant"]').first();
+			await message.getByRole('button', { name: 'Read aloud', exact: true }).click();
+			if (prose) {
+				await expect.poll(() => inputs).toEqual(['The public answer. The public conclusion.']);
+			} else {
+				await expect(message.getByRole('alert')).toContainText('There is no prose to read aloud');
+				expect(inputs).toEqual([]);
+			}
+		});
+	}
+}
+
 test('cancelled transcription cannot append a late result to the draft', async ({ page }) => {
 	await mockApi(page);
 	await mockMedia(page);

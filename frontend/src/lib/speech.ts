@@ -30,9 +30,11 @@ export async function synthesizeSpeech(input: string, signal: AbortSignal): Prom
 
 // Read prose in bounded requests, without reading Markdown syntax or code blocks.
 export function speechChunks(markdown: string): string[] {
-	const document = new DOMParser().parseFromString(renderContent(markdown, { renderStructuredAgentMarkup: true }), 'text/html');
-	// Structured traces can be collapsed or still streaming. Exclude their
-	// contents and tool summaries before sending any prose to the provider.
+	// The renderer only wraps completed tool calls. Strip reserved blocks first,
+	// including unfinished tool headers/arguments from streaming or interrupted
+	// replies, so Markdown cannot turn any part of their contents into prose.
+	const prose = markdown.replace(/<think>[\s\S]*?(?:<\/think>|$)|<tool_call(?=[\s>]|$)[\s\S]*?(?:<\/tool_call>|$)/g, ' ');
+	const document = new DOMParser().parseFromString(renderContent(prose, { renderStructuredAgentMarkup: true }), 'text/html');
 	document.querySelectorAll('.ai-inline-trace, .ai-inline-tool, pre, script, style, iframe, svg').forEach((node) => node.remove());
 	document.querySelectorAll('p, li, h1, h2, h3, h4, h5, h6, br, tr').forEach((node) => node.append(' '));
 	let text = (document.body.textContent ?? '').replace(/\s+/g, ' ').trim();
