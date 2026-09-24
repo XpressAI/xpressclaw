@@ -27,22 +27,24 @@
     file = result; content = result.content;
     return true;
    } catch {
-    // Directories (and unreadable entries) fall back to a tree listing.
-    await browse(path);
-    return true;
+    // Directories (and unreadable entries) fall back to a tree listing;
+    // propagate browse's result so a declined dirty-file prompt does not
+    // report a navigation that never happened.
+    return await browse(path);
    } finally { if (request === sequence) busy = false; }
   }
- function mayNavigate() { return !dirty || window.confirm('Discard the unsaved changes in the current file?'); }
- async function browse(path: string) {
-  if (!mayNavigate()) return;
-  const request = ++sequence; busy = true; error = '';
-  try {
-   const result = await environments.tree(agentId, path);
-   if (request !== sequence) return;
-   directory = result.path; location = result.path; entries = result.entries; truncated = result.truncated; file = null; content = '';
-  } catch (cause) { if (request === sequence) error = String(cause); }
-  finally { if (request === sequence) busy = false; }
- }
+  function mayNavigate() { return !dirty || window.confirm('Discard the unsaved changes in the current file?'); }
+  async function browse(path: string): Promise<boolean> {
+   if (!mayNavigate()) return false;
+   const request = ++sequence; busy = true; error = '';
+   try {
+    const result = await environments.tree(agentId, path);
+    if (request !== sequence) return true;
+    directory = result.path; location = result.path; entries = result.entries; truncated = result.truncated; file = null; content = '';
+    return true;
+   } catch (cause) { if (request === sequence) error = String(cause); return false; }
+   finally { if (request === sequence) busy = false; }
+  }
  async function open(path: string) {
   if (!mayNavigate()) return;
   const request = ++sequence; busy = true; error = '';
