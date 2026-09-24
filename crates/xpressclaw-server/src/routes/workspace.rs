@@ -1064,7 +1064,7 @@ async fn resolve_link(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_same_origin(&headers)?;
-    let (_, bootstrap) = agent_workspace(state, &agent_id)?;
+    let (_, bootstrap) = agent_workspace(&state, &agent_id)?;
     // Resolve against the bootstrap workspace, not the active repository
     // root: the whole bootstrap workspace is what is mounted into the
     // container, so every contained file is legitimately viewable.
@@ -1085,10 +1085,11 @@ async fn resolve_link(
 }
 
 /// Map an absolute path to a workspace-relative path when it is contained in
-/// the canonicalized workspace root. The longest existing ancestor is
-/// canonicalized so symlinks cannot escape the workspace; the remaining tail
-/// must not traverse upwards. Non-existent files inside the workspace still
-/// resolve so links to files an Agent described (but has not written) work.
+/// the canonicalized workspace root. Walks downward from the root,
+/// canonicalizing each existing segment, so symlinks cannot escape the
+/// workspace and `..` components are rejected outright. Non-existent files
+/// inside the workspace still resolve so links to files an Agent described
+/// (but has not written) work.
 fn scoped_workspace_relative_path(root: &FsPath, raw: &str) -> Option<PathBuf> {
     let root = root.canonicalize().ok()?;
     let path = FsPath::new(raw);
@@ -1096,39 +1097,45 @@ fn scoped_workspace_relative_path(root: &FsPath, raw: &str) -> Option<PathBuf> {
         return None;
     }
 
-    // Find the longest existing ancestor. Canonicalization resolves symlinks
-    // in the existing prefix, so a link pointing outside the workspace fails
-    // the containment check below instead of escaping it.
-    let components: Vec<Component> = path.components().collect();
-    let mut probe = path.to_path_buf();
-    let mut split_at = components.len();
-    let existing = loop {
-        match std::fs::canonicalize(&probe) {
-            Ok(canonical) => break canonical,
+    // Walk existing segments from the root, canonicalizing each one. The
+    // walk stops at the first segment that does not exist; everything after
+    // it must be plain normal components appended inside the workspace.
+    let mut existing = FsPath::new("/").to_path_buf();
+    let mut tail_started = false;
+    let mut relative = PathBuf::new();
+    for component in path.components() {
+        let segment = match component {
+            Component::RootDir => continue,
+            Component::Normal(value) => value,
+            // ParentDir, CurDir (only interior dots survive components()),
+            // and Windows prefixes never resolve inside the workspace.
+            Component::ParentDir | Component::CurDir | Component::Prefix(_) => return None,
+        };
+        if tail_started {
+            relative.push(segment);
+            continue;
+        }
+        match std::fs::canonicalize(existing.join(segment)) {
+            Ok(canonical) => existing = canonical,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let Some(parent) = probe.parent() else {
-                    return None;
-                };
-                if parent == probe {
-                    return None;
-                }
-                split_at -= 1;
-                probe = parent.to_path_buf();
+                tail_started = true;
+                relative.push(segment);
             }
             Err(_) => return None,
         }
-    };
+    }
 
-    // The canonicalized existing ancestor must sit inside the workspace.
-    let existing_relative = existing.strip_prefix(&root).ok()?;
-
-    // Remaining (not-yet-existing) components may only be normal segments.
-    let mut relative = existing_relative.to_path_buf();
-    for component in &components[split_at..] {
-        match component {
-            Component::Normal(value) => relative.push(value),
-            _ => return None,
-        }
+    if !tail_started {
+        // Every segment existed: derive the relative path from the
+        // canonicalized result.
+        relative = existing.strip_prefix(&root).ok()?.to_path_buf();
+    } else {
+        // Anchor the non-existent tail to the last canonicalized ancestor
+        // inside the workspace.
+        let anchor = existing.strip_prefix(&root).ok()?;
+        let mut combined = anchor.to_path_buf();
+        combined.push(&relative);
+        relative = combined;
     }
     if relative.as_os_str().is_empty() {
         return None;
@@ -1712,13 +1719,13 @@ mod tests {
 
         // Paths outside the workspace and traversal tails are rejected.
         assert_eq!(
-            scoped_workspace_relative_path(&root, outside.path().join("secret.md").to_str().unwrap()),
+            scoped_workspace_relative_path(
+                &root,
+                outside.path().join("secret.md").to_str().unwrap()
+            ),
             None
         );
-        assert_eq!(
-            scoped_workspace_relative_path(&root, "/etc/passwd"),
-            None
-        );
+        assert_eq!(scoped_workspace_relative_path(&root, "/etc/passwd"), None);
         let trailing = root.join("docs/arch/../../escape.md");
         // The existing prefix resolves, but the traversal tail is rejected.
         assert_eq!(
@@ -1728,7 +1735,10 @@ mod tests {
 
         // Relative input and the bare workspace root resolve to nothing.
         assert_eq!(scoped_workspace_relative_path(&root, "docs/arch"), None);
-        assert_eq!(scoped_workspace_relative_path(&root, root.to_str().unwrap()), None);
+        assert_eq!(
+            scoped_workspace_relative_path(&root, root.to_str().unwrap()),
+            None
+        );
     }
 
     #[test]
