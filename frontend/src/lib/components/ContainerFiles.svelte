@@ -45,7 +45,13 @@
     if (request !== sequence) return true;
     directory = result.path; location = result.path; entries = result.entries; truncated = result.truncated; file = null; content = '';
     return true;
-   } catch (cause) { if (request === sequence) error = String(cause); return false; }
+   } catch (cause) {
+    // A superseded request's failure belongs to the navigation that replaced
+    // it; report success so callers do not roll back the newer view.
+    if (request !== sequence) return true;
+    error = String(cause);
+    return false;
+   }
    finally { if (request === sequence) busy = false; }
   }
  async function open(path: string) {
