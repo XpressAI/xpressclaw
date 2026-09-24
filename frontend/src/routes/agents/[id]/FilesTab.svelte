@@ -6,7 +6,7 @@
 	import type { GitChange, WorkspaceEntry, WorkspaceFile, WorkspaceGitDiff, WorkspaceGitStatus, WorkspaceStatus } from '$lib/api';
 	import MonacoEditor from '$lib/components/MonacoEditor.svelte';
 	import TerminalPanel from '$lib/components/TerminalPanel.svelte';
-	import ContainerFiles from '$lib/components/ContainerFiles.svelte';
+	import ContainerFiles, { type OpenPathResult } from '$lib/components/ContainerFiles.svelte';
 
 	let { agentId, route = '' }: { agentId: string; route?: string } = $props();
 	let status = $state<WorkspaceStatus | null>(null);
@@ -32,7 +32,7 @@
 	// navigation; only a *changed* buffer needs a second prompt after the
 	// workspace read completes.
 	let confirmedContainerContent: string | null = null;
-	let containerBrowser = $state<{ refresh: () => void; refreshAwaiting: () => Promise<boolean>; openPath: (path: string) => Promise<boolean>; dirtyContent: () => string | null }>();
+	let containerBrowser = $state<{ refresh: () => void; refreshAwaiting: () => Promise<boolean>; openPath: (path: string) => Promise<OpenPathResult>; dirtyContent: () => string | null }>();
 	let showTree = $state(true);
 	let initialized = $state(false);
 	let syncedRoute = '';
@@ -167,6 +167,9 @@
  			// The container editor stayed mounted during the asynchronous read;
  			// only a buffer that changed in the meantime needs another prompt.
  			if (leavingContainer && containerDirty && containerBrowser?.dirtyContent() !== confirmedContainerContent && !window.confirm('Discard the unsaved changes in the current file?')) {
+ 				// The rejection invalidates the approval even if the buffer is
+ 				// later edited back to the approved content.
+ 				confirmedContainerContent = null;
  				await rollback();
  				return;
  			}
@@ -199,8 +202,11 @@
 		// The child confirms unsaved container edits itself through
 		// mayNavigate() and mirrors its dirty flag back via onDirtyChange,
 		// so the parent neither prompts nor clears state prematurely.
+		// 'stale' means a newer in-child navigation superseded the deep link;
+		// the parent must not commit the route over the newer view.
 		const opened = await containerBrowser?.openPath(path);
-		return opened === false ? 'failed' : 'opened';
+		if (opened === 'stale') return 'stale';
+		return opened === 'declined' ? 'failed' : 'opened';
 	}
 
 	function clearFileSelection(): FileOpenResult {

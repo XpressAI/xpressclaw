@@ -21,19 +21,21 @@
   export async function refreshAwaiting(): Promise<boolean> { return browse(directory); }
   /** The current buffer when dirty, for callers snapshotting a discard approval. */
   export function dirtyContent(): string | null { return dirty ? content : null; }
+  /** Open-path outcomes: 'opened' committed, 'declined' cancelled, 'stale' superseded by a newer child navigation. */
+  export type OpenPathResult = 'opened' | 'declined' | 'stale';
    /** Open a specific absolute container path: a file directly, a directory via browse. */
-   export async function openPath(path: string): Promise<boolean> {
-    if (!mayNavigate()) return false;
+   export async function openPath(path: string): Promise<OpenPathResult> {
+    if (!mayNavigate()) return 'declined';
     const request = ++sequence; busy = true; error = '';
     try {
      const result = await environments.readFile(agentId, path);
-     if (request !== sequence) return true;
-     if (!commitFile(result)) return false;
-     return true;
+     // A newer in-child navigation superseded this read; the parent must not
+     // record the deep-linked route as applied over it.
+     if (request !== sequence) return 'stale';
+     if (!commitFile(result)) return 'declined';
+     return 'opened';
     } catch {
-     // A newer navigation superseded this read: drop it instead of letting
-     // the directory fallback clobber the newer view.
-     if (request !== sequence) return true;
+     if (request !== sequence) return 'stale';
      // Directories (and unreadable entries) fall back to a tree listing;
      // propagate browse's result so a declined dirty-file prompt does not
      // report a navigation that never happened.
@@ -44,7 +46,7 @@
       // unrelated navigation.
       confirmedDiscardContent = null;
      }
-     return browsed;
+     return browsed ? 'opened' : (request === sequence ? 'declined' : 'stale');
     } finally { if (request === sequence) busy = false; }
    }
   // Content whose dirty state the user already accepted discarding for the
