@@ -7,8 +7,8 @@
 	let phase = $state<'idle' | 'loading' | 'playing'>('idle');
 	let error = $state('');
 	let request: AbortController | undefined;
-	let audio: HTMLAudioElement | undefined;
-	let url: string | undefined;
+	let context: AudioContext | undefined;
+	let source: AudioBufferSourceNode | undefined;
 	let releasePlayback: (() => void) | undefined;
 	let generation = 0;
 
@@ -17,16 +17,12 @@
 	$effect(() => { if (!$speechSettings?.enabled) stop(); });
 
 	function releaseAudio() {
-		if (audio) {
-			audio.onended = null;
-			audio.onerror = null;
-			audio.pause();
-			audio.removeAttribute('src');
-			audio.load();
-			audio = undefined;
+		if (source) {
+			source.onended = null;
+			source.stop();
+			source.disconnect();
+			source = undefined;
 		}
-		if (url) URL.revokeObjectURL(url);
-		url = undefined;
 	}
 
 	function stop() {
@@ -34,6 +30,8 @@
 		request?.abort();
 		request = undefined;
 		releaseAudio();
+		if (context) void context.close().catch(() => {});
+		context = undefined;
 		releasePlayback?.();
 		releasePlayback = undefined;
 		phase = 'idle';
@@ -44,6 +42,19 @@
 		error = '';
 		const chunks = speechChunks(content);
 		if (!chunks.length) { error = 'There is no prose to read aloud in this reply.'; return; }
+		let playback: AudioContext;
+		let ready: Promise<void>;
+		try {
+			playback = new AudioContext();
+			context = playback;
+			// Resume during the click, before requesting audio. Safari requires
+			// user activation here; all later chunks share this unlocked context.
+			ready = playback.resume();
+		} catch {
+			stop();
+			error = 'This browser could not start speech playback.';
+			return;
+		}
 		releasePlayback = claimSpeechPlayback(stop);
 		const current = generation;
 		const controller = new AbortController();
@@ -55,14 +66,18 @@
 			if (!input) { stop(); return; }
 			phase = 'loading';
 			try {
+				await ready;
+				if (current !== generation) return;
 				const blob = await synthesizeSpeech(input, controller.signal);
 				if (current !== generation) return;
-				url = URL.createObjectURL(blob);
-				audio = new Audio(url);
-				audio.onended = () => { void playNext(); };
-				audio.onerror = () => { stop(); error = 'The speech response could not be played.'; };
-				await audio.play();
-				if (current === generation) phase = 'playing';
+				const buffer = await playback.decodeAudioData(await blob.arrayBuffer());
+				if (current !== generation) return;
+				source = playback.createBufferSource();
+				source.buffer = buffer;
+				source.connect(playback.destination);
+				source.onended = () => { void playNext(); };
+				source.start();
+				phase = 'playing';
 			} catch (cause) {
 				if (current !== generation) return;
 				stop();

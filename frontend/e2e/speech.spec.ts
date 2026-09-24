@@ -59,13 +59,13 @@ async function mockApi(page: Page, options: { enabled?: boolean; reply?: string 
 
 declare global {
 	interface Window {
-		speechTest: { stopped: number; played: number; paused: number; revoked: number; deny: boolean; uploaded: string[]; resolvePermission?: () => void; endPlayback?: () => void };
+		speechTest: { stopped: number; played: number; closed: number; released: number; deny: boolean; uploaded: string[]; resolvePermission?: () => void; endPlayback?: () => void };
 	}
 }
 
 async function mockMedia(page: Page, mime = 'audio/webm;codecs=opus', deferredPermission = false) {
 	await page.addInitScript(({ mime, deferredPermission }) => {
-		window.speechTest = { stopped: 0, played: 0, paused: 0, revoked: 0, deny: false, uploaded: [] };
+		window.speechTest = { stopped: 0, played: 0, closed: 0, released: 0, deny: false, uploaded: [] };
 		const fetch = window.fetch.bind(window);
 		window.fetch = async (input, init) => {
 			if (String(input).endsWith('/api/speech/transcriptions') && init?.body instanceof FormData) {
@@ -98,16 +98,33 @@ async function mockMedia(page: Page, mime = 'audio/webm;codecs=opus', deferredPe
 			}
 		}
 		Object.defineProperty(window, 'MediaRecorder', { configurable: true, value: FakeRecorder });
-		Object.defineProperty(window, 'Audio', { configurable: true, value: function () {
-			const audio = document.createElement('audio');
-			audio.play = async () => { window.speechTest.played += 1; };
-			audio.pause = () => { window.speechTest.paused += 1; };
-			audio.load = () => {};
-			window.speechTest.endPlayback = () => audio.dispatchEvent(new Event('ended'));
-			return audio;
-		} });
-		const revoke = URL.revokeObjectURL.bind(URL);
-		URL.revokeObjectURL = (url) => { window.speechTest.revoked += 1; revoke(url); };
+		let inClick = false;
+		document.addEventListener('click', () => {
+			inClick = true;
+			setTimeout(() => { inClick = false; }, 0);
+		}, true);
+		class FakeAudioContext {
+			destination = {};
+			async resume() {
+				if (!inClick) throw new DOMException('Playback must start during a click', 'NotAllowedError');
+			}
+			async close() { window.speechTest.closed += 1; }
+			async decodeAudioData() { return {}; }
+			createBufferSource() {
+				const source = {
+					onended: null as (() => void) | null,
+					connect() {},
+					disconnect() { window.speechTest.released += 1; },
+					stop() {},
+					start() {
+						window.speechTest.played += 1;
+						window.speechTest.endPlayback = () => source.onended?.();
+					}
+				};
+				return source;
+			}
+		}
+		Object.defineProperty(window, 'AudioContext', { configurable: true, value: FakeAudioContext });
 	}, { mime, deferredPermission });
 }
 
@@ -236,7 +253,8 @@ test('read aloud retries CSRF, reads long prose in chunks, and stops competing p
 	await expect.poll(() => page.evaluate(() => window.speechTest.played)).toBe(3);
 	await expect(replies.first().getByRole('button', { name: 'Read aloud', exact: true })).toBeVisible();
 	await replies.last().getByRole('button', { name: 'Stop reading aloud' }).click();
-	await expect.poll(() => page.evaluate(() => window.speechTest.revoked)).toBe(3);
+	await expect.poll(() => page.evaluate(() => window.speechTest.released)).toBe(3);
+	expect(await page.evaluate(() => window.speechTest.closed)).toBe(2);
 });
 
 test('speech controls stay hidden while disabled', async ({ page }) => {
@@ -290,4 +308,33 @@ test('read aloud can cancel generation and recover from a provider error', async
 	await expect(reply.getByRole('alert')).toHaveText('Speech provider unavailable');
 	expect(await page.evaluate(() => window.speechTest.played)).toBe(0);
 	await expect(reply.getByRole('button', { name: 'Read aloud', exact: true })).toBeEnabled();
+});
+
+test('read aloud decodes and plays provider audio through the native browser audio context', async ({ page }) => {
+	await mockApi(page);
+	await page.addInitScript(() => {
+		window.speechTest = { stopped: 0, played: 0, closed: 0, released: 0, deny: false, uploaded: [] };
+		const NativeAudioContext = window.AudioContext;
+		window.AudioContext = class extends NativeAudioContext {
+			createBufferSource() {
+				const source = super.createBufferSource();
+				const start = source.start.bind(source);
+				source.start = () => { window.speechTest.played += 1; start(); };
+				return source;
+			}
+		};
+	});
+	// A short silent PCM clip exercises the real decoder and playback lifecycle.
+	const wav = Buffer.alloc(1644);
+	wav.write('RIFF', 0); wav.writeUInt32LE(wav.length - 8, 4); wav.write('WAVEfmt ', 8);
+	wav.writeUInt32LE(16, 16); wav.writeUInt16LE(1, 20); wav.writeUInt16LE(1, 22);
+	wav.writeUInt32LE(8000, 24); wav.writeUInt32LE(16000, 28); wav.writeUInt16LE(2, 32);
+	wav.writeUInt16LE(16, 34); wav.write('data', 36); wav.writeUInt32LE(wav.length - 44, 40);
+	await page.route('**/api/speech/synthesize', (route) => route.fulfill({ contentType: 'audio/wav', body: wav }));
+	await page.goto('/conversations/voice-chat');
+	const reply = page.locator('[data-message-role="assistant"]').first();
+	await reply.getByRole('button', { name: 'Read aloud', exact: true }).click();
+	await expect.poll(() => page.evaluate(() => window.speechTest.played)).toBe(1);
+	await expect(reply.getByRole('button', { name: 'Read aloud', exact: true })).toBeVisible();
+	await expect(reply.getByRole('alert')).toHaveCount(0);
 });
