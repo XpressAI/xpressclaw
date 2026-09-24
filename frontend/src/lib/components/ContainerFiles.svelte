@@ -24,7 +24,7 @@
    try {
     const result = await environments.readFile(agentId, path);
     if (request !== sequence) return true;
-    file = result; content = result.content;
+    if (!commitFile(result)) return false;
     return true;
    } catch {
     // A newer navigation superseded this read: drop it instead of letting
@@ -37,6 +37,12 @@
    } finally { if (request === sequence) busy = false; }
   }
   function mayNavigate() { return !dirty || window.confirm('Discard the unsaved changes in the current file?'); }
+  /** Commit a freshly read file, rechecking edits made while the read was in flight. */
+  function commitFile(result: WorkspaceFile): boolean {
+   if (dirty && !window.confirm('Discard the unsaved changes in the current file?')) return false;
+   file = result; content = result.content;
+   return true;
+  }
   async function browse(path: string): Promise<boolean> {
    if (!mayNavigate()) return false;
    const request = ++sequence; busy = true; error = '';
@@ -54,13 +60,13 @@
    }
    finally { if (request === sequence) busy = false; }
   }
- async function open(path: string) {
-  if (!mayNavigate()) return;
-  const request = ++sequence; busy = true; error = '';
-  try { const result = await environments.readFile(agentId, path); if (request === sequence) { file = result; content = result.content; } }
-  catch (cause) { if (request === sequence) error = String(cause); }
-  finally { if (request === sequence) busy = false; }
- }
+  async function open(path: string) {
+   if (!mayNavigate()) return;
+   const request = ++sequence; busy = true; error = '';
+   try { const result = await environments.readFile(agentId, path); if (request !== sequence) return; commitFile(result); }
+   catch (cause) { if (request === sequence) error = String(cause); }
+   finally { if (request === sequence) busy = false; }
+  }
  async function save() {
   if (!file || !dirty || busy) return;
   busy = true; error = '';

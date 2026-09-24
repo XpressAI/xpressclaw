@@ -3,6 +3,9 @@
 	import { renderContent } from '$lib/formatMessage';
 
 	function handleFileLinkClick(click: MouseEvent) {
+		// auxclick only carries the middle button here; right-clicks (button 2)
+		// must keep the native context menu.
+		if (click.type === 'auxclick' && click.button !== 1) return;
 		const target = click.target as HTMLElement | null;
 		const anchor = target?.closest?.('a[data-file-path]');
 		if (!anchor) return;

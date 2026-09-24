@@ -102,6 +102,9 @@
 	}
 
 	function handleContentClick(event: MouseEvent) {
+		// auxclick only carries the middle button here; right-clicks (button 2)
+		// must keep the native context menu.
+		if (event.type === 'auxclick' && event.button !== 1) return;
 		const target = event.target as HTMLElement | null;
 		const anchor = target?.closest?.('a[data-file-path]');
 		if (!anchor) return;
