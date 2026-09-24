@@ -1097,8 +1097,10 @@ async fn resolve_link(
     // Files elsewhere in the mounted bootstrap workspace are still mounted
     // into the Agent's container, so expose them through the container file
     // API at their mount-relative location instead of a host-relative one.
+    // The bootstrap itself is what is mounted, so anchor the path at the
+    // bootstrap's container mount root (not the active repository's).
     if let Some(relative) = scoped_workspace_relative_path(&bootstrap, raw) {
-        let container_path = container_root_for(&agent, &active_root, &bootstrap)?.join(&relative);
+        let container_path = container_root_for(&agent, &bootstrap, &bootstrap)?.join(&relative);
         return Ok(Json(json!({
             "kind": "container",
             "path": container_path.display().to_string().replace('\\', "/"),

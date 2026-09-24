@@ -1312,6 +1312,16 @@
 		}
 	}
 
+	function handleResultFileClick(event: MouseEvent) {
+		const target = event.target as HTMLElement | null;
+		const anchor = target?.closest?.('a[data-file-path]');
+		if (!anchor) return;
+		if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+		event.preventDefault();
+		const path = anchor.getAttribute('data-file-path');
+		if (path) void openLinkedFile(path);
+	}
+
 	function openChangedFile(event: MouseEvent, agentId: string, path: string) {
 		if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
 		event.preventDefault();
@@ -1741,7 +1751,10 @@
 								<span class="h-2 w-2 rounded-full bg-emerald-400"></span>
 								Result
 							</div>
-							<div data-task-result-content class="prose prose-invert prose-sm max-w-none">{@html renderContent(latestResult, { openLinksInNewWindow: true, renderStructuredAgentMarkup: true })}</div>
+							<!-- svelte-ignore a11y_click_events_have_key_events -->
+						<!-- svelte-ignore a11y_no_static_element_interactions -->
+						<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+						<div data-task-result-content class="prose prose-invert prose-sm max-w-none" onclick={handleResultFileClick}>{@html renderContent(latestResult, { openLinksInNewWindow: true, renderStructuredAgentMarkup: true })}</div>
 						</section>
 					{:else if latestError}
 						<section role="alert" data-attempt-error class="rounded-lg border border-red-500/30 bg-red-500/5 p-4">
