@@ -1720,7 +1720,7 @@
 									</AiMessage>
 								{:else}
 									<div data-transcript-kind="activity" data-transcript-timestamp={item.timestamp}>
-										<ActivityEventRow event={item.event} />
+										<ActivityEventRow event={item.event} onfilelink={(path) => void openLinkedFile(path)} />
 									</div>
 								{/if}
 							{/each}

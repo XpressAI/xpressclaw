@@ -89,6 +89,19 @@
 			return;
 		}
 
+		// A previously-applied container route must be reset so the workspace
+		// file below actually renders instead of the container browser.
+		if (source === 'container') {
+			if (containerDirty && !window.confirm('Discard the unsaved changes in the current file?')) {
+				const restored = routeForFileState(requestedRoute, previousPath, previousShowTree);
+				syncedRoute = restored;
+				await goto(restored, { replaceState: true, keepFocus: true, noScroll: true });
+				return;
+			}
+			containerDirty = false;
+			source = 'workspace';
+		}
+
 		if (requested.path === selectedPath) {
 			fileOpenSequence += 1;
 			loadingFile = false;
