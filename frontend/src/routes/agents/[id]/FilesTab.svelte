@@ -132,6 +132,12 @@
 			: clearFileSelection();
 		if (result === 'stale' || route !== requestedRoute) return;
 		if (result === 'opened') {
+			// The container editor stayed mounted during the asynchronous read;
+			// edits made in the meantime still need an explicit discard.
+			if (leavingContainer && containerDirty && !window.confirm('Discard the unsaved changes in the current file?')) {
+				await rollback();
+				return;
+			}
 			source = 'workspace';
 			syncedRoute = requestedRoute;
 			return;

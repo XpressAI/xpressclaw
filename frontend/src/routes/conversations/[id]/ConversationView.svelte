@@ -84,10 +84,14 @@
 				url = `${base}&path=${encodeURIComponent(resolution.path)}`;
 			}
 			// Modifier-clicks request a new browsing context for the resolved
-			// route; fall back to same-tab navigation when the popup is
-			// blocked (resolution was asynchronous).
+			// route. Open without the noopener feature — it makes window.open
+			// return null even on success — and sever the opener manually.
 			if (click && (click.metaKey || click.ctrlKey || click.shiftKey)) {
-				if (window.open(url, '_blank', 'noopener')) return;
+				const opened = window.open(url, '_blank');
+				if (opened) {
+					opened.opener = null;
+					return;
+				}
 			}
 			await goto(url);
 		} catch {

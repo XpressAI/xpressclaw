@@ -159,7 +159,7 @@
 			<!-- svelte-ignore a11y_click_events_have_key_events -->
 			<!-- svelte-ignore a11y_no_static_element_interactions -->
 			<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-			<div class="rounded-lg rounded-tl-[4px] bg-accent/55 px-3.5 py-2.5 text-sm text-foreground shadow-[var(--shadow-hairline)]" data-agent-update-content onclick={handleFileLinkClick}>
+			<div class="rounded-lg rounded-tl-[4px] bg-accent/55 px-3.5 py-2.5 text-sm text-foreground shadow-[var(--shadow-hairline)]" data-agent-update-content onclick={handleFileLinkClick} onauxclick={handleFileLinkClick}>
 				<div class="prose-chat max-w-none break-words">
 					{@html renderContent(event.summary, { openLinksInNewWindow: true, renderStructuredAgentMarkup: true })}
 				</div>
@@ -198,7 +198,7 @@
 					<!-- svelte-ignore a11y_click_events_have_key_events -->
 					<!-- svelte-ignore a11y_no_static_element_interactions -->
 					<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-					<div data-activity-rich-content class="prose prose-invert prose-sm max-w-none text-xs text-foreground/80" onclick={handleFileLinkClick}>
+					<div data-activity-rich-content class="prose prose-invert prose-sm max-w-none text-xs text-foreground/80" onclick={handleFileLinkClick} onauxclick={handleFileLinkClick}>
 						{@html renderContent(event.summary, { openLinksInNewWindow: true, renderStructuredAgentMarkup: true })}
 					</div>
 				{:else if !isTool}

@@ -1312,11 +1312,14 @@
 
 	async function openFileLink(url: string, click?: MouseEvent): Promise<void> {
 		// Modifier-clicks request a new browsing context for the resolved
-		// route; fall back to same-tab navigation when the popup is blocked
-		// (resolution was asynchronous).
+		// route. Open without the noopener feature — it makes window.open
+		// return null even on success — and sever the opener manually.
 		if (click && (click.metaKey || click.ctrlKey || click.shiftKey)) {
-			const opened = window.open(url, '_blank', 'noopener');
-			if (opened) return;
+			const opened = window.open(url, '_blank');
+			if (opened) {
+				opened.opener = null;
+				return;
+			}
 		}
 		await goto(url);
 	}
@@ -1777,7 +1780,7 @@
 							<!-- svelte-ignore a11y_click_events_have_key_events -->
 						<!-- svelte-ignore a11y_no_static_element_interactions -->
 						<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-						<div data-task-result-content class="prose prose-invert prose-sm max-w-none" onclick={handleResultFileClick}>{@html renderContent(latestResult, { openLinksInNewWindow: true, renderStructuredAgentMarkup: true })}</div>
+						<div data-task-result-content class="prose prose-invert prose-sm max-w-none" onclick={handleResultFileClick} onauxclick={handleResultFileClick}>{@html renderContent(latestResult, { openLinksInNewWindow: true, renderStructuredAgentMarkup: true })}</div>
 						</section>
 					{:else if latestError}
 						<section role="alert" data-attempt-error class="rounded-lg border border-red-500/30 bg-red-500/5 p-4">

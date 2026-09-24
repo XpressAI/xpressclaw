@@ -163,6 +163,7 @@
 			bind:this={contentElement}
 			use:watchSelection
 			onclick={handleContentClick}
+			onauxclick={handleContentClick}
 			class="relative rounded-lg rounded-[10px] px-3.5 py-2.5 text-sm
 				{isSystem ? 'bg-muted/55 text-xs italic text-muted-foreground shadow-[var(--shadow-hairline)]' :
 				fromUser ? 'rounded-tr-[4px] bg-primary text-primary-foreground shadow-sm' :
