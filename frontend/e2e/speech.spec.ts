@@ -265,6 +265,36 @@ test('speech controls stay hidden while disabled', async ({ page }) => {
 	await expect(page.getByRole('button', { name: 'Read aloud', exact: true })).toHaveCount(0);
 });
 
+for (const prose of [true, false]) {
+	test(`read aloud excludes reasoning and tool details ${prose ? 'from spoken prose' : 'when no prose remains'}`, async ({ page }) => {
+		const reply = [
+			prose ? 'The **public** answer.' : '',
+			'<think>Private completed reasoning.</think>',
+			'<tool_call name="private_tool">{"argument":"private tool argument"}</tool_call>',
+			prose ? 'The public conclusion.' : '',
+			'<think>Private unfinished reasoning.',
+		].join('\n\n');
+		await mockApi(page, { reply });
+		await mockMedia(page);
+		const inputs: string[] = [];
+		await page.route('**/api/speech/synthesize', async (route) => {
+			inputs.push(route.request().postDataJSON().input);
+			await route.fulfill({ contentType: 'audio/mpeg', body: Buffer.from('test-audio') });
+		});
+		await page.goto('/conversations/voice-chat');
+		const message = page.locator('[data-message-role="assistant"]').first();
+		await expect(message.locator('.ai-inline-trace')).toHaveCount(2);
+		await expect(message.locator('.ai-inline-tool')).toHaveCount(1);
+		await message.getByRole('button', { name: 'Read aloud', exact: true }).click();
+		if (prose) {
+			await expect.poll(() => inputs).toEqual(['The public answer. The public conclusion.']);
+		} else {
+			await expect(message.getByRole('alert')).toContainText('There is no prose to read aloud');
+			expect(inputs).toEqual([]);
+		}
+	});
+}
+
 test('cancelled transcription cannot append a late result to the draft', async ({ page }) => {
 	await mockApi(page);
 	await mockMedia(page);

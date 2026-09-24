@@ -39,9 +39,9 @@ sending. **Cancel dictation** discards the recording or pending transcript.
 Recordings stop after five minutes and must fit within 25 MiB.
 
 Press **Read aloud** beside an Agent reply to hear an AI-generated voice.
-Press it again to stop. Long replies are read in successive chunks; fenced code
-and embedded visualizations are skipped. Starting another reply stops the
-previous playback. Speech never starts automatically.
+Press it again to stop. Long replies are read in successive chunks; reasoning
+traces, tool calls, fenced code, and embedded visualizations are skipped.
+Starting another reply stops the previous playback. Speech never starts automatically.
 
 Recordings and text are sent to the configured provider. Raw recordings and
 generated audio are not saved by XpressClaw; the transcript is saved when sent,

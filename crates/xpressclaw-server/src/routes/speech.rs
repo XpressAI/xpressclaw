@@ -310,14 +310,18 @@ async fn synthesize(
         "response_format": "mp3",
     })))
     .await?;
-    let mime = response
+    let content_type = response
         .headers()
         .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("audio/mpeg")
+        .cloned()
+        .unwrap_or_else(|| HeaderValue::from_static("audio/mpeg"));
+    let mime = content_type
+        .to_str()
+        .unwrap_or("")
         .split(';')
         .next()
         .unwrap_or("")
+        .trim()
         .to_ascii_lowercase();
     if !mime.starts_with("audio/") && mime != "application/octet-stream" {
         return Err(SpeechError::upstream(
@@ -330,15 +334,18 @@ async fn synthesize(
             "Speech provider returned empty audio",
         ));
     }
-    Ok((
+    let mut response = (
         [
-            (header::CONTENT_TYPE, "audio/mpeg"),
             (header::CACHE_CONTROL, "no-store"),
             (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
         ],
         Body::from(bytes),
     )
-        .into_response())
+        .into_response();
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, content_type);
+    Ok(response)
 }
 
 async fn send(request: reqwest::RequestBuilder) -> Result<reqwest::Response, SpeechError> {
@@ -648,6 +655,43 @@ mod tests {
             forwarded,
             json!({"input":"Read this aloud.","model":"custom-speaker","voice":"custom-voice","response_format":"mp3"})
         );
+    }
+
+    #[tokio::test]
+    async fn speech_preserves_provider_audio_content_type() {
+        let (state, _root) = state();
+        for content_type in [
+            Some("audio/mpeg"),
+            Some("audio/wav"),
+            Some("audio/ogg; codecs=opus"),
+            Some("application/octet-stream"),
+            None,
+        ] {
+            let upstream = provider(Router::new().route(
+                "/compatible/v1/audio/speech",
+                post(move || async move {
+                    let mut response = Response::builder();
+                    if let Some(content_type) = content_type {
+                        response = response.header(header::CONTENT_TYPE, content_type);
+                    }
+                    response.body(Body::from("provider-audio")).unwrap()
+                }),
+            ))
+            .await;
+            enable(&state, upstream.url.clone());
+            let response = speech(state.clone(), "Read this aloud.").await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers()[header::CONTENT_TYPE],
+                content_type.unwrap_or("audio/mpeg")
+            );
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            assert_eq!(
+                response.headers()[header::X_CONTENT_TYPE_OPTIONS],
+                "nosniff"
+            );
+            assert_eq!(body(response).await, "provider-audio");
+        }
     }
 
     #[tokio::test]

@@ -31,7 +31,9 @@ export async function synthesizeSpeech(input: string, signal: AbortSignal): Prom
 // Read prose in bounded requests, without reading Markdown syntax or code blocks.
 export function speechChunks(markdown: string): string[] {
 	const document = new DOMParser().parseFromString(renderContent(markdown, { renderStructuredAgentMarkup: true }), 'text/html');
-	document.querySelectorAll('pre, script, style, iframe, svg').forEach((node) => node.remove());
+	// Structured traces can be collapsed or still streaming. Exclude their
+	// contents and tool summaries before sending any prose to the provider.
+	document.querySelectorAll('.ai-inline-trace, .ai-inline-tool, pre, script, style, iframe, svg').forEach((node) => node.remove());
 	document.querySelectorAll('p, li, h1, h2, h3, h4, h5, h6, br, tr').forEach((node) => node.append(' '));
 	let text = (document.body.textContent ?? '').replace(/\s+/g, ' ').trim();
 	const chunks: string[] = [];
