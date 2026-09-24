@@ -38,13 +38,16 @@
 	let changeByPath = $derived(new Map((git?.files ?? []).map((change) => [change.path, change])));
 
 	onMount(() => {
+		const initialRoute = route;
 		showTerminal = Boolean(routeState(route).terminal);
 		showTree = routeState(route).showTree;
 		void initialize().finally(() => {
-			// The initial route was applied during initialization; record it
-			// so the effect below does not re-apply or fight it.
-			syncedRoute = route || `${window.location.pathname}${window.location.search}`;
+			// Initialization applied `initialRoute`; record exactly that so a
+			// route change arriving mid-initialization is not silently marked
+			// as synchronized, and replay it explicitly.
+			syncedRoute = initialRoute || `${window.location.pathname}${window.location.search}`;
 			initialized = true;
+			if (route !== initialRoute) void applyRoute(route || syncedRoute);
 		});
 	});
 
