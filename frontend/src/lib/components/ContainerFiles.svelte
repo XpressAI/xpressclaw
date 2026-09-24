@@ -17,6 +17,8 @@
  onDestroy(() => onDirtyChange(false));
  onMount(() => { void browse('/tmp'); });
   export function refresh() { void browse(directory); }
+  /** Refresh the current directory and report whether the navigation happened. */
+  export async function refreshAwaiting(): Promise<boolean> { return browse(directory); }
   /** The current buffer when dirty, for callers snapshotting a discard approval. */
   export function dirtyContent(): string | null { return dirty ? content : null; }
    /** Open a specific absolute container path: a file directly, a directory via browse. */

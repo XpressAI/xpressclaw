@@ -32,7 +32,7 @@
 	// navigation; only a *changed* buffer needs a second prompt after the
 	// workspace read completes.
 	let confirmedContainerContent: string | null = null;
-	let containerBrowser = $state<{ refresh: () => void; openPath: (path: string) => Promise<boolean>; dirtyContent: () => string | null }>();
+	let containerBrowser = $state<{ refresh: () => void; refreshAwaiting: () => Promise<boolean>; openPath: (path: string) => Promise<boolean>; dirtyContent: () => string | null }>();
 	let showTree = $state(true);
 	let initialized = $state(false);
 	let syncedRoute = '';
@@ -146,6 +146,7 @@
  		// rollback would recreate it at /tmp instead of the prior view.
  		const leavingContainer = source === 'container';
  		if (leavingContainer && containerDirty && containerBrowser?.dirtyContent() !== confirmedContainerContent && !window.confirm('Discard the unsaved changes in the current file?')) {
+ 			confirmedContainerContent = null;
  			await rollback();
  			return;
  		}
@@ -176,6 +177,9 @@
  			return;
  		}
 
+ 		// The route application did not commit; the approval snapshot no
+ 		// longer applies to a future navigation.
+ 		confirmedContainerContent = null;
  		await rollback();
  		} finally {
  			if (run === routeApplySequence) activeApplyRoute = null;
@@ -186,8 +190,11 @@
 		if (source !== 'container') source = 'container';
 		await tick();
 		if (!path) {
-			containerBrowser?.refresh();
-			return 'opened';
+			// The pathless route refreshes the current directory; await the
+			// result so declined prompts or failed listings roll the route
+			// back instead of recording it as applied.
+			const refreshed = await containerBrowser?.refreshAwaiting();
+			return refreshed === false ? 'failed' : 'opened';
 		}
 		// The child confirms unsaved container edits itself through
 		// mayNavigate() and mirrors its dirty flag back via onDirtyChange,
