@@ -40,13 +40,20 @@
 	onMount(() => {
 		showTerminal = Boolean(routeState(route).terminal);
 		showTree = routeState(route).showTree;
-		void initialize().finally(() => (initialized = true));
+		void initialize().finally(() => {
+			// The initial route was applied during initialization; record it
+			// so the effect below does not re-apply or fight it.
+			syncedRoute = route || `${window.location.pathname}${window.location.search}`;
+			initialized = true;
+		});
 	});
 
 	$effect(() => {
 		const requestedRoute = route;
 		if (!initialized || requestedRoute === syncedRoute) return;
-		syncedRoute = requestedRoute;
+		// applyRoute owns syncedRoute: it must remain the last *applied* route
+		// until the new one succeeds, or rollbacks would restore the rejected
+		// route instead of the view the user kept.
 		void applyRoute(requestedRoute);
 	});
 
@@ -74,6 +81,7 @@
 
  	async function applyRoute(requestedRoute: string) {
  		const previousShowTree = showTree;
+		const previousSource = source;
 		// The last applied route (or the page URL) is the only faithful
 		// rollback target: workspace state (selectedPath) knows nothing about
 		// an active container view and vice versa.
@@ -83,14 +91,19 @@
  		showTree = requested.showTree;
 
 		async function rollback(): Promise<void> {
+			source = previousSource;
+			showTree = previousShowTree;
 			syncedRoute = rollbackRoute;
 			await goto(rollbackRoute, { replaceState: true, keepFocus: true, noScroll: true });
 		}
 
 		if (requested.source === 'container') {
 			const result = await applyContainerRoute(requested.path);
-			if (result === 'opened' || result === 'stale' || route !== requestedRoute) return;
-			showTree = previousShowTree;
+			if (result === 'stale' || route !== requestedRoute) return;
+			if (result === 'opened') {
+				syncedRoute = requestedRoute;
+				return;
+			}
 			await rollback();
 			return;
 		}
@@ -102,36 +115,38 @@
 				await rollback();
 				return;
 			}
-			containerDirty = false;
 			source = 'workspace';
 		}
 
 		if (requested.path === selectedPath) {
 			fileOpenSequence += 1;
 			loadingFile = false;
+			syncedRoute = requestedRoute;
 			return;
 		}
 
 		const result = requested.path
 			? await openFile(requested.path, false, false)
 			: clearFileSelection();
-		if (result === 'opened' || result === 'stale' || route !== requestedRoute) return;
+		if (result === 'stale' || route !== requestedRoute) return;
+		if (result === 'opened') {
+			syncedRoute = requestedRoute;
+			return;
+		}
 
-		showTree = previousShowTree;
 		await rollback();
 	}
 
 	async function applyContainerRoute(path: string): Promise<FileOpenResult> {
-		if (containerDirty && !window.confirm('Discard the unsaved changes in the current file?')) {
-			return 'cancelled';
-		}
-		containerDirty = false;
 		if (source !== 'container') source = 'container';
 		await tick();
 		if (!path) {
 			containerBrowser?.refresh();
 			return 'opened';
 		}
+		// The child confirms unsaved container edits itself through
+		// mayNavigate() and mirrors its dirty flag back via onDirtyChange,
+		// so the parent neither prompts nor clears state prematurely.
 		const opened = await containerBrowser?.openPath(path);
 		return opened === false ? 'failed' : 'opened';
 	}
