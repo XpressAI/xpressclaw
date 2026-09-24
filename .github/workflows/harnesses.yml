@@ -48,6 +48,9 @@ jobs:
       - name: Validate pinned runner versions
         run: node --test scripts/runner-versions.test.mjs
 
+      - name: Test ACP smoke-test process cleanup
+        run: node --test harnesses/native/common/verify-acp-initialize.test.mjs
+
       - name: Generate runner matrix
         id: versions
         run: |
@@ -57,6 +60,7 @@ jobs:
   build-native-runners:
     needs: runner-matrix
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
       packages: write
