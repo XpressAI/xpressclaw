@@ -327,6 +327,16 @@
 		if (source === 'workspace') editorValue = selectedFile?.content ?? '';
 		containerDirty = false;
 		source = select.value as typeof source;
+		// Rewrite the URL so it matches the selected source: leaving stale
+		// source/path params would reopen the container file on refresh or
+		// feed the container path into workspace readFile on tree toggles.
+		const target = routeForFileState(
+			route || window.location.href,
+			source === 'workspace' ? selectedPath : '',
+			showTree
+		);
+		syncedRoute = target;
+		void goto(target, { replaceState: true, keepFocus: true, noScroll: true });
 	}
 </script>
 
