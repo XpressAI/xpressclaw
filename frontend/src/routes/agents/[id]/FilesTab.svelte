@@ -32,7 +32,7 @@
 	// navigation; only a *changed* buffer needs a second prompt after the
 	// workspace read completes.
 	let confirmedContainerContent: string | null = null;
-	let containerBrowser = $state<{ refresh: () => void; refreshAwaiting: () => Promise<boolean>; openPath: (path: string) => Promise<OpenPathResult>; dirtyContent: () => string | null }>();
+	let containerBrowser = $state<{ refresh: () => void; refreshAwaiting: () => Promise<OpenPathResult>; openPath: (path: string) => Promise<OpenPathResult>; dirtyContent: () => string | null }>();
 	let showTree = $state(true);
 	let initialized = $state(false);
 	let syncedRoute = '';
@@ -131,7 +131,14 @@
  				return;
  			}
  			const result = await applyContainerRoute(requested.path);
- 			if (result === 'stale' || route !== requestedRoute || superseded()) return;
+ 			if (route !== requestedRoute || superseded()) return;
+ 			if (result === 'stale') {
+ 				// The child superseded this deep link with its own navigation.
+ 				// Mark the route synchronized so the effect does not retry it
+ 				// over the child's newer view; the URL already matches.
+ 				syncedRoute = requestedRoute;
+ 				return;
+ 			}
  			if (result === 'opened') {
  				appliedSource = 'container';
  				syncedRoute = requestedRoute;
@@ -197,13 +204,13 @@
 			// result so declined prompts or failed listings roll the route
 			// back instead of recording it as applied.
 			const refreshed = await containerBrowser?.refreshAwaiting();
-			return refreshed === false ? 'failed' : 'opened';
+			if (refreshed === 'stale') return 'stale';
+			return refreshed === 'declined' ? 'failed' : 'opened';
 		}
 		// The child confirms unsaved container edits itself through
 		// mayNavigate() and mirrors its dirty flag back via onDirtyChange,
 		// so the parent neither prompts nor clears state prematurely.
-		// 'stale' means a newer in-child navigation superseded the deep link;
-		// the parent must not commit the route over the newer view.
+		// 'stale' means a newer in-child navigation superseded the deep link.
 		const opened = await containerBrowser?.openPath(path);
 		if (opened === 'stale') return 'stale';
 		return opened === 'declined' ? 'failed' : 'opened';
