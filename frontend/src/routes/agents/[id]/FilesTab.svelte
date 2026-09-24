@@ -23,6 +23,10 @@
 	let saving = $state(false);
 	let showTerminal = $state(false);
 	let source = $state<'workspace' | 'container'>('workspace');
+	// The source of the last *successfully applied* route. Overlapping route
+	// applications must not capture each other's transient `source` mutations
+	// for rollback; only applied state is a faithful restore target.
+	let appliedSource: 'workspace' | 'container' = 'workspace';
 	let containerDirty = $state(false);
 	let containerBrowser = $state<{ refresh: () => void; openPath: (path: string) => Promise<boolean> }>();
 	let showTree = $state(true);
@@ -96,7 +100,7 @@
  		const superseded = () => run !== routeApplySequence;
  		try {
  		const previousShowTree = showTree;
- 		const previousSource = source;
+ 		const previousSource = appliedSource;
  		// The last applied route (or the page URL) is the only faithful
  		// rollback target: workspace state (selectedPath) knows nothing about
  		// an active container view and vice versa.
@@ -108,6 +112,7 @@
  		async function rollback(): Promise<void> {
  			if (superseded()) return;
  			source = previousSource;
+ 			appliedSource = previousSource;
  			showTree = previousShowTree;
  			syncedRoute = rollbackRoute;
  			await goto(rollbackRoute, { replaceState: true, keepFocus: true, noScroll: true });
@@ -117,6 +122,7 @@
  			const result = await applyContainerRoute(requested.path);
  			if (result === 'stale' || route !== requestedRoute || superseded()) return;
  			if (result === 'opened') {
+ 				appliedSource = 'container';
  				syncedRoute = requestedRoute;
  				return;
  			}
@@ -151,7 +157,8 @@
  				await rollback();
  				return;
  			}
- 			source = 'workspace';
+  			source = 'workspace';
+ 			appliedSource = 'workspace';
  			syncedRoute = requestedRoute;
  			return;
  		}
@@ -210,6 +217,7 @@
 				// the applyRoute effect never sees the initial container deep
 				// link; apply it directly during initialization.
 				await applyContainerRoute(initial.path);
+				appliedSource = 'container';
 			} else if (initial.path) {
 				await openFile(initial.path, true, false);
 			}

@@ -135,7 +135,9 @@ const APP_ROUTE_SEGMENTS = new Set([
 // before the path is resolved server-side. The application root and known
 // SPA routes are navigation, not files.
 function filesystemPathFromHref(href: string): string | null {
-	if (!href.startsWith('/')) return null;
+	// Protocol-relative URLs (//example.com/…) are external links, not
+	// filesystem paths; only root-relative paths are candidates.
+	if (!href.startsWith('/') || href.startsWith('//')) return null;
 	let pathname: string;
 	try {
 		pathname = decodeURIComponent(new URL(href, 'file:///').pathname);

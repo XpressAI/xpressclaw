@@ -36,22 +36,32 @@
     return await browse(path);
    } finally { if (request === sequence) busy = false; }
   }
-  function mayNavigate() { return !dirty || window.confirm('Discard the unsaved changes in the current file?'); }
-  /** Commit a freshly read file, rechecking edits made while the read was in flight. */
+  // Content whose dirty state the user already accepted discarding for the
+  // in-flight navigation; only a *changed* buffer needs a second prompt.
+  let confirmedDiscardContent: string | null = null;
+  function mayNavigate() {
+   if (!dirty) return true;
+   if (!window.confirm('Discard the unsaved changes in the current file?')) return false;
+   confirmedDiscardContent = content;
+   return true;
+  }
+  /** Commit a freshly read file, re-prompting only for edits made while the read was in flight. */
   function commitFile(result: WorkspaceFile): boolean {
-   if (dirty && !window.confirm('Discard the unsaved changes in the current file?')) return false;
+   if (dirty && content !== confirmedDiscardContent && !window.confirm('Discard the unsaved changes in the current file?')) return false;
+   confirmedDiscardContent = null;
    file = result; content = result.content;
    return true;
   }
   async function browse(path: string): Promise<boolean> {
    if (!mayNavigate()) return false;
    const request = ++sequence; busy = true; error = '';
-   try {
-    const result = await environments.tree(agentId, path);
-    if (request !== sequence) return true;
-    directory = result.path; location = result.path; entries = result.entries; truncated = result.truncated; file = null; content = '';
-    return true;
-   } catch (cause) {
+    try {
+     const result = await environments.tree(agentId, path);
+     if (request !== sequence) return true;
+     directory = result.path; location = result.path; entries = result.entries; truncated = result.truncated; file = null; content = '';
+     confirmedDiscardContent = null;
+     return true;
+    } catch (cause) {
     // A superseded request's failure belongs to the navigation that replaced
     // it; report success so callers do not roll back the newer view.
     if (request !== sequence) return true;
