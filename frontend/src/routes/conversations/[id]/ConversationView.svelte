@@ -67,7 +67,7 @@
 		return participantAgentIds.length === 1 ? participantAgentIds[0] : null;
 	}
 
-	async function openLinkedFile(path: string, agentId: string) {
+	async function openLinkedFile(path: string, agentId: string, click?: MouseEvent) {
 		try {
 			const resolution = await workspaces.resolveLink(agentId, path);
 			const base = `/agents/${encodeURIComponent(agentId)}?tab=files`;
@@ -82,6 +82,12 @@
 				url = `${base}&source=container&path=${encodeURIComponent(`${mountRoot}/${resolution.path}`)}`;
 			} else {
 				url = `${base}&path=${encodeURIComponent(resolution.path)}`;
+			}
+			// Modifier-clicks request a new browsing context for the resolved
+			// route; fall back to same-tab navigation when the popup is
+			// blocked (resolution was asynchronous).
+			if (click && (click.metaKey || click.ctrlKey || click.shiftKey)) {
+				if (window.open(url, '_blank', 'noopener')) return;
 			}
 			await goto(url);
 		} catch {
@@ -588,7 +594,7 @@
 								visualizationUrl={(artifact) => conversations.visualizationUrl(conversationId, message.id, artifact.id)}
 								visualizationFollowUpTarget="this Conversation"
 								onvisualizationfollowup={sendVisualizationFollowUp}
-								onfilelink={fileLinkAgentId(message) ? (path) => void openLinkedFile(path, fileLinkAgentId(message)!) : undefined}
+								onfilelink={fileLinkAgentId(message) ? (path, click) => void openLinkedFile(path, fileLinkAgentId(message)!, click) : undefined}
 								ondelete={() => void deleteConversationMessage(message)}
 								deleting={deletingMessageId === message.id}
 							>

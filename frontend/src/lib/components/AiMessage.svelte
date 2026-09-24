@@ -42,7 +42,7 @@
 		visualizationUrl?: (artifact: MessageVisualization) => string;
 		visualizationFollowUpTarget?: string;
 		onvisualizationfollowup?: (prompt: string, title?: string) => Promise<void>;
-		onfilelink?: (path: string) => void;
+		onfilelink?: (path: string, event: MouseEvent) => void;
 		ondelete?: () => void;
 		deleting?: boolean;
 		children?: Snippet;
@@ -105,13 +105,14 @@
 		const target = event.target as HTMLElement | null;
 		const anchor = target?.closest?.('a[data-file-path]');
 		if (!anchor) return;
-		// Preserve modifier-click behavior (open the raw href).
-		if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+		// The raw href is a garbage SPA route; intercept every click,
+		// including modifier-clicks, and let the resolver pick the browsing
+		// context.
 		event.preventDefault();
 		const path = anchor.getAttribute('data-file-path');
 		if (!path) return;
 		if (onfilelink) {
-			onfilelink(path);
+			onfilelink(path, event);
 			return;
 		}
 		// No resolver available: copying the path is safer than navigating

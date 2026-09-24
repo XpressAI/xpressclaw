@@ -41,7 +41,7 @@
 		const initialRoute = route;
 		showTerminal = Boolean(routeState(route).terminal);
 		showTree = routeState(route).showTree;
-		void initialize().finally(() => {
+		void initialize(initialRoute).finally(() => {
 			// Initialization applied `initialRoute`; record exactly that so a
 			// route change arriving mid-initialization is not silently marked
 			// as synchronized, and replay it explicitly.
@@ -168,7 +168,7 @@
 		return 'opened';
 	}
 
-	async function initialize() {
+	async function initialize(initialRoute: string) {
 		loading = true;
 		error = '';
 		try {
@@ -180,7 +180,9 @@
 			status = workspaceStatus;
 			directories = { '': rootDirectory.entries };
 			git = gitStatus;
-			const initial = routeState(route);
+			// Read the captured route: the reactive `route` may already point at
+			// a newer navigation that the finalizer replays after this finishes.
+			const initial = routeState(initialRoute);
 			if (initial.source === 'container') {
 				// +page.svelte does not thread the URL through as `route`, so
 				// the applyRoute effect never sees the initial container deep

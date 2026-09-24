@@ -2,23 +2,23 @@
 	import type { SessionEvent } from '$lib/api';
 	import { renderContent } from '$lib/formatMessage';
 
-	function handleFileLinkClick(event: MouseEvent) {
-		const target = event.target as HTMLElement | null;
+	function handleFileLinkClick(click: MouseEvent) {
+		const target = click.target as HTMLElement | null;
 		const anchor = target?.closest?.('a[data-file-path]');
 		if (!anchor) return;
-		if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
-		event.preventDefault();
+		// The raw href is a garbage SPA route; intercept every click.
+		click.preventDefault();
+		const path = anchor.getAttribute('data-file-path');
+		if (!path) return;
 		if (!onfilelink) {
-			const path = anchor.getAttribute('data-file-path');
-			if (path) void navigator.clipboard?.writeText(path).catch(() => undefined);
+			void navigator.clipboard?.writeText(path).catch(() => undefined);
 			return;
 		}
-		const path = anchor.getAttribute('data-file-path');
-		if (path) onfilelink(path);
+		onfilelink(path, click);
 	}
 	import { timeAgo } from '$lib/utils';
 
-	let { event, onfilelink }: { event: SessionEvent; onfilelink?: (path: string) => void } = $props();
+	let { event, onfilelink }: { event: SessionEvent; onfilelink?: (path: string, click: MouseEvent) => void } = $props();
 	let expanded = $state(false);
 
 	interface ToolDiff {

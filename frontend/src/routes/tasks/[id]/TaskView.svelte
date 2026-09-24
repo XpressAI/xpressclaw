@@ -1293,7 +1293,7 @@
 		return path ? `${base}&path=${encodeURIComponent(path)}` : base;
 	}
 
-	async function openLinkedFile(path: string) {
+	async function openLinkedFile(path: string, click?: MouseEvent) {
 		const agentId = task?.agent_id;
 		if (!agentId) {
 			void navigator.clipboard?.writeText(path).catch(() => undefined);
@@ -1301,12 +1301,24 @@
 		}
 		try {
 			const resolution = await workspaces.resolveLink(agentId, path);
-			await goto(await fileLinkUrl(agentId, resolution));
+			const url = await fileLinkUrl(agentId, resolution);
+			await openFileLink(url, click);
 		} catch {
 			// Resolution is unavailable (agent removed, offline): copy instead
 			// of navigating the SPA to a garbage route.
 			void navigator.clipboard?.writeText(path).catch(() => undefined);
 		}
+	}
+
+	async function openFileLink(url: string, click?: MouseEvent): Promise<void> {
+		// Modifier-clicks request a new browsing context for the resolved
+		// route; fall back to same-tab navigation when the popup is blocked
+		// (resolution was asynchronous).
+		if (click && (click.metaKey || click.ctrlKey || click.shiftKey)) {
+			const opened = window.open(url, '_blank', 'noopener');
+			if (opened) return;
+		}
+		await goto(url);
 	}
 
 	async function fileLinkUrl(agentId: string, resolution: WorkspaceLinkResolution): Promise<string> {
@@ -1323,14 +1335,14 @@
 		return workspaceFileUrl(agentId, resolution.path);
 	}
 
-	function handleResultFileClick(event: MouseEvent) {
-		const target = event.target as HTMLElement | null;
+	function handleResultFileClick(click: MouseEvent) {
+		const target = click.target as HTMLElement | null;
 		const anchor = target?.closest?.('a[data-file-path]');
 		if (!anchor) return;
-		if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
-		event.preventDefault();
+		// The raw href is a garbage SPA route; intercept every click.
+		click.preventDefault();
 		const path = anchor.getAttribute('data-file-path');
-		if (path) void openLinkedFile(path);
+		if (path) void openLinkedFile(path, click);
 	}
 
 	function openChangedFile(event: MouseEvent, agentId: string, path: string) {
@@ -1725,13 +1737,13 @@
 										visualizationUrl={item.messageId === undefined ? undefined : (artifact) => tasks.visualizationUrl(taskId, item.messageId!, artifact.id)}
 										visualizationFollowUpTarget="this Task"
 										onvisualizationfollowup={sendVisualizationFollowUp}
-										onfilelink={(path) => void openLinkedFile(path)}
+										onfilelink={(path, click) => void openLinkedFile(path, click)}
 									>
 										<ImageAttachmentPreviews attachments={item.attachments} message />
 									</AiMessage>
 								{:else}
 									<div data-transcript-kind="activity" data-transcript-timestamp={item.timestamp}>
-										<ActivityEventRow event={item.event} onfilelink={(path) => void openLinkedFile(path)} />
+										<ActivityEventRow event={item.event} onfilelink={(path, click) => void openLinkedFile(path, click)} />
 									</div>
 								{/if}
 							{/each}
