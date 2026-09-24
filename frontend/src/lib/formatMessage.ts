@@ -129,19 +129,34 @@ const APP_ROUTE_SEGMENTS = new Set([
 	'login'
 ]);
 
+// Extract the filesystem path a markdown link refers to, or null when the
+// link is app navigation. Markdown link targets may carry URL syntax
+// (`%20` escapes, `#fragments`, `?queries`) that must be decoded/stripped
+// before the path is resolved server-side. The application root and known
+// SPA routes are navigation, not files.
+function filesystemPathFromHref(href: string): string | null {
+	if (!href.startsWith('/')) return null;
+	const segment = href.slice(1).split(/[/?#]/, 1)[0];
+	if (!segment || APP_ROUTE_SEGMENTS.has(segment)) return null;
+	try {
+		return decodeURIComponent(new URL(href, 'file:///').pathname);
+	} catch {
+		// Malformed percent sequences: use the raw path portion as-is.
+		return href.split(/[?#]/, 1)[0];
+	}
+}
+
 // Absolute-path links emitted by Agents ("see [guide](/home/…/model.md))")
 // navigate to a garbage SPA route when clicked. Mark them so AiMessage can
 // intercept the click and resolve them through the server's scoped
-// workspace/container APIs instead. App-internal routes stay untouched.
+// workspace/container APIs instead.
 function markFilesystemLinks(html: string): string {
 	const template = document.createElement('template');
 	template.innerHTML = html;
 	for (const link of template.content.querySelectorAll<HTMLAnchorElement>('a[href]')) {
-		const href = link.getAttribute('href') ?? '';
-		if (!href.startsWith('/')) continue;
-		const segment = href.slice(1).split(/[/?#]/, 1)[0];
-		if (APP_ROUTE_SEGMENTS.has(segment)) continue;
-		link.dataset.filePath = href;
+		const path = filesystemPathFromHref(link.getAttribute('href') ?? '');
+		if (path === null) continue;
+		link.dataset.filePath = path;
 		link.title = 'Open in files';
 	}
 	return template.innerHTML;

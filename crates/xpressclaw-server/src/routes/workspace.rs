@@ -131,17 +131,7 @@ async fn workspace_status(
     let root = workspace_root(&state, &agent_id).await?;
     let repository = repository_status_json(&state, &agent_id).await?;
     let (agent, bootstrap) = agent_workspace(&state, &agent_id)?;
-    let container_root = if agent.runner.container_engine
-        == xpressclaw_core::config::ContainerEngineAccess::Host
-        && cfg!(unix)
-    {
-        root.clone()
-    } else {
-        PathBuf::from("/workspace").join(
-            root.strip_prefix(&bootstrap)
-                .map_err(|_| internal_error("Workspace is outside the bootstrap root"))?,
-        )
-    };
+    let container_root = container_root_for(&agent, &root, &bootstrap)?;
     let docker = state.docker().await;
     let container_exists = match docker.as_ref() {
         Some(docker) => docker.is_project_container(&agent_id).await,
@@ -1045,6 +1035,27 @@ fn log_output_bytes(output: bollard::container::LogOutput) -> Vec<u8> {
     }
 }
 
+/// The container path where the active workspace root is mounted for this
+/// Agent. Host container engines share the host path itself; sandboxed
+/// engines see the bootstrap workspace under /workspace.
+fn container_root_for(
+    agent: &xpressclaw_core::config::AgentConfig,
+    active_root: &FsPath,
+    bootstrap: &FsPath,
+) -> ApiResult<PathBuf> {
+    if agent.runner.container_engine == xpressclaw_core::config::ContainerEngineAccess::Host
+        && cfg!(unix)
+    {
+        Ok(active_root.to_path_buf())
+    } else {
+        Ok(PathBuf::from("/workspace").join(
+            active_root
+                .strip_prefix(bootstrap)
+                .map_err(|_| internal_error("Workspace is outside the bootstrap root"))?,
+        ))
+    }
+}
+
 async fn workspace_root(state: &AppState, agent_id: &str) -> ApiResult<PathBuf> {
     let (_, bootstrap) = agent_workspace(state, agent_id)?;
     let inspection = inspect_repository(state, agent_id, bootstrap).await?;
@@ -1064,24 +1075,42 @@ async fn resolve_link(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_same_origin(&headers)?;
-    let (_, bootstrap) = agent_workspace(&state, &agent_id)?;
-    // Resolve against the bootstrap workspace, not the active repository
-    // root: the whole bootstrap workspace is what is mounted into the
-    // container, so every contained file is legitimately viewable.
+    let (agent, bootstrap) = agent_workspace(&state, &agent_id)?;
     let raw = query.path.trim();
     if raw.is_empty() || raw.contains('\0') {
         return Err(api_error(StatusCode::BAD_REQUEST, "a path is required"));
     }
-    match scoped_workspace_relative_path(&bootstrap, raw) {
-        Some(relative) => Ok(Json(json!({
+
+    // Paths inside the active repository root are viewable through the
+    // workspace file API, whose paths are relative to that same root.
+    let active_root = inspect_repository(&state, &agent_id, bootstrap.clone())
+        .await?
+        .active_root()
+        .to_path_buf();
+    if let Some(relative) = scoped_workspace_relative_path(&active_root, raw) {
+        return Ok(Json(json!({
             "kind": "workspace",
             "path": relative_path_string(&relative),
-        }))),
-        None => Ok(Json(json!({
-            "kind": "container",
-            "path": raw,
-        }))),
+        })));
     }
+
+    // Files elsewhere in the mounted bootstrap workspace are still mounted
+    // into the Agent's container, so expose them through the container file
+    // API at their mount-relative location instead of a host-relative one.
+    if let Some(relative) = scoped_workspace_relative_path(&bootstrap, raw) {
+        let container_path = container_root_for(&agent, &active_root, &bootstrap)?.join(&relative);
+        return Ok(Json(json!({
+            "kind": "container",
+            "path": container_path.display().to_string().replace('\\', "/"),
+        })));
+    }
+
+    // Anything else is treated as a path inside the Agent's own container.
+    // Host files outside the workspace are never exposed by this endpoint.
+    Ok(Json(json!({
+        "kind": "container",
+        "path": raw,
+    })))
 }
 
 /// Map an absolute path to a workspace-relative path when it is contained in
