@@ -41,6 +41,8 @@
   let confirmedDiscardContent: string | null = null;
   function mayNavigate() {
    if (!dirty) return true;
+   // A discard already accepted for this exact buffer stays accepted.
+   if (content === confirmedDiscardContent) return true;
    if (!window.confirm('Discard the unsaved changes in the current file?')) return false;
    confirmedDiscardContent = content;
    return true;
