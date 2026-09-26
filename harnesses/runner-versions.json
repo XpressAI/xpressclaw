@@ -314,7 +314,7 @@
     },
     "kilo": {
       "auto_update": true,
-      "version": "7.7.9",
+      "version": "7.8.1",
       "acp_command": [
         "kilo",
         "acp"
@@ -330,7 +330,7 @@
       ],
       "build_args": {
         "AGENT_KIND": "kilo",
-        "AGENT_PACKAGE": "@kilocode/cli@7.7.9",
+        "AGENT_PACKAGE": "@kilocode/cli@7.8.1",
         "AGENT_BINARY": "kilo"
       }
     },
