@@ -18,6 +18,11 @@ export default defineConfig({
 	},
 	projects: [
 		{
+			name: 'speech-webkit',
+			use: { ...devices['Desktop Safari'] },
+			testMatch: /speech\.spec\.ts/,
+		},
+		{
 			name: 'chromium',
 			use: { ...devices['Desktop Chrome'], ...chromiumLaunch },
 		},

@@ -1,4 +1,5 @@
 <script lang="ts">
+	import DictationButton from '$lib/components/DictationButton.svelte';
 	import { onDestroy, onMount } from 'svelte';
 	import yaml from 'js-yaml';
 	import { agents, conversations, projects, workflows, type Agent, type Conversation, type ConversationMessage, type ConversationMessageUpload, type ConversationTurn, type Project, type Task, type Workflow } from '$lib/api';
@@ -630,9 +631,10 @@
 							<textarea bind:this={composerInput} bind:value={content} onkeydown={handleKeydown} onpaste={handlePaste} oncompositionstart={() => (composing = true)} oncompositionend={() => (composing = false)} rows="3" placeholder="Message #{conversation.title || 'conversation'}…" class="block max-h-36 w-full resize-none bg-transparent px-3.5 py-2.5 text-sm outline-none"></textarea>
 							{#if attachmentError}<div class="px-3.5 pb-2 text-xs text-destructive" role="alert">{attachmentError}</div>{/if}
 							<div class="flex items-center justify-between px-2 pb-2">
-								<div>
+								<div class="flex items-center gap-1">
 									<input bind:this={fileInput} data-conversation-attachment-input onchange={handleFileInput} type="file" multiple class="hidden" />
 									<button type="button" onclick={() => fileInput?.click()} class="ai-icon-button" title="Attach files" aria-label="Attach files"><svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" /></svg></button>
+									{#key conversationId}<DictationButton disabled={sending} ontranscript={(text) => { content = content.trimEnd() ? `${content.trimEnd()} ${text}` : text; composerInput?.focus(); }} />{/key}
 								</div>
 								<button type="button" onclick={() => void send()} disabled={sending || !content.trim() && attachments.length === 0} class="flex h-8 w-8 items-center justify-center rounded-lg bg-primary text-primary-foreground transition-transform enabled:active:scale-95 disabled:opacity-35" aria-label="Send">{#if sending}<span class="h-3 w-3 animate-spin rounded-full border-2 border-current border-r-transparent"></span>{:else}<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M12 19V5M5 12l7-7 7 7" /></svg>{/if}</button>
 							</div>

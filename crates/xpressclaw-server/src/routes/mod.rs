@@ -20,6 +20,7 @@ mod settings_collaboration;
 mod settings_instance;
 mod settings_sync;
 mod setup;
+mod speech;
 mod tasks;
 mod visualizations;
 mod workflows;
@@ -68,6 +69,7 @@ fn protected_api_routes() -> Router<AppState> {
         .nest("/schedules", schedules::routes())
         .nest("/sessions", sessions::routes())
         .nest("/settings", settings::routes())
+        .nest("/speech", speech::routes())
         .nest("/setup", setup::routes())
         .nest("/workflows", workflows::routes())
         .nest("/workspaces", workspace::routes())

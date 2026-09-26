@@ -4,6 +4,7 @@
 	import { renderContent } from '$lib/formatMessage';
 	import { splitMessageVisualizations } from '$lib/messageVisualizations';
 	import VisualizationArtifact from '$lib/components/VisualizationArtifact.svelte';
+	import ReadAloud from '$lib/components/ReadAloud.svelte';
 
 	type MessageRole = 'user' | 'assistant' | 'system' | string;
 	type SelectionAction = 'Explain' | 'Improve' | 'Shorten' | 'Tone' | 'Grammar';
@@ -125,6 +126,7 @@
 			<span class="font-medium {isSystem ? 'text-muted-foreground' : 'text-foreground'}">{sender}</span>
 			{#if badge}<span class="ai-status-pill h-5 bg-accent px-1.5 text-[9px] font-semibold uppercase tracking-wide text-accent-foreground">{badge}</span>{/if}
 			<span>{timestampLabel}</span>
+			{#if role === 'assistant'}<ReadAloud content={contentBlocks.filter((block) => block.kind === 'text').map((block) => block.content).join('\n\n')} />{/if}
 			{#if ondelete}
 				<button
 					type="button"

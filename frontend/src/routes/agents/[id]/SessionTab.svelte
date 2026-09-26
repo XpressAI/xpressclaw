@@ -4,6 +4,7 @@
 	import { sessions, tasks } from '$lib/api';
 	import type { ImageAttachmentUpload, SessionOverview, RunnerReadiness, Task } from '$lib/api';
 	import ImageAttachmentPreviews from '$lib/components/ImageAttachmentPreviews.svelte';
+	import DictationButton from '$lib/components/DictationButton.svelte';
 	import { clearComposerDraft, loadComposerDraft, saveComposerDraft } from '$lib/composerDrafts';
 	import { appendImageFiles, imageDataUrl, IMAGE_FILE_ACCEPT, MAX_IMAGE_ATTACHMENTS, pastedImageFiles, shouldHandleImagePaste } from '$lib/imageAttachments';
 	import { timeAgo } from '$lib/utils';
@@ -21,6 +22,7 @@
 	let startFresh = $state(false);
 	let imageAttachments = $state<ImageAttachmentUpload[]>([]);
 	let imageInput = $state<HTMLInputElement>();
+	let composerInput = $state<HTMLTextAreaElement>();
 	let imagePreviews = $derived(imageAttachments.map((attachment) => ({
 		name: attachment.name,
 		src: imageDataUrl(attachment),
@@ -198,7 +200,7 @@
 					{#if overview.queued_attempts.length > 0} · {overview.queued_attempts.length} queued{/if}
 				</div>
 			</div>
-			<textarea bind:value={message} onkeydown={handleKeydown} onpaste={handlePaste} rows="4" placeholder="Send work or ask a question…" class="w-full resize-y bg-transparent px-5 pb-3 pt-5 text-sm leading-relaxed outline-none placeholder:text-muted-foreground"></textarea>
+			<textarea bind:this={composerInput} bind:value={message} onkeydown={handleKeydown} onpaste={handlePaste} rows="4" placeholder="Send work or ask a question…" class="w-full resize-y bg-transparent px-5 pb-3 pt-5 text-sm leading-relaxed outline-none placeholder:text-muted-foreground"></textarea>
 			<ImageAttachmentPreviews attachments={imagePreviews} onremove={(index) => (imageAttachments = imageAttachments.filter((_, itemIndex) => itemIndex !== index))} />
 			<div class="flex flex-col gap-3 px-4 pb-4 sm:flex-row sm:items-center sm:justify-between">
 				<label class="flex cursor-pointer items-center gap-2 text-xs text-muted-foreground" title="By default, this task branches from the agent's active conversation">
@@ -212,6 +214,7 @@
 						<svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" /></svg>
 					</button>
 					<span class="text-[11px] text-muted-foreground">⌘/Ctrl + Enter</span>
+					{#key agentId}<DictationButton disabled={sending} ontranscript={(text) => { message = message.trimEnd() ? `${message.trimEnd()} ${text}` : text; composerInput?.focus(); }} />{/key}
 					<button onclick={send} disabled={sending || (!message.trim() && imageAttachments.length === 0)} class="rounded-lg bg-primary px-5 py-2 text-sm font-medium text-primary-foreground disabled:opacity-40">
 						{sending ? 'Sending…' : 'Send'}
 					</button>

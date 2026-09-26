@@ -18,9 +18,9 @@ export class ApiError extends Error {
 	}
 }
 
-export async function request<T>(path: string, init?: RequestInit, retryCsrf = true): Promise<T> {
+export async function requestResponse(path: string, init?: RequestInit, retryCsrf = true): Promise<Response> {
 	const headers = new Headers(init?.headers);
-	if (init?.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
+	if (init?.body && !(init.body instanceof FormData) && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
 	if (mutation(init?.method) && csrfToken) headers.set('X-XpressClaw-CSRF', csrfToken);
 	const res = await fetch(`${BASE}${path}`, {
 		credentials: 'same-origin',
@@ -31,11 +31,16 @@ export async function request<T>(path: string, init?: RequestInit, retryCsrf = t
 		const body = await res.json().catch(() => ({ error: res.statusText }));
 		if (res.status === 403 && retryCsrf && mutation(init?.method) && String(body.error).includes('CSRF')) {
 			const session = await auth.bootstrap();
-			if (session.authenticated) return request<T>(path, init, false);
+			if (session.authenticated) return requestResponse(path, init, false);
 		}
 		if (res.status === 401 && !path.startsWith('/api/auth/')) sendToLogin();
 		throw new ApiError(body.error || res.statusText, res.status);
 	}
+	return res;
+}
+
+export async function request<T>(path: string, init?: RequestInit, retryCsrf = true): Promise<T> {
+	const res = await requestResponse(path, init, retryCsrf);
 	if (res.status === 204 || res.headers.get('content-length') === '0') return undefined as T;
 	const text = await res.text();
 	if (!text) return undefined as T;
@@ -1322,7 +1327,19 @@ export interface CollaborationSettings {
 	reset_confirmation: string;
 }
 
+export interface SpeechSettings {
+	enabled: boolean;
+	base_url: string;
+	has_api_key: boolean;
+	stt_model: string;
+	tts_model: string;
+	voice: string;
+}
+
 export const settings = {
+	getSpeech: () => request<SpeechSettings>('/api/settings/speech'),
+	putSpeech: (config: Omit<SpeechSettings, 'has_api_key'> & { api_key?: string }) =>
+		request<SpeechSettings>('/api/settings/speech', { method: 'PUT', body: JSON.stringify(config) }),
 	getProfile: () => request<UserProfile>('/api/settings/profile'),
 	putProfile: (profile: UserProfile) =>
 		request<UserProfile>('/api/settings/profile', {

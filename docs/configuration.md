@@ -83,6 +83,13 @@ replace TLS for the subsequent browser session.
 Application authentication does not provide TLS. See [Remote
 access](remote-access.md) before selecting a non-loopback address.
 
+## Speech
+
+**Settings → Speech** configures an optional OpenAI-compatible audio endpoint,
+API key, transcription model, speech model, and voice for dictation and read-aloud
+across harnesses. Credentials stay on the instance server. See
+[Speech](speech.md) for setup, usage, and provider requirements.
+
 ## Project lifecycle and configuration
 
 One control-plane instance can contain many Projects. Deleting a Project from

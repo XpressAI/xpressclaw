@@ -1,4 +1,6 @@
 <script lang="ts">
+	import DictationButton from '$lib/components/DictationButton.svelte';
+	import ReadAloud from '$lib/components/ReadAloud.svelte';
 	import { onMount, onDestroy } from 'svelte';
 	import { Check, PanelRightClose, PanelRightOpen, Play, Settings, Square, X } from '@lucide/svelte';
 	import ContextMenu from '$lib/components/ContextMenu.svelte';
@@ -1720,6 +1722,7 @@
 							<div class="mb-2 flex items-center gap-2 text-xs font-medium uppercase tracking-wide text-emerald-400">
 								<span class="h-2 w-2 rounded-full bg-emerald-400"></span>
 								Result
+								<ReadAloud content={latestResult} />
 							</div>
 							<div data-task-result-content class="prose prose-invert prose-sm max-w-none">{@html renderContent(latestResult, { openLinksInNewWindow: true, renderStructuredAgentMarkup: true })}</div>
 						</section>
@@ -2069,6 +2072,7 @@
 								class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-30">
 								<svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" /></svg>
 							</button>
+							{#key taskId}<DictationButton disabled={messageSending || interrupting || !task.agent_id || composerBlockedByElicitation} ontranscript={(text) => { messageInput = messageInput.trimEnd() ? `${messageInput.trimEnd()} ${text}` : text; composerEl?.querySelector<HTMLTextAreaElement>('textarea')?.focus(); }} />{/key}
 							{#if task.agent_id && (otherConfigOptions.length > 0 || hasModelMenu)}
 								<div class="flex min-w-0 flex-1 items-center gap-3 overflow-x-auto scrollbar-hide">
 									{#each otherConfigOptions as option}

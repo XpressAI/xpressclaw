@@ -7,6 +7,7 @@ export const SETTINGS_SECTIONS: {
 	href: string;
 }[] = [
 	{ kind: 'settings', label: 'Profile', shortLabel: 'P', href: '/settings' },
+	{ kind: 'settings-speech', label: 'Speech', shortLabel: 'S', href: '/settings/speech' },
 	{ kind: 'settings-sync', label: 'Project sync', shortLabel: '↕', href: '/settings/sync' },
 	{ kind: 'settings-collaboration', label: 'Local collaboration', shortLabel: 'C', href: '/settings/collaboration' },
 	{ kind: 'settings-mcp', label: 'MCP servers', shortLabel: 'M', href: '/settings/mcp' },
