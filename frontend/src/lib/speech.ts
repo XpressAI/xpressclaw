@@ -1,6 +1,7 @@
 import { writable } from 'svelte/store';
 import { request, requestResponse, settings, type SpeechSettings } from '$lib/api';
 import { renderContent } from '$lib/formatMessage';
+import { splitMessageVisualizations } from '$lib/messageVisualizations';
 
 export const speechSettings = writable<SpeechSettings | null>(null);
 let settingsRequest: Promise<void> | undefined;
@@ -30,10 +31,15 @@ export async function synthesizeSpeech(input: string, signal: AbortSignal): Prom
 
 // Read prose in bounded requests, without reading Markdown syntax or code blocks.
 export function speechChunks(markdown: string): string[] {
+	// Task results and any other caller must omit visualization metadata, too.
+	const content = splitMessageVisualizations(markdown, 'assistant')
+		.filter((block) => block.kind === 'text')
+		.map((block) => block.content)
+		.join('\n\n');
 	// The renderer only wraps completed tool calls. Strip reserved blocks first,
 	// including unfinished tool headers/arguments from streaming or interrupted
 	// replies, so Markdown cannot turn any part of their contents into prose.
-	const prose = markdown.replace(/<think>[\s\S]*?(?:<\/think>|$)|<tool_call(?=[\s>]|$)[\s\S]*?(?:<\/tool_call>|$)/g, ' ');
+	const prose = content.replace(/<think>[\s\S]*?(?:<\/think>|$)|<tool_call(?=[\s>]|$)[\s\S]*?(?:<\/tool_call>|$)/g, ' ');
 	const document = new DOMParser().parseFromString(renderContent(prose, { renderStructuredAgentMarkup: true }), 'text/html');
 	document.querySelectorAll('.ai-inline-trace, .ai-inline-tool, pre, script, style, iframe, svg').forEach((node) => node.remove());
 	document.querySelectorAll('p, li, h1, h2, h3, h4, h5, h6, br, tr').forEach((node) => node.append(' '));

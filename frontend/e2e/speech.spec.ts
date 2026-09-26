@@ -13,7 +13,7 @@ async function json(route: Route, body: unknown, status = 200) {
 	await route.fulfill({ status, json: body });
 }
 
-async function mockApi(page: Page, options: { enabled?: boolean; reply?: string } = {}) {
+async function mockApi(page: Page, options: { enabled?: boolean; reply?: string; result?: string } = {}) {
 	const state = { settings: { ...defaults, enabled: options.enabled ?? true }, saved: [] as Record<string, unknown>[], sent: [] as unknown[] };
 	await page.route('**/api/**', async (route) => {
 		const request = route.request();
@@ -43,7 +43,13 @@ async function mockApi(page: Page, options: { enabled?: boolean; reply?: string 
 		if (path === '/api/tasks' || path === '/api/tasks/recent-by-agent' || path.endsWith('/subtasks')) return json(route, { tasks: [], counts: {} });
 		if (path === '/api/tasks/counts') return json(route, {});
 		if (path === '/api/tasks/voice-task') return json(route, task);
-		if (path === '/api/tasks/voice-task/activity') return json(route, { attempts: [], events: [], has_more_before: false, has_more_after: false });
+		if (path === '/api/tasks/voice-task/activity') return json(route, {
+			attempts: options.result ? [{
+				id: 'voice-attempt', session_id: agent.id, task_id: task.id, kind: 'message', runner: 'codex',
+				status: 'completed', prompt: '', result: options.result, created_at: timestamp, completed_at: timestamp,
+			}] : [],
+			events: [], has_more_before: false, has_more_after: false
+		});
 		if (path.endsWith('/messages')) {
 			if (request.method() === 'POST') { state.sent.push(request.postDataJSON()); return json(route, {}); }
 			return json(route, [1, 2].map((id) => ({
@@ -290,6 +296,34 @@ for (const prose of [true, false]) {
 			await expect.poll(() => inputs).toEqual(['The public answer. The public conclusion.']);
 		} else {
 			await expect(message.getByRole('alert')).toContainText('There is no prose to read aloud');
+			expect(inputs).toEqual([]);
+		}
+	});
+}
+
+for (const prose of [true, false]) {
+	test(`task-result read aloud excludes visualization references ${prose ? 'from spoken prose' : 'when no prose remains'}`, async ({ page }) => {
+		const result = [
+			prose ? 'The **public** answer.' : '',
+			'visualize{"path":"/workspace/private-chart.html","title":"Private chart"}',
+			prose ? 'More public detail.' : '',
+			'visualize{"path":"/workspace/private-table.html","mode":"wide"}',
+			prose ? 'The public conclusion.' : '',
+		].join('\n\n');
+		await mockApi(page, { result });
+		await mockMedia(page);
+		const inputs: string[] = [];
+		await page.route('**/api/speech/synthesize', async (route) => {
+			inputs.push(route.request().postDataJSON().input);
+			await route.fulfill({ contentType: 'audio/mpeg', body: Buffer.from('test-audio') });
+		});
+		await page.goto('/tasks/voice-task');
+		const resultSection = page.locator('section:has(> [data-task-result-content])');
+		await resultSection.getByRole('button', { name: 'Read aloud', exact: true }).click();
+		if (prose) {
+			await expect.poll(() => inputs).toEqual(['The public answer. More public detail. The public conclusion.']);
+		} else {
+			await expect(resultSection.getByRole('alert')).toContainText('There is no prose to read aloud');
 			expect(inputs).toEqual([]);
 		}
 	});
