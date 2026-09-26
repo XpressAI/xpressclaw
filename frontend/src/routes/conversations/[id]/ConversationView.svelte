@@ -1,8 +1,9 @@
 <script lang="ts">
 	import DictationButton from '$lib/components/DictationButton.svelte';
 	import { onDestroy, onMount } from 'svelte';
+	import { goto } from '$app/navigation';
 	import yaml from 'js-yaml';
-	import { agents, conversations, projects, workflows, type Agent, type Conversation, type ConversationMessage, type ConversationMessageUpload, type ConversationTurn, type Project, type Task, type Workflow } from '$lib/api';
+	import { agents, conversations, projects, workflows, workspaces, type Agent, type Conversation, type ConversationMessage, type ConversationMessageUpload, type ConversationTurn, type Project, type Task, type Workflow } from '$lib/api';
 	import { clearComposerDraft, loadComposerDraft, saveComposerDraft } from '$lib/composerDrafts';
 	import { clipboardFiles, imageDataUrl, pastedImageFiles, shouldHandleImagePaste } from '$lib/imageAttachments';
 	import { PROJECT_MUTATION_EVENT, type ProjectMutation } from '$lib/projectEvents';
@@ -54,6 +55,55 @@
 
 	let projectAgents = $derived(agentList.filter((agent) => agent.project_id === conversation?.project_id));
 	let participantAgentIds = $derived(conversation?.participants.filter((participant) => participant.participant_type === 'agent').map((participant) => participant.participant_id) ?? []);
+
+	function fileLinkAgentId(message: ConversationMessage): string | null {
+		if (message.sender_type === 'agent') {
+			// Historical messages outlive membership changes; the resolver
+			// itself validates that the Agent still exists and scopes its
+			// files, so agent-authored links always use their sender.
+			return message.sender_id;
+		}
+		// Person-authored links resolve against the sole participating Agent,
+		// when there is exactly one; otherwise there is no unambiguous scope.
+		return participantAgentIds.length === 1 ? participantAgentIds[0] : null;
+	}
+
+	async function openLinkedFile(path: string, agentId: string, click?: MouseEvent) {
+		// Modifier- and middle-clicks must open the window synchronously while
+		// the user activation is live; network awaits afterwards would let the
+		// browser block the popup. Open a placeholder now and navigate it once
+		// the resolved URL is known.
+		let placeholder: Window | null = null;
+		if (click && (click.metaKey || click.ctrlKey || click.shiftKey || click.button === 1)) {
+			placeholder = window.open('', '_blank');
+			if (placeholder) placeholder.opener = null;
+		}
+		try {
+			const resolution = await workspaces.resolveLink(agentId, path);
+			const base = `/agents/${encodeURIComponent(agentId)}?tab=files`;
+			let url: string;
+			if (resolution.kind === 'container') {
+				url = `${base}&source=container&path=${encodeURIComponent(resolution.path)}`;
+			} else if (resolution.directory) {
+				// The workspace file API only opens files; browse workspace
+				// directories through the container view at their mount point.
+				const status = await workspaces.status(agentId);
+				const mountRoot = (status.container_root ?? '/workspace').replace(/\/+$/, '');
+				url = `${base}&source=container&path=${encodeURIComponent(`${mountRoot}/${resolution.path}`)}`;
+			} else {
+				url = `${base}&path=${encodeURIComponent(resolution.path)}`;
+			}
+			if (placeholder) {
+				if (placeholder.closed) return;
+				placeholder.location.href = url;
+				return;
+			}
+			await goto(url);
+		} catch {
+			placeholder?.close();
+			void navigator.clipboard?.writeText(path).catch(() => undefined);
+		}
+	}
 	let participantAgents = $derived(projectAgents.filter((agent) => participantAgentIds.includes(agent.id)));
 	let availableAgents = $derived(projectAgents.filter((agent) => !participantAgentIds.includes(agent.id)));
 	let activeTurns = $derived(turns.filter((turn) => turn.status === 'queued' || turn.status === 'running'));
@@ -554,6 +604,7 @@
 								visualizationUrl={(artifact) => conversations.visualizationUrl(conversationId, message.id, artifact.id)}
 								visualizationFollowUpTarget="this Conversation"
 								onvisualizationfollowup={sendVisualizationFollowUp}
+								onfilelink={fileLinkAgentId(message) ? (path, click) => void openLinkedFile(path, fileLinkAgentId(message)!, click) : undefined}
 								ondelete={() => void deleteConversationMessage(message)}
 								deleting={deletingMessageId === message.id}
 							>

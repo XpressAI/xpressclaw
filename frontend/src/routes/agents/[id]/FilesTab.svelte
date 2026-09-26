@@ -1,11 +1,12 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import { tick } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { workspaces, environments } from '$lib/api';
 	import type { GitChange, WorkspaceEntry, WorkspaceFile, WorkspaceGitDiff, WorkspaceGitStatus, WorkspaceStatus } from '$lib/api';
 	import MonacoEditor from '$lib/components/MonacoEditor.svelte';
 	import TerminalPanel from '$lib/components/TerminalPanel.svelte';
-	import ContainerFiles from '$lib/components/ContainerFiles.svelte';
+	import ContainerFiles, { type OpenPathResult } from '$lib/components/ContainerFiles.svelte';
 
 	let { agentId, route = '' }: { agentId: string; route?: string } = $props();
 	let status = $state<WorkspaceStatus | null>(null);
@@ -22,8 +23,16 @@
 	let saving = $state(false);
 	let showTerminal = $state(false);
 	let source = $state<'workspace' | 'container'>('workspace');
+	// The source of the last *successfully applied* route. Overlapping route
+	// applications must not capture each other's transient `source` mutations
+	// for rollback; only applied state is a faithful restore target.
+	let appliedSource: 'workspace' | 'container' = 'workspace';
 	let containerDirty = $state(false);
-	let containerBrowser = $state<{ refresh: () => void }>();
+	// Container buffer whose discard the user accepted for the in-flight
+	// navigation; only a *changed* buffer needs a second prompt after the
+	// workspace read completes.
+	let confirmedContainerContent: string | null = null;
+	let containerBrowser = $state<{ refresh: () => void; refreshAwaiting: () => Promise<OpenPathResult>; openPath: (path: string) => Promise<OpenPathResult>; dirtyContent: () => string | null }>();
 	let showTree = $state(true);
 	let initialized = $state(false);
 	let syncedRoute = '';
@@ -37,25 +46,44 @@
 	let changeByPath = $derived(new Map((git?.files ?? []).map((change) => [change.path, change])));
 
 	onMount(() => {
+		const initialRoute = route;
 		showTerminal = Boolean(routeState(route).terminal);
 		showTree = routeState(route).showTree;
-		void initialize().finally(() => (initialized = true));
+		void initialize(initialRoute).finally(() => {
+			// Initialization applied `initialRoute`; record exactly that so a
+			// route change arriving mid-initialization is not silently marked
+			// as synchronized, and replay it explicitly.
+			syncedRoute = initialRoute || `${window.location.pathname}${window.location.search}`;
+			initialized = true;
+			if (route !== initialRoute) void applyRoute(route || syncedRoute);
+		});
 	});
+
+	// Serialize route applications: an effect re-run for the route already
+	// being applied (e.g. re-triggered while applyRoute awaits a confirm
+	// dialog) would capture mutated state and clobber the first run's
+	// rollback.
+	let routeApplySequence = 0;
+	let activeApplyRoute: string | null = null;
 
 	$effect(() => {
 		const requestedRoute = route;
 		if (!initialized || requestedRoute === syncedRoute) return;
-		syncedRoute = requestedRoute;
+		if (activeApplyRoute === requestedRoute) return;
+		// applyRoute owns syncedRoute: it must remain the last *applied* route
+		// until the new one succeeds, or rollbacks would restore the rejected
+		// route instead of the view the user kept.
 		void applyRoute(requestedRoute);
 	});
 
-	function routeState(value: string): { path: string; showTree: boolean; terminal: string | null } {
+	function routeState(value: string): { path: string; showTree: boolean; terminal: string | null; source: 'workspace' | 'container' } {
 		const search = value.includes('?') ? value.slice(value.indexOf('?')) : window.location.search;
 		const params = new URLSearchParams(search);
 		return {
 			path: params.get('path') ?? '',
 			showTree: params.get('tree') !== 'collapsed',
 			terminal: params.get('terminal'),
+			source: params.get('source') === 'container' ? 'container' : 'workspace',
 		};
 	}
 
@@ -63,32 +91,129 @@
 		const url = new URL(value || window.location.href, window.location.origin);
 		if (path) url.searchParams.set('path', path);
 		else url.searchParams.delete('path');
+		if (source === 'container') url.searchParams.set('source', 'container');
+		else url.searchParams.delete('source');
 		if (treeVisible) url.searchParams.delete('tree');
 		else url.searchParams.set('tree', 'collapsed');
 		return `${url.pathname}${url.search}${url.hash}`;
 	}
 
-	async function applyRoute(requestedRoute: string) {
-		const previousPath = selectedPath;
-		const previousShowTree = showTree;
-		const requested = routeState(requestedRoute);
-		if (requested.terminal) showTerminal = true;
-		showTree = requested.showTree;
-		if (requested.path === selectedPath) {
-			fileOpenSequence += 1;
-			loadingFile = false;
-			return;
+ 	async function applyRoute(requestedRoute: string) {
+ 		const run = ++routeApplySequence;
+ 		activeApplyRoute = requestedRoute;
+ 		const superseded = () => run !== routeApplySequence;
+ 		try {
+ 		const previousShowTree = showTree;
+ 		const previousSource = appliedSource;
+ 		// The last applied route (or the page URL) is the only faithful
+ 		// rollback target: workspace state (selectedPath) knows nothing about
+ 		// an active container view and vice versa.
+ 		const rollbackRoute = syncedRoute || window.location.href;
+ 		const requested = routeState(requestedRoute);
+ 		if (requested.terminal) showTerminal = true;
+ 		showTree = requested.showTree;
+
+ 		async function rollback(): Promise<void> {
+ 			if (superseded()) return;
+ 			source = previousSource;
+ 			appliedSource = previousSource;
+ 			showTree = previousShowTree;
+ 			syncedRoute = rollbackRoute;
+ 			await goto(rollbackRoute, { replaceState: true, keepFocus: true, noScroll: true });
+ 		}
+
+ 		if (requested.source === 'container') {
+ 			// Tree- or terminal-only route changes must not reopen (and
+ 			// re-confirm) the deep-linked container file.
+ 			const applied = routeState(syncedRoute || '');
+ 			if (appliedSource === 'container' && applied.source === 'container' && applied.path === requested.path) {
+ 				syncedRoute = requestedRoute;
+ 				return;
+ 			}
+ 			const result = await applyContainerRoute(requested.path);
+ 			if (route !== requestedRoute || superseded()) return;
+ 			if (result === 'stale') {
+ 				// The child superseded this deep link with its own navigation.
+ 				// Mark the route synchronized so the effect does not retry it
+ 				// over the child's newer view; the URL already matches.
+ 				syncedRoute = requestedRoute;
+ 				return;
+ 			}
+ 			if (result === 'opened') {
+ 				appliedSource = 'container';
+ 				syncedRoute = requestedRoute;
+ 				return;
+ 			}
+ 			await rollback();
+ 			return;
+ 		}
+
+ 		// Leaving container mode waits for the workspace read to succeed:
+ 		// flipping `source` early would unmount ContainerFiles, and a
+ 		// rollback would recreate it at /tmp instead of the prior view.
+ 		const leavingContainer = source === 'container';
+ 		if (leavingContainer && containerDirty && containerBrowser?.dirtyContent() !== confirmedContainerContent && !window.confirm('Discard the unsaved changes in the current file?')) {
+ 			confirmedContainerContent = null;
+ 			await rollback();
+ 			return;
+ 		}
+ 		if (leavingContainer && containerDirty) confirmedContainerContent = containerBrowser?.dirtyContent() ?? null;
+
+ 		if (!leavingContainer && requested.path === selectedPath) {
+ 			fileOpenSequence += 1;
+ 			loadingFile = false;
+ 			syncedRoute = requestedRoute;
+ 			return;
+ 		}
+
+ 		const result = requested.path
+ 			? await openFile(requested.path, false, false)
+ 			: clearFileSelection();
+ 		if (result === 'stale' || route !== requestedRoute || superseded()) return;
+  		if (result === 'opened') {
+ 			// The container editor stayed mounted during the asynchronous read;
+ 			// only a buffer that changed in the meantime needs another prompt.
+ 			if (leavingContainer && containerDirty && containerBrowser?.dirtyContent() !== confirmedContainerContent && !window.confirm('Discard the unsaved changes in the current file?')) {
+ 				// The rejection invalidates the approval even if the buffer is
+ 				// later edited back to the approved content.
+ 				confirmedContainerContent = null;
+ 				await rollback();
+ 				return;
+ 			}
+ 			confirmedContainerContent = null;
+ 			source = 'workspace';
+ 			appliedSource = 'workspace';
+ 			syncedRoute = requestedRoute;
+ 			return;
+ 		}
+
+ 		// The route application did not commit; the approval snapshot no
+ 		// longer applies to a future navigation.
+ 		confirmedContainerContent = null;
+ 		await rollback();
+ 		} finally {
+ 			if (run === routeApplySequence) activeApplyRoute = null;
+ 		}
+ 	}
+
+	async function applyContainerRoute(path: string): Promise<FileOpenResult> {
+		if (source !== 'container') source = 'container';
+		await tick();
+		if (!path) {
+			// The pathless route refreshes the current directory; await the
+			// result so declined prompts or failed listings roll the route
+			// back instead of recording it as applied.
+			const refreshed = await containerBrowser?.refreshAwaiting();
+			if (refreshed === 'stale') return 'stale';
+			return refreshed === 'declined' ? 'failed' : 'opened';
 		}
-
-		const result = requested.path
-			? await openFile(requested.path, false, false)
-			: clearFileSelection();
-		if (result === 'opened' || result === 'stale' || route !== requestedRoute) return;
-
-		showTree = previousShowTree;
-		const restoredRoute = routeForFileState(requestedRoute, previousPath, previousShowTree);
-		syncedRoute = restoredRoute;
-		await goto(restoredRoute, { replaceState: true, keepFocus: true, noScroll: true });
+		// The child confirms unsaved container edits itself through
+		// mayNavigate() and mirrors its dirty flag back via onDirtyChange,
+		// so the parent neither prompts nor clears state prematurely.
+		// 'stale' means a newer in-child navigation superseded the deep link.
+		const opened = await containerBrowser?.openPath(path);
+		if (opened === 'stale') return 'stale';
+		return opened === 'declined' ? 'failed' : 'opened';
 	}
 
 	function clearFileSelection(): FileOpenResult {
@@ -105,7 +230,7 @@
 		return 'opened';
 	}
 
-	async function initialize() {
+	async function initialize(initialRoute: string) {
 		loading = true;
 		error = '';
 		try {
@@ -117,8 +242,18 @@
 			status = workspaceStatus;
 			directories = { '': rootDirectory.entries };
 			git = gitStatus;
-			const initialPath = routeState(route).path;
-			if (initialPath) await openFile(initialPath, true, false);
+			// Read the captured route: the reactive `route` may already point at
+			// a newer navigation that the finalizer replays after this finishes.
+			const initial = routeState(initialRoute);
+			if (initial.source === 'container') {
+				// +page.svelte does not thread the URL through as `route`, so
+				// the applyRoute effect never sees the initial container deep
+				// link; apply it directly during initialization.
+				await applyContainerRoute(initial.path);
+				appliedSource = 'container';
+			} else if (initial.path) {
+				await openFile(initial.path, true, false);
+			}
 		} catch (cause) {
 			error = cause instanceof Error ? cause.message : String(cause);
 		} finally {
@@ -259,7 +394,27 @@
 		}
 		if (source === 'workspace') editorValue = selectedFile?.content ?? '';
 		containerDirty = false;
+		// A deep link may still be awaiting openFile; invalidate it (and any
+		// pending route application) so a late completion cannot write the
+		// deep-linked file under the manually selected route.
+		fileOpenSequence += 1;
+		routeApplySequence += 1;
+		activeApplyRoute = null;
+		loadingFile = false;
 		source = select.value as typeof source;
+		// The manually selected source is now the applied state a later
+		// rollback must restore.
+		appliedSource = source;
+		// Rewrite the URL so it matches the selected source: leaving stale
+		// source/path params would reopen the container file on refresh or
+		// feed the container path into workspace readFile on tree toggles.
+		const target = routeForFileState(
+			route || window.location.href,
+			source === 'workspace' ? selectedPath : '',
+			showTree
+		);
+		syncedRoute = target;
+		void goto(target, { replaceState: true, keepFocus: true, noScroll: true });
 	}
 </script>
 

@@ -1,9 +1,27 @@
 <script lang="ts">
 	import type { SessionEvent } from '$lib/api';
 	import { renderContent } from '$lib/formatMessage';
+
+	function handleFileLinkClick(click: MouseEvent) {
+		// auxclick only carries the middle button here; right-clicks (button 2)
+		// must keep the native context menu.
+		if (click.type === 'auxclick' && click.button !== 1) return;
+		const target = click.target as HTMLElement | null;
+		const anchor = target?.closest?.('a[data-file-path]');
+		if (!anchor) return;
+		// The raw href is a garbage SPA route; intercept every click.
+		click.preventDefault();
+		const path = anchor.getAttribute('data-file-path');
+		if (!path) return;
+		if (!onfilelink) {
+			void navigator.clipboard?.writeText(path).catch(() => undefined);
+			return;
+		}
+		onfilelink(path, click);
+	}
 	import { timeAgo } from '$lib/utils';
 
-	let { event }: { event: SessionEvent } = $props();
+	let { event, onfilelink }: { event: SessionEvent; onfilelink?: (path: string, click: MouseEvent) => void } = $props();
 	let expanded = $state(false);
 
 	interface ToolDiff {
@@ -141,7 +159,10 @@
 				<span class="ai-status-pill h-5 bg-accent px-1.5 text-[9px] font-semibold uppercase tracking-wide text-accent-foreground">Update</span>
 				<span class="text-xs text-muted-foreground">{timeAgo(event.created_at)}</span>
 			</div>
-			<div class="rounded-lg rounded-tl-[4px] bg-accent/55 px-3.5 py-2.5 text-sm text-foreground shadow-[var(--shadow-hairline)]" data-agent-update-content>
+			<!-- svelte-ignore a11y_click_events_have_key_events -->
+			<!-- svelte-ignore a11y_no_static_element_interactions -->
+			<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+			<div class="rounded-lg rounded-tl-[4px] bg-accent/55 px-3.5 py-2.5 text-sm text-foreground shadow-[var(--shadow-hairline)]" data-agent-update-content onclick={handleFileLinkClick} onauxclick={handleFileLinkClick}>
 				<div class="prose-chat max-w-none break-words">
 					{@html renderContent(event.summary, { openLinksInNewWindow: true, renderStructuredAgentMarkup: true })}
 				</div>
@@ -177,7 +198,10 @@
 		{#if expanded}
 			<div class="mb-1 mr-2 border-l border-border/60 py-2 pl-3 text-xs {isTool || richText ? 'ml-4' : 'ml-[5.25rem] sm:ml-[6rem]'}">
 				{#if richText}
-					<div data-activity-rich-content class="prose prose-invert prose-sm max-w-none text-xs text-foreground/80">
+					<!-- svelte-ignore a11y_click_events_have_key_events -->
+					<!-- svelte-ignore a11y_no_static_element_interactions -->
+					<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+					<div data-activity-rich-content class="prose prose-invert prose-sm max-w-none text-xs text-foreground/80" onclick={handleFileLinkClick} onauxclick={handleFileLinkClick}>
 						{@html renderContent(event.summary, { openLinksInNewWindow: true, renderStructuredAgentMarkup: true })}
 					</div>
 				{:else if !isTool}

@@ -99,6 +99,7 @@ pub fn routes() -> Router<AppState> {
         .route("/{agent_id}", get(workspace_status))
         .route("/{agent_id}/tree", get(list_directory))
         .route("/{agent_id}/file", get(read_file).put(write_file))
+        .route("/{agent_id}/resolve-link", get(resolve_link))
         .route("/{agent_id}/git/status", get(git_status))
         .route("/{agent_id}/git/diff", get(git_diff))
         .route(
@@ -130,17 +131,7 @@ async fn workspace_status(
     let root = workspace_root(&state, &agent_id).await?;
     let repository = repository_status_json(&state, &agent_id).await?;
     let (agent, bootstrap) = agent_workspace(&state, &agent_id)?;
-    let container_root = if agent.runner.container_engine
-        == xpressclaw_core::config::ContainerEngineAccess::Host
-        && cfg!(unix)
-    {
-        root.clone()
-    } else {
-        PathBuf::from("/workspace").join(
-            root.strip_prefix(&bootstrap)
-                .map_err(|_| internal_error("Workspace is outside the bootstrap root"))?,
-        )
-    };
+    let container_root = container_root_for(&agent, &root, &bootstrap)?;
     let docker = state.docker().await;
     let container_exists = match docker.as_ref() {
         Some(docker) => docker.is_project_container(&agent_id).await,
@@ -1044,10 +1035,166 @@ fn log_output_bytes(output: bollard::container::LogOutput) -> Vec<u8> {
     }
 }
 
+/// The container path where the active workspace root is mounted for this
+/// Agent. Host container engines share the host path itself; sandboxed
+/// engines see the bootstrap workspace under /workspace.
+fn container_root_for(
+    agent: &xpressclaw_core::config::AgentConfig,
+    active_root: &FsPath,
+    bootstrap: &FsPath,
+) -> ApiResult<PathBuf> {
+    if agent.runner.container_engine == xpressclaw_core::config::ContainerEngineAccess::Host
+        && cfg!(unix)
+    {
+        Ok(active_root.to_path_buf())
+    } else {
+        Ok(PathBuf::from("/workspace").join(
+            active_root
+                .strip_prefix(bootstrap)
+                .map_err(|_| internal_error("Workspace is outside the bootstrap root"))?,
+        ))
+    }
+}
+
 async fn workspace_root(state: &AppState, agent_id: &str) -> ApiResult<PathBuf> {
     let (_, bootstrap) = agent_workspace(state, agent_id)?;
     let inspection = inspect_repository(state, agent_id, bootstrap).await?;
     Ok(inspection.active_root().to_path_buf())
+}
+
+/// Resolve an absolute filesystem path from rendered Agent message links to a
+/// scoped view target. Host files are only ever exposed when the path is
+/// inside the Agent's mounted workspace (the container's mount boundary and
+/// the outer authorization boundary). Everything else is reported as a
+/// container path: reading it then goes through the Agent's own container,
+/// which never touches the host filesystem.
+async fn resolve_link(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+    Query(query): Query<WorkspacePathQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    require_same_origin(&headers)?;
+    let (agent, bootstrap) = agent_workspace(&state, &agent_id)?;
+    // Only whitespace-check with trim(): filenames may legitimately end in
+    // whitespace, and trimming would silently resolve a different file.
+    let raw = query.path;
+    if raw.trim().is_empty() || raw.contains('\0') {
+        return Err(api_error(StatusCode::BAD_REQUEST, "a path is required"));
+    }
+
+    // Paths inside the active repository root are viewable through the
+    // workspace file API, whose paths are relative to that same root.
+    let active_root = inspect_repository(&state, &agent_id, bootstrap.clone())
+        .await?
+        .active_root()
+        .to_path_buf();
+
+    // A link to the workspace root itself has an empty relative path, which
+    // the scoped checks below reject; map it straight to its container mount
+    // (sandboxed runners see the root at /workspace, not the host path).
+    if let Ok(canonical) = std::fs::canonicalize(&raw) {
+        let mount = if canonical == active_root {
+            Some(container_root_for(&agent, &active_root, &bootstrap)?)
+        } else if canonical == bootstrap {
+            Some(container_root_for(&agent, &bootstrap, &bootstrap)?)
+        } else {
+            None
+        };
+        if let Some(mount) = mount {
+            return Ok(Json(json!({
+                "kind": "container",
+                "path": mount.display().to_string().replace('\\', "/"),
+            })));
+        }
+    }
+    if let Some((relative, directory)) = scoped_workspace_relative_path(&active_root, &raw) {
+        return Ok(Json(json!({
+            "kind": "workspace",
+            "path": relative_path_string(&relative),
+            "directory": directory,
+        })));
+    }
+
+    // Files elsewhere in the mounted bootstrap workspace are still mounted
+    // into the Agent's container, so expose them through the container file
+    // API at their mount-relative location instead of a host-relative one.
+    // The bootstrap itself is what is mounted, so anchor the path at the
+    // bootstrap's container mount root (not the active repository's).
+    if let Some((relative, _)) = scoped_workspace_relative_path(&bootstrap, &raw) {
+        let container_path = container_root_for(&agent, &bootstrap, &bootstrap)?.join(&relative);
+        return Ok(Json(json!({
+            "kind": "container",
+            "path": container_path.display().to_string().replace('\\', "/"),
+        })));
+    }
+
+    // Anything else is treated as a path inside the Agent's own container.
+    // Host files outside the workspace are never exposed by this endpoint.
+    Ok(Json(json!({
+        "kind": "container",
+        "path": raw,
+    })))
+}
+
+/// Map an absolute path to a workspace-relative path when it is contained in
+/// the canonicalized workspace root, along with whether the fully-existing
+/// target is a directory (non-existent tails are file-like). Walks downward
+/// from the root, canonicalizing each existing segment, so symlinks cannot
+/// escape the workspace and `..` components are rejected outright.
+/// Non-existent files inside the workspace still resolve so links to files an
+/// Agent described (but has not written) work.
+fn scoped_workspace_relative_path(root: &FsPath, raw: &str) -> Option<(PathBuf, bool)> {
+    let root = root.canonicalize().ok()?;
+    let path = FsPath::new(raw);
+    if !path.is_absolute() {
+        return None;
+    }
+
+    // Walk existing segments from the root, canonicalizing each one. The
+    // walk stops at the first segment that does not exist; everything after
+    // it must be plain normal components appended inside the workspace.
+    let mut existing = FsPath::new("/").to_path_buf();
+    let mut tail_started = false;
+    let mut relative = PathBuf::new();
+    for component in path.components() {
+        let segment = match component {
+            Component::RootDir => continue,
+            Component::Normal(value) => value,
+            // ParentDir, CurDir (only interior dots survive components()),
+            // and Windows prefixes never resolve inside the workspace.
+            Component::ParentDir | Component::CurDir | Component::Prefix(_) => return None,
+        };
+        if tail_started {
+            relative.push(segment);
+            continue;
+        }
+        match std::fs::canonicalize(existing.join(segment)) {
+            Ok(canonical) => existing = canonical,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                tail_started = true;
+                relative.push(segment);
+            }
+            Err(_) => return None,
+        }
+    }
+
+    if !tail_started {
+        // Every segment existed: derive the relative path from the
+        // canonicalized result.
+        relative = existing.strip_prefix(&root).ok()?.to_path_buf();
+    } else {
+        // Anchor the non-existent tail to the last canonicalized ancestor
+        // inside the workspace.
+        let anchor = existing.strip_prefix(&root).ok()?;
+        let mut combined = anchor.to_path_buf();
+        combined.push(&relative);
+        relative = combined;
+    }
+    if relative.as_os_str().is_empty() {
+        return None;
+    }
+    Some((relative, !tail_started && existing.is_dir()))
 }
 
 fn agent_workspace(
@@ -1589,6 +1736,69 @@ mod tests {
         assert!(normalize_relative_path("../secret").is_err());
         assert!(normalize_relative_path("src/../../secret").is_err());
         assert!(normalize_relative_path("/etc/passwd").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scoped_link_resolution_stays_inside_the_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(workspace.path().join("docs/arch")).unwrap();
+        std::fs::write(workspace.path().join("docs/arch/model.md"), "x").unwrap();
+        let root = workspace.path().canonicalize().unwrap();
+
+        // Existing file inside the workspace resolves relatively.
+        let existing = root.join("docs/arch/model.md");
+        assert_eq!(
+            scoped_workspace_relative_path(&root, existing.to_str().unwrap()),
+            Some((FsPath::new("docs/arch/model.md").to_path_buf(), false))
+        );
+
+        // Existing directories are reported as such.
+        assert_eq!(
+            scoped_workspace_relative_path(&root, root.join("docs/arch").to_str().unwrap()),
+            Some((FsPath::new("docs/arch").to_path_buf(), true))
+        );
+
+        // Non-existent file inside an existing directory still resolves.
+        let missing = root.join("docs/arch/pending.md");
+        assert_eq!(
+            scoped_workspace_relative_path(&root, missing.to_str().unwrap()),
+            Some((FsPath::new("docs/arch/pending.md").to_path_buf(), false))
+        );
+
+        // A symlinked directory inside the workspace that points outside is
+        // rejected (canonicalization resolves it outside the root).
+        std::fs::write(outside.path().join("secret.md"), "nope").unwrap();
+        std::os::unix::fs::symlink(outside.path(), workspace.path().join("shared")).unwrap();
+        let escaped = root.join("shared/secret.md");
+        assert_eq!(
+            scoped_workspace_relative_path(&root, escaped.to_str().unwrap()),
+            None
+        );
+
+        // Paths outside the workspace and traversal tails are rejected.
+        assert_eq!(
+            scoped_workspace_relative_path(
+                &root,
+                outside.path().join("secret.md").to_str().unwrap()
+            ),
+            None
+        );
+        assert_eq!(scoped_workspace_relative_path(&root, "/etc/passwd"), None);
+        let trailing = root.join("docs/arch/../../escape.md");
+        // The existing prefix resolves, but the traversal tail is rejected.
+        assert_eq!(
+            scoped_workspace_relative_path(&root, trailing.to_str().unwrap()),
+            None
+        );
+
+        // Relative input and the bare workspace root resolve to nothing.
+        assert_eq!(scoped_workspace_relative_path(&root, "docs/arch"), None);
+        assert_eq!(
+            scoped_workspace_relative_path(&root, root.to_str().unwrap()),
+            None
+        );
     }
 
     #[test]

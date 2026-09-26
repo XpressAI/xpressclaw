@@ -658,6 +658,10 @@ export const sessions = {
 
 // -- Project workspaces --
 
+export type WorkspaceLinkResolution =
+	| { kind: 'workspace'; path: string; directory?: boolean }
+	| { kind: 'container'; path: string };
+
 export interface WorkspaceStatus {
     container_root?: string;
 	agent_id: string;
@@ -738,6 +742,10 @@ export interface WorkspaceGitDiff {
 export const workspaces = {
 	status: (agentId: string) =>
 		request<WorkspaceStatus>(`/api/workspaces/${encodeURIComponent(agentId)}`),
+	resolveLink: (agentId: string, path: string) =>
+		request<WorkspaceLinkResolution>(
+			`/api/workspaces/${encodeURIComponent(agentId)}/resolve-link?path=${encodeURIComponent(path)}`
+		),
 	tree: (agentId: string, path = '') =>
 		request<WorkspaceDirectory>(`/api/workspaces/${encodeURIComponent(agentId)}/tree?path=${encodeURIComponent(path)}`),
 	readFile: (agentId: string, path: string) =>

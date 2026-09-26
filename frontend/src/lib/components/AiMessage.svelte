@@ -24,6 +24,7 @@
 		visualizationUrl,
 		visualizationFollowUpTarget = 'this thread',
 		onvisualizationfollowup,
+		onfilelink,
 		ondelete,
 		deleting = false,
 		children,
@@ -42,6 +43,7 @@
 		visualizationUrl?: (artifact: MessageVisualization) => string;
 		visualizationFollowUpTarget?: string;
 		onvisualizationfollowup?: (prompt: string, title?: string) => Promise<void>;
+		onfilelink?: (path: string, event: MouseEvent) => void;
 		ondelete?: () => void;
 		deleting?: boolean;
 		children?: Snippet;
@@ -100,6 +102,28 @@
 		clearSelectionActions();
 	}
 
+	function handleContentClick(event: MouseEvent) {
+		// auxclick only carries the middle button here; right-clicks (button 2)
+		// must keep the native context menu.
+		if (event.type === 'auxclick' && event.button !== 1) return;
+		const target = event.target as HTMLElement | null;
+		const anchor = target?.closest?.('a[data-file-path]');
+		if (!anchor) return;
+		// The raw href is a garbage SPA route; intercept every click,
+		// including modifier-clicks, and let the resolver pick the browsing
+		// context.
+		event.preventDefault();
+		const path = anchor.getAttribute('data-file-path');
+		if (!path) return;
+		if (onfilelink) {
+			onfilelink(path, event);
+			return;
+		}
+		// No resolver available: copying the path is safer than navigating
+		// the SPA to a garbage route.
+		void navigator.clipboard?.writeText(path).catch(() => undefined);
+	}
+
 	async function copyMessage() {
 		try {
 			await navigator.clipboard.writeText(content);
@@ -137,9 +161,14 @@
 				>{deleting ? 'Deleting…' : 'Delete'}</button>
 			{/if}
 		</div>
+		<!-- svelte-ignore a11y_click_events_have_key_events -->
+		<!-- svelte-ignore a11y_no_static_element_interactions -->
+		<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
 		<div
 			bind:this={contentElement}
 			use:watchSelection
+			onclick={handleContentClick}
+			onauxclick={handleContentClick}
 			class="relative rounded-lg rounded-[10px] px-3.5 py-2.5 text-sm
 				{isSystem ? 'bg-muted/55 text-xs italic text-muted-foreground shadow-[var(--shadow-hairline)]' :
 				fromUser ? 'rounded-tr-[4px] bg-primary text-primary-foreground shadow-sm' :

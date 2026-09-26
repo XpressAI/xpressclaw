@@ -16,25 +16,92 @@
  $effect(() => onDirtyChange(dirty));
  onDestroy(() => onDirtyChange(false));
  onMount(() => { void browse('/tmp'); });
- export function refresh() { void browse(directory); }
- function mayNavigate() { return !dirty || window.confirm('Discard the unsaved changes in the current file?'); }
- async function browse(path: string) {
-  if (!mayNavigate()) return;
-  const request = ++sequence; busy = true; error = '';
-  try {
-   const result = await environments.tree(agentId, path);
-   if (request !== sequence) return;
-   directory = result.path; location = result.path; entries = result.entries; truncated = result.truncated; file = null; content = '';
-  } catch (cause) { if (request === sequence) error = String(cause); }
-  finally { if (request === sequence) busy = false; }
- }
- async function open(path: string) {
-  if (!mayNavigate()) return;
-  const request = ++sequence; busy = true; error = '';
-  try { const result = await environments.readFile(agentId, path); if (request === sequence) { file = result; content = result.content; } }
-  catch (cause) { if (request === sequence) error = String(cause); }
-  finally { if (request === sequence) busy = false; }
- }
+  export function refresh() { void browse(directory); }
+  /** Refresh the current directory and report whether the navigation happened. */
+  export async function refreshAwaiting(): Promise<OpenPathResult> { return browse(directory); }
+  /** The current buffer when dirty, for callers snapshotting a discard approval. */
+  export function dirtyContent(): string | null { return dirty ? content : null; }
+  /** Child navigation outcomes: 'opened' committed, 'declined' cancelled, 'stale' superseded. */
+  export type OpenPathResult = 'opened' | 'declined' | 'stale';
+   /** Open a specific absolute container path: a file directly, a directory via browse. */
+   export async function openPath(path: string): Promise<OpenPathResult> {
+    if (!mayNavigate()) return 'declined';
+    const request = ++sequence; busy = true; error = '';
+    try {
+     const result = await environments.readFile(agentId, path);
+     // A newer in-child navigation superseded this read; the parent must not
+     // record the deep-linked route as applied over it.
+     if (request !== sequence) return 'stale';
+     if (!commitFile(result)) return 'declined';
+     return 'opened';
+    } catch {
+     if (request !== sequence) return 'stale';
+     // Directories (and unreadable entries) fall back to a tree listing;
+     // browse reports its own tri-state outcome because it supersedes this
+     // request's sequence number itself.
+     return browse(path);
+    } finally { if (request === sequence) busy = false; }
+   }
+  // Content whose dirty state the user already accepted discarding for the
+  // in-flight navigation; only a *changed* buffer needs a second prompt.
+  let confirmedDiscardContent: string | null = null;
+  function mayNavigate() {
+   if (!dirty) return true;
+   // A discard already accepted for this exact buffer stays accepted.
+   if (content === confirmedDiscardContent) return true;
+   if (!window.confirm('Discard the unsaved changes in the current file?')) return false;
+   confirmedDiscardContent = content;
+   return true;
+  }
+    /** Commit a freshly read file, re-prompting only for edits made while the read was in flight. */
+    function commitFile(result: WorkspaceFile): boolean {
+     if (dirty && content !== confirmedDiscardContent && !window.confirm('Discard the unsaved changes in the current file?')) {
+      // A rejection invalidates the approval even if the buffer is later
+      // edited back to the approved content.
+      confirmedDiscardContent = null;
+      return false;
+     }
+     confirmedDiscardContent = null;
+     file = result; content = result.content;
+     return true;
+    }
+    /** Commit a directory listing, re-prompting for edits made while the tree request was in flight. */
+    function commitDirectory(result: { path: string; entries: WorkspaceEntry[]; truncated: boolean }): boolean {
+     if (dirty && content !== confirmedDiscardContent && !window.confirm('Discard the unsaved changes in the current file?')) {
+      confirmedDiscardContent = null;
+      return false;
+     }
+     confirmedDiscardContent = null;
+     directory = result.path; location = result.path; entries = result.entries; truncated = result.truncated; file = null; content = '';
+     return true;
+    }
+    async function browse(path: string): Promise<OpenPathResult> {
+     if (!mayNavigate()) return 'declined';
+     const request = ++sequence; busy = true; error = '';
+      try {
+       const result = await environments.tree(agentId, path);
+       if (request !== sequence) return 'stale';
+       if (!commitDirectory(result)) return 'declined';
+       return 'opened';
+      } catch (cause) {
+     // A superseded request's failure belongs to the navigation that
+     // replaced it; do not roll back the newer view.
+     if (request !== sequence) return 'stale';
+     error = String(cause);
+     // The navigation failed while the original dirty file may still be
+     // showing; the discard approval no longer applies.
+     confirmedDiscardContent = null;
+     return 'declined';
+    }
+    finally { if (request === sequence) busy = false; }
+   }
+   async function open(path: string) {
+    if (!mayNavigate()) return;
+    const request = ++sequence; busy = true; error = '';
+    try { const result = await environments.readFile(agentId, path); if (request !== sequence) return; commitFile(result); }
+    catch (cause) { if (request === sequence) { error = String(cause); confirmedDiscardContent = null; } }
+    finally { if (request === sequence) busy = false; }
+   }
  async function save() {
   if (!file || !dirty || busy) return;
   busy = true; error = '';

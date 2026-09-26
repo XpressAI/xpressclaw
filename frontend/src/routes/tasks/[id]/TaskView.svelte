@@ -7,7 +7,7 @@
 	import TaskPlanningActions from '$lib/components/planning/TaskActions.svelte';
 	import { dateLabel, planningViewport } from '$lib/taskPlanning';
 	import { goto } from '$app/navigation';
-	import { tasks, agents, sessions, workspaces } from '$lib/api';
+	import { tasks, agents, sessions, workspaces, type WorkspaceLinkResolution } from '$lib/api';
 	import type { AcpCommand, AcpConfigOption, AcpModeState, Task, TaskMessage, Agent, WorkAttempt, SessionEvent, ImageAttachmentUpload, GitChange, WorkspaceGitStatus, MessageVisualization } from '$lib/api';
 	import { timeAgo } from '$lib/utils';
 	import { serverTimestampMs } from '$lib/serverTime';
@@ -1295,6 +1295,65 @@
 		return path ? `${base}&path=${encodeURIComponent(path)}` : base;
 	}
 
+	async function openLinkedFile(path: string, click?: MouseEvent) {
+		const agentId = task?.agent_id;
+		if (!agentId) {
+			void navigator.clipboard?.writeText(path).catch(() => undefined);
+			return;
+		}
+		// Modifier- and middle-clicks must open the window synchronously while
+		// the user activation is live; network awaits afterwards would let the
+		// browser block the popup. Open a placeholder now and navigate it once
+		// the resolved URL is known.
+		let placeholder: Window | null = null;
+		if (click && (click.metaKey || click.ctrlKey || click.shiftKey || click.button === 1)) {
+			placeholder = window.open('', '_blank');
+			if (placeholder) placeholder.opener = null;
+		}
+		try {
+			const resolution = await workspaces.resolveLink(agentId, path);
+			const url = await fileLinkUrl(agentId, resolution);
+			if (placeholder) {
+				if (placeholder.closed) return;
+				placeholder.location.href = url;
+				return;
+			}
+			await goto(url);
+		} catch {
+			// Resolution is unavailable (agent removed, offline): close the
+			// placeholder and copy instead of navigating to a garbage route.
+			placeholder?.close();
+			void navigator.clipboard?.writeText(path).catch(() => undefined);
+		}
+	}
+
+	async function fileLinkUrl(agentId: string, resolution: WorkspaceLinkResolution): Promise<string> {
+		if (resolution.kind === 'container') {
+			return `${workspaceFileUrl(agentId)}&source=container&path=${encodeURIComponent(resolution.path)}`;
+		}
+		if (resolution.directory) {
+			// The workspace file API only opens files; browse workspace
+			// directories through the container view at their mount point.
+			const status = await workspaces.status(agentId);
+			const mountRoot = (status.container_root ?? '/workspace').replace(/\/+$/, '');
+			return `${workspaceFileUrl(agentId)}&source=container&path=${encodeURIComponent(`${mountRoot}/${resolution.path}`)}`;
+		}
+		return workspaceFileUrl(agentId, resolution.path);
+	}
+
+	function handleResultFileClick(click: MouseEvent) {
+		// auxclick only carries the middle button here; right-clicks (button 2)
+		// must keep the native context menu.
+		if (click.type === 'auxclick' && click.button !== 1) return;
+		const target = click.target as HTMLElement | null;
+		const anchor = target?.closest?.('a[data-file-path]');
+		if (!anchor) return;
+		// The raw href is a garbage SPA route; intercept every click.
+		click.preventDefault();
+		const path = anchor.getAttribute('data-file-path');
+		if (path) void openLinkedFile(path, click);
+	}
+
 	function openChangedFile(event: MouseEvent, agentId: string, path: string) {
 		if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
 		event.preventDefault();
@@ -1687,12 +1746,13 @@
 										visualizationUrl={item.messageId === undefined ? undefined : (artifact) => tasks.visualizationUrl(taskId, item.messageId!, artifact.id)}
 										visualizationFollowUpTarget="this Task"
 										onvisualizationfollowup={sendVisualizationFollowUp}
+										onfilelink={(path, click) => void openLinkedFile(path, click)}
 									>
 										<ImageAttachmentPreviews attachments={item.attachments} message />
 									</AiMessage>
 								{:else}
 									<div data-transcript-kind="activity" data-transcript-timestamp={item.timestamp}>
-										<ActivityEventRow event={item.event} />
+										<ActivityEventRow event={item.event} onfilelink={(path, click) => void openLinkedFile(path, click)} />
 									</div>
 								{/if}
 							{/each}
@@ -1724,7 +1784,10 @@
 								Result
 								<ReadAloud content={latestResult} />
 							</div>
-							<div data-task-result-content class="prose prose-invert prose-sm max-w-none">{@html renderContent(latestResult, { openLinksInNewWindow: true, renderStructuredAgentMarkup: true })}</div>
+							<!-- svelte-ignore a11y_click_events_have_key_events -->
+						<!-- svelte-ignore a11y_no_static_element_interactions -->
+						<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+						<div data-task-result-content class="prose prose-invert prose-sm max-w-none" onclick={handleResultFileClick} onauxclick={handleResultFileClick}>{@html renderContent(latestResult, { openLinksInNewWindow: true, renderStructuredAgentMarkup: true })}</div>
 						</section>
 					{:else if latestError}
 						<section role="alert" data-attempt-error class="rounded-lg border border-red-500/30 bg-red-500/5 p-4">

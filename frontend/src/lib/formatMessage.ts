@@ -106,8 +106,64 @@ function openLinksInNewWindow(html: string): string {
 	const template = document.createElement('template');
 	template.innerHTML = html;
 	for (const link of template.content.querySelectorAll<HTMLAnchorElement>('a[href]')) {
+		if (link.dataset.filePath !== undefined) continue;
 		link.target = '_blank';
 		link.rel = 'noopener noreferrer';
+	}
+	return template.innerHTML;
+}
+
+// First path segments that belong to the SPA's own routes. A markdown link
+// pointing at one of them is app navigation, not a filesystem path.
+const APP_ROUTE_SEGMENTS = new Set([
+	'dashboard',
+	'projects',
+	'conversations',
+	'agents',
+	'tasks',
+	'automations',
+	'schedules',
+	'workflows',
+	'settings',
+	'setup',
+	'login'
+]);
+
+// Extract the filesystem path a markdown link refers to, or null when the
+// link is app navigation. Markdown link targets may carry URL syntax
+// (`%20` escapes, `#fragments`, `?queries`) that must be decoded/stripped
+// before the path is resolved server-side. The application root and known
+// SPA routes are navigation, not files.
+function filesystemPathFromHref(href: string): string | null {
+	// Protocol-relative URLs (//example.com/…) are external links, not
+	// filesystem paths; only root-relative paths are candidates.
+	if (!href.startsWith('/') || href.startsWith('//')) return null;
+	let pathname: string;
+	try {
+		pathname = decodeURIComponent(new URL(href, 'file:///').pathname);
+	} catch {
+		// Malformed percent sequences: use the raw path portion as-is.
+		pathname = href.split(/[?#]/, 1)[0];
+	}
+	// Classify the decoded first segment: a percent-encoded app route such
+	// as /%61gents/foo is still app navigation.
+	const segment = pathname.slice(1).split('/', 1)[0];
+	if (!segment || APP_ROUTE_SEGMENTS.has(segment)) return null;
+	return pathname;
+}
+
+// Absolute-path links emitted by Agents ("see [guide](/home/…/model.md))")
+// navigate to a garbage SPA route when clicked. Mark them so AiMessage can
+// intercept the click and resolve them through the server's scoped
+// workspace/container APIs instead.
+function markFilesystemLinks(html: string): string {
+	const template = document.createElement('template');
+	template.innerHTML = html;
+	for (const link of template.content.querySelectorAll<HTMLAnchorElement>('a[href]')) {
+		const path = filesystemPathFromHref(link.getAttribute('href') ?? '');
+		if (path === null) continue;
+		link.dataset.filePath = path;
+		link.title = 'Open in files';
 	}
 	return template.innerHTML;
 }
@@ -186,6 +242,8 @@ export function renderContent(content: string, options: RenderContentOptions = {
 		ADD_TAGS: ['details', 'summary'],
 		ADD_ATTR: ['open'],
 	});
+
+	result = markFilesystemLinks(result);
 
 	return options.openLinksInNewWindow ? openLinksInNewWindow(result) : result;
 }
