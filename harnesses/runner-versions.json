@@ -23,7 +23,7 @@
     },
     "claude": {
       "auto_update": true,
-      "version": "0.81.1",
+      "version": "0.81.2",
       "acp_command": [
         "claude-agent-acp"
       ],
@@ -37,7 +37,7 @@
         }
       ],
       "build_args": {
-        "CLAUDE_ACP_VERSION": "0.81.1"
+        "CLAUDE_ACP_VERSION": "0.81.2"
       }
     },
     "deepseek-harness": {
@@ -91,7 +91,7 @@
     },
     "junie": {
       "auto_update": true,
-      "version": "3419.7.0",
+      "version": "3419.16.0",
       "acp_command": [
         "junie",
         "--acp=true"
@@ -108,8 +108,8 @@
         "AGENT_KIND": "junie",
         "AGENT_BINARY": "junie",
         "AGENT_PATH": "junie-app/bin/junie",
-        "AGENT_ARCHIVE_AMD64": "https://github.com/JetBrains/junie-acp-release/releases/download/3419.7/junie-release-3419.7-linux-amd64.zip",
-        "AGENT_ARCHIVE_ARM64": "https://github.com/JetBrains/junie-acp-release/releases/download/3419.7/junie-release-3419.7-linux-aarch64.zip",
+        "AGENT_ARCHIVE_AMD64": "https://github.com/JetBrains/junie-acp-release/releases/download/3419.16/junie-release-3419.16-linux-amd64.zip",
+        "AGENT_ARCHIVE_ARM64": "https://github.com/JetBrains/junie-acp-release/releases/download/3419.16/junie-release-3419.16-linux-aarch64.zip",
         "AGENT_SHA256_AMD64": "",
         "AGENT_SHA256_ARM64": ""
       }
@@ -161,7 +161,7 @@
     },
     "pi": {
       "auto_update": true,
-      "version": "0.0.33",
+      "version": "0.0.34",
       "acp_command": [
         "pi-acp"
       ],
@@ -190,7 +190,7 @@
       ],
       "build_args": {
         "AGENT_KIND": "pi",
-        "AGENT_PACKAGE": "pi-acp@0.0.33",
+        "AGENT_PACKAGE": "pi-acp@0.0.34",
         "AGENT_BINARY": "pi-acp",
         "AGENT_EXTRA_PACKAGES": "@earendil-works/pi-coding-agent@0.87.1",
         "AGENT_EXTRA_BINARY": "pi",
@@ -223,7 +223,7 @@
     },
     "cline": {
       "auto_update": true,
-      "version": "3.0.64",
+      "version": "3.0.65",
       "acp_command": [
         "cline",
         "--acp"
@@ -239,7 +239,7 @@
       ],
       "build_args": {
         "AGENT_KIND": "cline",
-        "AGENT_PACKAGE": "cline@3.0.64",
+        "AGENT_PACKAGE": "cline@3.0.65",
         "AGENT_BINARY": "cline"
       }
     },
