@@ -18,6 +18,7 @@
 		badge = '',
 		transcriptTimestamp = '',
 		openLinksInNewWindow = role === 'assistant',
+		downloadAgentId,
 		selectionActions = role === 'assistant',
 		onselectionaction,
 		visualizations = [],
@@ -36,6 +37,7 @@
 		badge?: string;
 		transcriptTimestamp?: string;
 		openLinksInNewWindow?: boolean;
+		downloadAgentId?: string | null;
 		selectionActions?: boolean;
 		onselectionaction?: (action: SelectionAction, text: string) => void;
 		visualizations?: MessageVisualization[];
@@ -148,7 +150,7 @@
 			{#each contentBlocks as block, index (`${block.kind}:${index}`)}
 				{#if block.kind === 'text'}
 					<div class="prose-chat max-w-none break-words {fromUser ? 'prose-chat-user' : ''}">
-						{@html renderContent(block.content, { openLinksInNewWindow, renderStructuredAgentMarkup: role === 'assistant' })}
+						{@html renderContent(block.content, { openLinksInNewWindow, renderStructuredAgentMarkup: role === 'assistant', downloadAgentId: role === 'assistant' ? downloadAgentId : undefined })}
 					</div>
 				{:else}
 					<VisualizationArtifact

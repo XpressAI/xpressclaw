@@ -547,6 +547,7 @@
 								sender={message.sender_name || message.sender_id}
 								timestampLabel={timeAgo(message.created_at)}
 								content={message.content}
+								downloadAgentId={message.sender_type === 'agent' ? message.sender_id : undefined}
 								avatar={fromUser ? 'Y' : message.sender_name?.slice(0, 1).toUpperCase() || 'A'}
 								selectionActions={!fromUser}
 								onselectionaction={handleSelectionAction}

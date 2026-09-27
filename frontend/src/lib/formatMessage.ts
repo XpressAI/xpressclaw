@@ -1,9 +1,30 @@
 import { Lexer, Marked } from 'marked';
 import DOMPurify from 'dompurify';
+import { environments } from '$lib/api';
 
 interface RenderContentOptions {
 	openLinksInNewWindow?: boolean;
 	renderStructuredAgentMarkup?: boolean;
+	downloadAgentId?: string | null;
+}
+
+// Root-relative application links are URLs, even inside an Agent reply.
+const appRoots = new Set(['api', 'agents', 'automations', 'conversations', 'dashboard', 'login', 'projects', 'schedules', 'settings', 'setup', 'tasks', 'workflows', '_app']);
+
+function fileDownloadUrl(href: string, agentId: string): string | null {
+	const explicitFile = href.startsWith('file:///') || href.startsWith('sandbox:/');
+	const path = href.startsWith('file:///') ? href.slice(7) : href.startsWith('sandbox:/') ? href.slice(8) : href;
+	if (!path.startsWith('/') || path.startsWith('//')) return null;
+	try {
+		// Decode once, after separating URL fragments/queries. Encoded #, ?, %,
+		// spaces and Unicode belong to the filename and must survive the request.
+		const decoded = decodeURIComponent(path.split(/[?#]/, 1)[0]);
+		if (decoded === '/' || decoded.startsWith('//') || /[\x00-\x1f\x7f]/.test(decoded)) return null;
+		if (!explicitFile && appRoots.has(decoded.split('/')[1])) return null;
+		return environments.downloadUrl(agentId, decoded);
+	} catch {
+		return null;
+	}
 }
 
 function escapeHtml(value: string): string {
@@ -86,12 +107,19 @@ const markdown = new Marked({
 	},
 });
 
-function renderMarkdown(content: string, allowDetails = false): string {
+function renderMarkdown(content: string, allowDetails = false, downloadAgentId?: string | null): string {
 	// Protect individual HTML tags before block tokenization. Escaping a completed
 	// HTML block token would also capture adjacent Markdown through the next blank
 	// line, while protecting only "<" would let URLs in attributes become links.
 	const protectedHtml = protectRawHtmlTags(content);
-	const sanitized = DOMPurify.sanitize(markdown.parse(protectedHtml.content) as string, allowDetails ? {
+	const html = markdown.parse(protectedHtml.content, {
+		walkTokens(token) {
+			if (downloadAgentId && token.type === 'link') {
+				token.href = fileDownloadUrl(token.href, downloadAgentId) ?? token.href;
+			}
+		},
+	}) as string;
+	const sanitized = DOMPurify.sanitize(html, allowDetails ? {
 		ADD_TAGS: ['details', 'summary'],
 		ADD_ATTR: ['open'],
 	} : undefined);
@@ -102,12 +130,17 @@ function renderMarkdown(content: string, allowDetails = false): string {
 	return result;
 }
 
-function openLinksInNewWindow(html: string): string {
+function formatLinks(html: string, options: RenderContentOptions): string {
 	const template = document.createElement('template');
 	template.innerHTML = html;
+	const downloadPrefix = options.downloadAgentId ? environments.downloadUrl(options.downloadAgentId, '') : null;
 	for (const link of template.content.querySelectorAll<HTMLAnchorElement>('a[href]')) {
-		link.target = '_blank';
-		link.rel = 'noopener noreferrer';
+		if (downloadPrefix && link.getAttribute('href')?.startsWith(downloadPrefix)) {
+			link.download = '';
+		} else if (options.openLinksInNewWindow) {
+			link.target = '_blank';
+			link.rel = 'noopener noreferrer';
+		}
 	}
 	return template.innerHTML;
 }
@@ -150,12 +183,12 @@ export function renderContent(content: string, options: RenderContentOptions = {
 	result = result.replace(/@\[AGENT:([^:]+):([^\]]+)\]/g, '**@$2**');
 
 	// Markdown-generated HTML is sanitized after raw HTML tokens have become text.
-	result = renderMarkdown(result, true);
+	result = renderMarkdown(result, true, options.downloadAgentId);
 
 	// Re-insert thinking blocks
 	for (let i = 0; i < thinkingBlocks.length; i++) {
 		const thinking = thinkingBlocks[i];
-		const escaped = renderMarkdown(thinking);
+		const escaped = renderMarkdown(thinking, false, options.downloadAgentId);
 
 		result = result.replace(
 			`%%THINK_${i}%%`,
@@ -187,5 +220,5 @@ export function renderContent(content: string, options: RenderContentOptions = {
 		ADD_ATTR: ['open'],
 	});
 
-	return options.openLinksInNewWindow ? openLinksInNewWindow(result) : result;
+	return options.openLinksInNewWindow || options.downloadAgentId ? formatLinks(result, options) : result;
 }

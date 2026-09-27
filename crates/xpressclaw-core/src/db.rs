@@ -2753,6 +2753,20 @@ INSERT INTO dashboard_events (
   ORDER BY se.id ASC;
 "#;
 
+const MIGRATION_V49: &str = r#"
+ALTER TABLE task_messages ADD COLUMN agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL;
+
+-- Recover the author of existing final replies only when their matching
+-- attempts agree. Never substitute the Task's current assignment for history.
+UPDATE task_messages SET agent_id = (
+    SELECT MIN(session.agent_id)
+    FROM work_attempts attempt
+    JOIN logical_sessions session ON session.id = attempt.session_id
+    WHERE attempt.task_id = task_messages.task_id AND attempt.result = task_messages.content
+    HAVING COUNT(DISTINCT session.agent_id) = 1
+) WHERE role = 'assistant' AND content != '';
+"#;
+
 fn schema_migrations() -> &'static [(u32, &'static str)] {
     &[
         (1, MIGRATION_V1),
@@ -2803,12 +2817,53 @@ fn schema_migrations() -> &'static [(u32, &'static str)] {
         (46, MIGRATION_V46),
         (47, MIGRATION_V47),
         (48, MIGRATION_V48),
+        (49, MIGRATION_V49),
     ]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_agent_upgrade_recovers_unambiguous_authors_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upgrade.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)").unwrap();
+        for &(_, sql) in schema_migrations()
+            .iter()
+            .filter(|(version, _)| *version < 49)
+        {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.execute_batch("INSERT OR REPLACE INTO config (key, value) VALUES ('schema_version', '48');
+            INSERT INTO agents (id, name, backend, config) VALUES ('first', 'First', 'native', '{}'), ('second', 'Second', 'native', '{}');
+            INSERT INTO tasks (id, title, agent_id) VALUES ('task', 'Reassigned task', 'second');
+            INSERT INTO logical_sessions (id, agent_id) VALUES ('first-session', 'first'), ('second-session', 'second');
+            INSERT INTO work_attempts (id, task_id, session_id, runner, result) VALUES
+                ('a', 'task', 'first-session', 'codex', 'Download A'),
+                ('b', 'task', 'second-session', 'codex', 'Download B'),
+                ('c', 'task', 'first-session', 'codex', 'Repeated reply'),
+                ('d', 'task', 'second-session', 'codex', 'Repeated reply');
+            INSERT INTO task_messages (task_id, role, content) VALUES
+                ('task', 'assistant', 'Download A'), ('task', 'assistant', 'Download B'),
+                ('task', 'assistant', 'Repeated reply'), ('task', 'assistant', 'Unknown reply'),
+                ('task', 'user', 'Download A');").unwrap();
+        drop(conn);
+        let db = Database::open(&path).unwrap();
+        let messages = crate::tasks::conversation::TaskConversation::new(Arc::new(db))
+            .get_messages("task")
+            .unwrap();
+        let authors: Vec<_> = messages
+            .iter()
+            .map(|message| message.agent_id.as_deref())
+            .collect();
+        assert_eq!(
+            authors,
+            vec![Some("first"), Some("second"), None, None, None]
+        );
+    }
 
     #[test]
     fn dashboard_upgrade_backfills_agent_updates_in_order_without_inventing_tokens() {
@@ -2819,6 +2874,7 @@ mod tests {
             // Recreate the pre-upgrade boundary with representative old history.
             conn.execute_batch("DROP TRIGGER dashboard_agent_update_insert;
                 DROP TABLE dashboard_prompt_usage;
+                ALTER TABLE task_messages DROP COLUMN agent_id;
                 DELETE FROM config WHERE key = 'dashboard_token_recording_started_at';
                 UPDATE config SET value = '47' WHERE key = 'schema_version';
                 INSERT INTO agents (id, name, backend, config) VALUES ('agent', 'Agent', 'native', '{}');
@@ -2869,7 +2925,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "48");
+        assert_eq!(version, "49");
         let visualization_table: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master

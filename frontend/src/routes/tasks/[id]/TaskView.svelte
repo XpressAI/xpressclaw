@@ -123,6 +123,7 @@
 			role: string;
 			content: string;
 			messageId?: number;
+			agentId?: string | null;
 			attachments: { id?: string; name: string; src: string; mimeType?: string; size?: number }[];
 			visualizations: MessageVisualization[];
 			sequence: number;
@@ -261,6 +262,7 @@
 			role: message.role,
 			content: message.content,
 			messageId: message.id,
+			agentId: message.agent_id,
 			attachments: (message.attachments ?? []).map((attachment) => ({
 				id: attachment.id,
 				name: attachment.name,
@@ -313,7 +315,8 @@
 	let activeAttempt = $derived(runningAttempt ?? queuedAttempt);
 	let usageAttempt = $derived(activeAttempt ?? attempts[0] ?? null);
 	let contextUsage = $derived(contextUsageFor(usageAttempt, activityEvents));
-	let latestAttemptResult = $derived(attempts.find(attempt => attempt.result)?.result ?? null);
+	let latestResultAttempt = $derived(attempts.find(attempt => attempt.result));
+	let latestAttemptResult = $derived(latestResultAttempt?.result ?? null);
 	let latestResult = $derived(
 		latestAttemptResult && !messages.some(message =>
 			message.role === 'assistant' && message.content === latestAttemptResult
@@ -1675,6 +1678,7 @@
 									{@const isAssistant = item.role === 'assistant'}
 									<AiMessage
 										role={item.role}
+										downloadAgentId={item.agentId}
 										sender={isSystem ? 'system' : isAssistant ? 'agent' : 'you'}
 										timestampLabel={timeAgo(item.timestamp)}
 										content={item.content}
@@ -1724,7 +1728,7 @@
 								Result
 								<ReadAloud content={latestResult} />
 							</div>
-							<div data-task-result-content class="prose prose-invert prose-sm max-w-none">{@html renderContent(latestResult, { openLinksInNewWindow: true, renderStructuredAgentMarkup: true })}</div>
+							<div data-task-result-content class="prose prose-invert prose-sm max-w-none">{@html renderContent(latestResult, { openLinksInNewWindow: true, renderStructuredAgentMarkup: true, downloadAgentId: latestResultAttempt?.session_id })}</div>
 						</section>
 					{:else if latestError}
 						<section role="alert" data-attempt-error class="rounded-lg border border-red-500/30 bg-red-500/5 p-4">

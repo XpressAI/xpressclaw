@@ -18,6 +18,11 @@ export default defineConfig({
 	},
 	projects: [
 		{
+			name: 'downloads-webkit',
+			use: { ...devices['Desktop Safari'] },
+			testMatch: /file-downloads\.spec\.ts/,
+		},
+		{
 			name: 'speech-webkit',
 			use: { ...devices['Desktop Safari'] },
 			testMatch: /speech\.spec\.ts/,
