@@ -7,7 +7,7 @@ import { expect, test as base, type Locator, type Page } from '@playwright/test'
 const test = base.extend<{}, { downloadServer: string }>({
 	downloadServer: [async ({}, use) => {
 		const server = createServer((_request, response) => {
-			response.writeHead(200, { 'content-type': 'application/octet-stream', 'content-disposition': 'attachment; filename="report.txt"' });
+			response.writeHead(200, { 'content-type': 'application/octet-stream', 'content-disposition': "attachment; filename=\"report caf_.txt\"; filename*=UTF-8''%72%65%70%6F%72%74%20%63%61%66%C3%A9%2E%74%78%74" });
 			response.end('the original Agent file');
 		}).listen(0, '127.0.0.1');
 		await once(server, 'listening');
@@ -82,7 +82,7 @@ for (const surface of ['tasks/download-task', 'conversations/download-chat']) {
 		await page.goto(`/${surface}`);
 		const link = page.getByRole('link', { name: 'Download report', exact: true });
 		const download = await clickDownload(page, link);
-		expect(download.suggestedFilename()).toBe('report.txt');
+		expect(download.suggestedFilename()).toBe('report café.txt');
 		expect(await readFile((await download.path())!, 'utf8')).toBe('the original Agent file');
 		expect(downloads).toEqual([{ agent: author, path: '/tmp/report #?% café.txt' }]);
 		expect(page.url()).toContain(`/${surface}`);

@@ -218,6 +218,8 @@ pub struct PortableTaskMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_record_id: Option<String>,
     pub task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
     pub role: String,
     pub content: String,
     pub created_at: String,
@@ -776,6 +778,17 @@ impl PortableSnapshot {
             &task_ids,
         )?;
         for message in &self.task_messages {
+            validate_optional_reference(
+                "task message Agent",
+                &message.record_id,
+                message.agent_id.as_ref(),
+                &agent_ids,
+            )?;
+            if message.agent_id.is_some() && message.role != "assistant" {
+                return Err(Error::Sync(
+                    "only assistant task messages can have an Agent author".into(),
+                ));
+            }
             validate_text("task message role", &message.role, 100, false)?;
             if !["user", "assistant", "system"].contains(&message.role.as_str()) {
                 return Err(Error::Sync(format!(
