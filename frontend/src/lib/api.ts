@@ -908,6 +908,7 @@ export const tasks = {
 export interface TaskMessage {
 	id: number;
 	task_id: string;
+	agent_id?: string | null;
 	role: string;
 	content: string;
 	timestamp: string;

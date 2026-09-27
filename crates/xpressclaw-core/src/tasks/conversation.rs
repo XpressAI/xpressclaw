@@ -28,6 +28,9 @@ pub struct TaskMessageAttachment {
 pub struct TaskMessage {
     pub id: i64,
     pub task_id: String,
+    /// Agent that produced this reply; retained when the Task is reassigned.
+    #[serde(default)]
+    pub agent_id: Option<String>,
     pub role: String,
     pub content: String,
     pub timestamp: String,
@@ -208,9 +211,27 @@ impl TaskConversation {
         if let Some(project_id) = project_id.as_deref() {
             ensure_project_accepts_work(tx, project_id)?;
         }
+        let agent_id: Option<String> = if role != "assistant" {
+            None
+        } else if let Some(attempt_id) = extras.attempt_id {
+            tx.query_row(
+                "SELECT session.agent_id FROM work_attempts attempt
+                 JOIN logical_sessions session ON session.id = attempt.session_id
+                 WHERE attempt.id = ?1 AND attempt.task_id = ?2",
+                rusqlite::params![attempt_id, task_id],
+                |row| row.get(0),
+            )
+            .optional()?
+        } else {
+            tx.query_row(
+                "SELECT agent_id FROM tasks WHERE id = ?1",
+                [task_id],
+                |row| row.get(0),
+            )?
+        };
         tx.execute(
-            "INSERT INTO task_messages (task_id, role, content) VALUES (?1, ?2, ?3)",
-            rusqlite::params![task_id, role, content],
+            "INSERT INTO task_messages (task_id, role, content, agent_id) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![task_id, role, content, agent_id],
         )?;
 
         let id = tx.last_insert_rowid();
@@ -271,6 +292,7 @@ impl TaskConversation {
         Ok(TaskMessage {
             id,
             task_id,
+            agent_id,
             role,
             content,
             timestamp,
@@ -440,6 +462,7 @@ impl TaskConversation {
                 Ok(TaskMessage {
                     id: row.get("id")?,
                     task_id: row.get("task_id")?,
+                    agent_id: row.get("agent_id")?,
                     role: row.get("role")?,
                     content: row.get("content")?,
                     timestamp: row.get("timestamp")?,
@@ -662,6 +685,45 @@ mod tests {
             .transition_attempt(&attempt_id, "running", "Working", None, None)
             .unwrap();
         (task.id, item.id, attempt_id)
+    }
+
+    #[test]
+    fn reply_keeps_its_producing_agent_after_task_reassignment() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let (task_id, _, attempt_id) = running_attempt(&db);
+        let conversation = TaskConversation::new(db.clone());
+        let streaming = conversation.add_message(&task_id, "assistant", "").unwrap();
+        AgentRegistry::new(db.clone())
+            .ensure("other", "generic")
+            .unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE tasks SET agent_id = 'other' WHERE id = ?1",
+                [&task_id],
+            )
+        })
+        .unwrap();
+        let reply = conversation
+            .add_final_assistant_message(
+                &task_id,
+                "[Download](/tmp/report.pdf)",
+                &attempt_id,
+                &[],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(reply.agent_id.as_deref(), Some("atlas"));
+        conversation
+            .update_message_content(streaming.id, "Finished streaming")
+            .unwrap();
+        let user = conversation
+            .add_message(&task_id, "user", "Thanks")
+            .unwrap();
+        assert!(user.agent_id.is_none());
+        let messages = conversation.get_messages(&task_id).unwrap();
+        assert_eq!(messages[0].agent_id.as_deref(), Some("atlas"));
+        assert_eq!(messages[1].agent_id.as_deref(), Some("atlas"));
+        assert!(messages[2].agent_id.is_none());
     }
 
     #[test]

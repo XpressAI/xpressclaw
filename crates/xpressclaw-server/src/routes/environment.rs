@@ -320,6 +320,10 @@ async fn download(
         )
         .await
         .map_err(bad)?;
+    file_download_response(value)
+}
+
+fn file_download_response(value: Value) -> ApiResult<Response> {
     let data = STANDARD
         .decode(value["data"].as_str().unwrap_or(""))
         .map_err(bad)?;
@@ -335,6 +339,23 @@ async fn download(
             }
         })
         .collect();
+    // RFC 6266/8187: keep an ASCII fallback and send the UTF-8 name separately.
+    // Percent-encoding every byte also keeps quotes and CR/LF out of the header.
+    let encoded_filename: String = value["name"]
+        .as_str()
+        .unwrap_or("download")
+        .chars()
+        .map(|ch| {
+            if ch.is_control() || matches!(ch, '/' | '\\') {
+                '_'
+            } else {
+                ch
+            }
+        })
+        .collect::<String>()
+        .bytes()
+        .map(|byte| format!("%{byte:02X}"))
+        .collect();
     Response::builder()
         .header(
             header::CONTENT_TYPE,
@@ -344,7 +365,7 @@ async fn download(
         )
         .header(
             header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{filename}\""),
+            format!("attachment; filename=\"{filename}\"; filename*=UTF-8''{encoded_filename}"),
         )
         .header(header::CACHE_CONTROL, "no-store")
         .header("x-content-type-options", "nosniff")
@@ -515,6 +536,27 @@ mod tests {
         config::{AgentConfig, Config},
         db::Database,
     };
+
+    #[tokio::test]
+    async fn download_response_preserves_utf8_filename_and_file_bytes() {
+        let response = file_download_response(json!({
+            "name": "report café.txt", "mime_type": "text/plain", "data": STANDARD.encode(b"report bytes"),
+        })).unwrap();
+        assert_eq!(response.headers()[header::CONTENT_DISPOSITION],
+            "attachment; filename=\"report caf_.txt\"; filename*=UTF-8''%72%65%70%6F%72%74%20%63%61%66%C3%A9%2E%74%78%74");
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            &b"report bytes"[..]
+        );
+        let response = file_download_response(json!({
+            "name": "\"/\\\r\n%.txt", "data": "",
+        }))
+        .unwrap();
+        assert_eq!(
+            response.headers()[header::CONTENT_DISPOSITION],
+            "attachment; filename=\"______.txt\"; filename*=UTF-8''%22%5F%5F%5F%5F%25%2E%74%78%74"
+        );
+    }
 
     fn app() -> (Router, Arc<Database>) {
         let db = Arc::new(Database::open_memory().unwrap());

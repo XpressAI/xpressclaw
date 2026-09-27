@@ -387,7 +387,16 @@ fn export_transaction(
         },
     )?;
 
-    let task_messages = export_task_messages(connection, &manifest.project_id)?;
+    let mut task_messages = export_task_messages(connection, &manifest.project_id)?;
+    for message in &mut task_messages {
+        if message
+            .agent_id
+            .as_deref()
+            .is_some_and(|id| !portable_agent_ids.contains(id))
+        {
+            message.agent_id = None;
+        }
+    }
     let mut conversation_messages = export_conversation_messages(connection, &manifest.project_id)?;
     for message in &mut conversation_messages {
         if message
@@ -549,6 +558,7 @@ fn export_task_messages(
     struct LocalMessage {
         id: i64,
         task_id: String,
+        agent_id: Option<String>,
         role: String,
         content: String,
         created_at: String,
@@ -559,7 +569,7 @@ fn export_task_messages(
     let messages = query_records(
         connection,
         "SELECT message.id, message.task_id, message.role, message.content, message.timestamp,
-                sync.record_id, sync.parent_record_id
+                sync.record_id, sync.parent_record_id, message.agent_id
          FROM task_messages message
          JOIN tasks task ON task.id = message.task_id
          LEFT JOIN task_message_sync sync ON sync.message_id = message.id
@@ -576,6 +586,7 @@ fn export_task_messages(
                 created_at: row.get(4)?,
                 record_id: row.get(5)?,
                 parent_record_id: row.get(6)?,
+                agent_id: row.get(7)?,
             })
         },
     )?;
@@ -598,6 +609,7 @@ fn export_task_messages(
             record_id,
             parent_record_id,
             task_id: message.task_id,
+            agent_id: message.agent_id,
             role: message.role,
             content: message.content,
             created_at: message.created_at,
@@ -1335,38 +1347,52 @@ fn import_task_messages(connection: &Connection, snapshot: &PortableSnapshot) ->
     }))?;
     for index in order {
         let message = &snapshot.task_messages[index];
-        let existing: Option<(i64, String, String, String, String)> = connection
+        let existing: Option<(i64, String, String, String, String, Option<String>)> = connection
             .query_row(
-                "SELECT message.id, message.task_id, message.role, message.content, message.timestamp
+                "SELECT message.id, message.task_id, message.role, message.content, message.timestamp, message.agent_id
                  FROM task_message_sync sync
                  JOIN task_messages message ON message.id = sync.message_id
                  WHERE sync.record_id = ?1",
                 [&message.record_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
             )
             .optional()?;
         let already_existed = existing.is_some();
-        let message_id = if let Some((id, task_id, role, content, created_at)) = existing {
+        let message_id = if let Some((id, task_id, role, content, created_at, agent_id)) = existing
+        {
             if task_id != message.task_id
                 || role != message.role
                 || content != message.content
                 || created_at != message.created_at
+                || agent_id
+                    .as_ref()
+                    .zip(message.agent_id.as_ref())
+                    .is_some_and(|(local, incoming)| local != incoming)
             {
                 return Err(Error::Sync(format!(
                     "immutable task message record '{}' differs from the local copy",
                     message.record_id
                 )));
             }
+            // Older stores omitted authors. Enrich unknown local authors, but
+            // never erase a known author when fetching such a legacy record.
+            if agent_id.is_none() && message.agent_id.is_some() {
+                connection.execute(
+                    "UPDATE task_messages SET agent_id = ?1 WHERE id = ?2",
+                    params![message.agent_id, id],
+                )?;
+            }
             id
         } else {
             connection.execute(
-                "INSERT INTO task_messages (task_id, role, content, timestamp)
-                 VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO task_messages (task_id, role, content, timestamp, agent_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
                     message.task_id,
                     message.role,
                     message.content,
-                    message.created_at
+                    message.created_at,
+                    message.agent_id
                 ],
             )?;
             connection.last_insert_rowid()
@@ -1800,7 +1826,8 @@ mod tests {
                      VALUES ('task-one', 'Build it', 'atlas', 'project-one');
                      INSERT INTO task_messages (task_id, role, content, timestamp)
                      VALUES ('task-one', 'user', 'start', '2026-01-01 00:00:00'),
-                            ('task-one', 'assistant', 'done', '2026-01-01 00:00:01');",
+                            ('task-one', 'assistant', 'done', '2026-01-01 00:00:01');
+                     UPDATE task_messages SET agent_id = 'atlas' WHERE role = 'assistant';",
                 )
                 .unwrap();
             connection
@@ -1903,6 +1930,71 @@ mod tests {
         assert!(!serialized.contains("must-stay-local"));
         assert!(!serialized.contains("/private/workspace"));
         assert!(!serialized.contains("SECRET"));
+    }
+
+    #[test]
+    fn task_message_authors_survive_sync_and_legacy_records() {
+        let source = Database::open_memory().unwrap();
+        insert_project_data(&source);
+        let source_config = Config {
+            agents: vec![AgentConfig {
+                name: "atlas".into(),
+                backend: "codex".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut snapshot = export_snapshot(&source, &source_config, &manifest()).unwrap();
+        assert_eq!(snapshot.task_messages[1].agent_id.as_deref(), Some("atlas"));
+        let mut other = snapshot.agents[0].clone();
+        other.id = "other".into();
+        other.name = "Other".into();
+        snapshot.agents.push(other);
+        snapshot.tasks[0].agent_id = Some("other".into());
+        let mut legacy_json = serde_json::to_value(&snapshot).unwrap();
+        for message in legacy_json["task_messages"].as_array_mut().unwrap() {
+            message.as_object_mut().unwrap().remove("agent_id");
+        }
+        let legacy: PortableSnapshot = serde_json::from_value(legacy_json).unwrap();
+        assert!(legacy.task_messages[1].agent_id.is_none());
+
+        for legacy_first in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("xpressclaw.yaml");
+            let target = std::sync::Arc::new(Database::open_memory().unwrap());
+            let mut config = Config::default();
+            let mut import = |snapshot: &PortableSnapshot| {
+                import_snapshot(&target, &mut config, &path, directory.path(), snapshot)
+            };
+            import(if legacy_first { &legacy } else { &snapshot }).unwrap();
+            import(&snapshot).unwrap();
+            import(&legacy).unwrap();
+            let messages = crate::tasks::conversation::TaskConversation::new(target.clone())
+                .get_messages("task-one")
+                .unwrap();
+            assert!(messages[0].agent_id.is_none());
+            assert_eq!(messages[1].agent_id.as_deref(), Some("atlas"));
+            let mut changed_author = snapshot.clone();
+            changed_author.task_messages[1].agent_id = Some("other".into());
+            assert!(import(&changed_author)
+                .unwrap_err()
+                .to_string()
+                .contains("immutable task message"));
+        }
+        let mut invalid = snapshot.clone();
+        invalid.task_messages[1].agent_id = Some("outside-project".into());
+        assert!(invalid.validate_for_sync("project-one").is_err());
+        invalid = snapshot;
+        invalid.task_messages[0].agent_id = Some("atlas".into());
+        assert!(invalid.validate_for_sync("project-one").is_err());
+
+        source
+            .with_conn(|conn| {
+                conn.execute("UPDATE agents SET project_id = NULL WHERE id = 'atlas'", [])
+            })
+            .unwrap();
+        let exported = export_snapshot(&source, &source_config, &manifest()).unwrap();
+        assert!(exported.task_messages[1].agent_id.is_none());
     }
 
     #[test]
