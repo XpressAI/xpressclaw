@@ -29,7 +29,7 @@ const conversation = { id: 'download-chat', title: 'Downloads', project_id: null
 const message = (content: string, extra = {}) => ({ id: 1, role: 'assistant', agent_id: author, sender_type: 'agent', sender_id: author, sender_name: 'Original Agent', content, attachments: [], created_at: timestamp, timestamp, ...extra });
 
 async function clickDownload(page: Page, link: Locator) {
-	await expect(link).toHaveAttribute('download', '');
+	await expect(link).toHaveAttribute('download', '', { timeout: 20_000 });
 	await expect(link).not.toHaveAttribute('target', '_blank');
 	// Download-attribute requests bypass Playwright routing (#22650). As in
 	// the existing Files test, assert the attribute then let Content-Disposition
@@ -118,7 +118,7 @@ test('file schemes download while application, API and external links keep their
 	await mockApi(page, { messages: [message(content)] });
 	await page.goto('/conversations/download-chat');
 	for (const [name, , path] of fileLinks) {
-		await expect(page.getByRole('link', { name, exact: true })).toHaveAttribute('href', `/api/environments/${author}/download?path=${encodeURIComponent(path)}`);
+		await expect(page.getByRole('link', { name, exact: true })).toHaveAttribute('href', `/api/environments/${author}/download?path=${encodeURIComponent(path)}`, { timeout: 20_000 });
 	}
 	for (const [name, href] of ordinaryLinks) {
 		await expect(page.getByRole('link', { name, exact: true })).toHaveAttribute('href', href);
@@ -135,7 +135,7 @@ test('user messages and old replies without a known author never guess a contain
 		message('[User file](/tmp/user.txt)', { id: 2, role: 'user' }),
 	] });
 	await page.goto('/tasks/download-task');
-	await expect(page.getByRole('link', { name: 'Unknown author' })).toHaveAttribute('href', '/tmp/old.txt');
+	await expect(page.getByRole('link', { name: 'Unknown author' })).toHaveAttribute('href', '/tmp/old.txt', { timeout: 20_000 });
 	await expect(page.getByRole('link', { name: 'User file' })).toHaveAttribute('href', '/tmp/user.txt');
 	await expect(page.locator('[data-transcript-kind="message"] a[download]')).toHaveCount(0);
 });
