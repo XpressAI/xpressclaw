@@ -88,6 +88,16 @@ for (const surface of ['tasks/download-task', 'conversations/download-chat']) {
 		expect(page.url()).toContain(`/${surface}`);
 		expect(page.context().pages()).toHaveLength(1);
 	});
+
+	test(`source line references download the file in ${surface}`, async ({ page, downloadServer }) => {
+		const path = '/home/agent/workspace/src/lib/auth.ts';
+		const downloads = await mockApi(page, { downloadServer, messages: [message(`[auth.ts:14](${path}:14)`)] });
+		await page.goto(`/${surface}`);
+		const download = await clickDownload(page, page.getByRole('link', { name: 'auth.ts:14', exact: true }));
+		expect(await readFile((await download.path())!, 'utf8')).toBe('the original Agent file');
+		expect(downloads).toEqual([{ agent: author, path }]);
+		expect(page.url()).toContain(`/${surface}`);
+	});
 }
 
 test('activity and standalone results use their producing attempt after reassignment', async ({ page, downloadServer }) => {
@@ -105,12 +115,21 @@ test('file schemes download while application, API and external links keep their
 		['Root file', '/home/agent/report%2520one.txt', '/home/agent/report%20one.txt'],
 		['File URI', 'file:///projects/report.txt', '/projects/report.txt'],
 		['Sandbox file', 'sandbox:/mnt/data/report.pdf', '/mnt/data/report.pdf'],
+		['Line and column', '/tmp/report.ts:14:3', '/tmp/report.ts'],
+		['File URI with line', 'file:///projects/report.ts:14', '/projects/report.ts'],
+		['Sandbox with location', 'sandbox:/mnt/data/report.ts:14:3#L14', '/mnt/data/report.ts'],
+		['Colon in directory', '/tmp/build:14/report.ts:14', '/tmp/build:14/report.ts'],
+		['Colon in filename', '/tmp/report:final.txt', '/tmp/report:final.txt'],
+		['Literal numeric suffix', '/tmp/report.ts%3A14%3A3', '/tmp/report.ts:14:3'],
+		['Literal suffix with line', '/tmp/report.ts%3A14:3', '/tmp/report.ts:14'],
 	];
 	const ordinaryLinks = [
 		['Task link', '/tasks/other-task'], ['Project link', '/projects/project-id'], ['Anchor', '#section'],
+		['Task with numeric suffix', '/tasks/task:14'],
 		['Attachment', '/api/conversations/chat/attachments/file'],
 		['Existing download', '/api/environments/another-agent/download?path=%2Ftmp%2Ffile.txt'],
 		['External', 'https://example.com/report.pdf'], ['Network URL', '//example.com/report.pdf'],
+		['External with line', 'https://example.com/report.ts:14'],
 		['Relative URL', 'guide.html'],
 	];
 	const content = [...fileLinks, ...ordinaryLinks].map(([name, href]) => `[${name}](${href})`).join('\n\n')

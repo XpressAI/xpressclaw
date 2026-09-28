@@ -16,9 +16,11 @@ function fileDownloadUrl(href: string, agentId: string): string | null {
 	const path = href.startsWith('file:///') ? href.slice(7) : href.startsWith('sandbox:/') ? href.slice(8) : href;
 	if (!path.startsWith('/') || path.startsWith('//')) return null;
 	try {
-		// Decode once, after separating URL fragments/queries. Encoded #, ?, %,
-		// spaces and Unicode belong to the filename and must survive the request.
-		const decoded = decodeURIComponent(path.split(/[?#]/, 1)[0]);
+		// Agent source links can end in :line or :line:column. Strip these before
+		// decoding so percent-encoded colons still represent literal filenames.
+		const filePath = path.split(/[?#]/, 1)[0].replace(/:\d+(?::\d+)?$/, '');
+		// Decode once so encoded #, ?, %, spaces and Unicode survive the request.
+		const decoded = decodeURIComponent(filePath);
 		if (decoded === '/' || decoded.startsWith('//') || /[\x00-\x1f\x7f]/.test(decoded)) return null;
 		if (!explicitFile && appRoots.has(decoded.split('/')[1])) return null;
 		return environments.downloadUrl(agentId, decoded);
