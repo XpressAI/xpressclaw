@@ -4,7 +4,7 @@
   "runners": {
     "codex": {
       "auto_update": true,
-      "version": "2.0.1",
+      "version": "2.1.0",
       "acp_command": [
         "codex-acp"
       ],
@@ -18,7 +18,7 @@
         }
       ],
       "build_args": {
-        "CODEX_ACP_VERSION": "2.0.1"
+        "CODEX_ACP_VERSION": "2.1.0"
       }
     },
     "claude": {
@@ -69,7 +69,7 @@
     },
     "github-copilot": {
       "auto_update": true,
-      "version": "1.0.89",
+      "version": "1.0.90",
       "acp_command": [
         "copilot",
         "--acp"
@@ -85,13 +85,13 @@
       ],
       "build_args": {
         "AGENT_KIND": "github-copilot",
-        "AGENT_PACKAGE": "@github/copilot@1.0.89",
+        "AGENT_PACKAGE": "@github/copilot@1.0.90",
         "AGENT_BINARY": "copilot"
       }
     },
     "junie": {
       "auto_update": true,
-      "version": "3419.22.0",
+      "version": "3419.24.0",
       "acp_command": [
         "junie",
         "--acp=true"
@@ -108,8 +108,8 @@
         "AGENT_KIND": "junie",
         "AGENT_BINARY": "junie",
         "AGENT_PATH": "junie-app/bin/junie",
-        "AGENT_ARCHIVE_AMD64": "https://github.com/JetBrains/junie-acp-release/releases/download/3419.22/junie-release-3419.22-linux-amd64.zip",
-        "AGENT_ARCHIVE_ARM64": "https://github.com/JetBrains/junie-acp-release/releases/download/3419.22/junie-release-3419.22-linux-aarch64.zip",
+        "AGENT_ARCHIVE_AMD64": "https://github.com/JetBrains/junie-acp-release/releases/download/3419.24/junie-release-3419.24-linux-amd64.zip",
+        "AGENT_ARCHIVE_ARM64": "https://github.com/JetBrains/junie-acp-release/releases/download/3419.24/junie-release-3419.24-linux-aarch64.zip",
         "AGENT_SHA256_AMD64": "",
         "AGENT_SHA256_ARM64": ""
       }
@@ -141,7 +141,7 @@
     },
     "opencode": {
       "auto_update": true,
-      "version": "1.18.33",
+      "version": "1.18.34",
       "acp_command": [
         "opencode",
         "acp"
@@ -156,7 +156,7 @@
         }
       ],
       "build_args": {
-        "OPENCODE_VERSION": "1.18.33"
+        "OPENCODE_VERSION": "1.18.34"
       }
     },
     "pi": {
@@ -192,9 +192,9 @@
         "AGENT_KIND": "pi",
         "AGENT_PACKAGE": "pi-acp@0.0.34",
         "AGENT_BINARY": "pi-acp",
-        "AGENT_EXTRA_PACKAGES": "@earendil-works/pi-coding-agent@0.99.1",
+        "AGENT_EXTRA_PACKAGES": "@earendil-works/pi-coding-agent@0.99.2",
         "AGENT_EXTRA_BINARY": "pi",
-        "PI_MCP_PACKAGE": "pi-mcp-adapter@3.3.0"
+        "PI_MCP_PACKAGE": "pi-mcp-adapter@4.0.0"
       }
     },
     "qwen": {
@@ -223,7 +223,7 @@
     },
     "cline": {
       "auto_update": true,
-      "version": "3.0.65",
+      "version": "3.0.67",
       "acp_command": [
         "cline",
         "--acp"
@@ -239,13 +239,13 @@
       ],
       "build_args": {
         "AGENT_KIND": "cline",
-        "AGENT_PACKAGE": "cline@3.0.65",
+        "AGENT_PACKAGE": "cline@3.0.67",
         "AGENT_BINARY": "cline"
       }
     },
     "cursor": {
       "auto_update": true,
-      "version": "2026.09.26",
+      "version": "2026.09.28",
       "acp_command": [
         "cursor-agent",
         "acp"
@@ -262,8 +262,8 @@
         "AGENT_KIND": "cursor",
         "AGENT_BINARY": "cursor-agent",
         "AGENT_PATH": "dist-package/cursor-agent",
-        "AGENT_ARCHIVE_AMD64": "https://downloads.cursor.com/lab/2026.09.26-dd393fe/linux/x64/agent-cli-package.tar.gz",
-        "AGENT_ARCHIVE_ARM64": "https://downloads.cursor.com/lab/2026.09.26-dd393fe/linux/arm64/agent-cli-package.tar.gz",
+        "AGENT_ARCHIVE_AMD64": "https://downloads.cursor.com/lab/2026.09.28-64d2043/linux/x64/agent-cli-package.tar.gz",
+        "AGENT_ARCHIVE_ARM64": "https://downloads.cursor.com/lab/2026.09.28-64d2043/linux/arm64/agent-cli-package.tar.gz",
         "AGENT_SHA256_AMD64": "",
         "AGENT_SHA256_ARM64": ""
       }
@@ -291,7 +291,7 @@
     },
     "grok": {
       "auto_update": true,
-      "version": "1.0.45",
+      "version": "1.0.46",
       "acp_command": [
         "grok",
         "agent",
@@ -308,7 +308,7 @@
       ],
       "build_args": {
         "AGENT_KIND": "grok",
-        "AGENT_PACKAGE": "@xai-official/grok@1.0.45",
+        "AGENT_PACKAGE": "@xai-official/grok@1.0.46",
         "AGENT_BINARY": "grok"
       }
     },
