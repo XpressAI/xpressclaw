@@ -819,7 +819,7 @@ test('connected tools publish through the platform bridge and cannot schedule lo
   });
   server.listen(0, '127.0.0.1'); await once(server, 'listening');
   const child = spawn(process.execPath, [fileURLToPath(new URL('./mcp-xpressclaw.mjs', import.meta.url))], {
-    env: { ...process.env, XPRESSCLAW_URL: `http://127.0.0.1:${server.address().port}`, XPRESSCLAW_AGENT_ID: 'atlas', XPRESSCLAW_CONVERSATION_ID: 'linked-turn', XPRESSCLAW_CONNECT: '1' }, stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, XPRESSCLAW_WORKSPACE: directory, XPRESSCLAW_URL: `http://127.0.0.1:${server.address().port}`, XPRESSCLAW_AGENT_ID: 'atlas', XPRESSCLAW_CONVERSATION_ID: 'linked-turn', XPRESSCLAW_CONNECT: '1' }, stdio: ['pipe', 'pipe', 'pipe'],
   });
   const output = createInterface({ input: child.stdout })[Symbol.asyncIterator](); let id = 0;
   async function call(method, params) {
@@ -834,7 +834,7 @@ test('connected tools publish through the platform bridge and cannot schedule lo
     const denied = await call('tools/call', { name: 'schedule_wakeup', arguments: { delay_seconds: 10 } });
     assert.equal(denied.isError, true); assert.equal(requests.length, 0);
     const sent = await call('tools/call', { name: 'publish_task_files', arguments: { files: [file], content: 'Ready' } });
-    assert.equal(sent.isError, false);
+    assert.equal(sent.isError, false, JSON.stringify(sent));
     assert.equal(requests.at(-1).url, '/api/settings/connect/conversations/linked-turn/tools');
     assert.equal(requests.at(-1).body.name, 'send_message');
     assert.equal(Buffer.from(requests.at(-1).body.arguments.attachments[0].data, 'base64').toString(), 'result');

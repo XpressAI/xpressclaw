@@ -36,6 +36,54 @@ fn fixture() -> (Arc<Database>, ConnectJournal, Command) {
 }
 
 #[test]
+fn agents_in_one_local_project_must_share_the_platform_project() {
+    let (db, journal, command) = fixture();
+    AgentRegistry::new(db.clone())
+        .ensure("second", "native")
+        .unwrap();
+    db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE agents SET project_id = 'atlas' WHERE id = 'second'",
+            [],
+        )
+    })
+    .unwrap();
+    let mut second = command.binding.clone();
+    second.id = Uuid::new_v4().to_string();
+    second.local_agent_id = "second".into();
+    second.agent_name = "local-second".into();
+    second.project_id = "other-team".into();
+    assert!(journal.bind("instance", &second).is_err());
+    assert_eq!(journal.bindings("instance").unwrap().len(), 1);
+    journal
+        .disable_binding("instance", &command.binding.id)
+        .unwrap();
+    assert!(journal.bind("instance", &second).is_err());
+    second.project_id = command.binding.project_id.clone();
+    journal.bind("instance", &second).unwrap();
+    assert_eq!(journal.bindings("instance").unwrap().len(), 2);
+}
+
+#[test]
+fn separate_local_projects_and_new_pairings_can_choose_their_own_mapping() {
+    let (db, journal, command) = fixture();
+    AgentRegistry::new(db.clone())
+        .ensure("second", "native")
+        .unwrap();
+    let mut second = command.binding.clone();
+    second.id = Uuid::new_v4().to_string();
+    second.local_project_id = "second".into();
+    second.local_agent_id = "second".into();
+    second.project_id = "other-team".into();
+    second.agent_name = "local-second".into();
+    journal.bind("instance", &second).unwrap();
+    let mut paired = command.binding.clone();
+    paired.id = Uuid::new_v4().to_string();
+    paired.project_id = "new-team".into();
+    journal.bind("new-instance", &paired).unwrap();
+}
+
+#[test]
 fn replay_after_completion_does_not_queue_another_turn() {
     let (db, journal, command) = fixture();
     let first = journal.admit("instance", &command, 200, 100).unwrap();

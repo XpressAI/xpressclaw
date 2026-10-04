@@ -99,6 +99,20 @@ impl ConnectJournal {
             if project.as_deref() != Some(binding.local_project_id.as_str()) {
                 return Err(invalid("Agent does not belong to the selected local Project"));
             }
+            // A mapping belongs to the local Project, not an individual Agent.
+            // Keep disabled bindings in this check: republishing must not retarget
+            // a Project within the same pairing.
+            let mut mappings = tx.prepare(
+                "SELECT binding_json FROM connect_bindings WHERE instance_id = ?1 AND local_project_id = ?2",
+            )?;
+            let rows = mappings.query_map(params![instance, binding.local_project_id], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                let previous: Binding = serde_json::from_str(&row?)?;
+                if previous.project_id != binding.project_id {
+                    return Err(invalid("Local Project is already bound to another platform project"));
+                }
+            }
+            drop(mappings);
             let existing: Option<(String, String)> = tx.query_row(
                 "SELECT instance_id, binding_json FROM connect_bindings WHERE id = ?1", [&binding.id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
