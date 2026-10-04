@@ -1,0 +1,1 @@
+Addressed PR251 lease-expiry and binding preflight findings plus CI lint failure. Running turns expire atomically to failed/unknown; queued turns cancel; native sessions are invalidated. Passed 20 focused Connect tests, 11 conversation runtime tests, and Clippy for core/server/CLI all targets.
