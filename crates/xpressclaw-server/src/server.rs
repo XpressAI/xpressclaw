@@ -139,10 +139,10 @@ async fn require_internal_token(
                     supplied,
                 ) && connected_capability_route(request.method(), callback_path, agent)
             });
-    if supplied != Some(token.as_ref())
-        && !connected_capability_matches
-        && !(agent_capability_matches && agent_capability_route)
-        && !collaboration_git_proxy
+    if !(supplied == Some(token.as_ref())
+        || connected_capability_matches
+        || (agent_capability_matches && agent_capability_route)
+        || collaboration_git_proxy)
     {
         return Err(StatusCode::UNAUTHORIZED);
     }

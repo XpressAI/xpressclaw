@@ -355,6 +355,9 @@ async fn bind(
     if agent.project_id.as_deref() != Some(input.local_project_id.as_str()) {
         return Err(bad("Select an Agent in the local Project"));
     }
+    ConnectJournal::new(state.db.clone())
+        .validate_project_mapping(instance, &input.local_project_id, &input.project_id)
+        .map_err(core_error)?;
     let runtime_config = state.config();
     let runtime = runtime_config
         .agents
@@ -598,7 +601,7 @@ pub async fn watch_leases(state: AppState) {
                         if execution.receipt.status == "accepted"
                             && execution.lease_until <= Utc::now().timestamp()
                         {
-                            let _ = cancel(&state, &execution);
+                            let _ = stop(&state, &execution, true);
                         }
                     }
                 }
@@ -613,10 +616,22 @@ fn cancel(
     state: &AppState,
     execution: &xpressclaw_core::connect::Execution,
 ) -> Result<(), ConnectError> {
+    stop(state, execution, false)
+}
+
+fn stop(
+    state: &AppState,
+    execution: &xpressclaw_core::connect::Execution,
+    lease_expired: bool,
+) -> Result<(), ConnectError> {
     if let (Some(conversation), Some(turn)) = (&execution.conversation_id, &execution.turn_id) {
-        let cancellation = ConversationTurnQueue::new(state.db.clone())
-            .cancel(conversation, turn)
-            .map_err(core_error)?;
+        let queue = ConversationTurnQueue::new(state.db.clone());
+        let cancellation = if lease_expired {
+            queue.expire_lease(conversation, turn)
+        } else {
+            queue.cancel(conversation, turn)
+        }
+        .map_err(core_error)?;
         if cancellation.was_running {
             state
                 .turn_controls
@@ -685,6 +700,61 @@ mod tests {
             cancel_requested: false,
         };
         assert!(lease_time(&lease).unwrap() <= Utc::now().timestamp() + 90);
+    }
+
+    #[tokio::test]
+    async fn conflicting_project_binding_is_rejected_before_remote_publication() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open_memory().unwrap());
+        AgentRegistry::new(db.clone())
+            .ensure("atlas", "native")
+            .unwrap();
+        let mut app_config = Config::load_default().unwrap();
+        app_config.system.data_dir = directory.path().to_path_buf();
+        let state = AppState::new(
+            Arc::new(app_config),
+            db.clone(),
+            None,
+            "test.yaml".into(),
+            true,
+        );
+        let binding = Binding {
+            id: uuid::Uuid::new_v4().to_string(),
+            local_project_id: "atlas".into(),
+            local_agent_id: "atlas".into(),
+            project_id: "original".into(),
+            agent_name: "atlas".into(),
+            generation: 1,
+            active: true,
+        };
+        let journal = ConnectJournal::new(db);
+        journal.bind("instance", &binding).unwrap();
+        // No platform listener exists: preflight must fail before making a request.
+        Settings {
+            base_url: "http://127.0.0.1:1".into(),
+            instance_id: Some("instance".into()),
+            credential: "private".into(),
+            enabled: true,
+            ..Settings::default()
+        }
+        .save(directory.path())
+        .unwrap();
+        let error = bind(
+            State(state),
+            Json(BindRequest {
+                local_project_id: "atlas".into(),
+                local_agent_id: "atlas".into(),
+                project_id: "different".into(),
+                agent_name: "atlas".into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert!(error
+            .1
+            .contains("already bound to another platform project"));
+        assert_eq!(journal.bindings("instance").unwrap(), vec![binding]);
     }
 
     #[tokio::test]

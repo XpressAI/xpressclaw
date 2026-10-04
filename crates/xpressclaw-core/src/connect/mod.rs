@@ -86,6 +86,17 @@ impl ConnectJournal {
         Self { db }
     }
 
+    pub fn validate_project_mapping(
+        &self,
+        instance: &str,
+        local_project: &str,
+        platform_project: &str,
+    ) -> Result<()> {
+        self.db.with_conn(|conn| {
+            validate_project_mapping(conn, instance, local_project, platform_project)
+        })
+    }
+
     pub fn bind(&self, instance: &str, binding: &Binding) -> Result<()> {
         if Uuid::parse_str(&binding.id).is_err() || binding.generation < 1 {
             return Err(invalid("Invalid platform binding"));
@@ -99,20 +110,7 @@ impl ConnectJournal {
             if project.as_deref() != Some(binding.local_project_id.as_str()) {
                 return Err(invalid("Agent does not belong to the selected local Project"));
             }
-            // A mapping belongs to the local Project, not an individual Agent.
-            // Keep disabled bindings in this check: republishing must not retarget
-            // a Project within the same pairing.
-            let mut mappings = tx.prepare(
-                "SELECT binding_json FROM connect_bindings WHERE instance_id = ?1 AND local_project_id = ?2",
-            )?;
-            let rows = mappings.query_map(params![instance, binding.local_project_id], |row| row.get::<_, String>(0))?;
-            for row in rows {
-                let previous: Binding = serde_json::from_str(&row?)?;
-                if previous.project_id != binding.project_id {
-                    return Err(invalid("Local Project is already bound to another platform project"));
-                }
-            }
-            drop(mappings);
+            validate_project_mapping(&tx, instance, &binding.local_project_id, &binding.project_id)?;
             let existing: Option<(String, String)> = tx.query_row(
                 "SELECT instance_id, binding_json FROM connect_bindings WHERE id = ?1", [&binding.id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
@@ -302,6 +300,32 @@ impl ConnectJournal {
             Ok(())
         })
     }
+}
+
+fn validate_project_mapping(
+    conn: &rusqlite::Connection,
+    instance: &str,
+    local_project: &str,
+    platform_project: &str,
+) -> Result<()> {
+    // A mapping belongs to the local Project, not an individual Agent.
+    // Keep disabled bindings in this check: republishing must not retarget
+    // a Project within the same pairing.
+    let mut mappings = conn.prepare(
+                "SELECT binding_json FROM connect_bindings WHERE instance_id = ?1 AND local_project_id = ?2",
+            )?;
+    let rows = mappings.query_map(params![instance, local_project], |row| {
+        row.get::<_, String>(0)
+    })?;
+    for row in rows {
+        let previous: Binding = serde_json::from_str(&row?)?;
+        if previous.project_id != platform_project {
+            return Err(invalid(
+                "Local Project is already bound to another platform project",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn execution(conn: &rusqlite::Connection, id: &str) -> Result<Execution> {

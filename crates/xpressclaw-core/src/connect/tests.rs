@@ -53,6 +53,9 @@ fn agents_in_one_local_project_must_share_the_platform_project() {
     second.local_agent_id = "second".into();
     second.agent_name = "local-second".into();
     second.project_id = "other-team".into();
+    assert!(journal
+        .validate_project_mapping("instance", &second.local_project_id, &second.project_id)
+        .is_err());
     assert!(journal.bind("instance", &second).is_err());
     assert_eq!(journal.bindings("instance").unwrap().len(), 1);
     journal
@@ -330,4 +333,64 @@ fn moved_agents_lose_callback_authority_and_deleted_turns_report_unknown_outcome
         result[0].receipt.error.as_deref(),
         Some("execution_state_lost_after_restart")
     );
+}
+
+#[test]
+fn expired_running_lease_records_unknown_outcome_and_cannot_be_replayed() {
+    let (db, journal, command) = fixture();
+    let execution = journal.admit("instance", &command, 200, 100).unwrap();
+    let queue = ConversationTurnQueue::new(db.clone());
+    let running = queue.claim_next().unwrap().unwrap();
+    db.with_conn(|conn| conn.execute(
+        "UPDATE conversation_agent_sessions SET native_session_id = 'old-session' WHERE conversation_id = ?1",
+        [&running.conversation_id],
+    )).unwrap();
+    let stopped = queue
+        .expire_lease(execution.conversation_id.as_ref().unwrap(), &running.id)
+        .unwrap();
+    assert!(stopped.was_running);
+    assert_eq!(stopped.turn.status, "failed");
+    assert!(
+        !queue
+            .expire_lease(&running.conversation_id, &running.id)
+            .unwrap()
+            .changed
+    );
+    let native: Option<String> = db
+        .with_conn(|conn| {
+            conn.query_row(
+        "SELECT native_session_id FROM conversation_agent_sessions WHERE conversation_id = ?1",
+        [&running.conversation_id], |row| row.get(0),
+    )
+        })
+        .unwrap();
+    assert!(native.is_none());
+    journal.collect("instance").unwrap();
+    let replay = journal.admit("instance", &command, 400, 300).unwrap();
+    assert_eq!(replay.receipt.status, "failed");
+    assert_eq!(
+        replay.receipt.error.as_deref(),
+        Some("execution_outcome_unknown_after_lease_expiry")
+    );
+    assert!(queue.claim_next().unwrap().is_none());
+}
+
+#[test]
+fn expired_queued_lease_can_be_cancelled_without_execution() {
+    let (db, journal, command) = fixture();
+    let execution = journal.admit("instance", &command, 200, 100).unwrap();
+    let queue = ConversationTurnQueue::new(db);
+    let stopped = queue
+        .expire_lease(
+            execution.conversation_id.as_ref().unwrap(),
+            execution.turn_id.as_ref().unwrap(),
+        )
+        .unwrap();
+    assert!(!stopped.was_running);
+    journal.collect("instance").unwrap();
+    assert_eq!(
+        journal.pending("instance").unwrap()[0].receipt.status,
+        "cancelled"
+    );
+    assert!(queue.claim_next().unwrap().is_none());
 }

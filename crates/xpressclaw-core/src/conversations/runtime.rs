@@ -436,6 +436,25 @@ impl ConversationTurnQueue {
         conversation_id: &str,
         turn_id: &str,
     ) -> Result<ConversationTurnCancellation> {
+        self.stop_turn(conversation_id, turn_id, false)
+    }
+
+    /// Expiring authorization cannot prove that running work had no effects.
+    /// Record that uncertainty atomically with stopping the turn.
+    pub fn expire_lease(
+        &self,
+        conversation_id: &str,
+        turn_id: &str,
+    ) -> Result<ConversationTurnCancellation> {
+        self.stop_turn(conversation_id, turn_id, true)
+    }
+
+    fn stop_turn(
+        &self,
+        conversation_id: &str,
+        turn_id: &str,
+        lease_expired: bool,
+    ) -> Result<ConversationTurnCancellation> {
         self.db.with_conn(|conn| {
             let transaction = rusqlite::Transaction::new_unchecked(
                 conn,
@@ -455,11 +474,25 @@ impl ConversationTurnQueue {
                 matches!(original.status.as_str(), "running" | "failed");
             let changed = transaction.execute(
                 "UPDATE conversation_turns
-                 SET status = 'cancelled', completed_at = CURRENT_TIMESTAMP,
-                     error_message = NULL
+                 SET status = ?3, completed_at = CURRENT_TIMESTAMP,
+                     error_message = ?4
                  WHERE id = ?1 AND conversation_id = ?2
-                   AND status IN ('queued', 'running', 'failed')",
-                rusqlite::params![turn_id, conversation_id],
+                   AND (status IN ('queued', 'running') OR (status = 'failed' AND ?5 = 0))",
+                rusqlite::params![
+                    turn_id,
+                    conversation_id,
+                    if lease_expired && was_running {
+                        "failed"
+                    } else {
+                        "cancelled"
+                    },
+                    if lease_expired && was_running {
+                        Some("execution_outcome_unknown_after_lease_expiry")
+                    } else {
+                        None
+                    },
+                    lease_expired
+                ],
             )? == 1;
             if changed && invalidates_native_session {
                 // Once a response started, the native ACP session may already
