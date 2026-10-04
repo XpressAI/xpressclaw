@@ -773,6 +773,20 @@ async fn execute_conversation_turn(
             BUILT_IN_RUNNER_PROTOCOL,
         )
         .await;
+    let connected =
+        crate::connect::ConnectJournal::new(db.clone()).is_linked(&turn.conversation_id)?;
+    if connected
+        && (!bundled_control_tools
+            || agent
+                .runner
+                .mcp_servers
+                .iter()
+                .any(|name| name == "xpressclaw"))
+    {
+        return Err(Error::Backend(
+            "Xpress AI Connect requires the bundled XpressClaw control tools".into(),
+        ));
+    }
     let github_mcp_attached = configure_bundled_github_mcp(
         &agent.runner,
         &kind,
@@ -797,6 +811,7 @@ async fn execute_conversation_turn(
             &repository.container_bootstrap,
             &repository.container_root,
             RunnerCallback {
+                connected,
                 port: control_plane_port,
                 token: control_plane_token.as_ref(),
                 container_runtime: docker.runtime(),
@@ -807,10 +822,11 @@ async fn execute_conversation_turn(
     if github_mcp_attached {
         mcp_servers.push(github::mcp_server(&github::GithubMcpContext {
             control_plane_url: control_plane_url(control_plane_port, docker.runtime()),
-            control_plane_token: agent_callback_capability(
-                control_plane_token.as_ref(),
-                &agent.name,
-            ),
+            control_plane_token: if connected {
+                crate::connect::callback_capability(control_plane_token.as_ref(), &agent.name)
+            } else {
+                agent_callback_capability(control_plane_token.as_ref(), &agent.name)
+            },
             agent_id: agent.name.clone(),
             workspace: repository.container_bootstrap.clone(),
             active_repository: repository.active.then(|| repository.container_root.clone()),
@@ -1399,6 +1415,7 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
             &repository.container_bootstrap,
             &repository.container_root,
             RunnerCallback {
+                connected: false,
                 port: control_plane_port,
                 token: control_plane_token.as_ref(),
                 container_runtime: docker.runtime(),
@@ -2649,6 +2666,7 @@ fn control_plane_url(control_plane_port: u16, container_runtime: &str) -> String
 
 #[derive(Clone, Copy)]
 struct RunnerCallback<'a> {
+    connected: bool,
     port: u16,
     token: &'a str,
     container_runtime: &'a str,
@@ -2670,6 +2688,7 @@ fn xpressclaw_control_mcp_server(
         "/workspace",
         "/workspace",
         RunnerCallback {
+            connected: false,
             port: control_plane_port,
             token: "test-control-token",
             container_runtime,
@@ -2695,8 +2714,18 @@ fn xpressclaw_control_mcp_server_for_context(
         EnvVariable::new("XPRESSCLAW_AGENT_ID", agent_id),
         EnvVariable::new("XPRESSCLAW_WORKSPACE", workspace),
         EnvVariable::new("XPRESSCLAW_REPOSITORY", repository),
-        EnvVariable::new("XPRESSCLAW_CONTROL_TOKEN", callback.token),
+        EnvVariable::new(
+            "XPRESSCLAW_CONTROL_TOKEN",
+            if callback.connected {
+                crate::connect::callback_capability(callback.token, agent_id)
+            } else {
+                callback.token.to_string()
+            },
+        ),
     ];
+    if callback.connected {
+        env.push(EnvVariable::new("XPRESSCLAW_CONNECT", "1"));
+    }
     if let Some(task_id) = task_id {
         env.push(EnvVariable::new("XPRESSCLAW_TASK_ID", task_id));
     }
@@ -4252,6 +4281,7 @@ mod tests {
             &runtime.container_bootstrap,
             &runtime.container_root,
             RunnerCallback {
+                connected: false,
                 port: 8935,
                 token: "control",
                 container_runtime: "docker",
@@ -5840,6 +5870,43 @@ flows:
             .to_string()
             .contains("reserves container mount target"));
         assert!(!pi_mcp_config_dir(data_dir.path(), "pi").exists());
+    }
+
+    #[test]
+    fn connected_mcp_never_receives_the_root_callback_secret() {
+        let McpServer::Stdio(server) = xpressclaw_control_mcp_server_for_context(
+            "atlas",
+            None,
+            Some("conversation"),
+            Some("project"),
+            "/workspace",
+            "/workspace",
+            RunnerCallback {
+                connected: true,
+                port: 1234,
+                token: "root-secret",
+                container_runtime: "docker",
+                collaboration_token: None,
+            },
+        ) else {
+            panic!("stdio");
+        };
+        let credential = server
+            .env
+            .iter()
+            .find(|v| v.name == "XPRESSCLAW_CONTROL_TOKEN")
+            .unwrap();
+        assert_ne!(credential.value, "root-secret");
+        assert!(crate::connect::verify_callback_capability(
+            "root-secret",
+            "atlas",
+            &credential.value
+        ));
+        assert!(!crate::repositories::verify_agent_callback_capability(
+            "root-secret",
+            "atlas",
+            &credential.value
+        ));
     }
 
     #[test]

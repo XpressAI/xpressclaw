@@ -129,13 +129,42 @@ async fn require_internal_token(
                     supplied,
                 )
             });
+    let connected_capability_matches =
+        supplied_agent
+            .zip(supplied)
+            .is_some_and(|(agent, supplied)| {
+                xpressclaw_core::connect::verify_callback_capability(
+                    token.as_ref(),
+                    agent,
+                    supplied,
+                ) && connected_capability_route(request.method(), callback_path, agent)
+            });
     if supplied != Some(token.as_ref())
+        && !connected_capability_matches
         && !(agent_capability_matches && agent_capability_route)
         && !collaboration_git_proxy
     {
         return Err(StatusCode::UNAUTHORIZED);
     }
     Ok(next.run(request).await)
+}
+
+fn connected_capability_route(method: &axum::http::Method, path: &str, agent: &str) -> bool {
+    use axum::http::Method;
+    let parts: Vec<_> = path.split('/').collect();
+    match parts.as_slice() {
+        ["", "api", "settings", "connect", "conversations", id, "tools"] => {
+            *method == Method::POST && uuid::Uuid::parse_str(id).is_ok()
+        }
+        ["", "api", "environments", owner, "ports"] if *owner == agent => {
+            matches!(*method, Method::GET | Method::POST)
+        }
+        ["", "api", "environments", owner, "ports", id] if *owner == agent && !id.is_empty() => {
+            *method == Method::DELETE
+        }
+        ["", "api", "workspaces", _, "repository", "resolve-github"] => *method == Method::POST,
+        _ => false,
+    }
 }
 
 fn environment_agent_capability_route(
@@ -277,6 +306,24 @@ pub async fn serve_on_with_bound_callback(
             Err(e) => warn!(error = %e, "workflow engine recovery failed"),
         }
     }
+
+    xpressclaw_core::connect::ConnectJournal::new(state.db.clone()).recover()?;
+    let connect_state = state.clone();
+    let connect_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = crate::connect::run(connect_state) => {},
+            _ = connect_shutdown.cancelled() => {},
+        }
+    });
+    let lease_state = state.clone();
+    let lease_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = crate::connect::watch_leases(lease_state) => {},
+            _ = lease_shutdown.cancelled() => {},
+        }
+    });
 
     // Consume tasks with ACP agent processes inside retained project
     // containers. The former harness dispatcher and desired-state agent
@@ -514,6 +561,50 @@ mod tests {
             .to_string();
         let body = json_body(response).await;
         (cookie, body["csrf_token"].as_str().unwrap().to_string())
+    }
+
+    #[tokio::test]
+    async fn connected_callback_cannot_schedule_local_tasks_or_change_settings() {
+        let app = create_internal_router(state(), Arc::from("root-secret"));
+        let capability = xpressclaw_core::connect::callback_capability("root-secret", "atlas");
+        for (method, path, agent, allowed) in [
+            (
+                "POST",
+                "/api/settings/connect/conversations/00000000-0000-0000-0000-000000000001/tools",
+                "atlas",
+                true,
+            ),
+            (
+                "POST",
+                "/api/settings/connect/conversations/00000000-0000-0000-0000-000000000001/tools",
+                "other",
+                false,
+            ),
+            ("POST", "/api/environments/atlas/tasks", "atlas", false),
+            ("POST", "/api/settings/connect/pair", "atlas", false),
+            ("DELETE", "/api/settings/connect/", "atlas", false),
+            ("GET", "/api/agents", "atlas", false),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header("x-xpressclaw-internal-token", &capability)
+                        .header("x-xpressclaw-agent-id", agent)
+                        .header("content-type", "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status() != StatusCode::UNAUTHORIZED,
+                allowed,
+                "{method} {path}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -805,3 +805,40 @@ test('conversation tools publish files, download attachments, and create linked 
     await rm(workspace, { recursive: true, force: true });
   }
 });
+
+test('connected tools publish through the platform bridge and cannot schedule local work', { timeout: 5000 }, async () => {
+  const requests = [];
+  const directory = await mkdtemp(path.join(tmpdir(), 'connect-tools-test-'));
+  const file = path.join(directory, 'result.txt');
+  await writeFile(file, 'result');
+  const server = createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    requests.push({ url: request.url, agent: request.headers['x-xpressclaw-agent-id'], body: JSON.parse(Buffer.concat(chunks).toString()) });
+    response.writeHead(200, { 'content-type': 'application/json' }); response.end('{}');
+  });
+  server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  const child = spawn(process.execPath, [fileURLToPath(new URL('./mcp-xpressclaw.mjs', import.meta.url))], {
+    env: { ...process.env, XPRESSCLAW_URL: `http://127.0.0.1:${server.address().port}`, XPRESSCLAW_AGENT_ID: 'atlas', XPRESSCLAW_CONVERSATION_ID: 'linked-turn', XPRESSCLAW_CONNECT: '1' }, stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  const output = createInterface({ input: child.stdout })[Symbol.asyncIterator](); let id = 0;
+  async function call(method, params) {
+    child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: ++id, method, params }) + '\n');
+    return JSON.parse((await output.next()).value).result;
+  }
+  try {
+    const names = (await call('tools/list')).tools.map(tool => tool.name);
+    assert.ok(names.includes('publish_task_files'));
+    assert.ok(names.includes('update_task_status'));
+    assert.ok(!names.includes('schedule_wakeup'));
+    const denied = await call('tools/call', { name: 'schedule_wakeup', arguments: { delay_seconds: 10 } });
+    assert.equal(denied.isError, true); assert.equal(requests.length, 0);
+    const sent = await call('tools/call', { name: 'publish_task_files', arguments: { files: [file], content: 'Ready' } });
+    assert.equal(sent.isError, false);
+    assert.equal(requests.at(-1).url, '/api/settings/connect/conversations/linked-turn/tools');
+    assert.equal(requests.at(-1).body.name, 'send_message');
+    assert.equal(Buffer.from(requests.at(-1).body.arguments.attachments[0].data, 'base64').toString(), 'result');
+    await call('tools/call', { name: 'update_task_status', arguments: { status: 'Done' } });
+    assert.deepEqual(requests.at(-1).body, { name: 'update_task_status', arguments: { status: 'Done' } });
+  } finally { child.kill(); await new Promise(resolve => server.close(resolve)); await rm(directory, { recursive: true, force: true }); }
+});

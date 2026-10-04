@@ -304,6 +304,12 @@ async fn send_user_message(
     Path(id): Path<String>,
     Json(request): Json<SendUserMessageRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
+    if xpressclaw_core::connect::ConnectJournal::new(state.db.clone())
+        .is_linked(&id)
+        .map_err(api_error)?
+    {
+        return Err(bad_request("This conversation belongs to Xpress AI. Continue there, or use the connected Agent tools."));
+    }
     if request.content.trim().is_empty() && request.attachments.is_empty() {
         return Err(bad_request("a message or attachment is required"));
     }
@@ -352,6 +358,12 @@ async fn send_agent_message(
     Path(id): Path<String>,
     Json(request): Json<SendAgentMessageRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
+    if xpressclaw_core::connect::ConnectJournal::new(state.db.clone())
+        .is_linked(&id)
+        .map_err(api_error)?
+    {
+        return Err(bad_request("This conversation belongs to Xpress AI. Continue there, or use the connected Agent tools."));
+    }
     if request.content.trim().is_empty() && request.attachments.is_empty() {
         return Err(bad_request("a message or attachment is required"));
     }
@@ -409,6 +421,12 @@ async fn create_linked_task(
     Path(id): Path<String>,
     Json(request): Json<CreateLinkedTaskRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
+    if xpressclaw_core::connect::ConnectJournal::new(state.db.clone())
+        .is_linked(&id)
+        .map_err(api_error)?
+    {
+        return Err(bad_request("This conversation belongs to Xpress AI. Continue there, or use the connected Agent tools."));
+    }
     let manager = ConversationManager::new(state.db.clone());
     let conversation = manager.get(&id).map_err(api_error)?;
     let project_id = conversation

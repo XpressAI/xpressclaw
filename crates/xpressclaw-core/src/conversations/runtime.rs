@@ -90,6 +90,18 @@ impl ConversationTurnQueue {
         sender_id: &str,
         content: &str,
     ) -> Result<Vec<String>> {
+        let has_connect: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'connect_commands')", [], |row| row.get(0),
+        )?;
+        let connected = has_connect
+            && transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM connect_commands WHERE conversation_id = ?1)",
+                [conversation_id],
+                |row| row.get::<_, bool>(0),
+            )?;
+        if connected {
+            return Ok(Vec::new());
+        }
         let agent_mentions = Self::agent_mentions(content);
         let mut statement = transaction.prepare(
             "SELECT participant_id FROM conversation_participants
