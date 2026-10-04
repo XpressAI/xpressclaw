@@ -346,13 +346,18 @@ fn expired_running_lease_records_unknown_outcome_and_cannot_be_replayed() {
         [&running.conversation_id],
     )).unwrap();
     let stopped = queue
-        .expire_lease(execution.conversation_id.as_ref().unwrap(), &running.id)
+        .expire_lease(
+            execution.conversation_id.as_ref().unwrap(),
+            &running.id,
+            &command.id,
+            200,
+        )
         .unwrap();
     assert!(stopped.was_running);
     assert_eq!(stopped.turn.status, "failed");
     assert!(
         !queue
-            .expire_lease(&running.conversation_id, &running.id)
+            .expire_lease(&running.conversation_id, &running.id, &command.id, 200)
             .unwrap()
             .changed
     );
@@ -384,6 +389,8 @@ fn expired_queued_lease_can_be_cancelled_without_execution() {
         .expire_lease(
             execution.conversation_id.as_ref().unwrap(),
             execution.turn_id.as_ref().unwrap(),
+            &command.id,
+            200,
         )
         .unwrap();
     assert!(!stopped.was_running);
@@ -393,4 +400,30 @@ fn expired_queued_lease_can_be_cancelled_without_execution() {
         "cancelled"
     );
     assert!(queue.claim_next().unwrap().is_none());
+}
+
+#[test]
+fn renewed_lease_survives_a_stale_watchdog_snapshot() {
+    let (db, journal, command) = fixture();
+    journal.admit("instance", &command, 200, 100).unwrap();
+    let queue = ConversationTurnQueue::new(db.clone());
+    let running = queue.claim_next().unwrap().unwrap();
+    let snapshot = journal.pending("instance").unwrap().remove(0);
+    assert_eq!(snapshot.lease_until, 200);
+    journal.renew("instance", &command.id, 400).unwrap();
+    let stopped = queue
+        .expire_lease(&running.conversation_id, &running.id, &snapshot.id, 200)
+        .unwrap();
+    assert!(!stopped.changed);
+    assert_eq!(stopped.turn.status, "running");
+    journal.collect("instance").unwrap();
+    let pending = journal.pending("instance").unwrap().remove(0);
+    assert_eq!(pending.receipt.status, "accepted");
+    assert_eq!(pending.lease_until, 400);
+    assert!(
+        queue
+            .expire_lease(&running.conversation_id, &running.id, &command.id, 400)
+            .unwrap()
+            .changed
+    );
 }

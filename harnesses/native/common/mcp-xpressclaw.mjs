@@ -19,7 +19,7 @@ const AGENT_ID = process.env.XPRESSCLAW_AGENT_ID ?? process.env.AGENT_ID ?? '';
 const TASK_ID = process.env.XPRESSCLAW_TASK_ID ?? '';
 const CONVERSATION_ID = process.env.XPRESSCLAW_CONVERSATION_ID ?? '';
 const CONNECTED = process.env.XPRESSCLAW_CONNECT === '1';
-const CONNECTED_TOOLS = new Set(['send_conversation_message', 'publish_task_files', 'download_conversation_attachment', 'create_conversation_task', 'forward_port', 'expose_port', 'list_port_forwards', 'remove_port_forward', 'list_platform_attachments', 'get_task', 'update_task_step', 'update_task_status']);
+const CONNECTED_TOOLS = new Set(['send_conversation_message', 'publish_task_files', 'download_conversation_attachment', 'create_conversation_task', 'list_platform_attachments', 'get_task', 'update_task_step', 'update_task_status']);
 const PROJECT_ID = process.env.XPRESSCLAW_PROJECT_ID ?? '';
 const REPOSITORY_ROOT = process.env.XPRESSCLAW_REPOSITORY ?? '';
 const LOCAL_COLLABORATION = process.env.XPRESSCLAW_LOCAL_COLLABORATION === '1';

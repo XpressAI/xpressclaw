@@ -627,12 +627,12 @@ fn stop(
     if let (Some(conversation), Some(turn)) = (&execution.conversation_id, &execution.turn_id) {
         let queue = ConversationTurnQueue::new(state.db.clone());
         let cancellation = if lease_expired {
-            queue.expire_lease(conversation, turn)
+            queue.expire_lease(conversation, turn, &execution.id, Utc::now().timestamp())
         } else {
             queue.cancel(conversation, turn)
         }
         .map_err(core_error)?;
-        if cancellation.was_running {
+        if cancellation.changed && cancellation.was_running {
             state
                 .turn_controls
                 .request_interrupt(turn, AcpInterruptMode::Immediate);

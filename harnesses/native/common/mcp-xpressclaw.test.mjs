@@ -830,6 +830,12 @@ test('connected tools publish through the platform bridge and cannot schedule lo
     const names = (await call('tools/list')).tools.map(tool => tool.name);
     assert.ok(names.includes('publish_task_files'));
     assert.ok(names.includes('update_task_status'));
+    for (const name of ['forward_port', 'expose_port', 'list_port_forwards', 'remove_port_forward']) {
+      assert.ok(!names.includes(name), name);
+      const denied = await call('tools/call', { name, arguments: { direction: 'host_to_container', host_port: 8080, container_port: 8081, id: 'mapping' } });
+      assert.equal(denied.isError, true, name);
+      assert.equal(requests.length, 0);
+    }
     assert.ok(!names.includes('schedule_wakeup'));
     const denied = await call('tools/call', { name: 'schedule_wakeup', arguments: { delay_seconds: 10 } });
     assert.equal(denied.isError, true); assert.equal(requests.length, 0);

@@ -137,7 +137,7 @@ async fn require_internal_token(
                     token.as_ref(),
                     agent,
                     supplied,
-                ) && connected_capability_route(request.method(), callback_path, agent)
+                ) && connected_capability_route(request.method(), callback_path)
             });
     if !(supplied == Some(token.as_ref())
         || connected_capability_matches
@@ -149,18 +149,12 @@ async fn require_internal_token(
     Ok(next.run(request).await)
 }
 
-fn connected_capability_route(method: &axum::http::Method, path: &str, agent: &str) -> bool {
+fn connected_capability_route(method: &axum::http::Method, path: &str) -> bool {
     use axum::http::Method;
     let parts: Vec<_> = path.split('/').collect();
     match parts.as_slice() {
         ["", "api", "settings", "connect", "conversations", id, "tools"] => {
             *method == Method::POST && uuid::Uuid::parse_str(id).is_ok()
-        }
-        ["", "api", "environments", owner, "ports"] if *owner == agent => {
-            matches!(*method, Method::GET | Method::POST)
-        }
-        ["", "api", "environments", owner, "ports", id] if *owner == agent && !id.is_empty() => {
-            *method == Method::DELETE
         }
         ["", "api", "workspaces", _, "repository", "resolve-github"] => *method == Method::POST,
         _ => false,
@@ -581,6 +575,14 @@ mod tests {
                 false,
             ),
             ("POST", "/api/environments/atlas/tasks", "atlas", false),
+            ("POST", "/api/environments/atlas/ports", "atlas", false),
+            ("GET", "/api/environments/atlas/ports", "atlas", false),
+            (
+                "DELETE",
+                "/api/environments/atlas/ports/mapping",
+                "atlas",
+                false,
+            ),
             ("POST", "/api/settings/connect/pair", "atlas", false),
             ("DELETE", "/api/settings/connect/", "atlas", false),
             ("GET", "/api/agents", "atlas", false),

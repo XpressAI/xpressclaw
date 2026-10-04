@@ -436,7 +436,7 @@ impl ConversationTurnQueue {
         conversation_id: &str,
         turn_id: &str,
     ) -> Result<ConversationTurnCancellation> {
-        self.stop_turn(conversation_id, turn_id, false)
+        self.stop_turn(conversation_id, turn_id, None)
     }
 
     /// Expiring authorization cannot prove that running work had no effects.
@@ -445,15 +445,17 @@ impl ConversationTurnQueue {
         &self,
         conversation_id: &str,
         turn_id: &str,
+        command_id: &str,
+        now: i64,
     ) -> Result<ConversationTurnCancellation> {
-        self.stop_turn(conversation_id, turn_id, true)
+        self.stop_turn(conversation_id, turn_id, Some((command_id, now)))
     }
 
     fn stop_turn(
         &self,
         conversation_id: &str,
         turn_id: &str,
-        lease_expired: bool,
+        lease_expiry: Option<(&str, i64)>,
     ) -> Result<ConversationTurnCancellation> {
         self.db.with_conn(|conn| {
             let transaction = rusqlite::Transaction::new_unchecked(
@@ -469,6 +471,26 @@ impl ConversationTurnQueue {
                 )
                 .optional()?
                 .ok_or_else(|| Error::Conversation(format!("turn {turn_id} not found")))?;
+            let lease_expired = lease_expiry.is_some();
+            if let Some((command_id, now)) = lease_expiry {
+                // The watchdog snapshot can race with a heartbeat. Check the
+                // current lease under the same write lock as the turn transition.
+                let expired: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM connect_commands
+                     WHERE id = ?1 AND turn_id = ?2 AND conversation_id = ?3
+                       AND status = 'accepted' AND lease_until <= ?4)",
+                    rusqlite::params![command_id, turn_id, conversation_id, now],
+                    |row| row.get(0),
+                )?;
+                if !expired {
+                    transaction.commit()?;
+                    return Ok(ConversationTurnCancellation {
+                        was_running: original.status == "running",
+                        turn: original,
+                        changed: false,
+                    });
+                }
+            }
             let was_running = original.status == "running";
             let invalidates_native_session =
                 matches!(original.status.as_str(), "running" | "failed");
