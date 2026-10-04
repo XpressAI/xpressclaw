@@ -16,6 +16,7 @@ pub fn routes() -> Router<AppState> {
         )
         .nest("/instance", settings_instance::routes())
         .nest("/collaboration", settings_collaboration::routes())
+        .nest("/connect", crate::connect::routes())
         .nest("/sync", settings_sync::routes())
 }
 

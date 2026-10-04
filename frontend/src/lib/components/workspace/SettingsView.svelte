@@ -6,6 +6,7 @@
 	import ServerSettingsPage from '../../../routes/settings/server/+page.svelte';
 	import SyncSettingsPage from '../../../routes/settings/sync/+page.svelte';
 	import SpeechSettingsPage from '../../../routes/settings/speech/+page.svelte';
+	import ConnectSettingsPage from '../../../routes/settings/connect/+page.svelte';
 
 	let { kind }: { kind: WorkspaceTabKind } = $props();
 </script>
@@ -13,6 +14,8 @@
 <div class="h-full min-h-0 overflow-y-auto">
 	{#if kind === 'settings-server'}
 		<ServerSettingsPage />
+	{:else if kind === 'settings-connect'}
+		<ConnectSettingsPage />
 	{:else if kind === 'settings-collaboration'}
 		<CollaborationSettingsPage />
 	{:else if kind === 'settings-mcp'}

@@ -4,6 +4,7 @@
 // an agent arm a durable future turn without exposing XpressClaw's broader
 // local API or allowing work to be scheduled for another project.
 
+import { createHash } from 'node:crypto';
 import { createInterface } from 'node:readline';
 import { execFile as execFileCallback } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
@@ -17,13 +18,15 @@ const CONTROL_TOKEN = process.env.XPRESSCLAW_CONTROL_TOKEN ?? '';
 const AGENT_ID = process.env.XPRESSCLAW_AGENT_ID ?? process.env.AGENT_ID ?? '';
 const TASK_ID = process.env.XPRESSCLAW_TASK_ID ?? '';
 const CONVERSATION_ID = process.env.XPRESSCLAW_CONVERSATION_ID ?? '';
+const CONNECTED = process.env.XPRESSCLAW_CONNECT === '1';
+const CONNECTED_TOOLS = new Set(['send_conversation_message', 'publish_task_files', 'download_conversation_attachment', 'create_conversation_task', 'list_platform_attachments', 'get_task', 'update_task_step', 'update_task_status']);
 const PROJECT_ID = process.env.XPRESSCLAW_PROJECT_ID ?? '';
 const REPOSITORY_ROOT = process.env.XPRESSCLAW_REPOSITORY ?? '';
 const LOCAL_COLLABORATION = process.env.XPRESSCLAW_LOCAL_COLLABORATION === '1';
 const COLLABORATION_TOKEN = process.env.XPRESSCLAW_COLLABORATION_TOKEN ?? '';
 const execFile = promisify(execFileCallback);
 
-const INSTRUCTIONS = `Container paths such as /tmp are not user download links. Use publish_task_files for task deliverables, or send_conversation_message with files for conversation deliverables. Both support files and folder archives. Users can browse the container and download larger folders from Files → Container. Use forward_port for a host-local LLM and expose_port for a container server. For shared interactive logins, run tmux new-session -s NAME; the user can join NAME from the Files terminal.\n\nUse schedule_wakeup whenever work must pause and resume later.
+const INSTRUCTIONS = CONNECTED ? `This turn belongs to Xpress AI. Your final response is returned to its chat or task automatically. Use send_conversation_message for interim updates and files (8 MiB per file, 20 MiB per turn), and list_platform_attachments and download_conversation_attachment for platform chat uploads. Use create_conversation_task to create independent follow-up work assigned to you in the same platform project. Local wake-ups and delegation are unavailable for connected turns; leave a clear final status when waiting. The platform owns task scheduling and cancellation. For an assigned task, call get_task to read its checklist, update_task_step for completed or skipped steps (zero-based step_num), then update_task_status with Done, Failed, Waiting, or Doing before your final reply. The requested status takes effect with the final reply, subject to the platform completion gates. Workspace paths are not download links; publish files before your final response.` : `Container paths such as /tmp are not user download links. Use publish_task_files for task deliverables, or send_conversation_message with files for conversation deliverables. Both support files and folder archives. Users can browse the container and download larger folders from Files → Container. Use forward_port for a host-local LLM and expose_port for a container server. For shared interactive logins, run tmux new-session -s NAME; the user can join NAME from the Files terminal.\n\nUse schedule_wakeup whenever work must pause and resume later.
 
 The wake-up is stored by XpressClaw, survives control-plane restarts, and starts exactly one future turn in this project's existing ACP conversation. After it is armed, end the current turn instead of sleeping, polling, or claiming that an OS timer can initiate a model turn.
 
@@ -53,7 +56,7 @@ export const TOOLS = [
     name: 'remove_port_forward', description: 'Stop and remove a saved port forward belonging to this Agent.',
     inputSchema: { type: 'object', properties: { id: { type: 'string', minLength: 1 } }, required: ['id'], additionalProperties: false },
   },
-  ...(TASK_ID ? [{
+  ...((TASK_ID || CONNECTED) ? [{
     name: 'publish_task_files',
     description: 'Copy files or whole folders from this container into durable downloadable attachments on the current task. Absolute paths including /tmp are supported; relative paths resolve from the working directory. Folders become .tar.gz archives. Up to 8 items and 20 MiB total; use the Files tab for larger downloads. Use this instead of giving the user inaccessible container paths.',
     inputSchema: { type: 'object', properties: { files: { type: 'array', items: { type: 'string', minLength: 1 }, minItems: 1, maxItems: 8 }, content: { type: 'string' } }, required: ['files'], additionalProperties: false },
@@ -1131,7 +1134,43 @@ export async function runManagedGitPush({
   }
 }
 
+async function connectedTool(name, args) {
+  return api('/api/settings/connect/conversations/' + encodeURIComponent(CONVERSATION_ID) + '/tools', {
+    method: 'POST', body: JSON.stringify({ name, arguments: args ?? {} }),
+  });
+}
+
+async function connectedDownload(args) {
+  const file = await connectedTool('download_attachment', { attachment_id: args?.attachment_id });
+  if (typeof file.data !== 'string' || file.data.length > 12 * 1024 * 1024) throw new Error('Invalid platform attachment');
+  const bytes = Buffer.from(file.data, 'base64');
+  if (bytes.length > 8 * 1024 * 1024 || createHash('sha256').update(bytes).digest('hex') !== file.sha256) throw new Error('Platform attachment integrity check failed');
+  const directory = await mkdtemp(path.join(tmpdir(), 'xpressai-attachment-'));
+  const filename = path.basename(String(args?.file_name ?? file.name ?? 'attachment')).replaceAll(/[^\p{L}\p{N}._ -]/gu, '_');
+  const destination = path.join(directory, filename && filename !== '.' && filename !== '..' ? filename : 'attachment');
+  await writeFile(destination, bytes, { mode: 0o600, flag: 'wx' });
+  return { path: destination, size: bytes.length, sha256: file.sha256 };
+}
+
 async function callTool(name, argumentsValue) {
+  if (CONNECTED) {
+    if (!CONNECTED_TOOLS.has(name)) throw new Error('This local tool is unavailable during platform work');
+    if (name === 'create_conversation_task') return connectedTool('create_task', argumentsValue);
+    if (['get_task', 'update_task_step', 'update_task_status'].includes(name)) return connectedTool(name, argumentsValue);
+    if (name === 'list_platform_attachments') return connectedTool('list_attachments', {});
+    if (name === 'download_conversation_attachment') return connectedDownload(argumentsValue);
+    if (name === 'send_conversation_message' || name === 'publish_task_files') {
+      const files = argumentsValue?.files ?? [];
+      if (!Array.isArray(files) || files.length > 8) throw new Error('At most eight files can be published');
+      const attachments = await Promise.all(files.map(conversationAttachment));
+      let size = 0;
+      for (const file of attachments) {
+        const length = Buffer.byteLength(file.data, 'base64'); size += length;
+        if (length > 8 * 1024 * 1024 || size > 20 * 1024 * 1024) throw new Error('Platform files allow 8 MiB per file and 20 MiB per turn');
+      }
+      return connectedTool('send_message', { content: argumentsValue?.content ?? '', attachments });
+    }
+  }
   const environmentPath = `/api/environments/${encodeURIComponent(AGENT_ID)}`;
   if (name === 'create_task') return api(`${environmentPath}/tasks`, { method: 'POST', body: JSON.stringify({ ...argumentsValue, parent_task_id: argumentsValue?.parent_task_id ?? (TASK_ID || undefined) }) });
   if (name === 'forward_port') return api(`${environmentPath}/ports`, { method: 'POST', body: JSON.stringify(argumentsValue) });
@@ -1179,7 +1218,7 @@ async function handle(message) {
   if (method === 'initialize') {
     let memoryIndex = null;
     try {
-      memoryIndex = await projectMemoryIndex({ signal: AbortSignal.timeout(2000) });
+      if (!CONNECTED) memoryIndex = await projectMemoryIndex({ signal: AbortSignal.timeout(2000) });
     } catch {
       // Memory discovery should enrich initialization, never prevent the
       // control-plane MCP server from starting if the API is still coming up.
@@ -1200,7 +1239,16 @@ async function handle(message) {
     return;
   }
   if (method === 'tools/list') {
-    result(id, { tools: TOOLS });
+    result(id, { tools: CONNECTED ? [
+      ...TOOLS.filter(tool => CONNECTED_TOOLS.has(tool.name)).map(tool => tool.name === 'create_conversation_task' ? {
+        ...tool, description: 'Create independent follow-up work assigned to this Agent in the platform project.',
+        inputSchema: { type: 'object', properties: { title: { type: 'string' }, description: { type: 'string' } }, required: ['title'], additionalProperties: false }
+      } : tool),
+      { name: 'get_task', description: 'Read the platform task assigned to this turn, including its checklist.', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
+      { name: 'update_task_step', description: 'Update a checklist step of the assigned platform task.', inputSchema: { type: 'object', properties: { step_num: { type: 'integer', minimum: 0 }, status: { type: 'string', enum: ['pending', 'in_progress', 'completed', 'skipped'] } }, required: ['step_num', 'status'], additionalProperties: false } },
+      { name: 'update_task_status', description: 'Request a status for the assigned platform task. It applies when your final response is accepted; Done requires all checklist steps and required source-chat handoffs.', inputSchema: { type: 'object', properties: { status: { type: 'string', enum: ['Doing', 'Done', 'Failed', 'Waiting'] }, reason: { type: 'string' } }, required: ['status'], additionalProperties: false } },
+      { name: 'list_platform_attachments', description: 'List uploaded files in the platform chat for this turn.', inputSchema: { type: 'object', properties: {}, additionalProperties: false } }
+    ] : TOOLS });
     return;
   }
   if (method === 'tools/call') {
@@ -1217,18 +1265,19 @@ async function handle(message) {
   }
   if (method === 'resources/list') {
     try {
-      result(id, { resources: await listMemoryResources() });
+      result(id, { resources: CONNECTED ? [] : await listMemoryResources() });
     } catch (cause) {
       error(id, -32603, cause instanceof Error ? cause.message : String(cause));
     }
     return;
   }
   if (method === 'resources/templates/list') {
-    result(id, { resourceTemplates: memoryResourceTemplates() });
+    result(id, { resourceTemplates: CONNECTED ? [] : memoryResourceTemplates() });
     return;
   }
   if (method === 'resources/read') {
     try {
+      if (CONNECTED) throw new Error('Local memory resources are unavailable during platform work');
       result(id, await readMemoryResource(params?.uri));
     } catch (cause) {
       error(id, -32602, cause instanceof Error ? cause.message : String(cause));

@@ -90,6 +90,18 @@ impl ConversationTurnQueue {
         sender_id: &str,
         content: &str,
     ) -> Result<Vec<String>> {
+        let has_connect: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'connect_commands')", [], |row| row.get(0),
+        )?;
+        let connected = has_connect
+            && transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM connect_commands WHERE conversation_id = ?1)",
+                [conversation_id],
+                |row| row.get::<_, bool>(0),
+            )?;
+        if connected {
+            return Ok(Vec::new());
+        }
         let agent_mentions = Self::agent_mentions(content);
         let mut statement = transaction.prepare(
             "SELECT participant_id FROM conversation_participants
@@ -424,6 +436,27 @@ impl ConversationTurnQueue {
         conversation_id: &str,
         turn_id: &str,
     ) -> Result<ConversationTurnCancellation> {
+        self.stop_turn(conversation_id, turn_id, None)
+    }
+
+    /// Expiring authorization cannot prove that running work had no effects.
+    /// Record that uncertainty atomically with stopping the turn.
+    pub fn expire_lease(
+        &self,
+        conversation_id: &str,
+        turn_id: &str,
+        command_id: &str,
+        now: i64,
+    ) -> Result<ConversationTurnCancellation> {
+        self.stop_turn(conversation_id, turn_id, Some((command_id, now)))
+    }
+
+    fn stop_turn(
+        &self,
+        conversation_id: &str,
+        turn_id: &str,
+        lease_expiry: Option<(&str, i64)>,
+    ) -> Result<ConversationTurnCancellation> {
         self.db.with_conn(|conn| {
             let transaction = rusqlite::Transaction::new_unchecked(
                 conn,
@@ -438,16 +471,50 @@ impl ConversationTurnQueue {
                 )
                 .optional()?
                 .ok_or_else(|| Error::Conversation(format!("turn {turn_id} not found")))?;
+            let lease_expired = lease_expiry.is_some();
+            if let Some((command_id, now)) = lease_expiry {
+                // The watchdog snapshot can race with a heartbeat. Check the
+                // current lease under the same write lock as the turn transition.
+                let expired: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM connect_commands
+                     WHERE id = ?1 AND turn_id = ?2 AND conversation_id = ?3
+                       AND status = 'accepted' AND lease_until <= ?4)",
+                    rusqlite::params![command_id, turn_id, conversation_id, now],
+                    |row| row.get(0),
+                )?;
+                if !expired {
+                    transaction.commit()?;
+                    return Ok(ConversationTurnCancellation {
+                        was_running: original.status == "running",
+                        turn: original,
+                        changed: false,
+                    });
+                }
+            }
             let was_running = original.status == "running";
             let invalidates_native_session =
                 matches!(original.status.as_str(), "running" | "failed");
             let changed = transaction.execute(
                 "UPDATE conversation_turns
-                 SET status = 'cancelled', completed_at = CURRENT_TIMESTAMP,
-                     error_message = NULL
+                 SET status = ?3, completed_at = CURRENT_TIMESTAMP,
+                     error_message = ?4
                  WHERE id = ?1 AND conversation_id = ?2
-                   AND status IN ('queued', 'running', 'failed')",
-                rusqlite::params![turn_id, conversation_id],
+                   AND (status IN ('queued', 'running') OR (status = 'failed' AND ?5 = 0))",
+                rusqlite::params![
+                    turn_id,
+                    conversation_id,
+                    if lease_expired && was_running {
+                        "failed"
+                    } else {
+                        "cancelled"
+                    },
+                    if lease_expired && was_running {
+                        Some("execution_outcome_unknown_after_lease_expiry")
+                    } else {
+                        None
+                    },
+                    lease_expired
+                ],
             )? == 1;
             if changed && invalidates_native_session {
                 // Once a response started, the native ACP session may already

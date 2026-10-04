@@ -2767,6 +2767,8 @@ UPDATE task_messages SET agent_id = (
 ) WHERE role = 'assistant' AND content != '';
 "#;
 
+const MIGRATION_V50: &str = include_str!("connect/schema.sql");
+
 fn schema_migrations() -> &'static [(u32, &'static str)] {
     &[
         (1, MIGRATION_V1),
@@ -2818,6 +2820,7 @@ fn schema_migrations() -> &'static [(u32, &'static str)] {
         (47, MIGRATION_V47),
         (48, MIGRATION_V48),
         (49, MIGRATION_V49),
+        (50, MIGRATION_V50),
     ]
 }
 
@@ -2869,28 +2872,30 @@ mod tests {
     fn dashboard_upgrade_backfills_agent_updates_in_order_without_inventing_tokens() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("upgrade.db");
-        let db = Database::open(&path).unwrap();
-        db.with_conn(|conn| {
-            // Recreate the pre-upgrade boundary with representative old history.
-            conn.execute_batch("DROP TRIGGER dashboard_agent_update_insert;
-                DROP TABLE dashboard_prompt_usage;
-                ALTER TABLE task_messages DROP COLUMN agent_id;
-                DELETE FROM config WHERE key = 'dashboard_token_recording_started_at';
-                UPDATE config SET value = '47' WHERE key = 'schema_version';
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)").unwrap();
+        for &(_, sql) in schema_migrations()
+            .iter()
+            .filter(|(version, _)| *version <= 47)
+        {
+            conn.execute_batch(sql).unwrap();
+        }
+        // Build the actual historical schema, rather than partially downgrading
+        // the latest schema and leaving later migrations' tables behind.
+        conn.execute_batch("INSERT OR REPLACE INTO config (key, value) VALUES ('schema_version', '47');
                 INSERT INTO agents (id, name, backend, config) VALUES ('agent', 'Agent', 'native', '{}');
                 INSERT INTO tasks (id, title) VALUES ('t', 'Old task');
                 INSERT INTO logical_sessions (id, agent_id, title) VALUES ('s', 'agent', 'Session');
                 INSERT INTO work_attempts (id, task_id, session_id, runner) VALUES ('a', 't', 's', 'codex');").unwrap();
-            for (text, payload) in [
-                ("First update", r#"{"item_type":"agent_message"}"#),
-                ("Second update", r#"{"item_type":"agent_message"}"#),
-                ("Booting runner", "{}"),
-                ("Invalid legacy event", "not json"),
-            ] {
-                conn.execute("INSERT INTO session_events (session_id, attempt_id, task_id, source_type, event_type, summary, payload) VALUES ('s', 'a', 't', 'acp', 'runner_progress', ?1, ?2)", [text, payload]).unwrap();
-            }
-        });
-        drop(db);
+        for (text, payload) in [
+            ("First update", r#"{"item_type":"agent_message"}"#),
+            ("Second update", r#"{"item_type":"agent_message"}"#),
+            ("Booting runner", "{}"),
+            ("Invalid legacy event", "not json"),
+        ] {
+            conn.execute("INSERT INTO session_events (session_id, attempt_id, task_id, source_type, event_type, summary, payload) VALUES ('s', 'a', 't', 'acp', 'runner_progress', ?1, ?2)", [text, payload]).unwrap();
+        }
+        drop(conn);
         let db = Arc::new(Database::open(&path).unwrap());
         let snapshot = crate::dashboard::DashboardManager::new(db)
             .snapshot(
@@ -2925,7 +2930,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "49");
+        assert_eq!(version, "50");
         let visualization_table: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
