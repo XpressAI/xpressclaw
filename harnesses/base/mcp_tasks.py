@@ -659,7 +659,7 @@ def main():
                         "capabilities": {"tools": {}},
                         "serverInfo": {
                             "name": "xpressclaw-tasks",
-                            "version": "0.4.12",
+                            "version": "0.4.13",
                         },
                     },
                 )

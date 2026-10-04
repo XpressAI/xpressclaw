@@ -267,7 +267,7 @@ def main():
                         "capabilities": {"tools": {}},
                         "serverInfo": {
                             "name": "xpressclaw-workflows",
-                            "version": "0.4.12",
+                            "version": "0.4.13",
                         },
                     },
                 )
