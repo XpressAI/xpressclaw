@@ -1190,7 +1190,7 @@ async function handle(message) {
         tools: {},
         resources: { listChanged: true },
       },
-      serverInfo: { name: 'xpressclaw-control', version: '0.4.12' },
+      serverInfo: { name: 'xpressclaw-control', version: '0.4.13' },
       instructions: buildInstructions(memoryIndex),
     });
     return;

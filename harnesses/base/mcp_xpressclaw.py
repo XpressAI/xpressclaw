@@ -88,7 +88,7 @@ def main():
                         "capabilities": {"tools": {}},
                         "serverInfo": {
                             "name": "xpressclaw",
-                            "version": "0.4.12",
+                            "version": "0.4.13",
                         },
                     },
                 )
