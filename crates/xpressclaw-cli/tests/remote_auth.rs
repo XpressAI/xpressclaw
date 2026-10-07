@@ -342,7 +342,7 @@ fn confirmed_saved_wildcard_no_auth_starts_without_repeating_the_cli_warning() {
     let _guard = DetachedGuard(instance.clone());
     wait_for_listener(config.instance.port);
 
-    assert_ne!(http_status(config.instance.port, "/api/projects/"), 401);
+    assert_ne!(http_status(config.instance.port, "/api/projects"), 401);
 
     let stopped = Command::new(binary)
         .args(["down", "--instance", instance.to_str().unwrap()])

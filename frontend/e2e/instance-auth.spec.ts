@@ -66,7 +66,7 @@ test('protected-route login returns through the persistent layout without exposi
 			});
 			return;
 		}
-		if (path === '/api/settings/instance/') {
+		if (path === '/api/settings/instance') {
 			await fulfill(route, { ...baseInstance, effective: { ...baseInstance.effective, authentication_enabled: true }, saved: { ...baseInstance.saved, authentication_enabled: true }, credential_kind: 'password', password_configured: true });
 			return;
 		}
@@ -463,7 +463,7 @@ test('Instance settings requires the explicit no-auth remote warning and shows r
 			await fulfill(route, { instance_id: baseInstance.instance_id, authentication_enabled: false, credential_kind: 'disabled', authenticated: true, csrf_token: null });
 			return;
 		}
-		if (path === '/api/settings/instance/') {
+		if (path === '/api/settings/instance') {
 			if (request.method() === 'PUT') {
 				updatePayload = request.postDataJSON() as Record<string, unknown>;
 				saved = {
@@ -525,7 +525,7 @@ test('Desktop persists a newly configured password before authentication restart
 			await fulfill(route, { instance_id: baseInstance.instance_id, authentication_enabled: false, credential_kind: 'disabled', authenticated: true, csrf_token: null });
 			return;
 		}
-		if (path === '/api/settings/instance/') {
+		if (path === '/api/settings/instance') {
 			if (request.method() === 'PUT') {
 				const update = request.postDataJSON() as { authentication_enabled: boolean; password?: string };
 				saved = { ...saved, authentication_enabled: update.authentication_enabled };
@@ -592,7 +592,7 @@ test('Desktop retains its keychain password while authentication is temporarily 
 			});
 			return;
 		}
-		if (path === '/api/settings/instance/') {
+		if (path === '/api/settings/instance') {
 			if (request.method() === 'PUT') {
 				const update = request.postDataJSON() as { authentication_enabled: boolean };
 				saved = { ...saved, authentication_enabled: update.authentication_enabled };
@@ -658,7 +658,7 @@ test('Desktop profiles can be edited without exposing their saved keychain crede
 		const path = new URL(route.request().url()).pathname;
 		if (path === '/api/auth/bootstrap') {
 			await fulfill(route, { instance_id: baseInstance.instance_id, authentication_enabled: false, credential_kind: 'disabled', authenticated: true, csrf_token: null });
-		} else if (path === '/api/settings/instance/') {
+		} else if (path === '/api/settings/instance') {
 			await fulfill(route, baseInstance);
 		} else {
 			await fulfill(route, genericResponse(path));

@@ -1165,7 +1165,7 @@ export interface InstanceSettings {
 }
 
 export const instanceSettings = {
-	get: () => request<InstanceSettings>('/api/settings/instance/'),
+	get: () => request<InstanceSettings>('/api/settings/instance'),
 	update: (value: {
 		bind: string;
 		port: number;
@@ -1173,7 +1173,7 @@ export const instanceSettings = {
 		acknowledge_unauthenticated_remote: boolean;
 		password?: string;
 		remove_password?: boolean;
-	}) => request<InstanceSettings>('/api/settings/instance/', {
+	}) => request<InstanceSettings>('/api/settings/instance', {
 		method: 'PUT',
 		body: JSON.stringify(value),
 	}),

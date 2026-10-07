@@ -14,7 +14,7 @@ test('pairing requires platform approval before publishing a selected local Agen
 		if (path === '/api/setup/config') return json({ llm: { providers: [] }, agents: [], mcp_servers: [], system: { budget: { daily: '0' } } });
 		if (path === '/api/health') return json({ status: 'ok', version: 'test', build: 'test' });
 		if (path === '/api/settings/profile') return json({ name: 'You', avatar: null });
-		if (path === '/api/settings/connect/') return json(settings);
+		if (path === '/api/settings/connect') return json(settings);
 		if (path === '/api/settings/connect/pair') {
 			expect(req.headers()['x-xpressclaw-csrf']).toBe('connect-csrf');
 			settings = { ...settings, ...req.postDataJSON(), pairing: { user_code: 'verify-this-code', verification_url: 'https://platform.example/settings/connect?code=verify-this-code', expires_at: '2030-01-01', interval: 5 } };

@@ -41,6 +41,13 @@ pub fn log_frontend_status() {
 pub async fn serve_frontend(req: Request<Body>) -> impl IntoResponse {
     let path = req.uri().path().trim_start_matches('/');
 
+    // An unmatched API path is a client bug, not a page. Answering with the
+    // SPA's index.html (200, text/html) surfaced only as a JSON parse error
+    // in the UI, e.g. a trailing slash that the nested API router rejects.
+    if path == "api" || path.starts_with("api/") {
+        return crate::routes::auth::error_response(StatusCode::NOT_FOUND, "API route not found");
+    }
+
     // Try the exact path first
     if let Some(file) = FrontendAssets::get(path) {
         return serve_file(path, &file.data);

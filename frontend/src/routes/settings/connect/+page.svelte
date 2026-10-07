@@ -19,7 +19,7 @@
 	let notice = $state('');
 	let confirmDisconnect = $state(false);
 	let stopped = false;
-	const endpoint = '/api/settings/connect/';
+	const endpoint = '/api/settings/connect';
 
 	async function load() {
 		const value = await request<Settings>(endpoint);
