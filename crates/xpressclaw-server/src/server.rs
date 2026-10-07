@@ -584,7 +584,7 @@ mod tests {
                 false,
             ),
             ("POST", "/api/settings/connect/pair", "atlas", false),
-            ("DELETE", "/api/settings/connect/", "atlas", false),
+            ("DELETE", "/api/settings/connect", "atlas", false),
             ("GET", "/api/agents", "atlas", false),
         ] {
             let response = app
@@ -1014,20 +1014,28 @@ mod tests {
         }
 
         // A nested router's "/" does not match a trailing slash. That must
-        // fail as a JSON 404 rather than fall back to the SPA's index.html.
-        for path in ["/api/settings/connect/", "/api/does-not-exist", "/api"] {
-            let response = app
-                .clone()
-                .oneshot(Request::get(path).body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
-            assert_eq!(
-                response.headers()[header::CONTENT_TYPE],
-                "application/json",
-                "{path}"
-            );
-            assert!(json_body(response).await["error"].is_string(), "{path}");
+        // fail as a JSON 404 rather than fall back to the SPA's index.html,
+        // on every listener that shares the frontend fallback.
+        for router in [app, create_unprotected_router(state())] {
+            for path in ["/api/settings/connect/", "/api/does-not-exist", "/api"] {
+                let response = router
+                    .clone()
+                    .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+                assert_eq!(
+                    response.headers()[header::CONTENT_TYPE],
+                    "application/json",
+                    "{path}"
+                );
+                assert_eq!(
+                    response.headers()[header::CACHE_CONTROL],
+                    "no-store",
+                    "{path}"
+                );
+                assert!(json_body(response).await["error"].is_string(), "{path}");
+            }
         }
     }
 }

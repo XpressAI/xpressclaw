@@ -45,11 +45,7 @@ pub async fn serve_frontend(req: Request<Body>) -> impl IntoResponse {
     // SPA's index.html (200, text/html) surfaced only as a JSON parse error
     // in the UI, e.g. a trailing slash that the nested API router rejects.
     if path == "api" || path.starts_with("api/") {
-        return Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(r#"{"error":"API route not found"}"#))
-            .unwrap();
+        return crate::routes::auth::error_response(StatusCode::NOT_FOUND, "API route not found");
     }
 
     // Try the exact path first

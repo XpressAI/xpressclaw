@@ -1709,7 +1709,7 @@ async fn require_pending_password_configuration(
     expected_instance_id: &str,
 ) -> Result<(), String> {
     let response = http_client()?
-        .get(format!("{url}/api/settings/instance/"))
+        .get(format!("{url}/api/settings/instance"))
         .send()
         .await
         .map_err(|error| format!("Could not verify pending instance authentication: {error}"))?;
@@ -2883,7 +2883,7 @@ mod tests {
             let mut request = [0_u8; 2048];
             let read = stream.read(&mut request).unwrap();
             assert!(String::from_utf8_lossy(&request[..read])
-                .starts_with("GET /api/settings/instance/ HTTP/1.1"));
+                .starts_with("GET /api/settings/instance HTTP/1.1"));
             let body = r#"{"instance_id":"pending-instance","saved":{"authentication_enabled":true},"password_configured":true}"#;
             write!(
                 stream,
