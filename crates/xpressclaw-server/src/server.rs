@@ -993,4 +993,41 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
+
+    #[tokio::test]
+    async fn settings_pages_reach_json_routes_and_unknown_api_paths_are_not_html() {
+        let app = create_router(state())
+            .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 43104))));
+
+        // The exact paths the Connect and Instance settings pages request.
+        for (path, field) in [
+            ("/api/settings/connect", "paired"),
+            ("/api/settings/instance", "instance_id"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert!(json_body(response).await.get(field).is_some(), "{path}");
+        }
+
+        // A nested router's "/" does not match a trailing slash. That must
+        // fail as a JSON 404 rather than fall back to the SPA's index.html.
+        for path in ["/api/settings/connect/", "/api/does-not-exist", "/api"] {
+            let response = app
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+            assert_eq!(
+                response.headers()[header::CONTENT_TYPE],
+                "application/json",
+                "{path}"
+            );
+            assert!(json_body(response).await["error"].is_string(), "{path}");
+        }
+    }
 }
