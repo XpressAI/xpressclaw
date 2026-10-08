@@ -92,6 +92,23 @@ response directly back to that in-flight ACP request. If an agent only asks in
 ordinary response text, the task still waits and a later chat reply resumes the
 same ACP session as a new turn.
 
+### Transient Claude credential refresh conflicts
+
+Claude can reject `session/prompt` because another Claude Code process is
+refreshing the shared OAuth token or exited while holding the refresh lock.
+For this specific error, the ACP client retries at most three times, waiting
+one minute between requests. Retries reuse the same prompt, native session,
+and task attempt or conversation turn; they do not create new work or rerun
+session setup. Intermediate failures stay in server diagnostics rather than
+appearing as failed work or chat errors. Claude's matching synthetic error
+message is also withheld from the visible transcript during recovery.
+
+Automatic replay is permitted only before genuine assistant output, thought,
+tool, plan, permission, or elicitation activity. Metadata and echoed user input
+do not prevent recovery. Cancellation and process shutdown interrupt the wait.
+After the retry limit, or for unrelated authentication/provider errors, the
+normal terminal error is surfaced so the user can intervene.
+
 ### Scoped control-plane wake-ups
 
 Built-in runner images include a narrow Xpressclaw MCP server that can arm,
