@@ -1983,6 +1983,14 @@ fn prepend_unresumed_interrupted_prompt(
     attempt_id: &str,
     prompt: &mut AgentPrompt,
 ) -> Result<()> {
+    // Each platform command supplies its own authorized context. A fresh native
+    // session must not revive an earlier command's interrupted instructions.
+    if crate::connect::ConnectJournal::new(db.clone())
+        .command_for_execution(attempt_id)?
+        .is_some()
+    {
+        return Ok(());
+    }
     let previous_prompt: Option<String> = db.with_conn(|conn| {
         conn.query_row(
             "SELECT prompt FROM work_attempts
@@ -2014,6 +2022,30 @@ fn prepend_unresumed_interrupted_prompt(
 }
 
 fn build_prompt(db: &Arc<Database>, item: &QueueItem, attempt_id: &str) -> Result<AgentPrompt> {
+    // Connect v1 admits one text message, including authorized platform history,
+    // per command. Reusing the Task must not replay any earlier command, even
+    // when it was cancelled/failed before recording a started_at boundary.
+    let connected_prompt: Option<Option<String>> = db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT m.content FROM connect_commands c
+             LEFT JOIN work_attempts a ON a.id=c.attempt_id AND a.task_id=c.task_id
+             LEFT JOIN task_messages m ON m.id=a.trigger_message_id
+               AND m.task_id=c.task_id AND m.task_id=?2 AND m.role='user'
+             WHERE c.attempt_id=?1",
+            rusqlite::params![attempt_id, item.task_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Error::from)
+    })?;
+    if let Some(content) = connected_prompt {
+        return Ok(AgentPrompt {
+            content: content.ok_or_else(|| {
+                Error::Task("Connected task command is missing its owned prompt message".into())
+            })?,
+            attachments: Vec::new(),
+        });
+    }
     let task = TaskBoard::new(db.clone()).get(&item.task_id)?;
     let (previous_trigger_message_id, previous_started, trigger_message_id) =
         db.with_conn(|conn| {
@@ -4920,6 +4952,161 @@ mod tests {
         assert!(!resumed_prompt.contains("Retain completed request"));
         assert!(!resumed_prompt.contains("Retained completed response"));
         assert!(resumed_prompt.contains("Newest request"));
+    }
+
+    fn connected_prompt_fixture() -> (
+        Arc<Database>,
+        crate::connect::ConnectJournal,
+        crate::connect::Command,
+    ) {
+        use crate::connect::{Binding, Command, ConnectJournal, TurnPayload};
+        let db = Arc::new(Database::open_memory().unwrap());
+        crate::agents::registry::AgentRegistry::new(db.clone())
+            .ensure("atlas", "native")
+            .unwrap();
+        let journal = ConnectJournal::new(db.clone());
+        let binding = Binding {
+            id: uuid::Uuid::new_v4().to_string(),
+            local_project_id: "atlas".into(),
+            local_agent_id: "atlas".into(),
+            project_id: "cloud".into(),
+            agent_name: "atlas".into(),
+            generation: 1,
+            active: true,
+        };
+        journal.bind("instance", &binding).unwrap();
+        let command = Command {
+            version: 1,
+            id: uuid::Uuid::new_v4().to_string(),
+            binding,
+            kind: "task_turn".into(),
+            work_id: "platform-task".into(),
+            source_conversation_id: None,
+            payload: TurnPayload {
+                text: "Obsolete request: deploy the old build".into(),
+                history: vec!["Obsolete platform context".into()],
+            },
+            expires_at: "2099-01-01T00:00:00Z".into(),
+            cancel_requested: false,
+        };
+        (db, journal, command)
+    }
+
+    #[test]
+    fn connected_task_prompts_exclude_prior_unstarted_commands() {
+        for outcome in [
+            "cancelled",
+            "expired",
+            "failed",
+            "recovered",
+            "interrupted",
+            "completed",
+        ] {
+            let (db, journal, mut command) = connected_prompt_fixture();
+            let now = chrono::Utc::now().timestamp();
+            let first = journal.admit("instance", &command, now + 90, now).unwrap();
+            let first_attempt = first.attempt_id.as_deref().unwrap();
+            let sessions = SessionManager::new(db.clone());
+            let queue = TaskQueue::new(db.clone());
+            match outcome {
+                "cancelled" => {
+                    journal.stop_task(&command.id, None).unwrap();
+                }
+                "expired" => {
+                    journal.stop_task(&command.id, Some(now + 91)).unwrap();
+                }
+                "recovered" => {
+                    journal.recover().unwrap();
+                }
+                status => {
+                    // A worker can fail/stop after claiming but before preparing.
+                    let item = queue.claim("atlas").unwrap().unwrap();
+                    let prompt = build_prompt(&db, &item, first_attempt).unwrap();
+                    db.with_conn(|conn| {
+                        conn.execute(
+                            "UPDATE work_attempts SET prompt=?2 WHERE id=?1",
+                            rusqlite::params![first_attempt, prompt.content],
+                        )
+                    })
+                    .unwrap();
+                    sessions
+                        .transition_attempt(
+                            first_attempt,
+                            status,
+                            "Stopped before startup",
+                            None,
+                            None,
+                        )
+                        .unwrap();
+                    assert!(
+                        finish_terminal_dispatch_after_worker_exit(&db, &item, status).unwrap()
+                    );
+                }
+            }
+            assert!(sessions
+                .get_attempt(first_attempt)
+                .unwrap()
+                .started_at
+                .is_none());
+            journal.collect("instance").unwrap();
+            journal.acknowledge("instance", &command.id).unwrap();
+            command.id = uuid::Uuid::new_v4().to_string();
+            command.payload.text = "Only inspect the new build; do not deploy".into();
+            command.payload.history = vec!["Current authorized platform context".into()];
+            let next = journal.admit("instance", &command, now + 180, now).unwrap();
+            assert_eq!(first.task_id, next.task_id);
+            let item = queue.claim("atlas").unwrap().unwrap();
+            let mut prompt = build_prompt(&db, &item, next.attempt_id.as_deref().unwrap()).unwrap();
+            // Fresh native sessions must not restore an obsolete interrupted prompt.
+            prepend_unresumed_interrupted_prompt(
+                &db,
+                &item,
+                next.attempt_id.as_deref().unwrap(),
+                &mut prompt,
+            )
+            .unwrap();
+            assert_eq!(prompt.content, "Recent platform history:\nCurrent authorized platform context\n\nCurrent request:\nOnly inspect the new build; do not deploy", "{outcome}");
+            assert!(prompt.attachments.is_empty());
+            let messages = TaskConversation::new(db.clone())
+                .get_messages(item.task_id.as_str())
+                .unwrap();
+            assert_eq!(messages.len(), 2);
+            assert!(messages[0].content.contains("Obsolete request"));
+            assert!(messages[1].content.contains("Only inspect the new build"));
+        }
+    }
+
+    #[test]
+    fn connected_task_prompt_requires_its_owned_trigger_message() {
+        for damage in [
+            "missing_boundary",
+            "deleted_message",
+            "foreign_message",
+            "non_user_message",
+        ] {
+            let (db, journal, command) = connected_prompt_fixture();
+            let now = chrono::Utc::now().timestamp();
+            let admitted = journal.admit("instance", &command, now + 90, now).unwrap();
+            let item = TaskQueue::new(db.clone()).claim("atlas").unwrap().unwrap();
+            let attempt_id = admitted.attempt_id.as_deref().unwrap();
+            db.with_conn(|conn| {
+                let trigger: i64 = conn.query_row("SELECT trigger_message_id FROM work_attempts WHERE id=?1", [attempt_id], |row| row.get(0))?;
+                match damage {
+                    "missing_boundary" => { conn.execute("UPDATE work_attempts SET trigger_message_id=NULL WHERE id=?1", [attempt_id])?; }
+                    "deleted_message" => { conn.execute("DELETE FROM task_messages WHERE id=?1", [trigger])?; }
+                    "foreign_message" => {
+                        conn.execute("INSERT INTO tasks (id,title) VALUES ('foreign-task','Other assignment')", [])?;
+                        conn.execute("UPDATE task_messages SET task_id='foreign-task' WHERE id=?1", [trigger])?;
+                    }
+                    _ => { conn.execute("UPDATE task_messages SET role='assistant' WHERE id=?1", [trigger])?; }
+                }
+                Ok::<_,Error>(())
+            }).unwrap();
+            assert!(
+                build_prompt(&db, &item, attempt_id).is_err(),
+                "{damage} must not replay the task description"
+            );
+        }
     }
 
     #[test]
