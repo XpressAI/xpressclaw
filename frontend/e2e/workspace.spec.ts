@@ -274,6 +274,7 @@ async function mockApi(
 	page: Page,
 	options: {
 		live?: boolean;
+		connectedTask?: boolean;
 		attemptError?: string;
 		taskLoadFailureOnce?: boolean;
 		taskUpdateRequests?: Record<string, unknown>[];
@@ -474,7 +475,7 @@ async function mockApi(
 		updated_at: timestamp(61),
 		completed_at: status === 'completed' ? timestamp(61) : null,
 		context: {},
-		provenance: 'durable',
+		provenance: options.connectedTask ? 'xpress_ai_connect' : 'durable',
 		blocks_parent: true,
 		activity_status: options.taskActivityStatus ?? status,
 		depends_on: [],
@@ -6196,6 +6197,51 @@ for (const viewport of [{ width: 1440, height: 900 }, { width: 390, height: 844 
 		expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
 	});
 }
+
+for (const viewport of [{ width: 390, height: 844 }, { width: 1440, height: 900 }]) {
+	for (const taskStatus of ['pending', 'in_progress', 'completed']) {
+		test(`connected task keeps lifecycle controls in Xpress AI at ${viewport.width}px (${taskStatus})`, async ({ page }) => {
+			await page.setViewportSize(viewport);
+			const taskStatusRequests: string[] = [];
+			const postedMessages: Record<string, unknown>[] = [];
+			const interruptedAttempts: string[] = [];
+			await mockApi(page, { connectedTask: true, live: taskStatus === 'in_progress', taskStatus, taskStatusRequests, postedMessages, interruptedAttempts });
+			await page.goto(`/tasks/${taskId}`);
+			await expect(page.getByText('This task is managed in Xpress AI. Continue or cancel it there.')).toBeVisible();
+			for (const name of ['Task settings', 'Start task', 'Complete task', 'Stop and cancel task', 'Cancel task', 'Interrupt agent now', 'Send message']) {
+				await expect(page.getByRole('button', { name, exact: true })).toHaveCount(0);
+			}
+			await expect(page.locator(`#task-message-input-${taskId}`)).toHaveCount(0);
+			await expect(page.locator('[data-task-transcript-scroll]')).toBeVisible();
+			await expect(page.getByRole('button', { name: /^(Show|Hide) task details$/ })).toBeVisible();
+			expect(taskStatusRequests).toEqual([]);
+			expect(postedMessages).toEqual([]);
+			expect(interruptedAttempts).toEqual([]);
+		});
+	}
+}
+
+test('connected task can still answer a local approval request', async ({ page }) => {
+	const elicitationResponses: { elicitationId: string; payload: Record<string, unknown> }[] = [];
+	await mockApi(page, {
+		connectedTask: true,
+		pendingElicitation: {
+			mode: 'form',
+			message: 'Approve the local operation?',
+			requestedSchema: { type: 'object', properties: { approved: { type: 'boolean', title: 'Approve' } } },
+		},
+		elicitationResponses,
+	});
+	await page.goto(`/tasks/${taskId}`);
+	await expect(page.getByText('This task is managed in Xpress AI. Continue or cancel it there.')).toBeVisible();
+	await expect(page.getByText('Approve the local operation?', { exact: true })).toBeVisible();
+	await page.getByRole('checkbox', { name: 'Approve', exact: true }).check();
+	await page.getByRole('button', { name: 'Review', exact: true }).click();
+	await page.getByRole('button', { name: 'Send answers', exact: true }).click();
+	await expect.poll(() => elicitationResponses).toEqual([{
+		elicitationId: 'elicitation-browser-test', payload: expect.objectContaining({ action: 'accept', content: { approved: true } }),
+	}]);
+});
 
 test('task status icons keep lifecycle errors visible and support retry', async ({ page }) => {
 	const taskStatusRequests: string[] = [];

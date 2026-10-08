@@ -29,7 +29,9 @@ wait for the instance to reconnect. If an executing instance stops responding,
 the execution lease expires and the platform pauses ambiguous task outcomes
 instead of rerunning possible side effects automatically.
 
-The local Conversations view contains execution transcripts. Continue hosted
+Platform tasks appear in the local Tasks view and execute as native task
+attempts. Follow-ups and retries reuse the same local task. Platform chats reuse
+a mapped Conversation rather than creating one for every message. Continue hosted
 chats and tasks from Xpress AI. Permission prompts remain in the local
 XpressClaw UI in this first version.
 

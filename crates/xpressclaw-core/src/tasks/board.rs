@@ -5,6 +5,7 @@ use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use super::queue::TaskQueue;
 use crate::db::Database;
 use crate::error::{Error, Result};
 use crate::projects::ensure_project_accepts_work;
@@ -317,6 +318,9 @@ impl TaskBoard {
             None
         };
         let parent_project = if let Some(parent_task_id) = req.parent_task_id.as_deref() {
+            // A local child would change the platform task's completion/roll-up
+            // semantics. ACP plan rows use their separate non-blocking sync path.
+            TaskQueue::ensure_locally_scheduled(transaction, parent_task_id)?;
             transaction
                 .query_row(
                     "SELECT project_id FROM tasks WHERE id = ?1",
@@ -420,6 +424,14 @@ impl TaskBoard {
                 id: task_id.to_string(),
             })??;
         Ok(task)
+    }
+
+    /// Check local authority before an API operation performs external side effects.
+    /// Connect mappings are immutable and created with a new task in one transaction;
+    /// an existing local task cannot acquire a platform owner after this check.
+    pub fn ensure_locally_managed(&self, task_id: &str) -> Result<()> {
+        self.db
+            .with_conn(|conn| TaskQueue::ensure_locally_scheduled(conn, task_id))
     }
 
     pub fn set_conversation_id(&self, task_id: &str, conversation_id: &str) -> Result<()> {
@@ -864,6 +876,7 @@ impl TaskBoard {
                     id: task_id.to_string(),
                 });
             }
+            super::queue::TaskQueue::ensure_locally_scheduled(&transaction, task_id)?;
 
             if let Some(ref title) = req.title {
                 transaction.execute(
@@ -1339,13 +1352,22 @@ impl TaskBoard {
 
     pub fn delete(&self, task_id: &str) -> Result<()> {
         let conn = self.db.conn();
-        conn.execute("DELETE FROM tasks WHERE id = ?1", [task_id])?;
+        let transaction =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+        TaskQueue::ensure_locally_scheduled(&transaction, task_id)?;
+        transaction.execute("DELETE FROM tasks WHERE id = ?1", [task_id])?;
+        transaction.commit()?;
         Ok(())
     }
 
     pub fn delete_by_status(&self, status: &str) -> Result<i64> {
         let conn = self.db.conn();
-        let count = conn.execute("DELETE FROM tasks WHERE status = ?1", [status])?;
+        let count = conn.execute(
+            "DELETE FROM tasks WHERE status = ?1 AND NOT EXISTS (
+                SELECT 1 FROM connect_work WHERE kind='task_turn' AND local_id=tasks.id
+            )",
+            [status],
+        )?;
         Ok(count as i64)
     }
 
@@ -1402,36 +1424,45 @@ impl TaskBoard {
     /// Add a dependency: task_id cannot start until depends_on_id completes.
     /// Returns error if this would create a cycle.
     pub fn add_dependency(&self, task_id: &str, depends_on_id: &str) -> Result<()> {
-        if task_id == depends_on_id {
-            return Err(Error::Task("a task cannot depend on itself".into()));
-        }
-        // Cycle detection: DFS from depends_on_id — can we reach task_id?
-        if self.would_create_cycle(task_id, depends_on_id)? {
-            return Err(Error::Task(format!(
-                "cannot add dependency: would create a cycle ({task_id} → {depends_on_id} → ... → {task_id})"
-            )));
-        }
         self.db.with_conn(|conn| {
-            conn.execute(
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn, rusqlite::TransactionBehavior::Immediate)?;
+            TaskQueue::ensure_locally_scheduled(&transaction, task_id)?;
+            if task_id == depends_on_id {
+                return Err(Error::Task("a task cannot depend on itself".into()));
+            }
+            // Hold the writer lock through cycle detection and insertion.
+            if Self::would_create_cycle(&transaction, task_id, depends_on_id)? {
+                return Err(Error::Task(format!(
+                    "cannot add dependency: would create a cycle ({task_id} → {depends_on_id} → ... → {task_id})"
+                )));
+            }
+            transaction.execute(
                 "INSERT OR IGNORE INTO task_dependencies (task_id, depends_on_id) VALUES (?1, ?2)",
                 rusqlite::params![task_id, depends_on_id],
-            )
-        })?;
-        Ok(())
+            )?;
+            transaction.commit()?;
+            Ok(())
+        })
     }
 
     /// Check if adding task_id → depends_on_id would create a cycle.
-    fn would_create_cycle(&self, task_id: &str, depends_on_id: &str) -> Result<bool> {
-        // DFS from depends_on_id: can we reach task_id?
+    fn would_create_cycle(
+        conn: &rusqlite::Connection,
+        task_id: &str,
+        depends_on_id: &str,
+    ) -> Result<bool> {
         let mut visited = std::collections::HashSet::new();
         let mut stack = vec![depends_on_id.to_string()];
+        let mut dependencies =
+            conn.prepare("SELECT depends_on_id FROM task_dependencies WHERE task_id = ?1")?;
         while let Some(current) = stack.pop() {
             if current == task_id {
                 return Ok(true);
             }
             if visited.insert(current.clone()) {
-                for dep in self.get_dependencies(&current)? {
-                    stack.push(dep);
+                for dep in dependencies.query_map([&current], |row| row.get::<_, String>(0))? {
+                    stack.push(dep?);
                 }
             }
         }
@@ -1580,17 +1611,27 @@ pub(super) fn ensure_task_agent_project(
     task_id: &str,
     agent_id: &str,
 ) -> Result<()> {
+    let (current_agent, task_project) = conn.query_row(
+        "SELECT agent_id, project_id FROM tasks WHERE id = ?1",
+        [task_id],
+        |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+            ))
+        },
+    )?;
+    // Native status transitions retain the bound Agent. Local assignment
+    // changes (including unassignment) must not invalidate a platform lease.
+    if current_agent.as_deref() != Some(agent_id) {
+        super::queue::TaskQueue::ensure_locally_scheduled(conn, task_id)?;
+    }
     // The update API historically uses an empty string as its unassigned
     // sentinel. Preserve that behavior; monitored pull requests apply their
     // stricter unassignment rule immediately after this check.
     if agent_id.is_empty() {
         return Ok(());
     }
-    let task_project = conn.query_row(
-        "SELECT project_id FROM tasks WHERE id = ?1",
-        [task_id],
-        |row| row.get::<_, Option<String>>(0),
-    )?;
     let agent_project = conn
         .query_row(
             "SELECT project_id FROM agents WHERE id = ?1",

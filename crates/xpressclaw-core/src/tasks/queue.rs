@@ -35,6 +35,23 @@ impl TaskQueue {
         Self { db }
     }
 
+    pub(crate) fn ensure_locally_scheduled(
+        conn: &rusqlite::Connection,
+        task_id: &str,
+    ) -> Result<()> {
+        let connected: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM connect_work WHERE kind='task_turn' AND local_id=?1)",
+            [task_id],
+            |r| r.get(0),
+        )?;
+        if connected {
+            return Err(Error::Task(
+                "This task is scheduled by Xpress AI; continue it on the platform".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Enqueue a task for an agent.
     pub fn enqueue(&self, task_id: &str, agent_id: &str) -> Result<QueueItem> {
         let item = self.db.with_conn(|conn| {
@@ -54,6 +71,25 @@ impl TaskQueue {
     /// transaction. Conversation work uses this so dispatch cannot survive a
     /// failed linked-message publication.
     pub(crate) fn enqueue_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        task_id: &str,
+        agent_id: &str,
+    ) -> Result<QueueItem> {
+        Self::ensure_locally_scheduled(transaction, task_id)?;
+        Self::enqueue_authorized_in_transaction(transaction, task_id, agent_id)
+    }
+
+    /// Only Connect admission may bypass local scheduling policy, after
+    /// validating its command, binding, and lease in this same transaction.
+    pub(crate) fn enqueue_platform_task_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        task_id: &str,
+        agent_id: &str,
+    ) -> Result<QueueItem> {
+        Self::enqueue_authorized_in_transaction(transaction, task_id, agent_id)
+    }
+
+    fn enqueue_authorized_in_transaction(
         transaction: &rusqlite::Transaction<'_>,
         task_id: &str,
         agent_id: &str,
@@ -170,6 +206,7 @@ impl TaskQueue {
                 conn,
                 rusqlite::TransactionBehavior::Immediate,
             )?;
+            Self::ensure_locally_scheduled(&transaction, task_id)?;
             ensure_task_project_accepts_work(&transaction, task_id)?;
             let active = transaction
                 .query_row(
@@ -206,6 +243,7 @@ impl TaskQueue {
                 conn,
                 rusqlite::TransactionBehavior::Immediate,
             )?;
+            Self::ensure_locally_scheduled(&transaction, task_id)?;
             ensure_task_project_accepts_work(&transaction, task_id)?;
             let changed = transaction.execute(
                 "INSERT INTO task_queue (task_id, agent_id, status)
@@ -274,6 +312,7 @@ impl TaskQueue {
         message_id: i64,
         message_timestamp: &str,
     ) -> Result<Option<QueueItem>> {
+        Self::ensure_locally_scheduled(transaction, task_id)?;
         ensure_task_project_accepts_work(transaction, task_id)?;
         let queued_attempt_id = Self::coalescible_queued_attempt(transaction, task_id)?;
 
@@ -447,6 +486,7 @@ impl TaskQueue {
                 conn,
                 rusqlite::TransactionBehavior::Immediate,
             )?;
+            Self::ensure_locally_scheduled(&transaction, task_id)?;
             ensure_task_project_accepts_work(&transaction, task_id)?;
             let (agent_id, title, description, context, status): (
                 Option<String>,
@@ -743,6 +783,11 @@ impl TaskQueue {
                            AND ({eligible})
                            AND (?2 IS NULL OR q.agent_id = ?2)
                            AND candidate.status = 'queued'
+                           AND (NOT EXISTS (SELECT 1 FROM connect_work w WHERE w.kind='task_turn' AND w.local_id=q.task_id)
+                             OR EXISTS (SELECT 1 FROM connect_commands c JOIN connect_bindings b ON b.id=c.binding_id
+                                JOIN agents bound ON bound.id=b.local_agent_id AND bound.project_id=b.local_project_id
+                                WHERE c.attempt_id=candidate.id AND c.status='accepted' AND c.lease_until > unixepoch(?1)
+                                  AND b.active=1 AND b.generation=c.binding_generation AND b.local_agent_id=q.agent_id AND t.agent_id=q.agent_id AND b.local_project_id=t.project_id))
                            AND NOT EXISTS (
                                SELECT 1 FROM task_dependencies d
                                JOIN tasks dependency ON dependency.id = d.depends_on_id

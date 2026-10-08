@@ -11,6 +11,8 @@ use crate::db::Database;
 use crate::error::{Error, Result};
 use crate::projects::ensure_project_accepts_work;
 
+mod local_work;
+
 #[cfg(test)]
 mod tests;
 
@@ -58,6 +60,8 @@ pub struct Execution {
     pub id: String,
     pub conversation_id: Option<String>,
     pub turn_id: Option<String>,
+    pub task_id: Option<String>,
+    pub attempt_id: Option<String>,
     pub receipt: Receipt,
     pub acknowledged: bool,
     pub lease_until: i64,
@@ -215,21 +219,11 @@ impl ConnectJournal {
             if project.as_deref() != Some(command.binding.local_project_id.as_str()) { return Err(invalid("Bound Agent has moved or was deleted")); }
             }
             if !cancelled && lease_until <= now { return Err(invalid("Execution authorization has expired")); }
-            let (conversation, turn) = if cancelled { (None, None) } else {
-                let conversation = Uuid::new_v4().to_string();
-                tx.execute("INSERT INTO conversations (id, title, project_id) VALUES (?1, ?2, ?3)",
-                    params![conversation, format!("Xpress AI · {} {}", command.kind, command.work_id), command.binding.local_project_id])?;
-                tx.execute("INSERT INTO conversation_participants (conversation_id, participant_type, participant_id) VALUES (?1, 'agent', ?2)", params![conversation, command.binding.local_agent_id])?;
-                let context = command.payload.history.join("\n");
-                let content = format!("This turn belongs to a connected Xpress AI {}.\n\nRecent platform history:\n{}\n\nCurrent request:\n{}", command.kind, context, command.payload.text);
-                tx.execute("INSERT INTO conversation_messages (conversation_id, sender_type, sender_id, sender_name, content) VALUES (?1, 'user', 'xpress-ai', 'Xpress AI', ?2)", params![conversation, content])?;
-                let trigger = tx.last_insert_rowid();
-                ConversationTurnQueue::enqueue_target_in_transaction(&tx, &conversation, &command.binding.local_agent_id, trigger)?;
-                let turn: String = tx.query_row("SELECT id FROM conversation_turns WHERE conversation_id = ?1", [&conversation], |row| row.get(0))?;
-                (Some(conversation), Some(turn))
-            };
-            tx.execute("INSERT INTO connect_commands (id, instance_id, binding_id, payload_hash, conversation_id, turn_id, status, lease_until, binding_generation) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![command.id, instance, command.binding.id, digest, conversation, turn, if cancelled { "cancelled" } else { "accepted" }, lease_until, command.binding.generation])?;
+            let work = if cancelled {
+                local_work::LocalWork { conversation: None, turn: None, task: None, attempt: None }
+            } else { local_work::admit_work(&tx, instance, command)? };
+            tx.execute("INSERT INTO connect_commands (id, instance_id, binding_id, payload_hash, conversation_id, turn_id, task_id, attempt_id, status, lease_until, binding_generation) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![command.id, instance, command.binding.id, digest, work.conversation, work.turn, work.task, work.attempt, if cancelled { "cancelled" } else { "accepted" }, lease_until, command.binding.generation])?;
             tx.commit()?;
             execution(conn, &command.id)
         })
@@ -268,7 +262,7 @@ impl ConnectJournal {
 
     pub fn renew(&self, instance: &str, id: &str, lease_until: i64) -> Result<()> {
         self.db.with_conn(|conn| {
-            conn.execute("UPDATE connect_commands SET lease_until = ?3 WHERE id = ?1 AND instance_id = ?2 AND status = 'accepted' AND binding_id IN (SELECT b.id FROM connect_bindings b JOIN agents a ON a.id = b.local_agent_id AND a.project_id = b.local_project_id JOIN projects p ON p.id = b.local_project_id AND p.deletion_started_at IS NULL WHERE b.active = 1 AND b.generation = connect_commands.binding_generation)", params![id, instance, lease_until])?;
+            conn.execute("UPDATE connect_commands SET lease_until = ?3 WHERE id = ?1 AND instance_id = ?2 AND status = 'accepted' AND binding_id IN (SELECT b.id FROM connect_bindings b JOIN agents a ON a.id = b.local_agent_id AND a.project_id = b.local_project_id JOIN projects p ON p.id = b.local_project_id AND p.deletion_started_at IS NULL WHERE b.active = 1 AND b.generation = connect_commands.binding_generation AND (connect_commands.task_id IS NULL OR EXISTS(SELECT 1 FROM tasks t WHERE t.id=connect_commands.task_id AND t.agent_id=b.local_agent_id AND t.project_id=b.local_project_id)))", params![id, instance, lease_until])?;
             Ok(())
         })
     }
@@ -282,6 +276,12 @@ impl ConnectJournal {
 
     pub fn collect(&self, instance: &str) -> Result<()> {
         self.db.with_conn(|conn| {
+            conn.execute("UPDATE connect_commands SET status='failed', result_error='execution_state_lost_after_restart' WHERE instance_id=?1 AND status='accepted' AND attempt_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM work_attempts a WHERE a.id=connect_commands.attempt_id)", [instance])?;
+            conn.execute("UPDATE connect_commands SET
+                status=(SELECT CASE a.status WHEN 'completed' THEN 'completed' WHEN 'cancelled' THEN 'cancelled' ELSE 'failed' END FROM work_attempts a WHERE a.id=connect_commands.attempt_id),
+                result_text=(SELECT a.result FROM work_attempts a WHERE a.id=connect_commands.attempt_id),
+                result_error=(SELECT a.error_message FROM work_attempts a WHERE a.id=connect_commands.attempt_id)
+                WHERE instance_id=?1 AND status='accepted' AND attempt_id IN (SELECT id FROM work_attempts WHERE status IN ('completed','failed','cancelled','interrupted'))", [instance])?;
             conn.execute("UPDATE connect_commands SET status = 'failed', result_error = 'execution_state_lost_after_restart' WHERE instance_id = ?1 AND status = 'accepted' AND turn_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM conversation_turns t WHERE t.id = connect_commands.turn_id)", [instance])?;
             conn.execute("UPDATE connect_commands SET
                 status = (SELECT CASE t.status WHEN 'completed' THEN 'completed' WHEN 'cancelled' THEN 'cancelled' ELSE 'failed' END FROM conversation_turns t WHERE t.id = connect_commands.turn_id),
@@ -295,6 +295,9 @@ impl ConnectJournal {
     pub fn recover(&self) -> Result<()> {
         self.db.with_conn(|conn| {
             let tx = conn.unchecked_transaction()?;
+            tx.execute("UPDATE work_attempts SET status='failed',error_message='execution_state_lost_after_restart',native_session_id=NULL,completed_at=CURRENT_TIMESTAMP WHERE id IN (SELECT attempt_id FROM connect_commands WHERE status='accepted') AND status IN ('queued','preparing','running','waiting_for_input','review')", [])?;
+            tx.execute("UPDATE task_queue SET status='failed',completed_at=CURRENT_TIMESTAMP WHERE attempt_id IN (SELECT attempt_id FROM connect_commands WHERE status='accepted') AND status IN ('queued','running')", [])?;
+            tx.execute("UPDATE tasks SET status='blocked',active_attempt_id=NULL,updated_at=CURRENT_TIMESTAMP WHERE id IN (SELECT c.task_id FROM connect_commands c JOIN work_attempts a ON a.id=c.attempt_id WHERE c.status='accepted' AND a.error_message='execution_state_lost_after_restart')", [])?;
             tx.execute("UPDATE conversation_turns SET status = 'failed', error_message = 'execution_state_lost_after_restart', completed_at = CURRENT_TIMESTAMP WHERE id IN (SELECT turn_id FROM connect_commands WHERE status = 'accepted') AND status IN ('queued', 'running')", [])?;
             tx.commit()?;
             Ok(())
@@ -329,10 +332,10 @@ fn validate_project_mapping(
 }
 
 fn execution(conn: &rusqlite::Connection, id: &str) -> Result<Execution> {
-    Ok(conn.query_row("SELECT id, conversation_id, turn_id, status, result_text, result_error, acknowledged, lease_until FROM connect_commands WHERE id = ?1", [id], |row| Ok(Execution {
+    Ok(conn.query_row("SELECT id, conversation_id, turn_id, status, result_text, result_error, acknowledged, lease_until, task_id, attempt_id FROM connect_commands WHERE id = ?1", [id], |row| Ok(Execution {
         id: row.get(0)?, conversation_id: row.get(1)?, turn_id: row.get(2)?,
         receipt: Receipt { status: row.get(3)?, text: row.get(4)?, error: row.get(5)? },
-        acknowledged: row.get(6)?, lease_until: row.get(7)?,
+        acknowledged: row.get(6)?, lease_until: row.get(7)?, task_id: row.get(8)?, attempt_id: row.get(9)?,
     }))?)
 }
 

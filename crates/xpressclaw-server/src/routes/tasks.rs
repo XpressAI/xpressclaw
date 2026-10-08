@@ -148,6 +148,9 @@ async fn register_pull_request(
     headers: HeaderMap,
     Json(request): Json<PullRequestInput>,
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
+    TaskBoard::new(state.db.clone())
+        .ensure_locally_managed(&id)
+        .map_err(task_write_error)?;
     if headers
         .get("x-xpressclaw-agent-id")
         .and_then(|value| value.to_str().ok())
@@ -534,8 +537,11 @@ async fn delete_task(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<Value>)> {
-    state.elicitations.cancel_task(&id);
     let board = TaskBoard::new(state.db.clone());
+    board
+        .ensure_locally_managed(&id)
+        .map_err(task_write_error)?;
+    state.elicitations.cancel_task(&id);
     board.delete(&id).map_err(internal_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -546,6 +552,11 @@ async fn update_task_status(
     Json(req): Json<StatusUpdate>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let board = TaskBoard::new(state.db.clone());
+    // Reject local lifecycle changes before cancelling attempts, interrupting
+    // parked workers, or applying any task/queue transition.
+    board
+        .ensure_locally_managed(&id)
+        .map_err(task_write_error)?;
     if req.status == "completed" && !board.subtasks_complete(&id).map_err(internal_error)? {
         return Err((
             StatusCode::CONFLICT,
@@ -1095,6 +1106,9 @@ async fn add_dependency(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let board = TaskBoard::new(state.db.clone());
     board
+        .ensure_locally_managed(&id)
+        .map_err(task_write_error)?;
+    board
         .add_dependency(&id, &req.depends_on)
         .map_err(internal_error)?;
     Ok(Json(json!({ "task_id": id, "depends_on": req.depends_on })))
@@ -1170,7 +1184,13 @@ mod tests {
             true,
         );
 
-        (Router::new().nest("/tasks", routes()).with_state(state), db)
+        (
+            Router::new()
+                .nest("/tasks", routes())
+                .nest("/sessions", crate::routes::sessions::routes())
+                .with_state(state),
+            db,
+        )
     }
 
     fn test_app() -> Router {
@@ -1180,6 +1200,220 @@ mod tests {
     async fn body_json(body: Body) -> Value {
         let bytes = body.collect().await.unwrap().to_bytes();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn connected_task_local_mutations_preserve_platform_dispatch() {
+        use xpressclaw_core::agents::registry::AgentRegistry;
+        use xpressclaw_core::connect::{Binding, Command, ConnectJournal, TurnPayload};
+
+        for phase in ["queued", "running", "waiting_for_input"] {
+            let (app, db) = test_app_with_db();
+            let registry = AgentRegistry::new(db.clone());
+            registry.ensure("connect-agent", "native").unwrap();
+            registry.ensure("connect-helper", "native").unwrap();
+            db.with_conn(|conn| {
+                conn.execute(
+                    "UPDATE agents SET project_id='connect-agent' WHERE id='connect-helper'",
+                    [],
+                )
+            })
+            .unwrap();
+            let journal = ConnectJournal::new(db.clone());
+            let binding = Binding {
+                id: uuid::Uuid::new_v4().to_string(),
+                local_project_id: "connect-agent".into(),
+                local_agent_id: "connect-agent".into(),
+                project_id: "cloud-project".into(),
+                agent_name: "connect-agent".into(),
+                generation: 1,
+                active: true,
+            };
+            journal.bind("instance", &binding).unwrap();
+            let command = Command {
+                version: 1,
+                id: uuid::Uuid::new_v4().to_string(),
+                binding,
+                kind: "task_turn".into(),
+                work_id: "platform-task".into(),
+                source_conversation_id: None,
+                payload: TurnPayload {
+                    text: "Perform the platform assignment".into(),
+                    history: vec![],
+                },
+                expires_at: "2099-01-01T00:00:00Z".into(),
+                cancel_requested: false,
+            };
+            let now = chrono::Utc::now().timestamp();
+            let execution = journal.admit("instance", &command, now + 90, now).unwrap();
+            let task_id = execution.task_id.as_deref().unwrap();
+            let attempt_id = execution.attempt_id.as_deref().unwrap();
+            let queue = TaskQueue::new(db.clone());
+            let sessions = SessionManager::new(db.clone());
+            let board = TaskBoard::new(db.clone());
+            if phase != "queued" {
+                queue.claim("connect-agent").unwrap().unwrap();
+                sessions
+                    .transition_attempt(attempt_id, "running", "Working", None, None)
+                    .unwrap();
+                board
+                    .update_status(task_id, "in_progress", Some("connect-agent"))
+                    .unwrap();
+                if phase == "waiting_for_input" {
+                    sessions
+                        .transition_attempt(attempt_id, phase, "Needs approval", None, None)
+                        .unwrap();
+                    board
+                        .update_status(task_id, phase, Some("connect-agent"))
+                        .unwrap();
+                }
+            }
+            let before_task = json!(board.get(task_id).unwrap());
+            let before_queue = json!(queue.list(None, None, 100).unwrap());
+            let before_attempt = json!(sessions.get_attempt(attempt_id).unwrap());
+            for (suffix, request) in [
+                (
+                    "",
+                    json!({"agent_id":"connect-helper","title":"Local edit","description":"Local description","priority":100}),
+                ),
+                ("", json!({"agent_id":""})),
+                ("", json!({"title":"Local edit"})),
+                (
+                    "/status",
+                    json!({"status":"in_progress","agent_id":"connect-helper"}),
+                ),
+                ("/status", json!({"status":"in_progress","agent_id":""})),
+                (
+                    "/status",
+                    json!({"status":"in_progress","agent_id":"connect-agent"}),
+                ),
+                ("/status", json!({"status":"cancelled"})),
+                ("/status", json!({"status":"completed"})),
+                ("/status", json!({"status":"pending"})),
+                ("/status", json!({"status":"blocked"})),
+                ("/status", json!({"status":"waiting_for_input"})),
+            ] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::patch(format!("/tasks/{task_id}{suffix}"))
+                            .header("content-type", "application/json")
+                            .body(Body::from(request.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{request}");
+                let body = body_json(response.into_body()).await;
+                assert!(body["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("continue it on the platform"));
+                assert_eq!(json!(board.get(task_id).unwrap()), before_task);
+                assert_eq!(json!(queue.list(None, None, 100).unwrap()), before_queue);
+                assert_eq!(
+                    json!(sessions.get_attempt(attempt_id).unwrap()),
+                    before_attempt
+                );
+            }
+            // Alternate lifecycle endpoints must reject before touching dispatch.
+            for request in [
+                Request::post("/tasks")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"title":"Local child","parent_task_id":task_id}).to_string(),
+                    ))
+                    .unwrap(),
+                Request::delete(format!("/tasks/{task_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+                Request::post(format!("/tasks/{task_id}/dependencies"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"depends_on":"another-task"}).to_string()))
+                    .unwrap(),
+                Request::post(format!("/tasks/{task_id}/pull-requests"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"agent_id":"connect-agent","phase":"begin"}).to_string(),
+                    ))
+                    .unwrap(),
+                Request::post(format!(
+                    "/sessions/connect-agent/attempts/{attempt_id}/cancel"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+                Request::post(format!(
+                    "/sessions/connect-agent/attempts/{attempt_id}/interrupt"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+            ] {
+                let response = app.clone().oneshot(request).await.unwrap();
+                let status = response.status();
+                let body = body_json(response.into_body()).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{phase}: {body}");
+                assert!(body["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("continue it on the platform"));
+                assert_eq!(json!(board.get(task_id).unwrap()), before_task);
+                assert_eq!(json!(queue.list(None, None, 100).unwrap()), before_queue);
+                assert_eq!(
+                    json!(sessions.get_attempt(attempt_id).unwrap()),
+                    before_attempt
+                );
+            }
+            // Core callers cannot bypass deletion or dependency ownership either.
+            assert!(board
+                .delete(task_id)
+                .unwrap_err()
+                .to_string()
+                .contains("continue it on the platform"));
+            assert!(board
+                .add_dependency(task_id, "another-task")
+                .unwrap_err()
+                .to_string()
+                .contains("continue it on the platform"));
+            assert_eq!(
+                board
+                    .delete_by_status(before_task["status"].as_str().unwrap())
+                    .unwrap(),
+                0
+            );
+            assert_eq!(json!(board.get(task_id).unwrap()), before_task);
+            journal.collect("instance").unwrap();
+            assert_eq!(
+                journal.pending("instance").unwrap()[0].receipt.status,
+                "accepted"
+            );
+            // Local edits cannot break renewal or divert the accepted work.
+            journal.renew("instance", &command.id, now + 180).unwrap();
+            assert_eq!(
+                journal.pending("instance").unwrap()[0].lease_until,
+                now + 180
+            );
+            assert!(queue.claim("connect-helper").unwrap().is_none());
+            if phase == "queued" {
+                assert_eq!(
+                    queue.claim("connect-agent").unwrap().unwrap().attempt_id,
+                    execution.attempt_id
+                );
+            }
+            // The worker can still update status using the existing owner.
+            board
+                .update_status(task_id, "in_progress", Some("connect-agent"))
+                .unwrap();
+            board
+                .update_status(task_id, "waiting_for_input", Some("connect-agent"))
+                .unwrap();
+            // Cancellation authorized by a platform command remains available.
+            journal.stop_task(&command.id, None).unwrap();
+            journal.collect("instance").unwrap();
+            assert_eq!(
+                sessions.get_attempt(attempt_id).unwrap().status,
+                "cancelled"
+            );
+        }
     }
 
     async fn assert_creation_revisions_are_ready_for_planning(batch: bool) {

@@ -153,7 +153,7 @@ fn connected_capability_route(method: &axum::http::Method, path: &str) -> bool {
     use axum::http::Method;
     let parts: Vec<_> = path.split('/').collect();
     match parts.as_slice() {
-        ["", "api", "settings", "connect", "conversations", id, "tools"] => {
+        ["", "api", "settings", "connect", "conversations" | "commands", id, "tools"] => {
             *method == Method::POST && uuid::Uuid::parse_str(id).is_ok()
         }
         ["", "api", "workspaces", _, "repository", "resolve-github"] => *method == Method::POST,
@@ -562,6 +562,18 @@ mod tests {
         let app = create_internal_router(state(), Arc::from("root-secret"));
         let capability = xpressclaw_core::connect::callback_capability("root-secret", "atlas");
         for (method, path, agent, allowed) in [
+            (
+                "POST",
+                "/api/settings/connect/commands/00000000-0000-0000-0000-000000000001/tools",
+                "atlas",
+                true,
+            ),
+            (
+                "GET",
+                "/api/settings/connect/commands/00000000-0000-0000-0000-000000000001/tools",
+                "atlas",
+                false,
+            ),
             (
                 "POST",
                 "/api/settings/connect/conversations/00000000-0000-0000-0000-000000000001/tools",

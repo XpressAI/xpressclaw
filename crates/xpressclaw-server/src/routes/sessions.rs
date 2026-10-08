@@ -420,6 +420,11 @@ async fn cancel_attempt(
             Json(json!({ "error": "attempt does not belong to this session" })),
         ));
     }
+    if let Some(task_id) = &attempt.task_id {
+        TaskBoard::new(state.db.clone())
+            .ensure_locally_managed(task_id)
+            .map_err(bad_request)?;
+    }
     let cancelled = sessions
         .transition_attempt(
             &attempt_id,
@@ -479,6 +484,11 @@ async fn interrupt_attempt(
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "attempt does not belong to this session" })),
         ));
+    }
+    if let Some(task_id) = &attempt.task_id {
+        TaskBoard::new(state.db.clone())
+            .ensure_locally_managed(task_id)
+            .map_err(bad_request)?;
     }
     let interrupted = state
         .interrupt_attempt(&attempt_id)

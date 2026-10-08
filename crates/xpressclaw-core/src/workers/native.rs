@@ -773,8 +773,9 @@ async fn execute_conversation_turn(
             BUILT_IN_RUNNER_PROTOCOL,
         )
         .await;
-    let connected =
-        crate::connect::ConnectJournal::new(db.clone()).is_linked(&turn.conversation_id)?;
+    let journal = crate::connect::ConnectJournal::new(db.clone());
+    let connected_command = journal.command_for_execution(&turn.id)?;
+    let connected = connected_command.is_some() || journal.is_linked(&turn.conversation_id)?;
     if connected
         && (!bundled_control_tools
             || agent
@@ -812,6 +813,7 @@ async fn execute_conversation_turn(
             &repository.container_root,
             RunnerCallback {
                 connected,
+                command_id: connected_command.as_deref(),
                 port: control_plane_port,
                 token: control_plane_token.as_ref(),
                 container_runtime: docker.runtime(),
@@ -1285,12 +1287,18 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
         .ok_or_else(|| Error::AgentNotFound {
             name: item.agent_id.clone(),
         })?;
+    let connected_command =
+        crate::connect::ConnectJournal::new(db.clone()).command_for_execution(attempt_id)?;
+    let connected = connected_command.is_some();
     let kind = resolve_runner_kind(agent)?;
     let session_start = session_start(&db, &item, &kind)?;
     let requested_session_config = requested_session_config(&db, agent, &item.task_id)?;
     let mut prompt = build_prompt(&db, &item, attempt_id)?;
     if session_start == AcpSessionStart::New {
         prepend_unresumed_interrupted_prompt(&db, &item, attempt_id, &mut prompt)?;
+    }
+    if connected {
+        prompt.content = format!("You are executing an assigned Xpress AI task through XpressClaw's task runtime. Perform the requested work in this task. Do not create a replacement task for this assignment or defer implementation to a chat/task lane. Read its platform checklist with get_task, update the checklist as you work, and report the final platform task status using update_task_status. Create follow-up work only for genuinely separate scope. The platform owns scheduling and review; local wakeups, delegation, and automatic GitHub review continuation are unavailable.\n\n{}", prompt.content);
     }
     append_plan_lifecycle_guidance(&mut prompt.content);
     db.with_conn(|conn| {
@@ -1308,7 +1316,7 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
         None,
         None,
     )?;
-    if attempt_is_terminal(&preparing.status) {
+    if finish_terminal_dispatch_after_worker_exit(&db, &item, &preparing.status)? {
         return Ok(());
     }
     if let Some(conversation_id) = conversation_id(&db, &item.task_id) {
@@ -1325,7 +1333,7 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
     let capture_task_dashboard_metrics = dashboard_task_metrics_enabled(&task);
     let control_task_id = continuation_task_id(&task).map(str::to_owned);
     let github_review_lifecycle =
-        control_task_id.is_some() && github_review_lifecycle_enabled(&task);
+        !connected && control_task_id.is_some() && github_review_lifecycle_enabled(&task);
     let _ = board.update_status(&item.task_id, "in_progress", Some(&item.agent_id));
 
     if let AcpSessionStart::Resume(native_session_id) = &session_start {
@@ -1367,7 +1375,7 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
                 None,
                 None,
             )?;
-            if attempt_is_terminal(&pulling.status) {
+            if finish_terminal_dispatch_after_worker_exit(&db, &item, &pulling.status)? {
                 return Ok(());
             }
             docker.pull_image(&spec.image).await?;
@@ -1391,6 +1399,18 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
             BUILT_IN_RUNNER_PROTOCOL,
         )
         .await;
+    if connected
+        && (!bundled_control_tools
+            || agent
+                .runner
+                .mcp_servers
+                .iter()
+                .any(|name| name == "xpressclaw"))
+    {
+        return Err(Error::Backend(
+            "Xpress AI Connect requires the bundled XpressClaw control tools".into(),
+        ));
+    }
     let github_mcp_attached = configure_bundled_github_mcp(
         &agent.runner,
         &kind,
@@ -1415,7 +1435,8 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
             &repository.container_bootstrap,
             &repository.container_root,
             RunnerCallback {
-                connected: false,
+                connected,
+                command_id: connected_command.as_deref(),
                 port: control_plane_port,
                 token: control_plane_token.as_ref(),
                 container_runtime: docker.runtime(),
@@ -1426,10 +1447,11 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
     if github_mcp_attached {
         mcp_servers.push(github::mcp_server(&github::GithubMcpContext {
             control_plane_url: control_plane_url(control_plane_port, docker.runtime()),
-            control_plane_token: agent_callback_capability(
-                control_plane_token.as_ref(),
-                &agent.name,
-            ),
+            control_plane_token: if connected {
+                crate::connect::callback_capability(control_plane_token.as_ref(), &agent.name)
+            } else {
+                agent_callback_capability(control_plane_token.as_ref(), &agent.name)
+            },
             agent_id: agent.name.clone(),
             workspace: repository.container_bootstrap.clone(),
             active_repository: repository.active.then(|| repository.container_root.clone()),
@@ -1460,7 +1482,11 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
     } else {
         None
     };
-    if attempt_is_terminal(&sessions.get_attempt(attempt_id)?.status) {
+    if finish_terminal_dispatch_after_worker_exit(
+        &db,
+        &item,
+        &sessions.get_attempt(attempt_id)?.status,
+    )? {
         return Ok(());
     }
     let workload_id = agent.name.as_str();
@@ -1957,6 +1983,14 @@ fn prepend_unresumed_interrupted_prompt(
     attempt_id: &str,
     prompt: &mut AgentPrompt,
 ) -> Result<()> {
+    // Each platform command supplies its own authorized context. A fresh native
+    // session must not revive an earlier command's interrupted instructions.
+    if crate::connect::ConnectJournal::new(db.clone())
+        .command_for_execution(attempt_id)?
+        .is_some()
+    {
+        return Ok(());
+    }
     let previous_prompt: Option<String> = db.with_conn(|conn| {
         conn.query_row(
             "SELECT prompt FROM work_attempts
@@ -1988,6 +2022,30 @@ fn prepend_unresumed_interrupted_prompt(
 }
 
 fn build_prompt(db: &Arc<Database>, item: &QueueItem, attempt_id: &str) -> Result<AgentPrompt> {
+    // Connect v1 admits one text message, including authorized platform history,
+    // per command. Reusing the Task must not replay any earlier command, even
+    // when it was cancelled/failed before recording a started_at boundary.
+    let connected_prompt: Option<Option<String>> = db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT m.content FROM connect_commands c
+             LEFT JOIN work_attempts a ON a.id=c.attempt_id AND a.task_id=c.task_id
+             LEFT JOIN task_messages m ON m.id=a.trigger_message_id
+               AND m.task_id=c.task_id AND m.task_id=?2 AND m.role='user'
+             WHERE c.attempt_id=?1",
+            rusqlite::params![attempt_id, item.task_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Error::from)
+    })?;
+    if let Some(content) = connected_prompt {
+        return Ok(AgentPrompt {
+            content: content.ok_or_else(|| {
+                Error::Task("Connected task command is missing its owned prompt message".into())
+            })?,
+            attachments: Vec::new(),
+        });
+    }
     let task = TaskBoard::new(db.clone()).get(&item.task_id)?;
     let (previous_trigger_message_id, previous_started, trigger_message_id) =
         db.with_conn(|conn| {
@@ -2087,6 +2145,7 @@ fn session_start(db: &Arc<Database>, item: &QueueItem, runner: &str) -> Result<A
         conn.query_row(
             "SELECT id, native_session_id FROM work_attempts
              WHERE session_id = ?1 AND runner = ?2
+               AND NOT EXISTS(SELECT 1 FROM connect_commands c WHERE c.attempt_id=work_attempts.id)
                AND native_session_id IS NOT NULL
                AND status IN ('completed', 'interrupted')
              ORDER BY COALESCE(completed_at, created_at) DESC, rowid DESC LIMIT 1",
@@ -2667,6 +2726,7 @@ fn control_plane_url(control_plane_port: u16, container_runtime: &str) -> String
 #[derive(Clone, Copy)]
 struct RunnerCallback<'a> {
     connected: bool,
+    command_id: Option<&'a str>,
     port: u16,
     token: &'a str,
     container_runtime: &'a str,
@@ -2689,6 +2749,7 @@ fn xpressclaw_control_mcp_server(
         "/workspace",
         RunnerCallback {
             connected: false,
+            command_id: None,
             port: control_plane_port,
             token: "test-control-token",
             container_runtime,
@@ -2723,6 +2784,9 @@ fn xpressclaw_control_mcp_server_for_context(
             },
         ),
     ];
+    if let Some(command) = callback.command_id {
+        env.push(EnvVariable::new("XPRESSCLAW_CONNECT_COMMAND_ID", command));
+    }
     if callback.connected {
         env.push(EnvVariable::new("XPRESSCLAW_CONNECT", "1"));
     }
@@ -4282,6 +4346,7 @@ mod tests {
             &runtime.container_root,
             RunnerCallback {
                 connected: false,
+                command_id: None,
                 port: 8935,
                 token: "control",
                 container_runtime: "docker",
@@ -4887,6 +4952,161 @@ mod tests {
         assert!(!resumed_prompt.contains("Retain completed request"));
         assert!(!resumed_prompt.contains("Retained completed response"));
         assert!(resumed_prompt.contains("Newest request"));
+    }
+
+    fn connected_prompt_fixture() -> (
+        Arc<Database>,
+        crate::connect::ConnectJournal,
+        crate::connect::Command,
+    ) {
+        use crate::connect::{Binding, Command, ConnectJournal, TurnPayload};
+        let db = Arc::new(Database::open_memory().unwrap());
+        crate::agents::registry::AgentRegistry::new(db.clone())
+            .ensure("atlas", "native")
+            .unwrap();
+        let journal = ConnectJournal::new(db.clone());
+        let binding = Binding {
+            id: uuid::Uuid::new_v4().to_string(),
+            local_project_id: "atlas".into(),
+            local_agent_id: "atlas".into(),
+            project_id: "cloud".into(),
+            agent_name: "atlas".into(),
+            generation: 1,
+            active: true,
+        };
+        journal.bind("instance", &binding).unwrap();
+        let command = Command {
+            version: 1,
+            id: uuid::Uuid::new_v4().to_string(),
+            binding,
+            kind: "task_turn".into(),
+            work_id: "platform-task".into(),
+            source_conversation_id: None,
+            payload: TurnPayload {
+                text: "Obsolete request: deploy the old build".into(),
+                history: vec!["Obsolete platform context".into()],
+            },
+            expires_at: "2099-01-01T00:00:00Z".into(),
+            cancel_requested: false,
+        };
+        (db, journal, command)
+    }
+
+    #[test]
+    fn connected_task_prompts_exclude_prior_unstarted_commands() {
+        for outcome in [
+            "cancelled",
+            "expired",
+            "failed",
+            "recovered",
+            "interrupted",
+            "completed",
+        ] {
+            let (db, journal, mut command) = connected_prompt_fixture();
+            let now = chrono::Utc::now().timestamp();
+            let first = journal.admit("instance", &command, now + 90, now).unwrap();
+            let first_attempt = first.attempt_id.as_deref().unwrap();
+            let sessions = SessionManager::new(db.clone());
+            let queue = TaskQueue::new(db.clone());
+            match outcome {
+                "cancelled" => {
+                    journal.stop_task(&command.id, None).unwrap();
+                }
+                "expired" => {
+                    journal.stop_task(&command.id, Some(now + 91)).unwrap();
+                }
+                "recovered" => {
+                    journal.recover().unwrap();
+                }
+                status => {
+                    // A worker can fail/stop after claiming but before preparing.
+                    let item = queue.claim("atlas").unwrap().unwrap();
+                    let prompt = build_prompt(&db, &item, first_attempt).unwrap();
+                    db.with_conn(|conn| {
+                        conn.execute(
+                            "UPDATE work_attempts SET prompt=?2 WHERE id=?1",
+                            rusqlite::params![first_attempt, prompt.content],
+                        )
+                    })
+                    .unwrap();
+                    sessions
+                        .transition_attempt(
+                            first_attempt,
+                            status,
+                            "Stopped before startup",
+                            None,
+                            None,
+                        )
+                        .unwrap();
+                    assert!(
+                        finish_terminal_dispatch_after_worker_exit(&db, &item, status).unwrap()
+                    );
+                }
+            }
+            assert!(sessions
+                .get_attempt(first_attempt)
+                .unwrap()
+                .started_at
+                .is_none());
+            journal.collect("instance").unwrap();
+            journal.acknowledge("instance", &command.id).unwrap();
+            command.id = uuid::Uuid::new_v4().to_string();
+            command.payload.text = "Only inspect the new build; do not deploy".into();
+            command.payload.history = vec!["Current authorized platform context".into()];
+            let next = journal.admit("instance", &command, now + 180, now).unwrap();
+            assert_eq!(first.task_id, next.task_id);
+            let item = queue.claim("atlas").unwrap().unwrap();
+            let mut prompt = build_prompt(&db, &item, next.attempt_id.as_deref().unwrap()).unwrap();
+            // Fresh native sessions must not restore an obsolete interrupted prompt.
+            prepend_unresumed_interrupted_prompt(
+                &db,
+                &item,
+                next.attempt_id.as_deref().unwrap(),
+                &mut prompt,
+            )
+            .unwrap();
+            assert_eq!(prompt.content, "Recent platform history:\nCurrent authorized platform context\n\nCurrent request:\nOnly inspect the new build; do not deploy", "{outcome}");
+            assert!(prompt.attachments.is_empty());
+            let messages = TaskConversation::new(db.clone())
+                .get_messages(item.task_id.as_str())
+                .unwrap();
+            assert_eq!(messages.len(), 2);
+            assert!(messages[0].content.contains("Obsolete request"));
+            assert!(messages[1].content.contains("Only inspect the new build"));
+        }
+    }
+
+    #[test]
+    fn connected_task_prompt_requires_its_owned_trigger_message() {
+        for damage in [
+            "missing_boundary",
+            "deleted_message",
+            "foreign_message",
+            "non_user_message",
+        ] {
+            let (db, journal, command) = connected_prompt_fixture();
+            let now = chrono::Utc::now().timestamp();
+            let admitted = journal.admit("instance", &command, now + 90, now).unwrap();
+            let item = TaskQueue::new(db.clone()).claim("atlas").unwrap().unwrap();
+            let attempt_id = admitted.attempt_id.as_deref().unwrap();
+            db.with_conn(|conn| {
+                let trigger: i64 = conn.query_row("SELECT trigger_message_id FROM work_attempts WHERE id=?1", [attempt_id], |row| row.get(0))?;
+                match damage {
+                    "missing_boundary" => { conn.execute("UPDATE work_attempts SET trigger_message_id=NULL WHERE id=?1", [attempt_id])?; }
+                    "deleted_message" => { conn.execute("DELETE FROM task_messages WHERE id=?1", [trigger])?; }
+                    "foreign_message" => {
+                        conn.execute("INSERT INTO tasks (id,title) VALUES ('foreign-task','Other assignment')", [])?;
+                        conn.execute("UPDATE task_messages SET task_id='foreign-task' WHERE id=?1", [trigger])?;
+                    }
+                    _ => { conn.execute("UPDATE task_messages SET role='assistant' WHERE id=?1", [trigger])?; }
+                }
+                Ok::<_,Error>(())
+            }).unwrap();
+            assert!(
+                build_prompt(&db, &item, attempt_id).is_err(),
+                "{damage} must not replay the task description"
+            );
+        }
     }
 
     #[test]
@@ -5883,6 +6103,7 @@ flows:
             "/workspace",
             RunnerCallback {
                 connected: true,
+                command_id: Some("command"),
                 port: 1234,
                 token: "root-secret",
                 container_runtime: "docker",
@@ -6803,6 +7024,74 @@ flows:
     }
 
     #[test]
+    fn connected_task_sessions_do_not_leak_into_local_work() {
+        use crate::connect::{Binding, Command, ConnectJournal, TurnPayload};
+        use crate::tasks::board::CreateTask;
+        let db = Arc::new(Database::open_memory().unwrap());
+        crate::agents::registry::AgentRegistry::new(db.clone())
+            .ensure("atlas", "native")
+            .unwrap();
+        let board = TaskBoard::new(db.clone());
+        let queue = TaskQueue::new(db.clone());
+        let local = board
+            .create(&CreateTask {
+                title: "Local task".into(),
+                agent_id: Some("atlas".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let local_item = queue.enqueue(&local.id, "atlas").unwrap();
+        db.with_conn(|conn|conn.execute("UPDATE work_attempts SET status='completed',runner='codex',native_session_id='local-session' WHERE id=?1",[local_item.attempt_id.as_deref().unwrap()])).unwrap();
+        queue.complete(local_item.id, "done").unwrap();
+        let journal = ConnectJournal::new(db.clone());
+        let binding = Binding {
+            id: uuid::Uuid::new_v4().to_string(),
+            local_project_id: "atlas".into(),
+            local_agent_id: "atlas".into(),
+            project_id: "cloud".into(),
+            agent_name: "atlas".into(),
+            generation: 1,
+            active: true,
+        };
+        journal.bind("instance", &binding).unwrap();
+        let command = Command {
+            version: 1,
+            id: uuid::Uuid::new_v4().to_string(),
+            binding,
+            kind: "task_turn".into(),
+            work_id: "123".into(),
+            source_conversation_id: None,
+            payload: TurnPayload {
+                text: "Implement assigned work".into(),
+                history: vec![],
+            },
+            expires_at: "2099-01-01T00:00:00Z".into(),
+            cancel_requested: false,
+        };
+        let now = chrono::Utc::now().timestamp();
+        let execution = journal.admit("instance", &command, now + 90, now).unwrap();
+        let connected = queue.claim("atlas").unwrap().unwrap();
+        assert_eq!(
+            session_start(&db, &connected, "codex").unwrap(),
+            AcpSessionStart::New
+        );
+        db.with_conn(|conn|conn.execute("UPDATE work_attempts SET status='completed',runner='codex',native_session_id='connected-session' WHERE id=?1",[execution.attempt_id.as_deref().unwrap()])).unwrap();
+        queue.complete(connected.id, "done").unwrap();
+        let next = board
+            .create(&CreateTask {
+                title: "Another local task".into(),
+                agent_id: Some("atlas".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let item = queue.enqueue(&next.id, "atlas").unwrap();
+        assert_eq!(
+            session_start(&db, &item, "codex").unwrap(),
+            AcpSessionStart::Fork("local-session".into())
+        );
+    }
+
+    #[test]
     fn selects_fork_resume_and_fresh_conversation_contexts() {
         use crate::tasks::board::CreateTask;
 
@@ -7147,6 +7436,38 @@ flows:
             expected_host
         );
         assert_eq!(local_runner_image_alias("example/custom:latest"), None);
+    }
+
+    #[test]
+    fn terminal_pre_execution_checkpoints_finalize_claimed_dispatches() {
+        for checkpoint in ["Preparing runner", "Pulling image", "Starting process"] {
+            let db = Arc::new(Database::open_memory().unwrap());
+            db.with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO tasks (id,title,agent_id) VALUES ('task','Task','atlas')",
+                    [],
+                )
+            })
+            .unwrap();
+            let queue = TaskQueue::new(db.clone());
+            let item = queue.enqueue("task", "atlas").unwrap();
+            queue.claim("atlas").unwrap().unwrap();
+            let sessions = SessionManager::new(db.clone());
+            let attempt = item.attempt_id.as_deref().unwrap();
+            sessions
+                .transition_attempt(attempt, "cancelled", "Cancelled", None, None)
+                .unwrap();
+            // A startup checkpoint cannot revive an attempt stopped while it
+            // was waiting for repository/image/process preparation.
+            let current = sessions
+                .transition_attempt(attempt, "preparing", checkpoint, None, None)
+                .unwrap();
+            assert!(
+                finish_terminal_dispatch_after_worker_exit(&db, &item, &current.status).unwrap()
+            );
+            assert_eq!(queue.get(item.id).unwrap().status, "failed");
+            assert_eq!(sessions.get_attempt(attempt).unwrap().status, "cancelled");
+        }
     }
 
     #[test]
