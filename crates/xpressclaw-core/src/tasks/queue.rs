@@ -35,30 +35,31 @@ impl TaskQueue {
         Self { db }
     }
 
-    fn ensure_locally_scheduled(&self, task_id: &str) -> Result<()> {
-        self.db.with_conn(|conn| {
-            let connected: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM connect_work WHERE kind='task_turn' AND local_id=?1)",
-                [task_id],
-                |r| r.get(0),
-            )?;
-            if connected {
-                return Err(Error::Task(
-                    "This task is scheduled by Xpress AI; continue it on the platform".into(),
-                ));
-            }
-            Ok(())
-        })
+    pub(crate) fn ensure_locally_scheduled(
+        conn: &rusqlite::Connection,
+        task_id: &str,
+    ) -> Result<()> {
+        let connected: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM connect_work WHERE kind='task_turn' AND local_id=?1)",
+            [task_id],
+            |r| r.get(0),
+        )?;
+        if connected {
+            return Err(Error::Task(
+                "This task is scheduled by Xpress AI; continue it on the platform".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Enqueue a task for an agent.
     pub fn enqueue(&self, task_id: &str, agent_id: &str) -> Result<QueueItem> {
-        self.ensure_locally_scheduled(task_id)?;
         let item = self.db.with_conn(|conn| {
             let transaction = rusqlite::Transaction::new_unchecked(
                 conn,
                 rusqlite::TransactionBehavior::Immediate,
             )?;
+            Self::ensure_locally_scheduled(&transaction, task_id)?;
             let item = Self::enqueue_in_transaction(&transaction, task_id, agent_id)?;
             transaction.commit()?;
             Ok::<_, Error>(item)
@@ -182,12 +183,12 @@ impl TaskQueue {
     /// recovery uses this after persisting task ownership but before (or after
     /// an interrupted) initial dispatch.
     pub fn ensure_enqueued(&self, task_id: &str, agent_id: &str) -> Result<Option<QueueItem>> {
-        self.ensure_locally_scheduled(task_id)?;
         let id = self.db.with_conn(|conn| {
             let transaction = rusqlite::Transaction::new_unchecked(
                 conn,
                 rusqlite::TransactionBehavior::Immediate,
             )?;
+            Self::ensure_locally_scheduled(&transaction, task_id)?;
             ensure_task_project_accepts_work(&transaction, task_id)?;
             let active = transaction
                 .query_row(
@@ -219,12 +220,12 @@ impl TaskQueue {
     /// turn. A running turn is intentionally not considered a duplicate: the
     /// continuation waits behind it and receives any messages sent meanwhile.
     pub fn enqueue_continuation(&self, task_id: &str, agent_id: &str) -> Result<Option<QueueItem>> {
-        self.ensure_locally_scheduled(task_id)?;
         let id = self.db.with_conn(|conn| {
             let transaction = rusqlite::Transaction::new_unchecked(
                 conn,
                 rusqlite::TransactionBehavior::Immediate,
             )?;
+            Self::ensure_locally_scheduled(&transaction, task_id)?;
             ensure_task_project_accepts_work(&transaction, task_id)?;
             let changed = transaction.execute(
                 "INSERT INTO task_queue (task_id, agent_id, status)
@@ -293,6 +294,7 @@ impl TaskQueue {
         message_id: i64,
         message_timestamp: &str,
     ) -> Result<Option<QueueItem>> {
+        Self::ensure_locally_scheduled(transaction, task_id)?;
         ensure_task_project_accepts_work(transaction, task_id)?;
         let queued_attempt_id = Self::coalescible_queued_attempt(transaction, task_id)?;
 

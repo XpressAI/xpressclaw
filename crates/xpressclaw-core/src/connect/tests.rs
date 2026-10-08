@@ -646,3 +646,154 @@ fn cancelling_queued_connected_task_and_recovery_cannot_restart_it() {
         Some("execution_state_lost_after_restart")
     );
 }
+
+#[test]
+fn connected_tasks_never_attach_default_workflows() {
+    use crate::tasks::board::{CreateTask, TaskBoard};
+    use crate::tasks::queue::TaskQueue;
+    use crate::workflows::engine::WorkflowEngine;
+    use crate::workflows::instance::InstanceManager;
+    use crate::workflows::manager::{CreateWorkflow, WorkflowManager};
+
+    let (db, journal, command, now) = task_fixture();
+    let workflows = WorkflowManager::new(db.clone());
+    let workflow = workflows.create(&CreateWorkflow {
+        name: "local-follow-up".into(),
+        description: None,
+        yaml_content: "name: local-follow-up\nflows:\n  main:\n    steps:\n      - id: follow_up\n        type: continue\n        prompt: Do a local follow-up\n".into(),
+    }).unwrap();
+    workflows.set_default_for_tasks(&workflow.id, true).unwrap();
+    let engine = WorkflowEngine::new(db.clone());
+    let execution = journal.admit("instance", &command, now + 90, now).unwrap();
+    let task = execution.task_id.as_deref().unwrap();
+    let queue = TaskQueue::new(db.clone());
+    let claimed = queue.claim("atlas").unwrap().unwrap();
+    assert!(engine
+        .attach_default_workflows_to_task(task)
+        .unwrap()
+        .is_empty());
+    crate::sessions::SessionManager::new(db.clone())
+        .transition_attempt(
+            execution.attempt_id.as_deref().unwrap(),
+            "completed",
+            "Done",
+            Some("Done"),
+            None,
+        )
+        .unwrap();
+    queue.complete(claimed.id, "Done").unwrap();
+    engine.on_task_completed(task, "completed", "Done").unwrap();
+    assert!(InstanceManager::new(db.clone())
+        .list_instances(&workflow.id, 10)
+        .unwrap()
+        .is_empty());
+    assert!(queue.claim("atlas").unwrap().is_none());
+    journal.collect("instance").unwrap();
+    assert_eq!(
+        journal.pending("instance").unwrap()[0].receipt.status,
+        "completed"
+    );
+
+    // The same default still attaches to ordinary work in this project.
+    let local = TaskBoard::new(db.clone())
+        .create(&CreateTask {
+            title: "Local work".into(),
+            agent_id: Some("atlas".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(
+        engine
+            .attach_default_workflows_to_task(&local.id)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn local_messages_cannot_coalesce_interrupt_or_strand_connected_tasks() {
+    use crate::sessions::SessionManager;
+    use crate::tasks::attachments::DecodedImageAttachment;
+    use crate::tasks::conversation::TaskConversation;
+    use crate::tasks::queue::TaskQueue;
+
+    for status in ["queued", "running", "completed"] {
+        let (db, journal, mut command, now) = task_fixture();
+        let execution = journal.admit("instance", &command, now + 90, now).unwrap();
+        let task = execution.task_id.as_deref().unwrap();
+        let attempt = execution.attempt_id.as_deref().unwrap();
+        let sessions = SessionManager::new(db.clone());
+        let queue = TaskQueue::new(db.clone());
+        if status != "queued" {
+            let claimed = queue.claim("atlas").unwrap().unwrap();
+            sessions
+                .transition_attempt(attempt, status, "Test", Some("Done"), None)
+                .unwrap();
+            if status == "completed" {
+                queue.complete(claimed.id, "Done").unwrap();
+                journal.collect("instance").unwrap();
+            }
+        }
+        let messages = TaskConversation::new(db.clone());
+        let original = messages.get_messages(task).unwrap().remove(0);
+        for agent in [Some("atlas"), None] {
+            let error = messages
+                .add_user_message_with_attachments_and_enqueue(
+                    task,
+                    agent,
+                    "Local interruption",
+                    &[DecodedImageAttachment {
+                        name: "local.txt".into(),
+                        mime_type: "text/plain".into(),
+                        data: b"Local file".to_vec(),
+                    }],
+                )
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("continue it on the platform"),
+                "{status}: {error}"
+            );
+        }
+        // The queue API must also guard callers that already own a message.
+        assert!(queue
+            .enqueue_continuation_for_message(task, "atlas", original.id, &original.timestamp)
+            .is_err());
+        assert_eq!(messages.get_messages(task).unwrap().len(), 1, "{status}");
+        assert_eq!(sessions.get_attempt(attempt).unwrap().status, status);
+        db.with_conn(|conn| {
+            for table in ["task_queue", "work_attempts"] {
+                let count: i64 =
+                    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
+                assert_eq!(count, 1, "{status}: {table}");
+            }
+            let attachments: i64 =
+                conn.query_row("SELECT COUNT(*) FROM task_message_attachments", [], |r| {
+                    r.get(0)
+                })?;
+            assert_eq!(attachments, 0);
+            let trigger: i64 = conn.query_row(
+                "SELECT trigger_message_id FROM work_attempts WHERE id=?1",
+                [attempt],
+                |r| r.get(0),
+            )?;
+            assert_eq!(trigger, original.id);
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+        command.id = Uuid::new_v4().to_string();
+        assert_eq!(
+            journal.can_admit("instance", &command).unwrap(),
+            status == "completed"
+        );
+        if status == "completed" {
+            assert_eq!(
+                journal
+                    .admit("instance", &command, now + 90, now)
+                    .unwrap()
+                    .task_id,
+                execution.task_id
+            );
+        }
+    }
+}

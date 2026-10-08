@@ -226,7 +226,7 @@ impl WorkflowEngine {
         if task.hidden
             || task.task_type != "normal"
             || task.is_native_plan_item()
-            || origin == Some("workflow")
+            || matches!(origin, Some("workflow" | "xpress_ai_connect"))
             || task.agent_id.is_none()
         {
             return Ok(Vec::new());

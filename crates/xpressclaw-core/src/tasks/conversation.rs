@@ -124,6 +124,7 @@ impl TaskConversation {
         let conn = self.db.conn();
         let tx =
             rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+        TaskQueue::ensure_locally_scheduled(&tx, task_id)?;
         let message = Self::insert_message_in_transaction(
             &tx,
             task_id,
