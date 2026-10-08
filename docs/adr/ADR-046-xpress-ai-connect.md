@@ -58,17 +58,24 @@ because its connection disappeared.
 
 Before executing, the connector obtains a 90-second renewable lease, then
 atomically verifies its locally approved binding, records the command digest,
-and creates a targeted Conversation turn in SQLite. A crash between lease
+and creates a native task attempt or targeted Conversation turn in SQLite. A crash between lease
 acceptance and local admission can redeliver the same command. Repeated admitted
 commands return the recorded execution, including after completion. Changed
 payloads under an existing command ID are rejected.
 
-Each command gets its own local execution Conversation. The platform supplies
-bounded recent context; the container workspace and project memory persist.
-Full harness session continuity between platform turns is outside this version.
-Imported context does not invoke local conversation fan-out. The local transcript
-is a projection: users continue the conversation in Xpress AI. Existing unlinked
-local work retains its normal behavior.
+Task commands map each platform task to one local Task and execute through the
+normal task queue and work-attempt runtime. Follow-ups and retries add attempts
+to that Task; replaying a command never creates another attempt. Assigned work
+receives task instructions, so it is performed in place rather than delegated
+from a chat lane. Chat commands reuse one local Conversation per binding and
+platform chat. Each command retains its own receipt; new commands for busy work
+items wait before accepting a lease so they cannot coalesce into one execution.
+
+The platform supplies bounded recent context; task and chat sessions remain
+separate. Connected callbacks are scoped to the current command and its live
+lease. Imported context does not invoke local conversation fan-out, and local
+continuations cannot bypass platform scheduling. Existing transcripts from
+older versions are retained; new task execution does not add Conversations.
 
 Receipts and final results remain in the local journal until acknowledged.
 The platform commits a final chat message transactionally with the command's

@@ -773,8 +773,9 @@ async fn execute_conversation_turn(
             BUILT_IN_RUNNER_PROTOCOL,
         )
         .await;
-    let connected =
-        crate::connect::ConnectJournal::new(db.clone()).is_linked(&turn.conversation_id)?;
+    let journal = crate::connect::ConnectJournal::new(db.clone());
+    let connected_command = journal.command_for_execution(&turn.id)?;
+    let connected = connected_command.is_some() || journal.is_linked(&turn.conversation_id)?;
     if connected
         && (!bundled_control_tools
             || agent
@@ -812,6 +813,7 @@ async fn execute_conversation_turn(
             &repository.container_root,
             RunnerCallback {
                 connected,
+                command_id: connected_command.as_deref(),
                 port: control_plane_port,
                 token: control_plane_token.as_ref(),
                 container_runtime: docker.runtime(),
@@ -1285,12 +1287,18 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
         .ok_or_else(|| Error::AgentNotFound {
             name: item.agent_id.clone(),
         })?;
+    let connected_command =
+        crate::connect::ConnectJournal::new(db.clone()).command_for_execution(attempt_id)?;
+    let connected = connected_command.is_some();
     let kind = resolve_runner_kind(agent)?;
     let session_start = session_start(&db, &item, &kind)?;
     let requested_session_config = requested_session_config(&db, agent, &item.task_id)?;
     let mut prompt = build_prompt(&db, &item, attempt_id)?;
     if session_start == AcpSessionStart::New {
         prepend_unresumed_interrupted_prompt(&db, &item, attempt_id, &mut prompt)?;
+    }
+    if connected {
+        prompt.content = format!("You are executing an assigned Xpress AI task through XpressClaw's task runtime. Perform the requested work in this task. Do not create a replacement task for this assignment or defer implementation to a chat/task lane. Read its platform checklist with get_task, update the checklist as you work, and report the final platform task status using update_task_status. Create follow-up work only for genuinely separate scope. The platform owns scheduling and review; local wakeups, delegation, and automatic GitHub review continuation are unavailable.\n\n{}", prompt.content);
     }
     append_plan_lifecycle_guidance(&mut prompt.content);
     db.with_conn(|conn| {
@@ -1325,7 +1333,7 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
     let capture_task_dashboard_metrics = dashboard_task_metrics_enabled(&task);
     let control_task_id = continuation_task_id(&task).map(str::to_owned);
     let github_review_lifecycle =
-        control_task_id.is_some() && github_review_lifecycle_enabled(&task);
+        !connected && control_task_id.is_some() && github_review_lifecycle_enabled(&task);
     let _ = board.update_status(&item.task_id, "in_progress", Some(&item.agent_id));
 
     if let AcpSessionStart::Resume(native_session_id) = &session_start {
@@ -1391,6 +1399,18 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
             BUILT_IN_RUNNER_PROTOCOL,
         )
         .await;
+    if connected
+        && (!bundled_control_tools
+            || agent
+                .runner
+                .mcp_servers
+                .iter()
+                .any(|name| name == "xpressclaw"))
+    {
+        return Err(Error::Backend(
+            "Xpress AI Connect requires the bundled XpressClaw control tools".into(),
+        ));
+    }
     let github_mcp_attached = configure_bundled_github_mcp(
         &agent.runner,
         &kind,
@@ -1415,7 +1435,8 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
             &repository.container_bootstrap,
             &repository.container_root,
             RunnerCallback {
-                connected: false,
+                connected,
+                command_id: connected_command.as_deref(),
                 port: control_plane_port,
                 token: control_plane_token.as_ref(),
                 container_runtime: docker.runtime(),
@@ -1426,10 +1447,11 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
     if github_mcp_attached {
         mcp_servers.push(github::mcp_server(&github::GithubMcpContext {
             control_plane_url: control_plane_url(control_plane_port, docker.runtime()),
-            control_plane_token: agent_callback_capability(
-                control_plane_token.as_ref(),
-                &agent.name,
-            ),
+            control_plane_token: if connected {
+                crate::connect::callback_capability(control_plane_token.as_ref(), &agent.name)
+            } else {
+                agent_callback_capability(control_plane_token.as_ref(), &agent.name)
+            },
             agent_id: agent.name.clone(),
             workspace: repository.container_bootstrap.clone(),
             active_repository: repository.active.then(|| repository.container_root.clone()),
@@ -2087,6 +2109,7 @@ fn session_start(db: &Arc<Database>, item: &QueueItem, runner: &str) -> Result<A
         conn.query_row(
             "SELECT id, native_session_id FROM work_attempts
              WHERE session_id = ?1 AND runner = ?2
+               AND NOT EXISTS(SELECT 1 FROM connect_commands c WHERE c.attempt_id=work_attempts.id)
                AND native_session_id IS NOT NULL
                AND status IN ('completed', 'interrupted')
              ORDER BY COALESCE(completed_at, created_at) DESC, rowid DESC LIMIT 1",
@@ -2667,6 +2690,7 @@ fn control_plane_url(control_plane_port: u16, container_runtime: &str) -> String
 #[derive(Clone, Copy)]
 struct RunnerCallback<'a> {
     connected: bool,
+    command_id: Option<&'a str>,
     port: u16,
     token: &'a str,
     container_runtime: &'a str,
@@ -2689,6 +2713,7 @@ fn xpressclaw_control_mcp_server(
         "/workspace",
         RunnerCallback {
             connected: false,
+            command_id: None,
             port: control_plane_port,
             token: "test-control-token",
             container_runtime,
@@ -2723,6 +2748,9 @@ fn xpressclaw_control_mcp_server_for_context(
             },
         ),
     ];
+    if let Some(command) = callback.command_id {
+        env.push(EnvVariable::new("XPRESSCLAW_CONNECT_COMMAND_ID", command));
+    }
     if callback.connected {
         env.push(EnvVariable::new("XPRESSCLAW_CONNECT", "1"));
     }
@@ -4282,6 +4310,7 @@ mod tests {
             &runtime.container_root,
             RunnerCallback {
                 connected: false,
+                command_id: None,
                 port: 8935,
                 token: "control",
                 container_runtime: "docker",
@@ -5883,6 +5912,7 @@ flows:
             "/workspace",
             RunnerCallback {
                 connected: true,
+                command_id: Some("command"),
                 port: 1234,
                 token: "root-secret",
                 container_runtime: "docker",
@@ -6800,6 +6830,74 @@ flows:
         assert!(prompt.contains("do not leave speculative review"));
         assert!(prompt.contains("Use create_task with this task as parent"));
         assert_eq!(prompt.matches(PLAN_LIFECYCLE_GUIDANCE).count(), 1);
+    }
+
+    #[test]
+    fn connected_task_sessions_do_not_leak_into_local_work() {
+        use crate::connect::{Binding, Command, ConnectJournal, TurnPayload};
+        use crate::tasks::board::CreateTask;
+        let db = Arc::new(Database::open_memory().unwrap());
+        crate::agents::registry::AgentRegistry::new(db.clone())
+            .ensure("atlas", "native")
+            .unwrap();
+        let board = TaskBoard::new(db.clone());
+        let queue = TaskQueue::new(db.clone());
+        let local = board
+            .create(&CreateTask {
+                title: "Local task".into(),
+                agent_id: Some("atlas".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let local_item = queue.enqueue(&local.id, "atlas").unwrap();
+        db.with_conn(|conn|conn.execute("UPDATE work_attempts SET status='completed',runner='codex',native_session_id='local-session' WHERE id=?1",[local_item.attempt_id.as_deref().unwrap()])).unwrap();
+        queue.complete(local_item.id, "done").unwrap();
+        let journal = ConnectJournal::new(db.clone());
+        let binding = Binding {
+            id: uuid::Uuid::new_v4().to_string(),
+            local_project_id: "atlas".into(),
+            local_agent_id: "atlas".into(),
+            project_id: "cloud".into(),
+            agent_name: "atlas".into(),
+            generation: 1,
+            active: true,
+        };
+        journal.bind("instance", &binding).unwrap();
+        let command = Command {
+            version: 1,
+            id: uuid::Uuid::new_v4().to_string(),
+            binding,
+            kind: "task_turn".into(),
+            work_id: "123".into(),
+            source_conversation_id: None,
+            payload: TurnPayload {
+                text: "Implement assigned work".into(),
+                history: vec![],
+            },
+            expires_at: "2099-01-01T00:00:00Z".into(),
+            cancel_requested: false,
+        };
+        let now = chrono::Utc::now().timestamp();
+        let execution = journal.admit("instance", &command, now + 90, now).unwrap();
+        let connected = queue.claim("atlas").unwrap().unwrap();
+        assert_eq!(
+            session_start(&db, &connected, "codex").unwrap(),
+            AcpSessionStart::New
+        );
+        db.with_conn(|conn|conn.execute("UPDATE work_attempts SET status='completed',runner='codex',native_session_id='connected-session' WHERE id=?1",[execution.attempt_id.as_deref().unwrap()])).unwrap();
+        queue.complete(connected.id, "done").unwrap();
+        let next = board
+            .create(&CreateTask {
+                title: "Another local task".into(),
+                agent_id: Some("atlas".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let item = queue.enqueue(&next.id, "atlas").unwrap();
+        assert_eq!(
+            session_start(&db, &item, "codex").unwrap(),
+            AcpSessionStart::Fork("local-session".into())
+        );
     }
 
     #[test]

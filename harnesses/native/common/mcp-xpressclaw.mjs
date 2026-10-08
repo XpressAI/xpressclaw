@@ -19,6 +19,7 @@ const AGENT_ID = process.env.XPRESSCLAW_AGENT_ID ?? process.env.AGENT_ID ?? '';
 const TASK_ID = process.env.XPRESSCLAW_TASK_ID ?? '';
 const CONVERSATION_ID = process.env.XPRESSCLAW_CONVERSATION_ID ?? '';
 const CONNECTED = process.env.XPRESSCLAW_CONNECT === '1';
+const CONNECT_COMMAND_ID = process.env.XPRESSCLAW_CONNECT_COMMAND_ID;
 const CONNECTED_TOOLS = new Set(['send_conversation_message', 'publish_task_files', 'download_conversation_attachment', 'create_conversation_task', 'list_platform_attachments', 'get_task', 'update_task_step', 'update_task_status']);
 const PROJECT_ID = process.env.XPRESSCLAW_PROJECT_ID ?? '';
 const REPOSITORY_ROOT = process.env.XPRESSCLAW_REPOSITORY ?? '';
@@ -26,7 +27,7 @@ const LOCAL_COLLABORATION = process.env.XPRESSCLAW_LOCAL_COLLABORATION === '1';
 const COLLABORATION_TOKEN = process.env.XPRESSCLAW_COLLABORATION_TOKEN ?? '';
 const execFile = promisify(execFileCallback);
 
-const INSTRUCTIONS = CONNECTED ? `This turn belongs to Xpress AI. Your final response is returned to its chat or task automatically. Use send_conversation_message for interim updates and files (8 MiB per file, 20 MiB per turn), and list_platform_attachments and download_conversation_attachment for platform chat uploads. Use create_conversation_task to create independent follow-up work assigned to you in the same platform project. Local wake-ups and delegation are unavailable for connected turns; leave a clear final status when waiting. The platform owns task scheduling and cancellation. For an assigned task, call get_task to read its checklist, update_task_step for completed or skipped steps (zero-based step_num), then update_task_status with Done, Failed, Waiting, or Doing before your final reply. The requested status takes effect with the final reply, subject to the platform completion gates. Workspace paths are not download links; publish files before your final response.` : `Container paths such as /tmp are not user download links. Use publish_task_files for task deliverables, or send_conversation_message with files for conversation deliverables. Both support files and folder archives. Users can browse the container and download larger folders from Files → Container. Use forward_port for a host-local LLM and expose_port for a container server. For shared interactive logins, run tmux new-session -s NAME; the user can join NAME from the Files terminal.\n\nUse schedule_wakeup whenever work must pause and resume later.
+const INSTRUCTIONS = CONNECTED ? `This turn belongs to Xpress AI. Your final response is returned to its chat or task automatically. Use send_conversation_message for interim updates and files (8 MiB per file, 20 MiB per turn), and list_platform_attachments and download_conversation_attachment for platform chat uploads. Use create_conversation_task to create independent follow-up work assigned to you in the same platform project. Local wake-ups and delegation are unavailable for connected turns; leave a clear final status when waiting. The platform owns task scheduling and cancellation. When executing an assigned task, perform the work in that task; never create a replacement task for the same assignment. For an assigned task, call get_task to read its checklist, update_task_step for completed or skipped steps (zero-based step_num), then update_task_status with Done, Failed, Waiting, or Doing before your final reply. The requested status takes effect with the final reply, subject to the platform completion gates. Workspace paths are not download links; publish files before your final response.` : `Container paths such as /tmp are not user download links. Use publish_task_files for task deliverables, or send_conversation_message with files for conversation deliverables. Both support files and folder archives. Users can browse the container and download larger folders from Files → Container. Use forward_port for a host-local LLM and expose_port for a container server. For shared interactive logins, run tmux new-session -s NAME; the user can join NAME from the Files terminal.\n\nUse schedule_wakeup whenever work must pause and resume later.
 
 The wake-up is stored by XpressClaw, survives control-plane restarts, and starts exactly one future turn in this project's existing ACP conversation. After it is armed, end the current turn instead of sleeping, polling, or claiming that an OS timer can initiate a model turn.
 
@@ -319,7 +320,7 @@ export const TOOLS = [
       openWorldHint: false,
     },
   },
-  ...(CONVERSATION_ID ? [
+  ...((CONVERSATION_ID || CONNECTED) ? [
     {
       name: 'send_conversation_message',
       description: 'Send a genuine interim update or publish container files or folders to the current XpressClaw conversation while continuing work. Your normal final response is delivered automatically; never use this tool to duplicate it.',
@@ -1135,7 +1136,8 @@ export async function runManagedGitPush({
 }
 
 async function connectedTool(name, args) {
-  return api('/api/settings/connect/conversations/' + encodeURIComponent(CONVERSATION_ID) + '/tools', {
+  const path = CONNECT_COMMAND_ID ? '/api/settings/connect/commands/' + encodeURIComponent(CONNECT_COMMAND_ID) : '/api/settings/connect/conversations/' + encodeURIComponent(CONVERSATION_ID);
+  return api(path + '/tools', {
     method: 'POST', body: JSON.stringify({ name, arguments: args ?? {} }),
   });
 }

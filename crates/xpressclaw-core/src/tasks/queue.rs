@@ -35,8 +35,25 @@ impl TaskQueue {
         Self { db }
     }
 
+    fn ensure_locally_scheduled(&self, task_id: &str) -> Result<()> {
+        self.db.with_conn(|conn| {
+            let connected: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM connect_work WHERE kind='task_turn' AND local_id=?1)",
+                [task_id],
+                |r| r.get(0),
+            )?;
+            if connected {
+                return Err(Error::Task(
+                    "This task is scheduled by Xpress AI; continue it on the platform".into(),
+                ));
+            }
+            Ok(())
+        })
+    }
+
     /// Enqueue a task for an agent.
     pub fn enqueue(&self, task_id: &str, agent_id: &str) -> Result<QueueItem> {
+        self.ensure_locally_scheduled(task_id)?;
         let item = self.db.with_conn(|conn| {
             let transaction = rusqlite::Transaction::new_unchecked(
                 conn,
@@ -165,6 +182,7 @@ impl TaskQueue {
     /// recovery uses this after persisting task ownership but before (or after
     /// an interrupted) initial dispatch.
     pub fn ensure_enqueued(&self, task_id: &str, agent_id: &str) -> Result<Option<QueueItem>> {
+        self.ensure_locally_scheduled(task_id)?;
         let id = self.db.with_conn(|conn| {
             let transaction = rusqlite::Transaction::new_unchecked(
                 conn,
@@ -201,6 +219,7 @@ impl TaskQueue {
     /// turn. A running turn is intentionally not considered a duplicate: the
     /// continuation waits behind it and receives any messages sent meanwhile.
     pub fn enqueue_continuation(&self, task_id: &str, agent_id: &str) -> Result<Option<QueueItem>> {
+        self.ensure_locally_scheduled(task_id)?;
         let id = self.db.with_conn(|conn| {
             let transaction = rusqlite::Transaction::new_unchecked(
                 conn,
@@ -743,6 +762,11 @@ impl TaskQueue {
                            AND ({eligible})
                            AND (?2 IS NULL OR q.agent_id = ?2)
                            AND candidate.status = 'queued'
+                           AND (NOT EXISTS (SELECT 1 FROM connect_work w WHERE w.kind='task_turn' AND w.local_id=q.task_id)
+                             OR EXISTS (SELECT 1 FROM connect_commands c JOIN connect_bindings b ON b.id=c.binding_id
+                                JOIN agents bound ON bound.id=b.local_agent_id AND bound.project_id=b.local_project_id
+                                WHERE c.attempt_id=candidate.id AND c.status='accepted' AND c.lease_until > unixepoch(?1)
+                                  AND b.active=1 AND b.generation=c.binding_generation AND b.local_agent_id=q.agent_id AND t.agent_id=q.agent_id AND b.local_project_id=t.project_id))
                            AND NOT EXISTS (
                                SELECT 1 FROM task_dependencies d
                                JOIN tasks dependency ON dependency.id = d.depends_on_id

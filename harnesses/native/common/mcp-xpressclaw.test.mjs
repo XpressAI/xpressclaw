@@ -806,7 +806,8 @@ test('conversation tools publish files, download attachments, and create linked 
   }
 });
 
-test('connected tools publish through the platform bridge and cannot schedule local work', { timeout: 5000 }, async () => {
+for (const mode of ['legacy-chat', 'task-command']) {
+test(`connected ${mode} tools publish through the platform bridge and cannot schedule local work`, { timeout: 5000 }, async () => {
   const requests = [];
   const directory = await mkdtemp(path.join(tmpdir(), 'connect-tools-test-'));
   const file = path.join(directory, 'result.txt');
@@ -819,7 +820,7 @@ test('connected tools publish through the platform bridge and cannot schedule lo
   });
   server.listen(0, '127.0.0.1'); await once(server, 'listening');
   const child = spawn(process.execPath, [fileURLToPath(new URL('./mcp-xpressclaw.mjs', import.meta.url))], {
-    env: { ...process.env, XPRESSCLAW_WORKSPACE: directory, XPRESSCLAW_URL: `http://127.0.0.1:${server.address().port}`, XPRESSCLAW_AGENT_ID: 'atlas', XPRESSCLAW_CONVERSATION_ID: 'linked-turn', XPRESSCLAW_CONNECT: '1' }, stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, XPRESSCLAW_WORKSPACE: directory, XPRESSCLAW_URL: `http://127.0.0.1:${server.address().port}`, XPRESSCLAW_AGENT_ID: 'atlas', XPRESSCLAW_CONVERSATION_ID: mode === 'legacy-chat' ? 'linked-turn' : '', XPRESSCLAW_TASK_ID: mode === 'task-command' ? 'local-task' : '', XPRESSCLAW_CONNECT_COMMAND_ID: mode === 'task-command' ? 'execution-id' : '', XPRESSCLAW_CONNECT: '1' }, stdio: ['pipe', 'pipe', 'pipe'],
   });
   const output = createInterface({ input: child.stdout })[Symbol.asyncIterator](); let id = 0;
   async function call(method, params) {
@@ -830,6 +831,10 @@ test('connected tools publish through the platform bridge and cannot schedule lo
     const names = (await call('tools/list')).tools.map(tool => tool.name);
     assert.ok(names.includes('publish_task_files'));
     assert.ok(names.includes('update_task_status'));
+    assert.ok(names.includes('send_conversation_message'));
+    assert.ok(names.includes('create_conversation_task'));
+    await call('tools/call', { name: 'get_task', arguments: {} });
+    assert.equal(requests.pop().body.name, 'get_task');
     for (const name of ['forward_port', 'expose_port', 'list_port_forwards', 'remove_port_forward']) {
       assert.ok(!names.includes(name), name);
       const denied = await call('tools/call', { name, arguments: { direction: 'host_to_container', host_port: 8080, container_port: 8081, id: 'mapping' } });
@@ -841,10 +846,12 @@ test('connected tools publish through the platform bridge and cannot schedule lo
     assert.equal(denied.isError, true); assert.equal(requests.length, 0);
     const sent = await call('tools/call', { name: 'publish_task_files', arguments: { files: [file], content: 'Ready' } });
     assert.equal(sent.isError, false, JSON.stringify(sent));
-    assert.equal(requests.at(-1).url, '/api/settings/connect/conversations/linked-turn/tools');
+    assert.equal(requests.at(-1).url, mode === 'task-command' ? '/api/settings/connect/commands/execution-id/tools' : '/api/settings/connect/conversations/linked-turn/tools');
     assert.equal(requests.at(-1).body.name, 'send_message');
     assert.equal(Buffer.from(requests.at(-1).body.arguments.attachments[0].data, 'base64').toString(), 'result');
     await call('tools/call', { name: 'update_task_status', arguments: { status: 'Done' } });
     assert.deepEqual(requests.at(-1).body, { name: 'update_task_status', arguments: { status: 'Done' } });
   } finally { child.kill(); await new Promise(resolve => server.close(resolve)); await rm(directory, { recursive: true, force: true }); }
 });
+
+}

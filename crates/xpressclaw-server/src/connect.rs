@@ -82,6 +82,7 @@ pub fn routes() -> Router<AppState> {
         .route("/bindings", post(bind))
         .route("/bindings/{id}", delete(unbind))
         .route("/conversations/{id}/tools", post(proxy_tool))
+        .route("/commands/{id}/tools", post(proxy_execution_tool))
 }
 
 impl Settings {
@@ -231,6 +232,31 @@ async fn proxy_tool(
     let config = Settings::load(&state.config().system.data_dir)?;
     let command = ConnectJournal::new(state.db.clone())
         .tool_command(config.connected()?, &id, agent, Utc::now().timestamp())
+        .map_err(core_error)?;
+    Ok(Json(
+        config
+            .request(
+                reqwest::Method::POST,
+                &format!("/instance/commands/{command}/tools"),
+                Some(body),
+            )
+            .await?,
+    ))
+}
+
+async fn proxy_execution_tool(
+    State(state): State<AppState>,
+    RoutePath(id): RoutePath<String>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ConnectError> {
+    let agent = headers
+        .get("x-xpressclaw-agent-id")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| bad("Agent identity is required"))?;
+    let config = Settings::load(&state.config().system.data_dir)?;
+    let command = ConnectJournal::new(state.db.clone())
+        .tool_execution_command(config.connected()?, &id, agent, Utc::now().timestamp())
         .map_err(core_error)?;
     Ok(Json(
         config
@@ -527,6 +553,9 @@ async fn sync(state: &AppState) -> Result<(), ConnectError> {
         if uuid::Uuid::parse_str(&command.id).is_err() {
             return Err(unavailable("Invalid platform command identity"));
         }
+        if !journal.can_admit(instance, &command).map_err(core_error)? {
+            continue;
+        }
         let approved = journal
             .bindings(instance)
             .map_err(core_error)?
@@ -624,6 +653,17 @@ fn stop(
     execution: &xpressclaw_core::connect::Execution,
     lease_expired: bool,
 ) -> Result<(), ConnectError> {
+    if execution.attempt_id.is_some() {
+        if let Some(attempt) = ConnectJournal::new(state.db.clone())
+            .stop_task(&execution.id, lease_expired.then(|| Utc::now().timestamp()))
+            .map_err(core_error)?
+        {
+            state
+                .turn_controls
+                .request_interrupt(&attempt, AcpInterruptMode::Immediate);
+            state.elicitations.cancel_attempt(&attempt);
+        }
+    }
     if let (Some(conversation), Some(turn)) = (&execution.conversation_id, &execution.turn_id) {
         let queue = ConversationTurnQueue::new(state.db.clone());
         let cancellation = if lease_expired {
@@ -759,6 +799,15 @@ mod tests {
 
     #[tokio::test]
     async fn protocol_delivery_replays_one_local_turn_and_keeps_credentials_private() {
+        protocol_delivery("chat_turn").await;
+    }
+
+    #[tokio::test]
+    async fn protocol_task_delivery_uses_task_queue_and_returns_attempt_receipt() {
+        protocol_delivery("task_turn").await;
+    }
+
+    async fn protocol_delivery(kind: &str) {
         let directory = tempfile::tempdir().unwrap();
         let db = Arc::new(Database::open_memory().unwrap());
         AgentRegistry::new(db.clone())
@@ -786,7 +835,7 @@ mod tests {
             version: 1,
             id: uuid::Uuid::new_v4().to_string(),
             binding: binding.clone(),
-            kind: "chat_turn".into(),
+            kind: kind.into(),
             work_id: uuid::Uuid::new_v4().to_string(),
             source_conversation_id: None,
             payload: xpressclaw_core::connect::TurnPayload {
@@ -829,22 +878,39 @@ mod tests {
         sync(&state).await.unwrap();
         let pending = journal.pending("instance").unwrap();
         assert_eq!(pending.len(), 1);
-        let conversation = pending[0].conversation_id.as_ref().unwrap();
-        assert!(journal
-            .tool_command(
-                "instance",
-                conversation,
-                "other-agent",
-                Utc::now().timestamp()
-            )
-            .is_err());
-        db.with_conn(|conn| {
-            conn.execute(
-                "UPDATE conversation_turns SET status = 'completed' WHERE id = ?1",
-                [pending[0].turn_id.as_ref().unwrap()],
-            )
-        })
-        .unwrap();
+        if kind == "chat_turn" {
+            let conversation = pending[0].conversation_id.as_ref().unwrap();
+            assert!(journal
+                .tool_command(
+                    "instance",
+                    conversation,
+                    "other-agent",
+                    Utc::now().timestamp()
+                )
+                .is_err());
+            db.with_conn(|conn| {
+                conn.execute(
+                    "UPDATE conversation_turns SET status='completed' WHERE id=?1",
+                    [pending[0].turn_id.as_ref().unwrap()],
+                )
+            })
+            .unwrap();
+        } else {
+            assert!(pending[0].conversation_id.is_none());
+            let queue = xpressclaw_core::tasks::queue::TaskQueue::new(db.clone());
+            let item = queue.claim("atlas").unwrap().unwrap();
+            assert_eq!(Some(&item.task_id), pending[0].task_id.as_ref());
+            xpressclaw_core::sessions::SessionManager::new(db.clone())
+                .transition_attempt(
+                    item.attempt_id.as_deref().unwrap(),
+                    "completed",
+                    "Done",
+                    Some("Finished assigned work"),
+                    None,
+                )
+                .unwrap();
+            queue.complete(item.id, "Finished assigned work").unwrap();
+        }
         sync(&state).await.unwrap();
         assert!(journal.pending("instance").unwrap().is_empty());
         assert!(receipts
@@ -859,7 +925,14 @@ mod tests {
                 })
             })
             .unwrap();
-        assert_eq!(turns, 1);
+        assert_eq!(turns, if kind == "chat_turn" { 1 } else { 0 });
+        if kind == "task_turn" {
+            assert!(receipts
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r["text"] == "Finished assigned work"));
+        }
         platform_task.abort();
     }
 }

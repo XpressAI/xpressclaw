@@ -2768,6 +2768,7 @@ UPDATE task_messages SET agent_id = (
 "#;
 
 const MIGRATION_V50: &str = include_str!("connect/schema.sql");
+const MIGRATION_V51: &str = include_str!("connect/task_dispatch.sql");
 
 fn schema_migrations() -> &'static [(u32, &'static str)] {
     &[
@@ -2821,12 +2822,41 @@ fn schema_migrations() -> &'static [(u32, &'static str)] {
         (48, MIGRATION_V48),
         (49, MIGRATION_V49),
         (50, MIGRATION_V50),
+        (51, MIGRATION_V51),
     ]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v51_preserves_legacy_connect_receipts_and_transcripts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connect-upgrade.db");
+        ensure_sqlite_vec();
+        let conn = Connection::open(&path).unwrap();
+        register_sql_functions(&conn).unwrap();
+        conn.execute_batch("CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)").unwrap();
+        for &(_, sql) in schema_migrations()
+            .iter()
+            .filter(|(version, _)| *version <= 50)
+        {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.execute_batch("INSERT OR REPLACE INTO config(key,value) VALUES ('schema_version','50');
+            INSERT INTO conversations(id,title) VALUES ('chat','Existing Connect transcript');
+            INSERT INTO connect_bindings(id,instance_id,local_project_id,local_agent_id,generation,active,binding_json) VALUES ('binding','instance','project','agent',1,1,'{}');
+            INSERT INTO connect_commands(id,instance_id,binding_id,payload_hash,binding_generation,conversation_id,turn_id,status,result_text,acknowledged,lease_until) VALUES ('command','instance','binding','digest',1,'chat','turn','completed','Saved result',1,200);").unwrap();
+        drop(conn);
+        let db = Database::open(&path).unwrap();
+        db.with_conn(|conn| {
+            let saved:(String,String,bool,Option<String>,Option<String>)=conn.query_row("SELECT conversation_id,result_text,acknowledged,task_id,attempt_id FROM connect_commands WHERE id='command'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).unwrap();
+            assert_eq!(saved,("chat".into(),"Saved result".into(),true,None,None));
+            let title:String=conn.query_row("SELECT title FROM conversations WHERE id='chat'",[],|r|r.get(0)).unwrap();
+            assert_eq!(title,"Existing Connect transcript");
+        });
+    }
 
     #[test]
     fn message_agent_upgrade_recovers_unambiguous_authors_only() {
@@ -2930,7 +2960,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "50");
+        assert_eq!(version, "51");
         let visualization_table: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master

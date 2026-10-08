@@ -291,8 +291,8 @@ fn connected_tools_require_the_owning_instance_agent_and_live_lease() {
 
 #[test]
 fn reactivating_binding_advances_generation_and_expires_old_work() {
-    let (_, journal, mut command) = fixture();
-    journal.admit("instance", &command, 200, 100).unwrap();
+    let (db, journal, mut command) = fixture();
+    let old = journal.admit("instance", &command, 200, 100).unwrap();
     journal
         .disable_binding("instance", &command.binding.id)
         .unwrap();
@@ -300,6 +300,16 @@ fn reactivating_binding_advances_generation_and_expires_old_work() {
     journal.bind("instance", &command.binding).unwrap();
     assert_eq!(journal.pending("instance").unwrap()[0].lease_until, 0);
     command.id = Uuid::new_v4().to_string();
+    assert!(!journal.can_admit("instance", &command).unwrap());
+    ConversationTurnQueue::new(db)
+        .expire_lease(
+            old.conversation_id.as_deref().unwrap(),
+            old.turn_id.as_deref().unwrap(),
+            &old.id,
+            210,
+        )
+        .unwrap();
+    journal.collect("instance").unwrap();
     assert!(journal.admit("instance", &command, 300, 210).is_ok());
 }
 
@@ -425,5 +435,214 @@ fn renewed_lease_survives_a_stale_watchdog_snapshot() {
             .expire_lease(&running.conversation_id, &running.id, &command.id, 400)
             .unwrap()
             .changed
+    );
+}
+
+fn task_fixture() -> (Arc<Database>, ConnectJournal, Command, i64) {
+    let (db, journal, mut command) = fixture();
+    command.kind = "task_turn".into();
+    command.work_id = "38168".into();
+    (db, journal, command, chrono::Utc::now().timestamp())
+}
+
+#[test]
+fn connected_task_uses_native_queue_and_replays_without_conversations() {
+    let (db, journal, command, now) = task_fixture();
+    let first = journal.admit("instance", &command, now + 90, now).unwrap();
+    assert!(first.conversation_id.is_none());
+    assert!(first.turn_id.is_none());
+    let task = first.task_id.as_deref().unwrap();
+    let queue = crate::tasks::queue::TaskQueue::new(db.clone());
+    assert!(queue.enqueue(task, "atlas").is_err());
+    assert!(queue.enqueue_continuation(task, "atlas").is_err());
+    let item = queue.claim("atlas").unwrap().unwrap();
+    assert_eq!(item.task_id, task);
+    assert_eq!(item.attempt_id, first.attempt_id);
+    let replay = journal.admit("instance", &command, now + 90, now).unwrap();
+    assert_eq!(replay.attempt_id, first.attempt_id);
+    assert_eq!(replay.task_id, first.task_id);
+    db.with_conn(|conn| {
+        for table in ["tasks", "task_queue", "work_attempts", "task_messages"] {
+            let count: i64 =
+                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
+            assert_eq!(count, 1, "{table}");
+        }
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))?;
+        assert_eq!(count, 0);
+        Ok::<_, Error>(())
+    })
+    .unwrap();
+}
+
+#[test]
+fn subsequent_platform_attempt_reuses_task_and_returns_full_result() {
+    let (db, journal, mut command, now) = task_fixture();
+    let first = journal.admit("instance", &command, now + 90, now).unwrap();
+    let queue = crate::tasks::queue::TaskQueue::new(db.clone());
+    let item = queue.claim("atlas").unwrap().unwrap();
+    let output = "finished ".repeat(1000);
+    crate::sessions::SessionManager::new(db.clone())
+        .transition_attempt(
+            first.attempt_id.as_deref().unwrap(),
+            "completed",
+            "done",
+            Some(&output),
+            None,
+        )
+        .unwrap();
+    queue.complete(item.id, &output).unwrap();
+    journal.collect("instance").unwrap();
+    journal.acknowledge("instance", &command.id).unwrap();
+    assert_eq!(
+        journal
+            .admit("instance", &command, now + 90, now)
+            .unwrap()
+            .receipt
+            .text,
+        Some(output)
+    );
+    command.id = Uuid::new_v4().to_string();
+    command.payload.text = "Continue the existing assignment".into();
+    assert!(journal.can_admit("instance", &command).unwrap());
+    let second = journal.admit("instance", &command, now + 90, now).unwrap();
+    assert_eq!(first.task_id, second.task_id);
+    assert_ne!(first.attempt_id, second.attempt_id);
+    assert_eq!(
+        crate::tasks::board::TaskBoard::new(db.clone())
+            .list_all(None, None, 100)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(queue.claim("atlas").unwrap().is_some());
+}
+
+#[test]
+fn chat_commands_reuse_conversation_but_never_merge_receipts() {
+    let (db, journal, mut command) = fixture();
+    let first = journal.admit("instance", &command, 200, 100).unwrap();
+    command.id = Uuid::new_v4().to_string();
+    assert!(!journal.can_admit("instance", &command).unwrap());
+    assert!(journal.admit("instance", &command, 200, 100).is_err());
+    db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE conversation_turns SET status='completed' WHERE id=?1",
+            [first.turn_id.as_deref().unwrap()],
+        )
+    })
+    .unwrap();
+    journal.collect("instance").unwrap();
+    assert!(journal.can_admit("instance", &command).unwrap());
+    let second = journal.admit("instance", &command, 200, 100).unwrap();
+    assert_eq!(first.conversation_id, second.conversation_id);
+    assert_ne!(first.turn_id, second.turn_id);
+    assert_eq!(journal.pending("instance").unwrap().len(), 2);
+}
+
+#[test]
+fn connected_task_callbacks_and_claims_require_the_live_command_lease() {
+    let (db, journal, command, now) = task_fixture();
+    let first = journal.admit("instance", &command, now + 90, now).unwrap();
+    let attempt = first.attempt_id.as_deref().unwrap();
+    assert!(journal
+        .tool_execution_command("instance", &command.id, "atlas", now)
+        .is_err());
+    assert!(journal
+        .tool_execution_command("other", &command.id, "atlas", now)
+        .is_err());
+    let queue = crate::tasks::queue::TaskQueue::new(db.clone());
+    db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE tasks SET agent_id=NULL WHERE id=?1",
+            [first.task_id.as_deref().unwrap()],
+        )
+    })
+    .unwrap();
+    assert!(queue.claim("atlas").unwrap().is_none());
+    journal.renew("instance", &command.id, now + 180).unwrap();
+    assert_eq!(
+        journal.pending("instance").unwrap()[0].lease_until,
+        now + 90
+    );
+    db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE tasks SET agent_id='atlas' WHERE id=?1",
+            [first.task_id.as_deref().unwrap()],
+        )
+    })
+    .unwrap();
+    assert!(queue
+        .claim_at(None, chrono::DateTime::from_timestamp(now + 91, 0).unwrap())
+        .unwrap()
+        .is_none());
+    queue
+        .claim_at(None, chrono::DateTime::from_timestamp(now, 0).unwrap())
+        .unwrap()
+        .unwrap();
+    crate::sessions::SessionManager::new(db.clone())
+        .transition_attempt(attempt, "running", "working", None, None)
+        .unwrap();
+    assert_eq!(
+        journal
+            .tool_execution_command("instance", &command.id, "atlas", now)
+            .unwrap(),
+        command.id
+    );
+    assert!(journal
+        .tool_execution_command("instance", &command.id, "other", now)
+        .is_err());
+    assert!(journal
+        .tool_execution_command("instance", &command.id, "atlas", now + 91)
+        .is_err());
+    journal.renew("instance", &command.id, now + 200).unwrap();
+    assert!(journal
+        .stop_task(&command.id, Some(now + 91))
+        .unwrap()
+        .is_none());
+    assert!(journal
+        .stop_task(&command.id, Some(now + 201))
+        .unwrap()
+        .is_some());
+    journal.collect("instance").unwrap();
+    let result = journal.pending("instance").unwrap().remove(0);
+    assert_eq!(result.receipt.status, "failed");
+    assert_eq!(
+        result.receipt.error.as_deref(),
+        Some("execution_outcome_unknown_after_lease_expiry")
+    );
+    assert!(journal
+        .tool_execution_command("instance", &command.id, "atlas", now)
+        .is_err());
+    assert!(journal.stop_task(&command.id, None).unwrap().is_none());
+}
+
+#[test]
+fn cancelling_queued_connected_task_and_recovery_cannot_restart_it() {
+    let (db, journal, mut command, now) = task_fixture();
+    let first = journal.admit("instance", &command, now + 90, now).unwrap();
+    journal.stop_task(&command.id, None).unwrap();
+    journal.collect("instance").unwrap();
+    assert_eq!(
+        journal.pending("instance").unwrap()[0].receipt.status,
+        "cancelled"
+    );
+    let queue = crate::tasks::queue::TaskQueue::new(db.clone());
+    assert!(queue.claim("atlas").unwrap().is_none());
+    command.id = Uuid::new_v4().to_string();
+    let second = journal.admit("instance", &command, now + 90, now).unwrap();
+    assert_eq!(first.task_id, second.task_id);
+    journal.recover().unwrap();
+    queue.recover_in_progress().unwrap();
+    journal.collect("instance").unwrap();
+    assert!(queue.claim("atlas").unwrap().is_none());
+    let execution = journal
+        .pending("instance")
+        .unwrap()
+        .into_iter()
+        .find(|r| r.id == second.id)
+        .unwrap();
+    assert_eq!(
+        execution.receipt.error.as_deref(),
+        Some("execution_state_lost_after_restart")
     );
 }
