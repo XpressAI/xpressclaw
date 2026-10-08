@@ -864,6 +864,7 @@ impl TaskBoard {
                     id: task_id.to_string(),
                 });
             }
+            super::queue::TaskQueue::ensure_locally_scheduled(&transaction, task_id)?;
 
             if let Some(ref title) = req.title {
                 transaction.execute(
@@ -1580,17 +1581,27 @@ pub(super) fn ensure_task_agent_project(
     task_id: &str,
     agent_id: &str,
 ) -> Result<()> {
+    let (current_agent, task_project) = conn.query_row(
+        "SELECT agent_id, project_id FROM tasks WHERE id = ?1",
+        [task_id],
+        |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+            ))
+        },
+    )?;
+    // Native status transitions retain the bound Agent. Local assignment
+    // changes (including unassignment) must not invalidate a platform lease.
+    if current_agent.as_deref() != Some(agent_id) {
+        super::queue::TaskQueue::ensure_locally_scheduled(conn, task_id)?;
+    }
     // The update API historically uses an empty string as its unassigned
     // sentinel. Preserve that behavior; monitored pull requests apply their
     // stricter unassignment rule immediately after this check.
     if agent_id.is_empty() {
         return Ok(());
     }
-    let task_project = conn.query_row(
-        "SELECT project_id FROM tasks WHERE id = ?1",
-        [task_id],
-        |row| row.get::<_, Option<String>>(0),
-    )?;
     let agent_project = conn
         .query_row(
             "SELECT project_id FROM agents WHERE id = ?1",
