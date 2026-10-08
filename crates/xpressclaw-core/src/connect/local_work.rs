@@ -100,8 +100,11 @@ pub(super) fn admit_work(
             params![local_id, content],
         )?;
         let trigger = tx.last_insert_rowid();
-        let queued =
-            TaskQueue::enqueue_in_transaction(tx, &local_id, &command.binding.local_agent_id)?;
+        let queued = TaskQueue::enqueue_platform_task_in_transaction(
+            tx,
+            &local_id,
+            &command.binding.local_agent_id,
+        )?;
         tx.execute(
             "UPDATE work_attempts SET trigger_message_id=?2 WHERE id=?1",
             params![queued.attempt_id, trigger],

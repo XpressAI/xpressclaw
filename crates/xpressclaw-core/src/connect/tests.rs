@@ -759,6 +759,9 @@ fn local_messages_cannot_coalesce_interrupt_or_strand_connected_tasks() {
         assert!(queue
             .enqueue_continuation_for_message(task, "atlas", original.id, &original.timestamp)
             .is_err());
+        assert!(queue
+            .enqueue_review_follow_up_for_current_agent(task, "Local review")
+            .is_err());
         assert_eq!(messages.get_messages(task).unwrap().len(), 1, "{status}");
         assert_eq!(sessions.get_attempt(attempt).unwrap().status, status);
         db.with_conn(|conn| {
@@ -793,6 +796,144 @@ fn local_messages_cannot_coalesce_interrupt_or_strand_connected_tasks() {
                     .unwrap()
                     .task_id,
                 execution.task_id
+            );
+        }
+    }
+}
+
+#[test]
+fn planner_and_transactional_enqueue_cannot_modify_connected_tasks() {
+    use crate::tasks::planning::{PlanningAction, PlanningChange, PlanningFilter, TaskPlanner};
+    use crate::tasks::queue::TaskQueue;
+
+    let (db, journal, command, now) = task_fixture();
+    AgentRegistry::new(db.clone())
+        .ensure("helper", "native")
+        .unwrap();
+    db.with_conn(|conn| conn.execute("UPDATE agents SET project_id='atlas' WHERE id='helper'", []))
+        .unwrap();
+    let execution = journal.admit("instance", &command, now + 90, now).unwrap();
+    let task = execution.task_id.as_deref().unwrap();
+    let planner = TaskPlanner::new(db.clone());
+    let before = planner.get(task).unwrap();
+    assert!(before
+        .planning
+        .disabled_reason
+        .as_deref()
+        .unwrap()
+        .contains("scheduled by Xpress AI"));
+    assert_eq!(
+        planner.list(&PlanningFilter::default()).unwrap().tasks[0]
+            .planning
+            .disabled_reason,
+        before.planning.disabled_reason
+    );
+    let snapshot = serde_json::to_value(&before).unwrap();
+    for change in [
+        PlanningAction::Schedule {
+            start_after: Some("2099-01-01T00:00:00Z".into()),
+            activate: true,
+        },
+        PlanningAction::Backlog,
+        PlanningAction::Queue,
+        PlanningAction::Assign {
+            agent_id: "helper".into(),
+        },
+        PlanningAction::Priority { priority: 100 },
+        PlanningAction::Reorder {
+            before_id: Some("other".into()),
+            after_id: None,
+        },
+    ] {
+        let error = planner
+            .change(
+                task,
+                &PlanningChange {
+                    expected_revision: before.task.revision,
+                    change,
+                },
+            )
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("continue it on the platform"));
+        assert_eq!(
+            serde_json::to_value(planner.get(task).unwrap()).unwrap(),
+            snapshot
+        );
+    }
+    db.with_conn(|conn| {
+        let tx = conn.unchecked_transaction().unwrap();
+        assert!(TaskQueue::enqueue_in_transaction(&tx, task, "helper").is_err());
+    });
+    // Neither the assignment nor the platform command's attempt was changed.
+    let queue = TaskQueue::new(db.clone());
+    assert!(queue.claim("helper").unwrap().is_none());
+    let claimed = queue.claim("atlas").unwrap().unwrap();
+    assert_eq!(claimed.attempt_id, execution.attempt_id);
+    assert_eq!(
+        crate::sessions::SessionManager::new(db)
+            .get_attempt(claimed.attempt_id.as_deref().unwrap())
+            .unwrap()
+            .session_id,
+        "atlas"
+    );
+}
+
+#[test]
+fn cancelled_or_expired_claimed_task_accepts_next_command_after_worker_exit() {
+    use crate::sessions::SessionManager;
+    use crate::tasks::queue::TaskQueue;
+
+    for phase in ["queued", "preparing", "running"] {
+        for expire in [false, true] {
+            let (db, journal, mut command, now) = task_fixture();
+            let execution = journal.admit("instance", &command, now + 90, now).unwrap();
+            let attempt = execution.attempt_id.as_deref().unwrap();
+            let queue = TaskQueue::new(db.clone());
+            let claimed = queue.claim("atlas").unwrap().unwrap();
+            let sessions = SessionManager::new(db.clone());
+            if phase != "queued" {
+                sessions
+                    .transition_attempt(attempt, phase, "Test", None, None)
+                    .unwrap();
+            }
+            if phase == "running" {
+                sessions
+                    .set_container(attempt, "running-container")
+                    .unwrap();
+            }
+            journal
+                .stop_task(&command.id, expire.then_some(now + 91))
+                .unwrap();
+            journal.collect("instance").unwrap();
+            assert_eq!(queue.get(claimed.id).unwrap().status, "running");
+            command.id = Uuid::new_v4().to_string();
+            assert!(!journal.can_admit("instance", &command).unwrap());
+            if phase == "running" {
+                assert_eq!(
+                    queue
+                        .finalize_released_terminal_dispatch(claimed.id)
+                        .unwrap()
+                        .status,
+                    "running"
+                );
+                sessions.clear_container(attempt).unwrap();
+            }
+            assert_eq!(
+                queue
+                    .finalize_released_terminal_dispatch(claimed.id)
+                    .unwrap()
+                    .status,
+                "failed"
+            );
+            assert!(journal.can_admit("instance", &command).unwrap());
+            let next = journal
+                .admit("instance", &command, now + 200, now + 92)
+                .unwrap();
+            assert_eq!(next.task_id, execution.task_id);
+            assert_eq!(
+                queue.claim("atlas").unwrap().unwrap().attempt_id,
+                next.attempt_id
             );
         }
     }

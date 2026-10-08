@@ -1316,7 +1316,7 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
         None,
         None,
     )?;
-    if attempt_is_terminal(&preparing.status) {
+    if finish_terminal_dispatch_after_worker_exit(&db, &item, &preparing.status)? {
         return Ok(());
     }
     if let Some(conversation_id) = conversation_id(&db, &item.task_id) {
@@ -1375,7 +1375,7 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
                 None,
                 None,
             )?;
-            if attempt_is_terminal(&pulling.status) {
+            if finish_terminal_dispatch_after_worker_exit(&db, &item, &pulling.status)? {
                 return Ok(());
             }
             docker.pull_image(&spec.image).await?;
@@ -1482,7 +1482,11 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
     } else {
         None
     };
-    if attempt_is_terminal(&sessions.get_attempt(attempt_id)?.status) {
+    if finish_terminal_dispatch_after_worker_exit(
+        &db,
+        &item,
+        &sessions.get_attempt(attempt_id)?.status,
+    )? {
         return Ok(());
     }
     let workload_id = agent.name.as_str();
@@ -7245,6 +7249,38 @@ flows:
             expected_host
         );
         assert_eq!(local_runner_image_alias("example/custom:latest"), None);
+    }
+
+    #[test]
+    fn terminal_pre_execution_checkpoints_finalize_claimed_dispatches() {
+        for checkpoint in ["Preparing runner", "Pulling image", "Starting process"] {
+            let db = Arc::new(Database::open_memory().unwrap());
+            db.with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO tasks (id,title,agent_id) VALUES ('task','Task','atlas')",
+                    [],
+                )
+            })
+            .unwrap();
+            let queue = TaskQueue::new(db.clone());
+            let item = queue.enqueue("task", "atlas").unwrap();
+            queue.claim("atlas").unwrap().unwrap();
+            let sessions = SessionManager::new(db.clone());
+            let attempt = item.attempt_id.as_deref().unwrap();
+            sessions
+                .transition_attempt(attempt, "cancelled", "Cancelled", None, None)
+                .unwrap();
+            // A startup checkpoint cannot revive an attempt stopped while it
+            // was waiting for repository/image/process preparation.
+            let current = sessions
+                .transition_attempt(attempt, "preparing", checkpoint, None, None)
+                .unwrap();
+            assert!(
+                finish_terminal_dispatch_after_worker_exit(&db, &item, &current.status).unwrap()
+            );
+            assert_eq!(queue.get(item.id).unwrap().status, "failed");
+            assert_eq!(sessions.get_attempt(attempt).unwrap().status, "cancelled");
+        }
     }
 
     #[test]

@@ -59,7 +59,6 @@ impl TaskQueue {
                 conn,
                 rusqlite::TransactionBehavior::Immediate,
             )?;
-            Self::ensure_locally_scheduled(&transaction, task_id)?;
             let item = Self::enqueue_in_transaction(&transaction, task_id, agent_id)?;
             transaction.commit()?;
             Ok::<_, Error>(item)
@@ -72,6 +71,25 @@ impl TaskQueue {
     /// transaction. Conversation work uses this so dispatch cannot survive a
     /// failed linked-message publication.
     pub(crate) fn enqueue_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        task_id: &str,
+        agent_id: &str,
+    ) -> Result<QueueItem> {
+        Self::ensure_locally_scheduled(transaction, task_id)?;
+        Self::enqueue_authorized_in_transaction(transaction, task_id, agent_id)
+    }
+
+    /// Only Connect admission may bypass local scheduling policy, after
+    /// validating its command, binding, and lease in this same transaction.
+    pub(crate) fn enqueue_platform_task_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        task_id: &str,
+        agent_id: &str,
+    ) -> Result<QueueItem> {
+        Self::enqueue_authorized_in_transaction(transaction, task_id, agent_id)
+    }
+
+    fn enqueue_authorized_in_transaction(
         transaction: &rusqlite::Transaction<'_>,
         task_id: &str,
         agent_id: &str,
@@ -468,6 +486,7 @@ impl TaskQueue {
                 conn,
                 rusqlite::TransactionBehavior::Immediate,
             )?;
+            Self::ensure_locally_scheduled(&transaction, task_id)?;
             ensure_task_project_accepts_work(&transaction, task_id)?;
             let (agent_id, title, description, context, status): (
                 Option<String>,

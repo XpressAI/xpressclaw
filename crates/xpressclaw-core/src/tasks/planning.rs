@@ -94,6 +94,7 @@ const SNAPSHOT: &str = "WITH facts AS (
    ELSE 'queue'
  END AS lane,
  CASE
+   WHEN EXISTS(SELECT 1 FROM connect_work w WHERE w.kind='task_turn' AND w.local_id=facts.id) THEN 'This task is scheduled by Xpress AI; continue it on the platform.'
    WHEN status IN ('completed','cancelled') THEN 'Finished tasks cannot be planned. Open task details to reopen work.'
    WHEN claimed OR live THEN 'This task has an active turn. Planning cannot interrupt it.'
    WHEN reviewing THEN 'Pull-request review must be handled in task details.'
@@ -222,6 +223,7 @@ impl TaskPlanner {
     pub fn change(&self, id: &str, request: &PlanningChange) -> Result<PlanningTask> {
         self.db.with_conn(|conn| {
             let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+            TaskQueue::ensure_locally_scheduled(&tx, id)?;
             let current = read_planning(&tx, id)?;
             if current.task.revision != request.expected_revision {
                 return Err(Error::Task("Task changed since it was loaded. Refresh and try again.".into()));
