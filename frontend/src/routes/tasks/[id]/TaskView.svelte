@@ -34,6 +34,7 @@
 	let statusUpdating = $state(false);
 	let actionError = $state('');
 	async function openPlanning() {
+		if (platformManaged) return;
 		planningError = '';
 		planningLoading = true;
 		try {
@@ -335,6 +336,7 @@
 			? latestErrorAttempt?.error_message ?? null
 			: null
 	);
+	let platformManaged = $derived(task?.provenance === 'xpress_ai_connect');
 	let taskActivityStatus = $derived(task?.activity_status ?? task?.status ?? '');
 	let messagePlaceholder = $derived(
 		!task?.agent_id
@@ -1036,7 +1038,7 @@
 	}
 
 	async function sendTaskMessage(immediate = false) {
-		if ((!messageInput.trim() && messageAttachments.length === 0) || !task || composerBlockedByElicitation) return;
+		if ((!messageInput.trim() && messageAttachments.length === 0) || !task || platformManaged || composerBlockedByElicitation) return;
 		const content = messageInput.trim();
 		const attachments = messageAttachments;
 		messageAttachmentError = '';
@@ -1065,6 +1067,7 @@
 
 	async function sendVisualizationFollowUp(prompt: string): Promise<void> {
 		if (!task) throw new Error('This task is no longer available.');
+		if (platformManaged) throw new Error('Continue this task in Xpress AI.');
 		followLatest = true;
 		showJumpToLatest = false;
 		await tasks.addMessage(task.id, 'user', prompt, {
@@ -1076,7 +1079,7 @@
 	}
 
 	async function interruptAgent() {
-		if (!task?.agent_id || !runningAttempt || interrupting || messageSending) return;
+		if (!task?.agent_id || platformManaged || !runningAttempt || interrupting || messageSending) return;
 		if (!composerBlockedByElicitation && (messageInput.trim() || messageAttachments.length > 0)) {
 			await sendTaskMessage(true);
 			return;
@@ -1155,7 +1158,7 @@
 	}
 
 	async function updateStatus(status: string) {
-		if (!task || statusUpdating) return;
+		if (!task || platformManaged || statusUpdating) return;
 		statusUpdating = true;
 		actionError = '';
 		try {
@@ -1169,7 +1172,7 @@
 	}
 
 	function startEditing() {
-		if (!task) return;
+		if (!task || platformManaged) return;
 		editError = '';
 		editTitle = task.title;
 		editDesc = task.description || '';
@@ -1189,7 +1192,7 @@
 	}
 
 	async function saveEdit() {
-		if (!task || editSaving) return;
+		if (!task || platformManaged || editSaving) return;
 		editSaving = true;
 		editError = '';
 		try {
@@ -1533,17 +1536,19 @@
 					</div>
 				</div>
 				<div class="flex shrink-0 items-center gap-1" data-task-header-actions>
-					<button bind:this={settingsButton} type="button" class="task-action" aria-label="Task settings" title="Edit task and schedule" aria-haspopup="menu" aria-expanded={!!settingsMenu} disabled={planningLoading || statusUpdating} onclick={openSettings}>
-						<Settings size={17} aria-hidden="true" />
-					</button>
-					{#if task.status === 'pending'}
-						<button type="button" class="task-action text-primary" aria-label="Start task" title="Start task when eligible" disabled={statusUpdating} onclick={() => updateStatus('in_progress')}><Play size={17} aria-hidden="true" /></button>
-					{/if}
-					{#if ['in_progress', 'pending', 'waiting_for_input', 'blocked'].includes(task.status)}
-						<button type="button" class="task-action text-emerald-600 dark:text-emerald-400" aria-label="Complete task" title="Complete task" disabled={statusUpdating} onclick={() => updateStatus('completed')}><Check size={18} aria-hidden="true" /></button>
-						<button type="button" class="task-action" aria-label={task.status === 'in_progress' ? 'Stop and cancel task' : 'Cancel task'} title={task.status === 'in_progress' ? 'Stop and cancel task' : 'Cancel task'} disabled={statusUpdating} onclick={() => updateStatus('cancelled')}>
-							{#if task.status === 'in_progress'}<Square size={14} aria-hidden="true" />{:else}<X size={18} aria-hidden="true" />{/if}
+					{#if !platformManaged}
+						<button bind:this={settingsButton} type="button" class="task-action" aria-label="Task settings" title="Edit task and schedule" aria-haspopup="menu" aria-expanded={!!settingsMenu} disabled={planningLoading || statusUpdating} onclick={openSettings}>
+							<Settings size={17} aria-hidden="true" />
 						</button>
+						{#if task.status === 'pending'}
+							<button type="button" class="task-action text-primary" aria-label="Start task" title="Start task when eligible" disabled={statusUpdating} onclick={() => updateStatus('in_progress')}><Play size={17} aria-hidden="true" /></button>
+						{/if}
+						{#if ['in_progress', 'pending', 'waiting_for_input', 'blocked'].includes(task.status)}
+							<button type="button" class="task-action text-emerald-600 dark:text-emerald-400" aria-label="Complete task" title="Complete task" disabled={statusUpdating} onclick={() => updateStatus('completed')}><Check size={18} aria-hidden="true" /></button>
+							<button type="button" class="task-action" aria-label={task.status === 'in_progress' ? 'Stop and cancel task' : 'Cancel task'} title={task.status === 'in_progress' ? 'Stop and cancel task' : 'Cancel task'} disabled={statusUpdating} onclick={() => updateStatus('cancelled')}>
+								{#if task.status === 'in_progress'}<Square size={14} aria-hidden="true" />{:else}<X size={18} aria-hidden="true" />{/if}
+							</button>
+						{/if}
 					{/if}
 					<button type="button" class="task-action" aria-label={showDetailsSidebar ? 'Hide task details' : 'Show task details'} title={showDetailsSidebar ? 'Hide task details' : 'Show task details'} aria-expanded={showDetailsSidebar || detailsSheetOpen} aria-controls={viewId + (detailsSheetOpen || !detailsSidebarFits ? '-details-dialog' : '-details')} onclick={toggleDetailsSidebar}>
 						{#if showDetailsSidebar}<PanelRightClose size={17} aria-hidden="true" />{:else}<PanelRightOpen size={17} aria-hidden="true" />{/if}
@@ -1972,169 +1977,173 @@
 					</div>
 				{/if}
 
-				<!-- Message input -->
-				<div class="shrink-0 border-t border-border bg-background px-3 pb-4 pt-3 sm:px-6 sm:pb-5 sm:pt-4">
-					{#if task.status === 'waiting_for_input'}
-						<div class="text-xs text-orange-400 mb-2">The agent needs additional input</div>
-					{:else if !task.agent_id}
-						<div class="text-xs text-muted-foreground mb-2">Assign an agent before sending a message</div>
-					{/if}
-					<div bind:this={composerEl} class="ai-card relative transition-all focus-within:ring-1 focus-within:ring-primary/35">
-						{#if slashMenuOpen}
-							<div class="ai-raised absolute bottom-full left-0 right-0 z-40 mb-2 max-h-72 overflow-y-auto p-1.5 sm:right-auto sm:w-96">
-								{#if filteredCommands.length > 0}
-									{#each filteredCommands as command, index}
-										<button
-											type="button"
-											onpointerenter={() => (selectedCommandIndex = index)}
-											onclick={() => chooseCommand(command)}
-											class="block w-full rounded-lg px-3 py-2 text-left transition-colors {index === selectedCommandIndex ? 'bg-accent' : 'hover:bg-accent/60'}"
-										>
-											<span class="block font-mono text-xs text-foreground">{command.name.startsWith('/') ? command.name : `/${command.name}`}</span>
-											<span class="mt-0.5 block text-[11px] leading-snug text-muted-foreground">{command.description}</span>
-										</button>
-									{/each}
-								{:else}
-									<div class="px-3 py-3 text-xs text-muted-foreground">No matching commands</div>
-								{/if}
-							</div>
+				{#if platformManaged}
+					<p class="shrink-0 border-t border-border px-3 py-4 text-sm text-muted-foreground sm:px-6">This task is managed in Xpress AI. Continue or cancel it there.</p>
+				{:else}
+					<!-- Message input -->
+					<div class="shrink-0 border-t border-border bg-background px-3 pb-4 pt-3 sm:px-6 sm:pb-5 sm:pt-4">
+						{#if task.status === 'waiting_for_input'}
+							<div class="text-xs text-orange-400 mb-2">The agent needs additional input</div>
+						{:else if !task.agent_id}
+							<div class="text-xs text-muted-foreground mb-2">Assign an agent before sending a message</div>
 						{/if}
-
-						{#if modelMenuOpen && hasModelMenu}
-							<div class="ai-raised absolute bottom-full left-0 right-0 z-30 mb-2 max-h-[65vh] overflow-y-auto p-2 sm:right-auto sm:w-80">
-								{#if modelOption}
-									<div class="px-2 pb-1 pt-1 text-[10px] font-medium uppercase tracking-[0.14em] text-muted-foreground/60">Model</div>
-									<div class="space-y-0.5">
-										{#each selectChoices(modelOption) as choice}
-											<button type="button" onclick={() => setConfigOption(modelOption!, choice.value)}
-												class="flex w-full items-start gap-2 rounded-lg px-2 py-2 text-left transition-colors {String(selectedValue(modelOption!)) === choice.value ? 'bg-accent' : 'hover:bg-accent/60'}">
-												<span class="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full border {String(selectedValue(modelOption!)) === choice.value ? 'border-primary' : 'border-muted-foreground/35'}">
-													{#if String(selectedValue(modelOption!)) === choice.value}<span class="h-2 w-2 rounded-full bg-primary"></span>{/if}
-												</span>
-												<span class="min-w-0"><span class="block text-xs text-foreground">{choice.name}</span>{#if choice.description}<span class="mt-0.5 block text-[11px] leading-snug text-muted-foreground">{choice.description}</span>{/if}</span>
+						<div bind:this={composerEl} class="ai-card relative transition-all focus-within:ring-1 focus-within:ring-primary/35">
+							{#if slashMenuOpen}
+								<div class="ai-raised absolute bottom-full left-0 right-0 z-40 mb-2 max-h-72 overflow-y-auto p-1.5 sm:right-auto sm:w-96">
+									{#if filteredCommands.length > 0}
+										{#each filteredCommands as command, index}
+											<button
+												type="button"
+												onpointerenter={() => (selectedCommandIndex = index)}
+												onclick={() => chooseCommand(command)}
+												class="block w-full rounded-lg px-3 py-2 text-left transition-colors {index === selectedCommandIndex ? 'bg-accent' : 'hover:bg-accent/60'}"
+											>
+												<span class="block font-mono text-xs text-foreground">{command.name.startsWith('/') ? command.name : `/${command.name}`}</span>
+												<span class="mt-0.5 block text-[11px] leading-snug text-muted-foreground">{command.description}</span>
 											</button>
 										{/each}
-									</div>
-								{/if}
-
-								{#if reasoningOption}
-									<div class="mx-2 my-2 border-t border-border/60"></div>
-									<div class="px-2 pb-1 text-[10px] font-medium uppercase tracking-[0.14em] text-muted-foreground/60">Reasoning effort</div>
-									<div class="flex flex-wrap gap-1 px-2 pb-1">
-										{#each selectChoices(reasoningOption) as choice}
-											<button type="button" onclick={() => setConfigOption(reasoningOption!, choice.value)} title={choice.description || choice.name}
-												class="rounded-md px-2 py-1 text-[11px] transition-colors {String(selectedValue(reasoningOption!)) === choice.value ? 'bg-accent text-foreground' : 'text-muted-foreground hover:bg-accent/60 hover:text-foreground'}">
-												{choice.name}
-											</button>
-										{/each}
-									</div>
-								{/if}
-
-								{#each modelConfigOptions as option}
-									<div class="mx-2 my-2 border-t border-border/60"></div>
-									{#if option.type === 'boolean'}
-										<button type="button" onclick={() => setConfigOption(option, !Boolean(selectedValue(option)))} class="flex w-full items-center justify-between rounded-lg px-2 py-2 text-left hover:bg-accent/60">
-											<span><span class="block text-xs text-foreground">{option.name}</span>{#if option.description}<span class="mt-0.5 block text-[11px] text-muted-foreground">{option.description}</span>{/if}</span>
-											<span class="relative h-4 w-7 rounded-full transition-colors {Boolean(selectedValue(option)) ? 'bg-primary' : 'bg-muted'}"><span class="absolute top-0.5 h-3 w-3 rounded-full bg-white transition-transform {Boolean(selectedValue(option)) ? 'translate-x-3.5' : 'translate-x-0.5'}"></span></span>
-										</button>
 									{:else}
-										<div class="px-2 pb-1 text-[10px] font-medium uppercase tracking-[0.14em] text-muted-foreground/60">{option.name}</div>
-										<div class="flex flex-wrap gap-1 px-2">
-											{#each selectChoices(option) as choice}
-												<button type="button" onclick={() => setConfigOption(option, choice.value)} class="rounded-md px-2 py-1 text-[11px] {String(selectedValue(option)) === choice.value ? 'bg-accent text-foreground' : 'text-muted-foreground hover:bg-accent/60'}">{choice.name}</button>
+										<div class="px-3 py-3 text-xs text-muted-foreground">No matching commands</div>
+									{/if}
+								</div>
+							{/if}
+
+							{#if modelMenuOpen && hasModelMenu}
+								<div class="ai-raised absolute bottom-full left-0 right-0 z-30 mb-2 max-h-[65vh] overflow-y-auto p-2 sm:right-auto sm:w-80">
+									{#if modelOption}
+										<div class="px-2 pb-1 pt-1 text-[10px] font-medium uppercase tracking-[0.14em] text-muted-foreground/60">Model</div>
+										<div class="space-y-0.5">
+											{#each selectChoices(modelOption) as choice}
+												<button type="button" onclick={() => setConfigOption(modelOption!, choice.value)}
+													class="flex w-full items-start gap-2 rounded-lg px-2 py-2 text-left transition-colors {String(selectedValue(modelOption!)) === choice.value ? 'bg-accent' : 'hover:bg-accent/60'}">
+													<span class="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full border {String(selectedValue(modelOption!)) === choice.value ? 'border-primary' : 'border-muted-foreground/35'}">
+														{#if String(selectedValue(modelOption!)) === choice.value}<span class="h-2 w-2 rounded-full bg-primary"></span>{/if}
+													</span>
+													<span class="min-w-0"><span class="block text-xs text-foreground">{choice.name}</span>{#if choice.description}<span class="mt-0.5 block text-[11px] leading-snug text-muted-foreground">{choice.description}</span>{/if}</span>
+												</button>
 											{/each}
 										</div>
 									{/if}
-								{/each}
-							</div>
-						{/if}
 
-						<ImageAttachmentPreviews attachments={messageImagePreviews} onremove={(index) => (messageAttachments = messageAttachments.filter((_, itemIndex) => itemIndex !== index))} />
+									{#if reasoningOption}
+										<div class="mx-2 my-2 border-t border-border/60"></div>
+										<div class="px-2 pb-1 text-[10px] font-medium uppercase tracking-[0.14em] text-muted-foreground/60">Reasoning effort</div>
+										<div class="flex flex-wrap gap-1 px-2 pb-1">
+											{#each selectChoices(reasoningOption) as choice}
+												<button type="button" onclick={() => setConfigOption(reasoningOption!, choice.value)} title={choice.description || choice.name}
+													class="rounded-md px-2 py-1 text-[11px] transition-colors {String(selectedValue(reasoningOption!)) === choice.value ? 'bg-accent text-foreground' : 'text-muted-foreground hover:bg-accent/60 hover:text-foreground'}">
+													{choice.name}
+												</button>
+											{/each}
+										</div>
+									{/if}
 
-						<textarea
-							id="task-message-input-{taskId}"
-							bind:value={messageInput}
-							oninput={handleMessageInput}
-							onfocus={() => (messageInputFocused = true)}
-							onblur={() => setTimeout(() => (messageInputFocused = false), 150)}
-							onkeydown={handleMessageKeydown}
-							onpaste={handleMessagePaste}
-							oncompositionstart={() => (composing = true)}
-							oncompositionend={() => setTimeout(() => (composing = false), 0)}
-							placeholder={messagePlaceholder}
-							rows={2}
-							class="max-h-32 w-full resize-none rounded-xl bg-transparent px-4 pb-1 pt-3 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none"
-							disabled={messageSending || interrupting || !task.agent_id || composerBlockedByElicitation}
-						></textarea>
-						{#if messageAttachmentError}<div class="px-4 pb-1 text-xs text-destructive">{messageAttachmentError}</div>{/if}
-
-						<div class="flex min-h-9 items-center gap-2 px-3 pb-2">
-							<input bind:this={messageImageInput} type="file" multiple onchange={handleMessageImageInput} class="hidden" />
-							<button type="button" onclick={() => messageImageInput?.click()}
-								disabled={messageSending || interrupting || !task.agent_id || composerBlockedByElicitation || messageAttachments.length >= MAX_IMAGE_ATTACHMENTS}
-								aria-label="Attach files" title="Attach files (you can also paste images)"
-								class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-30">
-								<svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" /></svg>
-							</button>
-							{#key taskId}<DictationButton disabled={messageSending || interrupting || !task.agent_id || composerBlockedByElicitation} ontranscript={(text) => { messageInput = messageInput.trimEnd() ? `${messageInput.trimEnd()} ${text}` : text; composerEl?.querySelector<HTMLTextAreaElement>('textarea')?.focus(); }} />{/key}
-							{#if task.agent_id && (otherConfigOptions.length > 0 || hasModelMenu)}
-								<div class="flex min-w-0 flex-1 items-center gap-3 overflow-x-auto scrollbar-hide">
-									{#each otherConfigOptions as option}
+									{#each modelConfigOptions as option}
+										<div class="mx-2 my-2 border-t border-border/60"></div>
 										{#if option.type === 'boolean'}
-											<button type="button" onclick={() => setConfigOption(option, !Boolean(selectedValue(option)))} title={option.description || option.name}
-												class="shrink-0 text-xs transition-colors {Boolean(selectedValue(option)) ? 'text-foreground' : 'text-muted-foreground/60'} hover:text-foreground">
-												{option.name}
+											<button type="button" onclick={() => setConfigOption(option, !Boolean(selectedValue(option)))} class="flex w-full items-center justify-between rounded-lg px-2 py-2 text-left hover:bg-accent/60">
+												<span><span class="block text-xs text-foreground">{option.name}</span>{#if option.description}<span class="mt-0.5 block text-[11px] text-muted-foreground">{option.description}</span>{/if}</span>
+												<span class="relative h-4 w-7 rounded-full transition-colors {Boolean(selectedValue(option)) ? 'bg-primary' : 'bg-muted'}"><span class="absolute top-0.5 h-3 w-3 rounded-full bg-white transition-transform {Boolean(selectedValue(option)) ? 'translate-x-3.5' : 'translate-x-0.5'}"></span></span>
 											</button>
 										{:else}
-											<label class="relative shrink-0" title={option.description || option.name}>
-												<span class="sr-only">{option.name}</span>
-												<select value={String(selectedValue(option))} onchange={(event) => setConfigOption(option, event.currentTarget.value)}
-											class="composer-value-select max-w-36 cursor-pointer appearance-none bg-transparent py-1 pl-0 pr-4 text-xs text-muted-foreground outline-none transition-colors hover:text-foreground">
-													{#each selectChoices(option) as choice}<option value={choice.value}>{choice.name}</option>{/each}
-												</select>
-												<svg class="pointer-events-none absolute right-0 top-1/2 h-3 w-3 -translate-y-1/2 text-muted-foreground/50" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="m6 9 6 6 6-6" /></svg>
-											</label>
+											<div class="px-2 pb-1 text-[10px] font-medium uppercase tracking-[0.14em] text-muted-foreground/60">{option.name}</div>
+											<div class="flex flex-wrap gap-1 px-2">
+												{#each selectChoices(option) as choice}
+													<button type="button" onclick={() => setConfigOption(option, choice.value)} class="rounded-md px-2 py-1 text-[11px] {String(selectedValue(option)) === choice.value ? 'bg-accent text-foreground' : 'text-muted-foreground hover:bg-accent/60'}">{choice.name}</button>
+												{/each}
+											</div>
 										{/if}
 									{/each}
-
-									{#if hasModelMenu}
-										<button type="button" onclick={() => (modelMenuOpen = !modelMenuOpen)} aria-expanded={modelMenuOpen} title="Model and reasoning effort"
-											class="flex shrink-0 items-center gap-1 py-1 text-xs text-muted-foreground transition-colors hover:text-foreground">
-											<span>{modelOption ? selectedChoiceName(modelOption) : 'Model settings'}</span>
-											<svg class="h-3 w-3 text-muted-foreground/50" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="m6 9 6 6 6-6" /></svg>
-										</button>
-									{/if}
 								</div>
-							{:else}
-								<div class="flex-1"></div>
 							{/if}
-							{#if runningAttempt}
-								<button
-									type="button"
-									onclick={interruptAgent}
-									aria-label={!composerBlockedByElicitation && (messageInput.trim() || messageAttachments.length > 0) ? 'Interrupt and send now' : 'Interrupt agent now'}
-									title={!composerBlockedByElicitation && (messageInput.trim() || messageAttachments.length > 0) ? 'Interrupt the current work and send this message now' : 'Interrupt the current work now'}
-									disabled={messageSending || interrupting}
-								class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground shadow-[var(--shadow-control)] transition-colors hover:bg-destructive/10 hover:text-destructive disabled:cursor-not-allowed disabled:opacity-30"
-								>
-									{#if interrupting}
-										<svg class="h-4 w-4 animate-spin" fill="none" viewBox="0 0 24 24" aria-hidden="true"><circle class="opacity-25" cx="12" cy="12" r="9" stroke="currentColor" stroke-width="3"/><path class="opacity-75" fill="currentColor" d="M21 12a9 9 0 0 0-9-9v3a6 6 0 0 1 6 6z"/></svg>
-									{:else}
-										<svg class="h-3.5 w-3.5" fill="currentColor" viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="5" width="14" height="14" rx="1.5"/></svg>
-									{/if}
+
+							<ImageAttachmentPreviews attachments={messageImagePreviews} onremove={(index) => (messageAttachments = messageAttachments.filter((_, itemIndex) => itemIndex !== index))} />
+
+							<textarea
+								id="task-message-input-{taskId}"
+								bind:value={messageInput}
+								oninput={handleMessageInput}
+								onfocus={() => (messageInputFocused = true)}
+								onblur={() => setTimeout(() => (messageInputFocused = false), 150)}
+								onkeydown={handleMessageKeydown}
+								onpaste={handleMessagePaste}
+								oncompositionstart={() => (composing = true)}
+								oncompositionend={() => setTimeout(() => (composing = false), 0)}
+								placeholder={messagePlaceholder}
+								rows={2}
+								class="max-h-32 w-full resize-none rounded-xl bg-transparent px-4 pb-1 pt-3 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none"
+								disabled={messageSending || interrupting || !task.agent_id || composerBlockedByElicitation}
+							></textarea>
+							{#if messageAttachmentError}<div class="px-4 pb-1 text-xs text-destructive">{messageAttachmentError}</div>{/if}
+
+							<div class="flex min-h-9 items-center gap-2 px-3 pb-2">
+								<input bind:this={messageImageInput} type="file" multiple onchange={handleMessageImageInput} class="hidden" />
+								<button type="button" onclick={() => messageImageInput?.click()}
+									disabled={messageSending || interrupting || !task.agent_id || composerBlockedByElicitation || messageAttachments.length >= MAX_IMAGE_ATTACHMENTS}
+									aria-label="Attach files" title="Attach files (you can also paste images)"
+									class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-30">
+									<svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" /></svg>
 								</button>
-							{/if}
-							<button
-								onclick={() => sendTaskMessage()}
-								aria-label="Send message"
-								disabled={(!messageInput.trim() && messageAttachments.length === 0) || messageSending || interrupting || !task.agent_id || composerBlockedByElicitation}
-							class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground transition-[background-color,transform] hover:bg-primary/90 enabled:active:scale-95 disabled:cursor-not-allowed disabled:opacity-30"
-						>
-							<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M12 19V5M5 12l7-7 7 7" /></svg>
-							</button>
+								{#key taskId}<DictationButton disabled={messageSending || interrupting || !task.agent_id || composerBlockedByElicitation} ontranscript={(text) => { messageInput = messageInput.trimEnd() ? `${messageInput.trimEnd()} ${text}` : text; composerEl?.querySelector<HTMLTextAreaElement>('textarea')?.focus(); }} />{/key}
+								{#if task.agent_id && (otherConfigOptions.length > 0 || hasModelMenu)}
+									<div class="flex min-w-0 flex-1 items-center gap-3 overflow-x-auto scrollbar-hide">
+										{#each otherConfigOptions as option}
+											{#if option.type === 'boolean'}
+												<button type="button" onclick={() => setConfigOption(option, !Boolean(selectedValue(option)))} title={option.description || option.name}
+													class="shrink-0 text-xs transition-colors {Boolean(selectedValue(option)) ? 'text-foreground' : 'text-muted-foreground/60'} hover:text-foreground">
+													{option.name}
+												</button>
+											{:else}
+												<label class="relative shrink-0" title={option.description || option.name}>
+													<span class="sr-only">{option.name}</span>
+													<select value={String(selectedValue(option))} onchange={(event) => setConfigOption(option, event.currentTarget.value)}
+												class="composer-value-select max-w-36 cursor-pointer appearance-none bg-transparent py-1 pl-0 pr-4 text-xs text-muted-foreground outline-none transition-colors hover:text-foreground">
+														{#each selectChoices(option) as choice}<option value={choice.value}>{choice.name}</option>{/each}
+													</select>
+													<svg class="pointer-events-none absolute right-0 top-1/2 h-3 w-3 -translate-y-1/2 text-muted-foreground/50" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="m6 9 6 6 6-6" /></svg>
+												</label>
+											{/if}
+										{/each}
+
+										{#if hasModelMenu}
+											<button type="button" onclick={() => (modelMenuOpen = !modelMenuOpen)} aria-expanded={modelMenuOpen} title="Model and reasoning effort"
+												class="flex shrink-0 items-center gap-1 py-1 text-xs text-muted-foreground transition-colors hover:text-foreground">
+												<span>{modelOption ? selectedChoiceName(modelOption) : 'Model settings'}</span>
+												<svg class="h-3 w-3 text-muted-foreground/50" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="m6 9 6 6 6-6" /></svg>
+											</button>
+										{/if}
+									</div>
+								{:else}
+									<div class="flex-1"></div>
+								{/if}
+								{#if runningAttempt}
+									<button
+										type="button"
+										onclick={interruptAgent}
+										aria-label={!composerBlockedByElicitation && (messageInput.trim() || messageAttachments.length > 0) ? 'Interrupt and send now' : 'Interrupt agent now'}
+										title={!composerBlockedByElicitation && (messageInput.trim() || messageAttachments.length > 0) ? 'Interrupt the current work and send this message now' : 'Interrupt the current work now'}
+										disabled={messageSending || interrupting}
+									class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground shadow-[var(--shadow-control)] transition-colors hover:bg-destructive/10 hover:text-destructive disabled:cursor-not-allowed disabled:opacity-30"
+									>
+										{#if interrupting}
+											<svg class="h-4 w-4 animate-spin" fill="none" viewBox="0 0 24 24" aria-hidden="true"><circle class="opacity-25" cx="12" cy="12" r="9" stroke="currentColor" stroke-width="3"/><path class="opacity-75" fill="currentColor" d="M21 12a9 9 0 0 0-9-9v3a6 6 0 0 1 6 6z"/></svg>
+										{:else}
+											<svg class="h-3.5 w-3.5" fill="currentColor" viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="5" width="14" height="14" rx="1.5"/></svg>
+										{/if}
+									</button>
+								{/if}
+								<button
+									onclick={() => sendTaskMessage()}
+									aria-label="Send message"
+									disabled={(!messageInput.trim() && messageAttachments.length === 0) || messageSending || interrupting || !task.agent_id || composerBlockedByElicitation}
+								class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground transition-[background-color,transform] hover:bg-primary/90 enabled:active:scale-95 disabled:cursor-not-allowed disabled:opacity-30"
+							>
+								<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M12 19V5M5 12l7-7 7 7" /></svg>
+								</button>
+							</div>
 						</div>
 					</div>
-				</div>
+				{/if}
 			</div>
 
 			<aside id={viewId + '-details'} data-task-details-sidebar aria-label="Task details" hidden={!showDetailsSidebar} class="w-72 shrink-0 space-y-4 overflow-y-auto border-l border-border p-4">
