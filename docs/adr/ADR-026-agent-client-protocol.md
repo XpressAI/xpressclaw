@@ -101,7 +101,10 @@ one minute between requests. Retries reuse the same prompt, native session,
 and task attempt or conversation turn; they do not create new work or rerun
 session setup. Intermediate failures stay in server diagnostics rather than
 appearing as failed work or chat errors. Claude's matching synthetic error
-message is also withheld from the visible transcript during recovery.
+message is buffered until the prompt response confirms the matching error,
+then withheld from the visible transcript during recovery. Successful replies
+that quote the error, and replies preceding unrelated failures, retain their
+text and message order.
 
 Automatic replay is permitted only before genuine assistant output, thought,
 tool, plan, permission, or elicitation activity. Metadata and echoed user input

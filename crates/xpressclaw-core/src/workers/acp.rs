@@ -409,6 +409,7 @@ struct TurnState {
     assistant_text: String,
     last_assistant_text: String,
     current_message_id: Option<String>,
+    deferred_agent_messages: Vec<(Option<String>, String)>,
     pending_thought: String,
     tool_titles: HashMap<String, String>,
     transcript: Vec<Value>,
@@ -481,6 +482,7 @@ impl AcpEventRecorder {
         state.assistant_text.clear();
         state.last_assistant_text.clear();
         state.current_message_id = None;
+        state.deferred_agent_messages.clear();
         state.pending_thought.clear();
         state.capture_prompt_output = true;
         state.prompt_activity_seen = false;
@@ -495,10 +497,11 @@ impl AcpEventRecorder {
         if state.has_prompt_activity(&self.runner) {
             return false;
         }
-        // Atomically recheck and discard only the synthetic failure notice;
-        // never erase work that arrived during the backoff.
+        // Called only after a matching JSON-RPC error. Atomically recheck and
+        // discard its synthetic notices, never work received during backoff.
         state.assistant_text.clear();
         state.current_message_id = None;
+        state.deferred_agent_messages.clear();
         true
     }
 
@@ -876,15 +879,28 @@ impl AcpEventRecorder {
             if message.is_empty() {
                 return Ok(());
             }
-            // Claude can echo its synthetic auth failure before the JSON-RPC
-            // error. Keep that notice in diagnostics, not the visible transcript.
-            if is_claude_oauth_refresh_notice(&self.runner, &message) {
+            let refresh_notice = is_claude_oauth_refresh_notice(&self.runner, &message);
+            if !refresh_notice {
+                state.prompt_activity_seen = true;
+            }
+            // The same text can be a legitimate quote in a successful response.
+            // Keep it, and subsequent messages in order, until the JSON-RPC
+            // response tells us whether this prompt actually hit the conflict.
+            if refresh_notice || !state.deferred_agent_messages.is_empty() {
+                state.deferred_agent_messages.push((message_id, message));
                 return Ok(());
             }
-            state.prompt_activity_seen = true;
-            state.last_assistant_text = message.clone();
             (message_id, message)
         };
+        self.publish_agent_message(message_id, message)
+    }
+
+    fn publish_agent_message(&self, message_id: Option<String>, message: String) -> Result<()> {
+        {
+            let mut state = self.state.lock().unwrap();
+            state.prompt_activity_seen = true;
+            state.last_assistant_text = message.clone();
+        }
         if self.conversation_id.is_some() {
             if let Err(error) = DashboardManager::new(self.db.clone())
                 .record_conversation_agent_update(&self.attempt_id, &message)
@@ -901,6 +917,25 @@ impl AcpEventRecorder {
                 "message_id": message_id,
             }),
         )
+    }
+
+    fn resolve_prompt_output(&self, refresh_conflict: bool) -> Result<()> {
+        let deferred = {
+            let mut state = self.state.lock().unwrap();
+            if refresh_conflict
+                && is_claude_oauth_refresh_notice(&self.runner, &state.assistant_text)
+            {
+                state.assistant_text.clear();
+                state.current_message_id = None;
+            }
+            std::mem::take(&mut state.deferred_agent_messages)
+        };
+        for (message_id, message) in deferred {
+            if !refresh_conflict || !is_claude_oauth_refresh_notice(&self.runner, &message) {
+                self.publish_agent_message(message_id, message)?;
+            }
+        }
+        Ok(())
     }
 
     fn flush_prompt_output(&self) -> Result<()> {
@@ -1748,7 +1783,6 @@ async fn run_connected_turn(
         };
         if cancelled {
             interrupt_sent.store(true, Ordering::SeqCst);
-            recorder.prepare_prompt_retry();
             break response;
         }
         // An update can arrive after the error response while we're backing off.
@@ -1756,6 +1790,14 @@ async fn run_connected_turn(
             break response;
         }
     };
+    recorder
+        .resolve_prompt_output(
+            response
+                .as_ref()
+                .err()
+                .is_some_and(|error| is_claude_oauth_refresh_conflict(&recorder.runner, error)),
+        )
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
     let interrupted = interrupt_sent.load(Ordering::SeqCst);
     if let Err(error) = DashboardManager::new(recorder.db.clone()).record_prompt_usage(
         &prompt_id,
@@ -2147,6 +2189,100 @@ mod tests {
         assert_eq!(times.len(), 2);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn claude_oauth_quote_in_a_successful_reply_survives_metadata_flushes() {
+        for conversation_lane in [false, true] {
+            let quote = format!("{OAUTH_REFRESH_CONFLICT}\nThis message means another process holds the refresh lock.");
+            let (result, times) = oauth_retry_scenario_in_lane(
+                "claude",
+                "unused error",
+                0,
+                Some(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                    ContentBlock::Text(TextContent::new(quote.clone())),
+                ))),
+                RetryTestAction::None,
+                conversation_lane,
+            )
+            .await;
+            assert_eq!(result.unwrap().summary, quote);
+            assert_eq!(times.len(), 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn claude_oauth_quote_is_preserved_when_the_request_fails_for_another_reason() {
+        let (result, times) = oauth_retry_scenario(
+            "claude",
+            "Internal error: connection lost",
+            1,
+            Some(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                ContentBlock::Text(TextContent::new(OAUTH_REFRESH_CONFLICT)),
+            ))),
+            RetryTestAction::None,
+        )
+        .await;
+        assert!(result.unwrap_err().to_string().contains("connection lost"));
+        assert_eq!(times.len(), 1);
+        // The scenario also checks that the flushed quote remains visible.
+    }
+
+    #[test]
+    fn claude_oauth_candidates_preserve_message_order_until_the_response() {
+        for refresh_conflict in [false, true] {
+            let db = Arc::new(Database::open_memory().unwrap());
+            let (mut recorder, _) = test_recorder(db.clone());
+            recorder.runner = "claude".into();
+            for (message_id, text) in [
+                ("quoted-error", OAUTH_REFRESH_CONFLICT),
+                (
+                    "explanation",
+                    "This is the explanation, not an auth failure.",
+                ),
+            ] {
+                recorder
+                    .record_notification(SessionNotification::new(
+                        "native-1",
+                        SessionUpdate::AgentMessageChunk(
+                            ContentChunk::new(ContentBlock::Text(TextContent::new(text)))
+                                .message_id(message_id),
+                        ),
+                    ))
+                    .unwrap();
+            }
+            recorder.flush_prompt_output().unwrap();
+            assert!(recorder.has_prompt_activity());
+            assert!(!recorder.prepare_prompt_retry(), "must retain real output");
+            let manager = SessionManager::new(db);
+            assert!(!manager
+                .list_events("session-1", None, 100)
+                .unwrap()
+                .iter()
+                .any(|event| event.payload["item_type"] == "agent_message"));
+
+            recorder.resolve_prompt_output(refresh_conflict).unwrap();
+            let messages = manager
+                .list_events("session-1", None, 100)
+                .unwrap()
+                .into_iter()
+                .filter(|event| event.payload["item_type"] == "agent_message")
+                .collect::<Vec<_>>();
+            assert_eq!(messages.len(), if refresh_conflict { 1 } else { 2 });
+            if !refresh_conflict {
+                assert_eq!(messages[0].payload["message_id"], "quoted-error");
+                assert_eq!(messages[0].summary, OAUTH_REFRESH_CONFLICT);
+            }
+            assert_eq!(
+                messages.last().unwrap().payload["message_id"],
+                "explanation"
+            );
+            assert_eq!(
+                recorder.finish().unwrap().0,
+                messages.last().unwrap().summary
+            );
+            assert!(recorder.has_prompt_activity());
+        }
+    }
+
     #[test]
     fn claude_oauth_notice_is_buffered_across_chunks_without_hiding_real_work() {
         let db = Arc::new(Database::open_memory().unwrap());
@@ -2172,7 +2308,7 @@ mod tests {
             .list_events("session-1", None, 100)
             .unwrap()
             .iter()
-            .any(|event| event.event_type == "agent_message"));
+            .any(|event| event.payload["item_type"] == "agent_message"));
 
         // Real output that has already been flushed still prevents replay even
         // when the most recent message is the synthetic error notice.
@@ -2275,6 +2411,13 @@ mod tests {
         let (output_tx, output_rx) = tokio::sync::mpsc::channel(8);
         let delayed_output = output_tx.clone();
         let (first_error_tx, first_error_rx) = oneshot::channel();
+        let refresh_conflict = runner == "claude"
+            && error
+                .to_ascii_lowercase()
+                .contains(CLAUDE_OAUTH_REFRESH_CONFLICT);
+        let sends_quote = matches!(&update, Some(SessionUpdate::AgentMessageChunk(chunk))
+            if matches!(&chunk.content, ContentBlock::Text(text)
+                if text.text.contains(OAUTH_REFRESH_CONFLICT)));
         let error = error.to_string();
         let mock_agent = tokio::spawn(async move {
             let mut requests = BufReader::new(agent_input).lines();
@@ -2303,7 +2446,7 @@ mod tests {
                             first_prompt = Some(request["params"].clone());
                         }
                         prompt_times.push(tokio::time::Instant::now());
-                        if prompt_times.len() <= failures {
+                        if prompt_times.len() <= failures || failures == 0 {
                             if let Some(update) = update.clone() {
                                 send_json(
                                     &output_tx,
@@ -2313,7 +2456,18 @@ mod tests {
                                     }),
                                 )
                                 .await;
+                                send_json(
+                                    &output_tx,
+                                    json!({
+                                        "jsonrpc": "2.0", "method": "session/update",
+                                        "params": SessionNotification::new("oauth-session",
+                                            SessionUpdate::UsageUpdate(agent_client_protocol::schema::v1::UsageUpdate::new(10, 100))),
+                                    }),
+                                )
+                                .await;
                             }
+                        }
+                        if prompt_times.len() <= failures {
                             send_json(&output_tx, json!({
                                 "jsonrpc": "2.0", "id": id,
                                 "error": {"code": -32603, "message": error, "data": {"errorKind": "server_error"}},
@@ -2323,7 +2477,10 @@ mod tests {
                             }
                             continue;
                         }
-                        send_json(
+                        if failures == 0 && update.is_some() {
+                            json!(PromptResponse::new(StopReason::EndTurn))
+                        } else {
+                            send_json(
                             &output_tx,
                             json!({
                                 "jsonrpc": "2.0", "method": "session/update",
@@ -2333,7 +2490,8 @@ mod tests {
                             }),
                         )
                         .await;
-                        json!(PromptResponse::new(StopReason::EndTurn))
+                            json!(PromptResponse::new(StopReason::EndTurn))
+                        }
                     }
                     other => panic!("unexpected ACP method: {other}"),
                 };
@@ -2421,9 +2579,16 @@ mod tests {
         let events = SessionManager::new(db)
             .list_events("session-1", None, 100)
             .unwrap();
-        assert!(!events
-            .iter()
-            .any(|event| event.summary.contains("Failed to refresh OAuth")));
+        if failures > 0 && refresh_conflict {
+            assert!(!events
+                .iter()
+                .any(|event| event.summary.contains("Failed to refresh OAuth")));
+        } else if sends_quote && !conversation_lane {
+            assert!(events
+                .iter()
+                .any(|event| event.payload["item_type"] == "agent_message"
+                    && event.summary.contains(OAUTH_REFRESH_CONFLICT)));
+        }
         (result, mock_agent.await.unwrap())
     }
 
