@@ -762,6 +762,18 @@ impl DockerManager {
     /// inspect failures are reported instead of being mistaken for absence.
     /// A same-named container without matching ownership labels is preserved.
     pub async fn remove_owned_workload(&self, agent_id: &str) -> Result<()> {
+        // Validate the whole set before deleting any writable layer. Upgraded
+        // installations can own both a retained environment and a legacy one.
+        let candidates = self.removable_owned_workload(agent_id).await?;
+        for container_name in candidates {
+            self.remove_container_reference(&container_name, agent_id)
+                .await?;
+            self.stop_agent_forwards(agent_id).await;
+        }
+        Ok(())
+    }
+
+    async fn removable_owned_workload(&self, agent_id: &str) -> Result<Vec<String>> {
         let mut candidates = Vec::with_capacity(2);
         if let Some(installation_id) = self.installation_id.as_deref() {
             candidates.push(project_container_name(installation_id, agent_id));
@@ -770,6 +782,7 @@ impl DockerManager {
         candidates.sort();
         candidates.dedup();
 
+        let mut owned = Vec::new();
         for container_name in candidates {
             let container = match self.docker.inspect_container(&container_name, None).await {
                 Ok(container) => container,
@@ -794,11 +807,10 @@ impl DockerManager {
             ) {
                 continue;
             }
-            self.remove_container_reference(&container_name, agent_id)
-                .await?;
-            self.stop_agent_forwards(agent_id).await;
+            self.ensure_no_container_dependents(&container_name).await?;
+            owned.push(container_name);
         }
-        Ok(())
+        Ok(owned)
     }
 
     /// Remove an exact container ID read from a Project-owned durable row.
@@ -858,22 +870,24 @@ impl DockerManager {
 
     /// Read-only preflight for explicit rebuild/deletion, before retiring any
     /// process. Agent-created containers need not carry XpressClaw labels.
+    /// Includes installation-owned legacy containers even if no retained
+    /// environment exists yet.
     pub async fn ensure_project_removable(&self, agent_id: &str) -> Result<()> {
         let installation = self.installation_id()?;
         let name = project_container_name(installation, agent_id);
-        let Some(container) = self.inspect_optional(&name).await? else {
-            return Ok(());
-        };
-        let labels = container
-            .config
-            .and_then(|config| config.labels)
-            .unwrap_or_default();
-        if !project_ownership_matches(&labels, installation, agent_id) {
-            return Err(Error::Container(format!(
-                "refusing to rebuild Agent {agent_id}'s environment with mismatched ownership"
-            )));
+        if let Some(container) = self.inspect_optional(&name).await? {
+            let labels = container
+                .config
+                .and_then(|config| config.labels)
+                .unwrap_or_default();
+            if !project_ownership_matches(&labels, installation, agent_id) {
+                return Err(Error::Container(format!(
+                    "refusing to rebuild Agent {agent_id}'s environment with mismatched ownership"
+                )));
+            }
         }
-        self.ensure_no_container_dependents(&name).await
+        self.removable_owned_workload(agent_id).await?;
+        Ok(())
     }
 
     async fn ensure_no_container_dependents(&self, reference: &str) -> Result<()> {
@@ -2242,6 +2256,184 @@ mod tests {
             .unwrap()
             .iter()
             .all(|request| request.starts_with("GET ")));
+        server.abort();
+    }
+
+    fn mixed_owned_environments() -> HashMap<String, (u16, serde_json::Value)> {
+        let name = project_container_name("installation", "zed");
+        assert!(name.as_str() < "xpressclaw-zed");
+        let retained = serde_json::json!({
+            "Id": "current", "Name": name,
+            "Config": {"Labels": project_container_labels("spec", "installation", "zed")},
+            "HostConfig": {}
+        });
+        let legacy = serde_json::json!({
+            "Id": "legacy", "Name": "xpressclaw-zed",
+            "Config": {"Labels": {INSTALLATION_LABEL: "installation"}},
+            "HostConfig": {}
+        });
+        HashMap::from([
+            (
+                format!("GET /containers/{name}/json"),
+                (200, retained.clone()),
+            ),
+            ("GET /containers/current/json".into(), (200, retained)),
+            (
+                "GET /containers/xpressclaw-zed/json".into(),
+                (200, legacy.clone()),
+            ),
+            ("GET /containers/legacy/json".into(), (200, legacy)),
+            (
+                "GET /containers/json".into(),
+                (
+                    200,
+                    serde_json::json!([
+                        {"Id":"current"}, {"Id":"legacy"}, {"Id":"child"}
+                    ]),
+                ),
+            ),
+            (
+                "GET /containers/child/json".into(),
+                (
+                    200,
+                    serde_json::json!({
+                        "Id":"child", "Name":"/legacy-experiment",
+                        "HostConfig":{"NetworkMode":"container:legacy"}
+                    }),
+                ),
+            ),
+            (
+                format!("DELETE /containers/{name}"),
+                (204, serde_json::Value::Null),
+            ),
+            (
+                "DELETE /containers/xpressclaw-zed".into(),
+                (204, serde_json::Value::Null),
+            ),
+        ])
+    }
+
+    #[tokio::test]
+    async fn owned_removal_preflights_legacy_dependencies_and_inspection_before_any_deletion() {
+        for inspection_failure in [false, true] {
+            let mut responses = mixed_owned_environments();
+            if inspection_failure {
+                responses.insert(
+                    "GET /containers/xpressclaw-zed/json".into(),
+                    (
+                        500,
+                        serde_json::json!({"message":"legacy inspection failed"}),
+                    ),
+                );
+            }
+            for preflight_only in [false, true] {
+                let (docker, requests, server) = mock_engine(responses.clone()).await;
+                let result = if preflight_only {
+                    docker.ensure_project_removable("zed").await
+                } else {
+                    docker.remove_owned_workload("zed").await
+                };
+                let error = result.unwrap_err().to_string();
+                assert!(
+                    error.contains(if inspection_failure {
+                        "legacy inspection failed"
+                    } else {
+                        "legacy-experiment"
+                    }),
+                    "{error}"
+                );
+                assert!(requests.lock().unwrap().iter().all(|request| request.starts_with("GET ")),
+                    "inspection_failure={inspection_failure}, preflight_only={preflight_only}: {:?}", requests.lock().unwrap());
+                server.abort();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn project_preflight_checks_legacy_dependencies_without_a_retained_container() {
+        let mut responses = mixed_owned_environments();
+        responses.insert(
+            format!(
+                "GET /containers/{}/json",
+                project_container_name("installation", "zed")
+            ),
+            (404, serde_json::json!({"message":"no retained container"})),
+        );
+        let (docker, requests, server) = mock_engine(responses).await;
+        let error = docker
+            .ensure_project_removable("zed")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("legacy-experiment"), "{error}");
+        assert!(requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|request| request.starts_with("GET ")));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn owned_removal_checks_both_environments_before_deleting_either() {
+        let mut responses = mixed_owned_environments();
+        responses.insert(
+            "GET /containers/json".into(),
+            (
+                200,
+                serde_json::json!([
+                    {"Id":"current"}, {"Id":"legacy"}
+                ]),
+            ),
+        );
+        let (docker, requests, server) = mock_engine(responses).await;
+        docker.ensure_project_removable("zed").await.unwrap();
+        requests.lock().unwrap().clear();
+        docker.remove_owned_workload("zed").await.unwrap();
+        let requests = requests.lock().unwrap();
+        let first_deletion = requests
+            .iter()
+            .position(|request| request.starts_with("DELETE "))
+            .unwrap();
+        assert!(requests[..first_deletion]
+            .iter()
+            .any(|request| request == "GET /containers/xpressclaw-zed/json"));
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.starts_with("DELETE "))
+                .count(),
+            2
+        );
+        assert!(!requests.iter().any(|request| request.starts_with("POST ")));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn owned_removal_preserves_foreign_legacy_container_and_its_dependents() {
+        let mut responses = mixed_owned_environments();
+        for reference in ["xpressclaw-zed", "legacy"] {
+            responses
+                .get_mut(&format!("GET /containers/{reference}/json"))
+                .unwrap()
+                .1["Config"]["Labels"][INSTALLATION_LABEL] =
+                serde_json::json!("other-installation");
+        }
+        let (docker, requests, server) = mock_engine(responses).await;
+        docker.ensure_project_removable("zed").await.unwrap();
+        docker.remove_owned_workload("zed").await.unwrap();
+        let requests = requests.lock().unwrap();
+        let deleted: Vec<_> = requests
+            .iter()
+            .filter(|request| request.starts_with("DELETE "))
+            .collect();
+        assert_eq!(
+            deleted,
+            vec![&format!(
+                "DELETE /containers/{}",
+                project_container_name("installation", "zed")
+            )]
+        );
         server.abort();
     }
 

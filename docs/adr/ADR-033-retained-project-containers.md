@@ -67,7 +67,9 @@ Before explicit removal, inspect all containers (including stopped and unlabelle
 containers) for namespace, volume-source, and link dependencies. If any reference
 the environment, preserve it and report their names. Do not stop the environment
 first and never recursively remove agent-created dependent containers. Engine
-inspection failures fail closed. The engine remains authoritative if another
+inspection failures fail closed. Check every owned candidate, including legacy
+containers from an older installation layout, before deleting any environment.
+The engine remains authoritative if another
 trusted host-engine client changes dependencies during removal. Host-engine access
 remains opt-in as specified in ADR-027.
 
@@ -102,7 +104,9 @@ containers whose ownership cannot be proven—are never included in that cleanup
 ## Validation
 
 Dependency preflight tests cover running and stopped unlabelled containers,
-namespace/volume/link references, and failed engine inspection. The optional
+namespace/volume/link references, and failed engine inspection. Mixed retained
+and legacy environments are checked together so a blocked legacy container
+cannot cause partial deletion of the current environment. The optional
 `image_update_retains_installed_files_and_dependent_container` integration test
 uses isolated containers to verify a writable-layer marker, stable container ID,
 and dependent network service across an image-selection change, plus installed-file
