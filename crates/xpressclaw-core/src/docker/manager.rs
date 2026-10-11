@@ -10,7 +10,7 @@ use bollard::container::{
 use bollard::errors::Error as BollardError;
 use bollard::exec::{CreateExecOptions, ResizeExecOptions, StartExecOptions, StartExecResults};
 use bollard::image::CreateImageOptions;
-use bollard::models::{HostConfig, Mount, MountTypeEnum};
+use bollard::models::{ContainerInspectResponse, HostConfig, Mount, MountTypeEnum};
 use bollard::Docker;
 use futures_util::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -25,6 +25,7 @@ use crate::external_tools::path_for_external_tool;
 const LIFECYCLE_LABEL: &str = "io.xpressclaw.lifecycle";
 const PROJECT_LIFECYCLE: &str = "project";
 const SPEC_FINGERPRINT_LABEL: &str = "io.xpressclaw.spec-fingerprint";
+const IMAGE_REFERENCE_LABEL: &str = "io.xpressclaw.image-reference";
 const INSTALLATION_LABEL: &str = "io.xpressclaw.installation";
 const AGENT_ID_LABEL: &str = "io.xpressclaw.agent-id";
 
@@ -445,9 +446,9 @@ impl DockerManager {
     }
 
     /// Start a project-owned ACP container, retaining and reusing its writable
-    /// layer between attempts. A changed runner specification or local image
-    /// replaces the environment so stale mounts, credentials, and commands
-    /// are never silently reused.
+    /// layer between attempts. Image updates never replace an existing
+    /// environment. Incompatible configuration requires an explicit rebuild;
+    /// reject it before stopping the old environment.
     pub async fn launch_project_attached(
         &self,
         agent_id: &str,
@@ -456,68 +457,32 @@ impl DockerManager {
         let installation_id = self.installation_id()?;
         let container_name = project_container_name(installation_id, agent_id);
         let fingerprint = container_spec_fingerprint(spec)?;
-        let existing = self.inspect_by_name(&container_name).await;
+        let existing = self.inspect_optional(&container_name).await?;
         let info = if let Some(existing) = existing {
-            let labels = existing
-                .config
-                .as_ref()
-                .and_then(|config| config.labels.as_ref())
-                .cloned()
-                .unwrap_or_default();
-            if !project_ownership_matches(&labels, installation_id, agent_id) {
-                return Err(Error::Container(format!(
-                    "refusing to replace Agent container {container_name} owned by another XpressClaw installation"
-                )));
-            }
-            let labels_match =
-                project_labels_match(&labels, &fingerprint, installation_id, agent_id);
-            let image_matches = self
-                .container_image_matches(&container_name, &spec.image)
-                .await;
-            if labels_match && image_matches {
-                self.stop_preserving(agent_id).await?;
-                let container_id = existing.id.ok_or_else(|| {
-                    Error::Container(format!(
-                        "Agent container {container_name} has no container ID"
-                    ))
+            validate_retained_spec(&existing, spec, installation_id, agent_id)?;
+            self.stop_preserving(agent_id).await?;
+            let container_id = existing.id.ok_or_else(|| {
+                Error::Container(format!(
+                    "Agent container {container_name} has no container ID"
+                ))
+            })?;
+            self.docker
+                .start_container::<String>(&container_id, None)
+                .await
+                .map_err(|error| {
+                    Error::Container(format!("failed to restart Agent container: {error}"))
                 })?;
-                self.docker
-                    .start_container::<String>(&container_id, None)
-                    .await
-                    .map_err(|error| {
-                        Error::Container(format!("failed to restart Agent container: {error}"))
-                    })?;
-                let host_port = self.get_host_port(&container_id, spec.expose_port).await;
-                info!(
-                    agent_id,
-                    container_id = &container_id[..12.min(container_id.len())],
-                    "restarted retained Agent container"
-                );
-                ContainerInfo {
-                    container_id,
-                    agent_id: agent_id.to_string(),
-                    status: "running".to_string(),
-                    host_port,
-                }
-            } else {
-                info!(
-                    agent_id,
-                    labels_match,
-                    image_matches,
-                    "recreating Agent container after runner configuration changed"
-                );
-                self.remove(&container_name).await?;
-                self.create_and_start(
-                    &container_name,
-                    agent_id,
-                    spec,
-                    Some(project_container_labels(
-                        &fingerprint,
-                        installation_id,
-                        agent_id,
-                    )),
-                )
-                .await?
+            let host_port = self.get_host_port(&container_id, spec.expose_port).await;
+            info!(
+                agent_id,
+                container_id = &container_id[..12.min(container_id.len())],
+                "restarted retained Agent container"
+            );
+            ContainerInfo {
+                container_id,
+                agent_id: agent_id.to_string(),
+                status: "running".to_string(),
+                host_port,
             }
         } else {
             self.create_and_start(
@@ -542,28 +507,59 @@ impl DockerManager {
         }
     }
 
-    /// Whether a retained Agent container still represents the requested
-    /// runner specification and the image currently available under its tag.
-    pub async fn project_container_matches(&self, agent_id: &str, spec: &ContainerSpec) -> bool {
-        let Ok(installation_id) = self.installation_id() else {
-            return false;
-        };
-        let Ok(fingerprint) = container_spec_fingerprint(spec) else {
-            return false;
-        };
+    /// Validate before retiring a live ACP process. An image update alone is
+    /// intentionally deferred until the user explicitly rebuilds the environment.
+    pub async fn validate_project_configuration(
+        &self,
+        agent_id: &str,
+        spec: &ContainerSpec,
+    ) -> Result<Option<String>> {
+        let installation_id = self.installation_id()?;
         let container_name = project_container_name(installation_id, agent_id);
-        let labels_match = self
-            .inspect_by_name(&container_name)
-            .await
-            .and_then(|container| container.config)
+        let Some(container) = self.inspect_optional(&container_name).await? else {
+            return Ok(None);
+        };
+        validate_retained_spec(&container, spec, installation_id, agent_id)?;
+        container.id.map(Some).ok_or_else(|| {
+            Error::Container(format!(
+                "Agent container {container_name} has no container ID"
+            ))
+        })
+    }
+
+    async fn inspect_optional(&self, reference: &str) -> Result<Option<ContainerInspectResponse>> {
+        match self.docker.inspect_container(reference, None).await {
+            Ok(container) => Ok(Some(container)),
+            Err(BollardError::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(None),
+            Err(error) => Err(Error::Container(format!(
+                "failed to inspect container {reference}: {error}"
+            ))),
+        }
+    }
+
+    /// Check capabilities on the image that actually backs the retained
+    /// environment, even if its tag has moved or configuration selects an update.
+    pub async fn retained_project_image(&self, agent_id: &str) -> Result<Option<String>> {
+        let installation = self.installation_id()?;
+        let name = project_container_name(installation, agent_id);
+        let Some(container) = self.inspect_optional(&name).await? else {
+            return Ok(None);
+        };
+        let labels = container
+            .config
             .and_then(|config| config.labels)
-            .is_some_and(|labels| {
-                project_labels_match(&labels, &fingerprint, installation_id, agent_id)
-            });
-        labels_match
-            && self
-                .container_image_matches(&container_name, &spec.image)
-                .await
+            .unwrap_or_default();
+        if !project_ownership_matches(&labels, installation, agent_id) {
+            return Err(Error::Container(format!(
+                "refusing access to Agent {agent_id}'s environment with mismatched ownership"
+            )));
+        }
+        container
+            .image
+            .map(Some)
+            .ok_or_else(|| Error::Container("retained environment has no image ID".into()))
     }
 
     async fn create_and_start(
@@ -573,6 +569,13 @@ impl DockerManager {
         spec: &ContainerSpec,
         mut labels: Option<HashMap<String, String>>,
     ) -> Result<ContainerInfo> {
+        if let Some(labels) = labels.as_mut().filter(|labels| {
+            labels.get(LIFECYCLE_LABEL).map(String::as_str) == Some(PROJECT_LIFECYCLE)
+        }) {
+            // Podman can canonicalize Config.Image (e.g. node:22 becomes
+            // docker.io/library/node:22). Retain the exact fingerprint input.
+            labels.insert(IMAGE_REFERENCE_LABEL.to_string(), spec.image.clone());
+        }
         if let Some(installation_id) = self.installation_id.as_deref() {
             labels
                 .get_or_insert_with(HashMap::new)
@@ -759,7 +762,6 @@ impl DockerManager {
     /// inspect failures are reported instead of being mistaken for absence.
     /// A same-named container without matching ownership labels is preserved.
     pub async fn remove_owned_workload(&self, agent_id: &str) -> Result<()> {
-        self.stop_agent_forwards(agent_id).await;
         let mut candidates = Vec::with_capacity(2);
         if let Some(installation_id) = self.installation_id.as_deref() {
             candidates.push(project_container_name(installation_id, agent_id));
@@ -794,6 +796,7 @@ impl DockerManager {
             }
             self.remove_container_reference(&container_name, agent_id)
                 .await?;
+            self.stop_agent_forwards(agent_id).await;
         }
         Ok(())
     }
@@ -830,14 +833,10 @@ impl DockerManager {
         container_reference: &str,
         workload_id: &str,
     ) -> Result<()> {
-        let stop_opts = StopContainerOptions { t: 2 };
-        if let Err(error) = self
-            .docker
-            .stop_container(container_reference, Some(stop_opts))
-            .await
-        {
-            warn!(workload_id, container_reference, %error, "error stopping owned container before removal");
-        }
+        // Do not stop first: a failed removal must not leave the environment
+        // and its dependents offline. Never use Podman's recursive --depend.
+        self.ensure_no_container_dependents(container_reference)
+            .await?;
         let opts = RemoveContainerOptions {
             force: true,
             ..Default::default()
@@ -855,6 +854,95 @@ impl DockerManager {
                 "failed to remove owned runtime '{workload_id}': {error}"
             ))),
         }
+    }
+
+    /// Read-only preflight for explicit rebuild/deletion, before retiring any
+    /// process. Agent-created containers need not carry XpressClaw labels.
+    pub async fn ensure_project_removable(&self, agent_id: &str) -> Result<()> {
+        let installation = self.installation_id()?;
+        let name = project_container_name(installation, agent_id);
+        let Some(container) = self.inspect_optional(&name).await? else {
+            return Ok(());
+        };
+        let labels = container
+            .config
+            .and_then(|config| config.labels)
+            .unwrap_or_default();
+        if !project_ownership_matches(&labels, installation, agent_id) {
+            return Err(Error::Container(format!(
+                "refusing to rebuild Agent {agent_id}'s environment with mismatched ownership"
+            )));
+        }
+        self.ensure_no_container_dependents(&name).await
+    }
+
+    async fn ensure_no_container_dependents(&self, reference: &str) -> Result<()> {
+        let dependents = self.container_dependents(reference).await?;
+        if dependents.is_empty() {
+            return Ok(());
+        }
+        Err(Error::Container(format!(
+            "Cannot remove environment {reference}: dependent containers {} still reference it. The environment and dependents have been preserved. Migrate or explicitly remove those containers before rebuilding or deleting this Agent; stopping them alone does not remove the dependency.",
+            dependents.join(", ")
+        )))
+    }
+
+    async fn container_dependents(&self, reference: &str) -> Result<Vec<String>> {
+        let Some(parent) = self.inspect_optional(reference).await? else {
+            return Ok(Vec::new());
+        };
+        let parent_id = parent
+            .id
+            .as_deref()
+            .ok_or_else(|| Error::Container("container has no ID; refusing removal".into()))?;
+        let parent_name = parent
+            .name
+            .as_deref()
+            .unwrap_or(reference)
+            .trim_start_matches('/');
+        let containers = self
+            .docker
+            .list_containers(Some(ListContainersOptions::<String> {
+                all: true,
+                ..Default::default()
+            }))
+            .await
+            .map_err(|error| {
+                Error::Container(format!("could not check container dependencies: {error}"))
+            })?;
+        let mut dependents = Vec::new();
+        for candidate in containers {
+            let id = candidate.id.ok_or_else(|| {
+                Error::Container(
+                    "container dependency listing omitted an ID; refusing removal".into(),
+                )
+            })?;
+            if id == parent_id {
+                continue;
+            }
+            // Include stopped containers; they still retain namespace/volume
+            // dependencies. A concurrent deletion is harmless, other errors
+            // must not turn an incomplete scan into permission to remove.
+            let Some(container) = self.inspect_optional(&id).await? else {
+                continue;
+            };
+            let host = container.host_config.as_ref().ok_or_else(|| {
+                Error::Container(format!(
+                    "dependency inspection for {id} omitted host configuration; refusing removal"
+                ))
+            })?;
+            if container_depends_on(host, parent_id, parent_name) {
+                dependents.push(
+                    container
+                        .name
+                        .unwrap_or(id)
+                        .trim_start_matches('/')
+                        .to_string(),
+                );
+            }
+        }
+        dependents.sort();
+        Ok(dependents)
     }
 
     /// Start an interactive shell inside this installation's retained project
@@ -1085,25 +1173,14 @@ impl DockerManager {
 
     /// Stop and remove an agent container.
     pub async fn stop(&self, agent_id: &str) -> Result<()> {
-        self.stop_agent_forwards(agent_id).await;
         let retained_name = self.owned_project_container_name(agent_id).ok();
         let container_name = match retained_name {
             Some(name) if self.inspect_by_name(&name).await.is_some() => name,
             _ => format!("xpressclaw-{agent_id}"),
         };
 
-        // Short timeout — containers will be restarted on next boot.
-        // Node.js/Python processes that don't handle SIGTERM get SIGKILL after this.
-        let stop_opts = StopContainerOptions { t: 2 };
-        if let Err(e) = self
-            .docker
-            .stop_container(&container_name, Some(stop_opts))
-            .await
-        {
-            warn!(agent_id, error = %e, "error stopping container");
-        }
-
         self.remove(&container_name).await?;
+        self.stop_agent_forwards(agent_id).await;
         info!(agent_id, "stopped container");
         Ok(())
     }
@@ -1518,6 +1595,7 @@ impl DockerManager {
     }
 
     async fn remove(&self, container_name: &str) -> Result<()> {
+        self.ensure_no_container_dependents(container_name).await?;
         let opts = RemoveContainerOptions {
             force: true,
             ..Default::default()
@@ -1724,6 +1802,111 @@ pub(crate) fn container_spec_fingerprint(spec: &ContainerSpec) -> Result<String>
     Ok(format!("{:x}", Sha256::digest(encoded)))
 }
 
+/// Image selection is only used when creating an environment. A new release
+/// must not throw away the initialized process or installed tools.
+pub(crate) fn retained_process_fingerprint(spec: &ContainerSpec) -> Result<String> {
+    let mut effective = spec.clone();
+    effective.image.clear();
+    container_spec_fingerprint(&effective)
+}
+
+fn validate_retained_spec(
+    container: &ContainerInspectResponse,
+    requested: &ContainerSpec,
+    installation: &str,
+    agent: &str,
+) -> Result<()> {
+    let labels = container
+        .config
+        .as_ref()
+        .and_then(|config| config.labels.as_ref());
+    if !labels.is_some_and(|labels| project_ownership_matches(labels, installation, agent)) {
+        return Err(Error::Container(format!(
+            "refusing access to Agent {agent}'s environment with mismatched ownership"
+        )));
+    }
+    // Use the original image reference, including for containers created before
+    // this retention policy. All other settings still have to match exactly;
+    // never silently retain an obsolete credential or host-engine grant.
+    let image = container
+        .config
+        .as_ref()
+        .and_then(|config| config.image.as_ref())
+        .ok_or_else(|| {
+            Error::Container(format!("Agent {agent}'s environment has no recorded image"))
+        })?;
+    let labels = labels.unwrap();
+    let mut images = vec![requested.image.as_str(), image.as_str()];
+    if let Some(original) = labels.get(IMAGE_REFERENCE_LABEL) {
+        images.push(original);
+    }
+    // Legacy containers have only the hash; accommodate engine normalization
+    // of common short references without weakening any non-image setting.
+    for prefix in ["docker.io/library/", "docker.io/", "localhost/"] {
+        if let Some(short) = image.strip_prefix(prefix) {
+            images.push(short);
+        }
+    }
+    let mut matches = false;
+    for image in images {
+        let mut effective = requested.clone();
+        effective.image = image.to_string();
+        if project_labels_match(
+            labels,
+            &container_spec_fingerprint(&effective)?,
+            installation,
+            agent,
+        ) {
+            matches = true;
+            break;
+        }
+    }
+    if !matches {
+        return Err(Error::Container(format!(
+            "Agent {agent}'s environment needs different container settings. Its installed tools and files have been preserved. Restore the previous settings, or explicitly rebuild the environment in Agent settings > Harness."
+        )));
+    }
+    Ok(())
+}
+
+fn container_depends_on(host: &HostConfig, parent_id: &str, parent_name: &str) -> bool {
+    let matches = |reference: &str| {
+        let reference = reference.trim_start_matches('/');
+        reference == parent_name
+            || reference == parent_id
+            || (reference.len() >= 12 && parent_id.starts_with(reference))
+    };
+    [
+        &host.network_mode,
+        &host.ipc_mode,
+        &host.pid_mode,
+        &host.uts_mode,
+        &host.userns_mode,
+    ]
+    .into_iter()
+    .filter_map(|mode| mode.as_deref())
+    .any(|mode| mode.strip_prefix("container:").is_some_and(matches))
+        || host
+            .volumes_from
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|volume| {
+                matches(
+                    volume
+                        .strip_suffix(":ro")
+                        .or_else(|| volume.strip_suffix(":rw"))
+                        .unwrap_or(volume),
+                )
+            })
+        || host
+            .links
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|link| matches(link.split(':').next().unwrap_or(link)))
+}
+
 fn project_container_name(installation_id: &str, agent_id: &str) -> String {
     let mut digest = Sha256::new();
     digest.update(installation_id.as_bytes());
@@ -1814,6 +1997,253 @@ fn recorded_container_id_matches(actual_id: Option<&str>, recorded_id: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn retained_fixture(spec: &ContainerSpec) -> ContainerInspectResponse {
+        serde_json::from_value(serde_json::json!({
+            "Id": "a".repeat(64), "Name": "/retained-agent", "Image": "sha256:original",
+            "Config": {"Image": spec.image, "Labels": project_container_labels(&container_spec_fingerprint(spec).unwrap(), "installation", "agent")},
+            "State": {"Running": true}
+        })).unwrap()
+    }
+
+    #[test]
+    fn retained_environment_keeps_image_but_rejects_changed_authority_or_settings() {
+        let spec = ContainerSpec {
+            environment: vec!["TOKEN=secret".into()],
+            ..Default::default()
+        };
+        let container = retained_fixture(&spec);
+        let mut changed = spec.clone();
+        changed.image = "new-image:latest".into();
+        validate_retained_spec(&container, &changed, "installation", "agent").unwrap();
+        assert_eq!(
+            retained_process_fingerprint(&spec).unwrap(),
+            retained_process_fingerprint(&changed).unwrap()
+        );
+        changed.environment.clear();
+        let error = validate_retained_spec(&container, &changed, "installation", "agent")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("preserved"));
+        assert!(!error.contains("secret"));
+        for changed in [
+            ContainerSpec {
+                cmd: Some(vec!["other-harness".into()]),
+                ..spec.clone()
+            },
+            ContainerSpec {
+                volumes: vec![VolumeMount::parse("/host:/container").unwrap()],
+                ..spec.clone()
+            },
+            ContainerSpec {
+                working_dir: Some("/other".into()),
+                ..spec.clone()
+            },
+            ContainerSpec {
+                run_as_host_user: true,
+                ..spec.clone()
+            },
+            ContainerSpec {
+                memory_limit: Some(1),
+                ..spec.clone()
+            },
+            ContainerSpec {
+                network_mode: Some("host".into()),
+                ..spec.clone()
+            },
+        ] {
+            assert!(validate_retained_spec(&container, &changed, "installation", "agent").is_err());
+        }
+        assert!(validate_retained_spec(&container, &spec, "other-installation", "agent").is_err());
+    }
+
+    #[test]
+    fn dependency_references_include_namespace_sharing_volumes_and_links() {
+        let id = "a".repeat(64);
+        for host in [
+            HostConfig {
+                network_mode: Some(format!("container:{id}")),
+                ..Default::default()
+            },
+            HostConfig {
+                ipc_mode: Some("container:retained-agent".into()),
+                ..Default::default()
+            },
+            HostConfig {
+                pid_mode: Some(format!("container:{}", &id[..12])),
+                ..Default::default()
+            },
+            HostConfig {
+                volumes_from: Some(vec!["/retained-agent:ro".into()]),
+                ..Default::default()
+            },
+            HostConfig {
+                links: Some(vec!["/retained-agent:/consumer/parent".into()]),
+                ..Default::default()
+            },
+        ] {
+            assert!(container_depends_on(&host, &id, "retained-agent"));
+        }
+        for host in [
+            HostConfig::default(),
+            HostConfig {
+                network_mode: Some("bridge".into()),
+                ..Default::default()
+            },
+            HostConfig {
+                network_mode: Some("container:other".into()),
+                ..Default::default()
+            },
+        ] {
+            assert!(!container_depends_on(&host, &id, "retained-agent"));
+        }
+    }
+
+    async fn mock_engine(
+        mut responses: HashMap<String, (u16, serde_json::Value)>,
+    ) -> (
+        DockerManager,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        responses.insert(
+            "GET /containers/xpressclaw-agent/json".into(),
+            (
+                404,
+                serde_json::json!({"message":"absent legacy container"}),
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        let server = tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                let mut socket = BufReader::new(socket);
+                let mut first = String::new();
+                socket.read_line(&mut first).await.unwrap();
+                let mut fields = first.split_whitespace();
+                let method = fields.next().unwrap_or_default();
+                let url = fields.next().unwrap_or_default();
+                let path = url
+                    .find("/containers")
+                    .map(|i| &url[i..])
+                    .unwrap_or(url)
+                    .split('?')
+                    .next()
+                    .unwrap();
+                let request = format!("{method} {path}");
+                recorded.lock().unwrap().push(request.clone());
+                let (code, body) = responses
+                    .get(&request)
+                    .cloned()
+                    .unwrap_or((500, serde_json::json!({"message": "unexpected request"})));
+                let body = body.to_string();
+                let response = format!("HTTP/1.1 {code} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                socket
+                    .get_mut()
+                    .write_all(response.as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let docker = Docker::connect_with_http(
+            &format!("http://{address}"),
+            5,
+            bollard::API_DEFAULT_VERSION,
+        )
+        .unwrap();
+        let manager = DockerManager {
+            docker,
+            rootless: false,
+            socket_path: None,
+            runtime: "podman",
+            runtime_version: None,
+            docker_desktop: false,
+            selinux: false,
+            installation_id: Some("installation".into()),
+            forwarding_lifecycle: Default::default(),
+            forwards: Default::default(),
+        };
+        (manager, requests, server)
+    }
+
+    #[tokio::test]
+    async fn incompatible_launch_does_not_stop_or_delete_existing_environment() {
+        let spec = ContainerSpec::default();
+        let parent = serde_json::to_value(retained_fixture(&spec)).unwrap();
+        let name = project_container_name("installation", "agent");
+        let (docker, requests, server) = mock_engine(HashMap::from([(
+            format!("GET /containers/{name}/json"),
+            (200, parent),
+        )]))
+        .await;
+        let changed = ContainerSpec {
+            environment: vec!["NEW_KEY=value".into()],
+            ..spec
+        };
+        assert!(docker
+            .launch_project_attached("agent", &changed)
+            .await
+            .is_err());
+        assert!(requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|request| request.starts_with("GET ")));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn removal_checks_running_and_stopped_unlabelled_dependents_before_any_stop() {
+        for running in [true, false] {
+            let spec = ContainerSpec::default();
+            let parent = serde_json::to_value(retained_fixture(&spec)).unwrap();
+            let name = project_container_name("installation", "agent");
+            let (docker, requests, server) = mock_engine(HashMap::from([
+                (format!("GET /containers/{name}/json"), (200, parent)),
+                ("GET /containers/json".into(), (200, serde_json::json!([{"Id":"child"}]))),
+                ("GET /containers/child/json".into(), (200, serde_json::json!({"Id":"child", "Name":"/experiment", "State":{"Running":running}, "HostConfig":{"NetworkMode":format!("container:{}", "a".repeat(64))}}))),
+            ])).await;
+            let error = docker
+                .remove_owned_workload("agent")
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("experiment"), "{error}");
+            assert!(error.contains("preserved"));
+            assert!(requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|request| request.starts_with("GET ")));
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn dependency_scan_errors_do_not_authorize_removal() {
+        let name = project_container_name("installation", "agent");
+        let parent = serde_json::to_value(retained_fixture(&ContainerSpec::default())).unwrap();
+        let (docker, requests, server) = mock_engine(HashMap::from([(
+            format!("GET /containers/{name}/json"),
+            (200, parent),
+        )]))
+        .await;
+        assert!(docker
+            .remove_owned_workload("agent")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("could not check"));
+        assert!(requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|request| request.starts_with("GET ")));
+        server.abort();
+    }
 
     #[test]
     fn terminal_session_names_accept_only_bounded_ascii_identifiers() {

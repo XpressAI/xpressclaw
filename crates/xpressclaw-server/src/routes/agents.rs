@@ -33,6 +33,10 @@ pub fn routes() -> Router<AppState> {
             "/{id}/runner-image/update",
             axum::routing::post(update_runner_image),
         )
+        .route(
+            "/{id}/environment/rebuild",
+            axum::routing::post(rebuild_environment),
+        )
         .route("/{id}/start", axum::routing::post(start_agent))
         .route("/{id}/stop", axum::routing::post(stop_agent))
         .route("/{id}/logs", get(raw_logs_removed))
@@ -134,6 +138,10 @@ async fn delete_agent(
     let sessions = xpressclaw_core::sessions::SessionManager::new(state.db.clone());
     let attempts = sessions.list_attempts(&id, None, 1_000).unwrap_or_default();
     if let Some(docker) = state.docker().await {
+        docker
+            .ensure_project_removable(&record.name)
+            .await
+            .map_err(environment_conflict)?;
         for attempt in attempts.iter().filter(|attempt| {
             !matches!(
                 attempt.status.as_str(),
@@ -144,7 +152,10 @@ async fn delete_agent(
         }
         // Project deletion is the explicit cleanup boundary for the retained
         // environment (and also removes a pre-ADR-025 legacy container).
-        let _ = docker.stop(&id).await;
+        docker
+            .remove_owned_workload(&record.name)
+            .await
+            .map_err(environment_conflict)?;
     }
     let _config_guard = state.config_write_lock.lock().await;
     let old_config = state.config();
@@ -297,7 +308,7 @@ async fn update_runner_image(
     ensure_agent_has_no_active_work(&state, &record.name)?;
 
     let changed = current_agent.runner.image != image;
-    let environment_stopped = if changed {
+    if changed {
         let mut new_config = (*current_config).clone();
         let agent = new_config
             .agents
@@ -313,22 +324,73 @@ async fn update_runner_image(
             xpressclaw_core::llm::router::LlmRouter::build_from_config(&new_config),
         );
         state.apply_config(new_config, Some(new_router));
-
-        state
-            .conversation_processes
-            .retire_agent_everywhere(&record.name)
-            .await;
-        docker.stop_preserving(&record.name).await.is_ok()
-    } else {
-        false
-    };
+    }
 
     Ok(Json(json!({
         "image": image,
         "version": version,
         "changed": changed,
-        "environment_stopped": environment_stopped,
+        "environment_stopped": false,
+        "environment_preserved": true,
     })))
+}
+
+#[derive(Deserialize)]
+struct RebuildEnvironmentRequest {
+    discard_installed_tools: bool,
+}
+
+fn environment_conflict(error: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({"error": error.to_string()})),
+    )
+}
+
+/// The only image/configuration update path that discards an existing
+/// environment. The next queued turn creates it from the saved settings.
+async fn rebuild_environment(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<RebuildEnvironmentRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !request.discard_installed_tools {
+        return Err(bad_request(
+            "Confirm that rebuilding discards installed tools and files outside mounted folders",
+        ));
+    }
+    let _config_guard = state.config_write_lock.lock().await;
+    let record = AgentRegistry::new(state.db.clone())
+        .get(&id)
+        .map_err(|error| match &error {
+            xpressclaw_core::error::Error::AgentNotFound { .. } => not_found(&error),
+            _ => internal_error(error),
+        })?;
+    let _runtime_guard = state
+        .native_runtime_lifecycle
+        .try_quiesce_agent(&record.name)
+        .ok_or_else(agent_busy)?;
+    ensure_agent_has_no_active_work(&state, &record.name)?;
+    let docker = state.docker().await.ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error":"Docker or Podman is not available"})),
+        )
+    })?;
+    // Crucially this precedes process retirement, forwarding changes, or stops.
+    docker
+        .ensure_project_removable(&record.name)
+        .await
+        .map_err(environment_conflict)?;
+    docker
+        .remove_owned_workload(&record.name)
+        .await
+        .map_err(environment_conflict)?;
+    state
+        .conversation_processes
+        .retire_agent_everywhere(&record.name)
+        .await;
+    Ok(Json(json!({"rebuilt": true})))
 }
 
 fn ensure_agent_has_no_active_work(
@@ -352,7 +414,7 @@ fn agent_busy() -> (StatusCode, Json<Value>) {
     (
         StatusCode::CONFLICT,
         Json(json!({
-            "error": "Finish or cancel this Agent's active work, then update its harness"
+            "error": "Finish or cancel this Agent's active work before changing its environment"
         })),
     )
 }
@@ -597,6 +659,65 @@ mod tests {
     async fn body_json(body: Body) -> Value {
         let bytes = body.collect().await.unwrap().to_bytes();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn rebuild_requires_explicit_acknowledgement_before_engine_access() {
+        let (app, _) = test_app();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/agents/atlas/environment/rebuild")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"discard_installed_tools":false}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(body_json(response.into_body()).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("Confirm"));
+    }
+
+    #[tokio::test]
+    async fn rebuild_refuses_an_active_attempt_without_changing_it() {
+        use xpressclaw_core::tasks::{
+            board::{CreateTask, TaskBoard},
+            queue::TaskQueue,
+        };
+        let (app, db) = test_app();
+        AgentRegistry::new(db.clone())
+            .ensure("atlas", "codex")
+            .unwrap();
+        let sessions = SessionManager::new(db.clone());
+        sessions.ensure("atlas", None).unwrap();
+        let task = TaskBoard::new(db.clone())
+            .create(&CreateTask {
+                title: "active work".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let queue = TaskQueue::new(db.clone());
+        let item = queue.enqueue(&task.id, "atlas").unwrap();
+        let attempt = sessions
+            .get_attempt(item.attempt_id.as_deref().unwrap())
+            .unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/agents/atlas/environment/rebuild")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"discard_installed_tools":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(sessions.get_attempt(&attempt.id).unwrap().status, "queued");
     }
 
     #[tokio::test]

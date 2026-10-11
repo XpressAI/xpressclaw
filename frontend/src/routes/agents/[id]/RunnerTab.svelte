@@ -46,6 +46,9 @@
 	let verifyingMcp = $state<string | null>(null);
 	let mcpVerification = $state<Record<string, McpVerificationResult>>({});
 	let updatingRunnerImage = $state(false);
+	let confirmingRebuild = $state(false);
+	let rebuildingEnvironment = $state(false);
+	let rebuildResult = $state<{ message: string; error: boolean } | null>(null);
 	let runnerImageUpdate = $state<{ message: string; error: boolean } | null>(null);
 	let savedKind = $state('');
 	let savedContainerEngine = $state<'none' | 'host'>('none');
@@ -139,8 +142,8 @@
 			const version = result.version ? ` ${result.version}` : '';
 			runnerImageUpdate = {
 				message: result.changed
-					? `Updated to the latest published harness${version}. New work will use it.`
-					: `This Agent already uses the latest published harness${version}.`,
+					? `Downloaded the latest published harness${version}. Your existing environment is preserved. Rebuild it explicitly to apply the image update.`
+					: `The latest published harness${version} is selected. Existing environments keep their installed image until rebuilt.`,
 				error: false
 			};
 		} catch (cause) {
@@ -150,6 +153,21 @@
 			};
 		} finally {
 			updatingRunnerImage = false;
+		}
+	}
+
+	async function rebuildEnvironment() {
+		if (!confirmingRebuild || rebuildingEnvironment) return;
+		rebuildingEnvironment = true;
+		rebuildResult = null;
+		try {
+			await agents.rebuildEnvironment(agentId);
+			confirmingRebuild = false;
+			rebuildResult = { message: 'The old environment was removed. New work will create an environment using your saved settings.', error: false };
+		} catch (error) {
+			rebuildResult = { message: error instanceof Error ? error.message : String(error), error: true };
+		} finally {
+			rebuildingEnvironment = false;
 		}
 	}
 
@@ -436,22 +454,37 @@
 		</div>
 
 		<div class="mt-4">
-			<label for="runner-image" class="mb-1 block text-xs font-medium text-muted-foreground">Container image</label>
+			<label for="runner-image" class="mb-1 block text-xs font-medium text-muted-foreground">Image for new environments</label>
 			<div class="flex gap-2">
 				<input id="runner-image" bind:value={image} class="min-w-0 flex-1 rounded-md border border-input bg-background px-3 py-2 font-mono text-sm outline-none focus:ring-1 focus:ring-ring" />
 				{#if canUpdateRunnerImage}
 					<button type="button" onclick={updateRunnerImage} disabled={updatingRunnerImage} class="shrink-0 rounded-md border border-border px-3 py-2 text-xs hover:bg-accent disabled:opacity-50">
-						{updatingRunnerImage ? 'Updating…' : 'Update harness'}
+						{updatingRunnerImage ? 'Downloading…' : 'Download harness update'}
 					</button>
 				{/if}
 			</div>
-			<p class="mt-1 text-[11px] text-muted-foreground">Published images are pulled on demand. While this Agent is idle, Update harness downloads the newest XpressClaw image and pins its exact digest. Extend one or provide a custom image whose command starts an ACP server over stdio.</p>
+			<p class="mt-1 text-[11px] text-muted-foreground">The Agent keeps its container, installed tools, and files across turns and image updates. Downloading an image selects it for the next explicit rebuild. Custom images must start an ACP server over stdio.</p>
 			{#if runnerImageUpdate}
 				<div role={runnerImageUpdate.error ? 'alert' : 'status'} class="mt-2 flex items-start justify-between gap-2 rounded-md border px-3 py-2 text-xs {runnerImageUpdate.error ? 'border-destructive/30 bg-destructive/5 text-destructive' : 'border-emerald-500/25 bg-emerald-500/10 text-emerald-600'}">
 					<span>{runnerImageUpdate.message}</span>
 					<button type="button" aria-label="Dismiss harness update message" onclick={() => (runnerImageUpdate = null)} class="shrink-0 opacity-70 hover:opacity-100">×</button>
 				</div>
 			{/if}
+			<div class="mt-4 border-t border-border pt-3">
+				<p class="text-xs text-muted-foreground">Save any settings changes first. Rebuilding applies the saved image, mounts, credentials, and startup configuration. It requires an idle Agent and no dependent containers.</p>
+				{#if confirmingRebuild}
+					<div role="alert" class="mt-2 rounded-md border border-destructive/30 p-3 text-xs">
+						<p>Rebuilding permanently deletes installed tools and files outside mounted folders. Workspace folders and mounted volumes are retained. Agent-created dependent containers must be migrated or explicitly removed first.</p>
+						<div class="mt-3 flex flex-wrap gap-2">
+							<button type="button" onclick={rebuildEnvironment} disabled={rebuildingEnvironment} class="rounded-md bg-destructive px-3 py-2 text-destructive-foreground disabled:opacity-50">{rebuildingEnvironment ? 'Rebuilding…' : 'Discard environment and rebuild'}</button>
+							<button type="button" onclick={() => confirmingRebuild = false} disabled={rebuildingEnvironment} class="rounded-md border border-border px-3 py-2">Cancel</button>
+						</div>
+					</div>
+				{:else}
+					<button type="button" onclick={() => { confirmingRebuild = true; rebuildResult = null; }} class="mt-2 rounded-md border border-border px-3 py-2 text-xs">Rebuild environment…</button>
+				{/if}
+				{#if rebuildResult}<p role={rebuildResult.error ? 'alert' : 'status'} class="mt-2 text-xs {rebuildResult.error ? 'text-destructive' : 'text-muted-foreground'}">{rebuildResult.message}</p>{/if}
+			</div>
 		</div>
 	</div>
 
