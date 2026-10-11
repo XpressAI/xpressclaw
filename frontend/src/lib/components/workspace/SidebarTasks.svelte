@@ -83,7 +83,7 @@
 		if (status === 'review') return 'Ready for review';
 		if (status === 'queued' || status === 'pending') return 'To do';
 		if (status === 'awaiting_review') return 'Awaiting review';
-		if (status === 'waiting_for_subtasks') return 'Waiting on subtasks';
+		if (status === 'waiting_for_subtasks') return 'Waiting for delegated work';
 		if (status === 'scheduled') return 'Scheduled';
 		if (status === 'backlog') return 'Backlog';
 		if (status === 'idle') return 'Not running';

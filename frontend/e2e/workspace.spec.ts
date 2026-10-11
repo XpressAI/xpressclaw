@@ -6606,3 +6606,137 @@ test('a touch swipe scrolls the compact tab strip instead of picking up a tab', 
 	await expect.poll(() => strip.evaluate((el) => el.scrollLeft)).toBeGreaterThan(0);
 	await expect(page.locator('[data-dnd-dragging]')).toHaveCount(0);
 });
+
+function delegatedFixture(overrides: Record<string, unknown> = {}) {
+	return {
+		task_id: 'review-child', title: 'Review authorized recovery and SDK retries',
+		agent_id: 'senior-reviewer', status: 'in_progress', activity_status: 'running', blocks_parent: true,
+		created_at: recentSqliteTimestamp(12 * 60_000), updated_at: recentSqliteTimestamp(5_000),
+		started_at: recentSqliteTimestamp(10 * 60_000), finished_at: null,
+		latest_event_type: 'tool_call', latest_event_at: recentSqliteTimestamp(5_000),
+		...overrides,
+	};
+}
+
+async function delegatedApi(page: Page, options: { parentStatus?: string; parentAttempt?: string; child?: Record<string, unknown>; pendingInput?: boolean } = {}) {
+	const state = {
+		attempts: [attempt(options.parentAttempt ?? 'queued', 10_000, null, null, { trigger_message_id: 2 })],
+		children: [delegatedFixture(options.child)],
+	};
+	await mockApi(page, {
+		taskStatus: options.parentStatus ?? 'in_progress', taskActivityStatus: options.parentStatus ?? 'in_progress',
+		pendingElicitation: options.pendingInput ? { mode: 'form', message: 'Approve this operation?', requestedSchema: { type: 'object', properties: {} } } : undefined,
+		taskSubtasks: [
+			{ id: 'plan-only', title: 'Validate the implementation', provenance: 'native_plan', status: 'completed', parent_task_id: taskId },
+			{ id: 'review-child', title: 'Review authorized recovery and SDK retries', provenance: 'durable', status: 'in_progress', parent_task_id: taskId },
+		],
+	});
+	await page.route(`**/api/tasks/${taskId}/activity*`, async (route) => {
+		const after = new URL(route.request().url()).searchParams.has('after');
+		await route.fulfill({ json: {
+			attempts: state.attempts,
+			events: after ? [] : options.pendingInput ? [timelineEvent(1, 0, 'elicitation_pending', 'Approval needed', {
+				elicitationId: 'delegated-approval', status: 'pending', mode: 'form', message: 'Approve this operation?',
+				requestedSchema: { type: 'object', properties: { approved: { type: 'boolean', title: 'Approve' } } },
+			})] : [timelineEvent(1, 0, 'attempt_queued', 'Work queued', {})],
+			has_more_before: false, has_more_after: false, delegated_work: state.children,
+		} });
+	});
+	return state;
+}
+
+for (const width of [390, 1440]) {
+	test(`delegated work explains a queued reply at ${width}px`, async ({ page }) => {
+		await page.setViewportSize({ width, height: 900 });
+		await delegatedApi(page);
+		await page.goto(`/tasks/${taskId}`);
+		const panel = page.getByRole('region', { name: 'Delegated work', exact: true });
+		await expect(panel).toBeVisible();
+		await expect(panel.getByText('senior-reviewer', { exact: true })).toBeVisible();
+		await expect(panel.getByText('Working', { exact: true })).toBeVisible();
+		await expect(panel.getByText('Required by this task')).toBeVisible();
+		await expect(panel.locator('[data-delegated-duration]')).toContainText('Elapsed: 10m');
+		await expect(panel.getByText(/Tool activity ·/)).toBeVisible();
+		await expect(panel.getByRole('link')).toHaveAttribute('href', '/tasks/review-child');
+		await expect(page.locator('[data-delegation-wait]')).toContainText('Waiting for senior-reviewer: Review authorized recovery and SDK retries');
+		await expect(page.locator('[data-delegation-wait]')).toContainText('Your reply is saved');
+		await expect(page.getByText('The agent is queued to respond', { exact: true })).toHaveCount(0);
+		await expect(page.locator('[data-task-activity-status="waiting_for_subtasks"]').first()).toBeVisible();
+		await expect(panel.getByText('Validate the implementation')).toHaveCount(0);
+		if (width === 1440) {
+			await expect(page.getByRole('heading', { name: 'Steps (1 complete)', exact: true })).toBeVisible();
+			await page.screenshot({ path: '/tmp/delegated-work-desktop.png' });
+		} else {
+			await page.screenshot({ path: '/tmp/delegated-work-mobile.png' });
+		}
+	});
+}
+
+test('delegated work refreshes on quiet polls and freezes completed duration', async ({ page }) => {
+	const state = await delegatedApi(page);
+	await page.goto(`/tasks/${taskId}`);
+	await expect(page.locator('[data-delegation-wait]')).toBeVisible();
+	Object.assign(state.children[0], { status: 'completed', activity_status: 'completed', blocks_parent: false, finished_at: recentSqliteTimestamp(60_000) });
+	await expect(page.locator('[data-delegation-wait]')).toHaveCount(0, { timeout: 10_000 });
+	await expect(page.getByText('The agent is queued to respond', { exact: true })).toBeVisible();
+	await page.getByText('Completed delegated work (1)', { exact: true }).click();
+	const duration = page.locator('[data-delegated-duration]');
+	await expect(duration).toContainText('Last run:');
+	const finished = await duration.innerText();
+	state.attempts = [attempt('running')];
+	await expect(page.getByText('The agent is responding', { exact: true })).toBeVisible({ timeout: 10_000 });
+	await expect(duration).toHaveText(finished);
+});
+
+for (const [activity, status, label] of [
+	['failed', 'in_progress', 'Failed'], ['cancelled', 'cancelled', 'Cancelled'],
+	['waiting_for_input', 'waiting_for_input', 'Needs input'], ['awaiting_review', 'in_progress', 'Awaiting review'],
+]) {
+	test(`delegated work keeps ${activity} children visible as blockers`, async ({ page }) => {
+		await delegatedApi(page, { child: { status, activity_status: activity, started_at: null } });
+		await page.goto(`/tasks/${taskId}`);
+		const panel = page.getByRole('region', { name: 'Delegated work', exact: true });
+		await expect(panel.getByText(label, { exact: true })).toBeVisible();
+		await expect(panel.getByText('Required by this task')).toBeVisible();
+		await expect(panel.getByText('Working', { exact: true })).toHaveCount(0);
+		await expect(page.locator('[data-delegation-wait]')).toBeVisible();
+	});
+}
+
+test('delegated work never replaces a running parent or makes optional work block it', async ({ page }) => {
+	const state = await delegatedApi(page, { parentAttempt: 'running' });
+	await page.goto(`/tasks/${taskId}`);
+	await expect(page.getByText('The agent is responding', { exact: true })).toBeVisible();
+	await expect(page.locator('[data-delegation-wait]')).toHaveCount(0);
+	state.children[0].blocks_parent = false;
+	state.attempts = [attempt('queued')];
+	await expect(page.getByText('The agent is queued to respond', { exact: true })).toBeVisible({ timeout: 10_000 });
+	await expect(page.locator('[data-delegation-wait]')).toHaveCount(0);
+	await expect(page.getByRole('region', { name: 'Delegated work', exact: true })).toBeVisible();
+});
+
+test('delegated work explains an idle parent without claiming a reply was saved', async ({ page }) => {
+	const state = await delegatedApi(page);
+	state.attempts = [];
+	await page.goto(`/tasks/${taskId}`);
+	await expect(page.locator('[data-delegation-wait]')).toBeVisible();
+	await expect(page.getByText(/Your reply is saved/)).toHaveCount(0);
+});
+
+test('delegated work does not replace the parent approval prompt', async ({ page }) => {
+	await delegatedApi(page, { parentStatus: 'waiting_for_input', parentAttempt: 'waiting_for_input', pendingInput: true });
+	await page.goto(`/tasks/${taskId}`);
+	await expect(page.getByText('Approve this operation?', { exact: true })).toBeVisible();
+	await expect(page.getByRole('region', { name: 'Delegated work', exact: true })).toBeVisible();
+	await expect(page.locator('[data-delegation-wait]')).toHaveCount(0);
+});
+
+test('delegated work still refreshes optional children after the parent completes', async ({ page }) => {
+	const state = await delegatedApi(page, { parentStatus: 'completed', parentAttempt: 'completed', child: { blocks_parent: false } });
+	await page.goto(`/tasks/${taskId}`);
+	const panel = page.getByRole('region', { name: 'Delegated work', exact: true });
+	await expect(panel.getByText('Working', { exact: true })).toBeVisible();
+	Object.assign(state.children[0], { status: 'completed', activity_status: 'completed', blocks_parent: false, finished_at: recentSqliteTimestamp(0) });
+	await expect(panel.getByText('Completed delegated work (1)', { exact: true })).toBeVisible({ timeout: 10_000 });
+	await expect(page.locator('[data-delegation-wait]')).toHaveCount(0);
+});
