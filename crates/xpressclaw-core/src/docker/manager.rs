@@ -1609,16 +1609,8 @@ impl DockerManager {
     }
 
     async fn remove(&self, container_name: &str) -> Result<()> {
-        self.ensure_no_container_dependents(container_name).await?;
-        let opts = RemoveContainerOptions {
-            force: true,
-            ..Default::default()
-        };
-        self.docker
-            .remove_container(container_name, Some(opts))
+        self.remove_container_reference(container_name, container_name)
             .await
-            .map_err(|e| Error::Container(format!("failed to remove container: {e}")))?;
-        Ok(())
     }
 
     /// Get the underlying bollard Docker client.
@@ -2257,6 +2249,40 @@ mod tests {
             .iter()
             .all(|request| request.starts_with("GET ")));
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn stopping_an_absent_attempt_is_idempotent_but_inspection_failure_is_not() {
+        for status in [404, 500] {
+            let (docker, requests, server) = mock_engine(HashMap::from([
+                (
+                    format!(
+                        "GET /containers/{}/json",
+                        project_container_name("installation", "attempt-test")
+                    ),
+                    (404, serde_json::json!({"message":"no retained attempt"})),
+                ),
+                (
+                    "GET /containers/xpressclaw-attempt-test/json".into(),
+                    (status, serde_json::json!({"message":"inspect failed"})),
+                ),
+                (
+                    "DELETE /containers/xpressclaw-attempt-test".into(),
+                    (404, serde_json::json!({"message":"no attempt container"})),
+                ),
+            ]))
+            .await;
+            let result = docker.stop("attempt-test").await;
+            assert_eq!(result.is_ok(), status == 404);
+            if status == 500 {
+                assert!(requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|request| request.starts_with("GET ")));
+            }
+            server.abort();
+        }
     }
 
     fn mixed_owned_environments() -> HashMap<String, (u16, serde_json::Value)> {

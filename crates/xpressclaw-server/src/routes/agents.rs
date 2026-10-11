@@ -136,7 +136,11 @@ async fn delete_agent(
         _ => internal_error(e),
     })?;
     let sessions = xpressclaw_core::sessions::SessionManager::new(state.db.clone());
-    let attempts = sessions.list_attempts(&id, None, 1_000).unwrap_or_default();
+    // Cleanup is not a paginated history view: an older active attempt may
+    // still own a container even after thousands of newer completed attempts.
+    let attempts = sessions
+        .list_attempts(&id, None, -1)
+        .map_err(internal_error)?;
     if let Some(docker) = state.docker().await {
         docker
             .ensure_project_removable(&record.name)
@@ -148,7 +152,10 @@ async fn delete_agent(
                 "completed" | "failed" | "cancelled" | "interrupted"
             )
         }) {
-            let _ = docker.stop(&format!("attempt-{}", attempt.id)).await;
+            docker
+                .stop(&format!("attempt-{}", attempt.id))
+                .await
+                .map_err(environment_conflict)?;
         }
         // Project deletion is the explicit cleanup boundary for the retained
         // environment (and also removes a pre-ADR-025 legacy container).
@@ -390,6 +397,9 @@ async fn rebuild_environment(
         .conversation_processes
         .retire_agent_everywhere(&record.name)
         .await;
+    SessionManager::new(state.db.clone())
+        .invalidate_native_sessions(&record.id)
+        .map_err(internal_error)?;
     Ok(Json(json!({"rebuilt": true})))
 }
 
@@ -718,6 +728,166 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::CONFLICT);
         assert_eq!(sessions.get_attempt(&attempt.id).unwrap().status, "queued");
+    }
+
+    /// Exercise the HTTP lifecycle against the engine, including writable-layer
+    /// loss and a legacy attempt that cannot be removed. Only isolated fixtures
+    /// belonging to this test installation are mutated.
+    #[tokio::test]
+    #[ignore = "requires Docker/Podman and XPRESSCLAW_RETENTION_TEST_IMAGE"]
+    async fn rebuild_and_delete_preserve_session_and_container_boundaries() {
+        use bollard::{
+            container::{Config as EngineConfig, CreateContainerOptions, RemoveContainerOptions},
+            models::HostConfig,
+            Docker,
+        };
+        use futures_util::FutureExt;
+        use xpressclaw_core::docker::manager::{ContainerSpec, DockerManager};
+
+        let Ok(image) = std::env::var("XPRESSCLAW_RETENTION_TEST_IMAGE") else {
+            eprintln!("skipping Agent environment lifecycle integration test; set XPRESSCLAW_RETENTION_TEST_IMAGE to the built fixture image to run it");
+            return;
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.yaml");
+        let agent = format!("retention-routes-{}", uuid::Uuid::new_v4());
+        let other = format!("other-{agent}");
+        let attempt_id = format!("work-{agent}");
+        let legacy_id = format!("attempt-{attempt_id}");
+        let child_name = format!("child-{agent}");
+        let db = Arc::new(Database::open_memory().unwrap());
+        let mut config = Config::default();
+        for name in [&agent, &other] {
+            config.agents.push(AgentConfig {
+                name: name.clone(),
+                ..Default::default()
+            });
+            AgentRegistry::new(db.clone())
+                .ensure(name, "codex")
+                .unwrap();
+            SessionManager::new(db.clone()).ensure(name, None).unwrap();
+            db.with_conn(|conn| {
+                conn.execute("INSERT INTO work_attempts (id, session_id, runner, status, native_session_id, result) VALUES (?1,?2,'codex','completed','native-task','saved result')", [&format!("work-{name}"), name])?;
+                conn.execute("INSERT INTO conversations (id,title) VALUES (?1,'preserved conversation')", [name])?;
+                conn.execute("INSERT INTO conversation_agent_sessions (conversation_id,agent_id,native_session_id) VALUES (?1,?1,'native-chat')", [name])?;
+                Ok::<_, xpressclaw_core::error::Error>(())
+            }).unwrap();
+        }
+        config.save(&config_path).unwrap();
+        let state = AppState::new(
+            Arc::new(config),
+            db.clone(),
+            None,
+            config_path.clone(),
+            true,
+        );
+        let docker = Arc::new(
+            DockerManager::connect_for_installation(&db.installation_id().unwrap())
+                .await
+                .unwrap(),
+        );
+        *state.docker.write().unwrap() = Some(docker.clone());
+        let app = Router::new()
+            .nest("/agents", routes())
+            .with_state(state.clone());
+        let engine = Docker::connect_with_defaults().unwrap();
+        let spec = ContainerSpec {
+            image: image.clone(),
+            expose_port: None,
+            cmd: Some(vec![
+                "node".into(),
+                "-e".into(),
+                "setInterval(()=>{},1000)".into(),
+            ]),
+            ..Default::default()
+        };
+        let retained = docker.launch_project_attached(&agent, &spec).await.unwrap();
+        let result = std::panic::AssertUnwindSafe(async {
+            async fn child(engine: &Docker, name: &str, image: &str, parent: &str) {
+                let child = engine.create_container(Some(CreateContainerOptions { name, platform: None }), EngineConfig {
+                    image: Some(image), cmd: Some(vec!["node", "-e", "setInterval(()=>{},1000)"]),
+                    host_config: Some(HostConfig { network_mode: Some(format!("container:{parent}")), ..Default::default() }), ..Default::default()
+                }).await.unwrap();
+                engine.start_container::<String>(&child.id,None).await.unwrap();
+            }
+            async fn request(app: &Router, agent: &str, rebuild: bool) -> axum::response::Response {
+                let request = if rebuild {
+                    Request::builder().method("POST").uri(format!("/agents/{agent}/environment/rebuild"))
+                        .header("content-type", "application/json").body(Body::from(r#"{"discard_installed_tools":true}"#)).unwrap()
+                } else {
+                    Request::builder().method("DELETE").uri(format!("/agents/{agent}")).body(Body::empty()).unwrap()
+                };
+                app.clone().oneshot(request).await.unwrap()
+            }
+            fn native_ids(db: &Arc<Database>, agent: &str) -> (Option<String>, Option<String>) {
+                db.with_conn(|conn| (
+                    conn.query_row("SELECT native_session_id FROM work_attempts WHERE session_id=?1", [agent], |row| row.get(0)).unwrap(),
+                    conn.query_row("SELECT native_session_id FROM conversation_agent_sessions WHERE agent_id=?1", [agent], |row| row.get(0)).unwrap(),
+                ))
+            }
+
+            child(&engine, &child_name, &image, &retained.info.container_id).await;
+            let blocked = request(&app, &agent, true).await;
+            assert_eq!(blocked.status(), StatusCode::CONFLICT);
+            assert_eq!(native_ids(&db,&agent), (Some("native-task".into()),Some("native-chat".into())));
+            assert!(docker.is_container_running(&retained.info.container_id).await);
+            engine.remove_container(&child_name,Some(RemoveContainerOptions{force:true,..Default::default()})).await.unwrap();
+
+            let rebuilt = request(&app, &agent, true).await;
+            assert_eq!(rebuilt.status(), StatusCode::OK, "{}", body_json(rebuilt.into_body()).await);
+            assert_eq!(native_ids(&db,&agent), (None,None));
+            assert_eq!(native_ids(&db,&other), (Some("native-task".into()),Some("native-chat".into())));
+            let attempt = SessionManager::new(db.clone()).get_attempt(&attempt_id).unwrap();
+            assert_eq!(attempt.result.as_deref(),Some("saved result"));
+            assert_eq!(attempt.status,"completed");
+            assert!(!docker.is_container_running(&retained.info.container_id).await);
+
+            let retained = docker.launch_project_attached(&agent, &spec).await.unwrap();
+            let legacy = docker.launch(&legacy_id,&spec).await.unwrap();
+            db.with_conn(|conn| {
+                conn.execute("UPDATE work_attempts SET status='running',container_id=?1,created_at='2000-01-01' WHERE id=?2", [&legacy.container_id,&attempt_id])?;
+                conn.execute("WITH RECURSIVE history(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM history WHERE n<1001)
+                    INSERT INTO work_attempts(id,session_id,runner,status)
+                    SELECT ?1 || '-history-' || n,?1,'codex','completed' FROM history", [&agent])?;
+                Ok::<_, xpressclaw_core::error::Error>(())
+            }).unwrap();
+            child(&engine, &child_name, &image, &legacy.container_id).await;
+            let saved_config = std::fs::read(&config_path).unwrap();
+            let blocked = request(&app, &agent, false).await;
+            assert_eq!(blocked.status(), StatusCode::CONFLICT);
+            assert!(body_json(blocked.into_body()).await["error"].as_str().unwrap().contains(&child_name));
+            assert!(AgentRegistry::new(db.clone()).get(&agent).is_ok());
+            assert_eq!(std::fs::read(&config_path).unwrap(),saved_config);
+            assert!(state.config().agents.iter().any(|record| record.name==agent));
+            assert_eq!(SessionManager::new(db.clone()).get_attempt(&attempt_id).unwrap().status,"running");
+            assert!(docker.is_container_running(&retained.info.container_id).await);
+            assert!(docker.is_container_running(&legacy.container_id).await);
+            assert!(docker.is_container_running(&child_name).await);
+
+            engine.remove_container(&child_name,Some(RemoveContainerOptions{force:true,..Default::default()})).await.unwrap();
+            // Queued work has no legacy container yet. Its absence must not
+            // prevent retrying deletion after the dependency is repaired.
+            db.with_conn(|conn| conn.execute("INSERT INTO work_attempts (id,session_id,runner,status) VALUES (?1,?2,'codex','queued')", [&format!("queued-{agent}"),&agent])).unwrap();
+            let deleted = request(&app, &agent, false).await;
+            assert_eq!(deleted.status(),StatusCode::NO_CONTENT);
+            assert!(AgentRegistry::new(db.clone()).get(&agent).is_err());
+            assert!(!docker.is_container_running(&retained.info.container_id).await);
+            assert!(!docker.is_container_running(&legacy.container_id).await);
+        }).catch_unwind().await;
+        let _ = engine
+            .remove_container(
+                &child_name,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+        docker.remove_owned_workload(&legacy_id).await.unwrap();
+        docker.remove_owned_workload(&agent).await.unwrap();
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     #[tokio::test]

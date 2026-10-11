@@ -62,6 +62,10 @@ Rebuild requires an idle Agent under the runtime lifecycle barrier, and warns
 that installed tools and unmounted files will be lost. It removes the old
 environment; the next turn creates one using the saved settings. No automatic
 update is allowed to discard a retained writable layer.
+After successful removal, clear the Agent's persisted task and conversation
+native session IDs while still holding the runtime boundary. Their harness
+storage may have lived in the deleted layer. Preserve logical history and start
+fresh harness sessions on subsequent turns. A rejected rebuild leaves IDs intact.
 
 Before explicit removal, inspect all containers (including stopped and unlabelled
 containers) for namespace, volume-source, and link dependencies. If any reference
@@ -72,6 +76,8 @@ containers from an older installation layout, before deleting any environment.
 The engine remains authoritative if another
 trusted host-engine client changes dependencies during removal. Host-engine access
 remains opt-in as specified in ADR-027.
+Agent deletion must also stop if cleanup of an active legacy attempt container
+fails, retaining the Agent's configuration and records for repair and retry.
 
 Configured startup commands initialize a retained environment once. A marker is
 written only after every command succeeds; a failed initialization is retried
@@ -113,6 +119,9 @@ and dependent network service across an image-selection change, plus installed-f
 retention across an explicit process restart.
 Run it with
 `XPRESSCLAW_RETENTION_TEST_IMAGE=node:22-bookworm-slim` on Docker or Podman.
+The server integration test `rebuild_and_delete_preserve_session_and_container_boundaries`
+uses the same fixture to check session invalidation only after successful rebuild
+and Agent preservation when a legacy attempt has a dependent container.
 
 Hard cancellation, process recovery, and control-plane restart still stop the
 shared Agent container and can disrupt namespace-sharing services. This change

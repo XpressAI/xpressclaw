@@ -4275,7 +4275,10 @@ mod tests {
             Docker,
         };
         use futures_util::{FutureExt, StreamExt};
-        let image = std::env::var("XPRESSCLAW_RETENTION_TEST_IMAGE").unwrap();
+        let Ok(image) = std::env::var("XPRESSCLAW_RETENTION_TEST_IMAGE") else {
+            eprintln!("skipping retained runner integration test; set XPRESSCLAW_RETENTION_TEST_IMAGE to the built fixture image to run it");
+            return;
+        };
         let installation = format!("retention-test-{}", uuid::Uuid::new_v4());
         let docker = DockerManager::connect_for_installation(&installation)
             .await
@@ -7315,6 +7318,23 @@ flows:
             session_start(&db, &old_task_follow_up, "codex").unwrap(),
             AcpSessionStart::Fork("thread-1".into())
         );
+
+        // Rebuilding destroys unmounted harness storage. Ordinary follow-ups,
+        // project forks, and dependency forks must all start fresh afterward.
+        SessionManager::new(db.clone())
+            .invalidate_native_sessions("atlas")
+            .unwrap();
+        for item in [
+            regular_item,
+            dependent_item,
+            active_follow_up,
+            old_task_follow_up,
+        ] {
+            assert_eq!(
+                session_start(&db, &item, "codex").unwrap(),
+                AcpSessionStart::New
+            );
+        }
     }
 
     #[test]
