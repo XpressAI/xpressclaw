@@ -31,7 +31,7 @@
 
 	const RECENT_WORK_LIMIT = 5;
 	const ATTENTION_STATUSES = ['waiting_for_input', 'blocked'];
-	let attentionTasks = $derived(taskList.filter((task) => ATTENTION_STATUSES.includes(task.status)));
+	let attentionTasks = $state<Task[]>([]);
 	let activeTasks = $derived(taskList.filter((task) => ['pending', 'in_progress'].includes(task.status)));
 	let recentWorkTasks = $state<Task[]>([]);
 
@@ -53,7 +53,7 @@
 
 	async function load() {
 		try {
-			const [nextOverview, result, recentWork] = await Promise.all([
+			const [nextOverview, result, recentWork, attention] = await Promise.all([
 				sessions.get(agentId),
 				tasks.list(undefined, agentId),
 				tasks.list(undefined, agentId, {
@@ -61,10 +61,12 @@
 					sort: 'recent',
 					excludeStatuses: ATTENTION_STATUSES,
 				}),
+				tasks.attention(agentId),
 			]);
 			overview = nextOverview;
 			taskList = result.tasks;
 			recentWorkTasks = recentWork.tasks;
+			attentionTasks = attention.tasks ?? result.tasks.filter(task => ATTENTION_STATUSES.includes(task.status));
 			error = null;
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
@@ -228,14 +230,16 @@
 		{#if attentionTasks.length > 0}
 			<section class="space-y-2">
 				<div class="flex items-center justify-between px-1">
-					<h2 class="text-sm font-semibold text-orange-500">Needs you</h2>
+					<h2 class="text-sm font-semibold text-orange-500">Needs attention</h2>
 					<span class="text-xs text-muted-foreground">{attentionTasks.length}</span>
 				</div>
 				{#each attentionTasks as task (task.id)}
 					<a href="/tasks/{task.id}" class="flex items-center gap-3 rounded-xl border p-4 transition-colors hover:border-primary/40 {taskTone(task.status)}">
 						<span class="h-2.5 w-2.5 shrink-0 rounded-full bg-orange-500 animate-pulse"></span>
 						<div class="min-w-0 flex-1">
-							<div class="truncate text-sm font-medium">{task.title}</div>
+							<div class="break-words text-sm font-medium">{task.title}</div>
+							{#if task.parent_task_id}<div class="text-xs text-muted-foreground">Delegated from {task.parent_title || 'another task'}</div>{/if}
+							{#if task.error_message}<p class="mt-1 whitespace-pre-wrap break-words text-xs text-destructive">{task.error_message}</p>{/if}
 							<div class="mt-0.5 text-xs text-muted-foreground">{task.status === 'waiting_for_input' ? 'Waiting for your reply' : 'Blocked'} · {timeAgo(task.updated_at)}</div>
 						</div>
 						<span class="text-muted-foreground">→</span>

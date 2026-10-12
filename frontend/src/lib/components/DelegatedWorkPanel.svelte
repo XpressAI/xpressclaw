@@ -85,6 +85,7 @@
 			<span class="min-w-0 break-words">{item.title}</span>
 			<ArrowUpRight class="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true" />
 		</a>
+		{#if item.error_message}<p class="mt-2 whitespace-pre-wrap break-words text-xs text-destructive" data-delegated-error>{item.error_message}</p>{/if}
 		<div class="mt-1.5 flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
 			{#if duration(item)}<span data-delegated-duration>{duration(item)}</span>{/if}
 			{#if lastActivity(item)}<span title={item.latest_event_at ?? undefined}>{lastActivity(item)}</span>{/if}

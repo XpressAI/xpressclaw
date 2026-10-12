@@ -341,12 +341,13 @@
 	);
 	let platformManaged = $derived(task?.provenance === 'xpress_ai_connect');
 	let blockingDelegates = $derived(delegatedWork.filter(item => item.blocks_parent));
+	let failedDelegates = $derived(blockingDelegates.filter(item => ['blocked', 'failed', 'cancelled', 'interrupted', 'waiting_for_input'].includes(item.activity_status)));
 	let waitingForDelegation = $derived(
 		blockingDelegates.length > 0 && !runningAttempt && !pendingElicitation
 		&& ['pending', 'in_progress'].includes(task?.status ?? '')
 		&& !['awaiting_review', 'backlog', 'scheduled'].includes(task?.activity_status ?? '')
 	);
-	let taskActivityStatus = $derived(waitingForDelegation ? 'waiting_for_subtasks' : task?.activity_status ?? task?.status ?? '');
+	let taskActivityStatus = $derived(waitingForDelegation ? (failedDelegates.length ? 'blocked' : 'waiting_for_subtasks') : task?.activity_status ?? task?.status ?? '');
 	function delegatedAgentName(item: DelegatedWork): string {
 		const agent = agentList.find(agent => agent.id === item.agent_id);
 		return agent?.title || agent?.name || item.agent_id || 'an assigned Agent';
@@ -1648,7 +1649,14 @@
 	{:else if task}
 		<div class="flex min-h-0 flex-1 overflow-hidden">
 			<!-- Left: conversation -->
-			<div class="flex-1 flex flex-col overflow-hidden">
+            <div class="flex-1 flex flex-col overflow-hidden">
+                {#if waitingForDelegation && failedDelegates.length > 0}
+                    <div role="alert" data-delegation-blocker class="shrink-0 border-b border-destructive/30 bg-destructive/5 px-3 py-2 text-xs sm:px-6">
+                        <span class="font-semibold text-destructive">Blocked by delegated work.</span>
+                        <a href="/tasks/{failedDelegates[0].task_id}" class="ml-1 text-primary underline">Open {delegatedAgentName(failedDelegates[0])}'s task</a>
+                        {#if failedDelegates.length > 1}<span> · {failedDelegates.length} tasks need attention</span>{/if}
+                    </div>
+                {/if}
 				<div bind:this={messagesEl} onscroll={handleTranscriptScroll} tabindex="-1" aria-label="Task transcript" data-task-transcript-scroll class="flex-1 space-y-4 overflow-y-auto px-3 py-4 sm:px-6 sm:py-5">
 					{#if hasEarlierActivity}
 						<div class="flex justify-center">
@@ -1938,7 +1946,8 @@
 						</section>
 					{/if}
 
-					<DelegatedWorkPanel items={delegatedWork} agents={agentList} />
+					{#if task.parent_task_id}<p class="my-3 text-xs text-muted-foreground">Delegated from <a href="/tasks/{task.parent_task_id}" class="text-primary underline">{task.parent_title || 'parent task'}</a></p>{/if}
+                    <DelegatedWorkPanel items={delegatedWork} agents={agentList} />
 
 					<!-- Live indicator -->
 					{#if workingAttempt}
@@ -1960,12 +1969,15 @@
 						</div>
 					{:else if waitingForDelegation}
 						<div role="status" class="space-y-1 py-2 text-sm text-amber-600 dark:text-amber-400" data-delegation-wait>
-							{#if blockingDelegates.length === 1}
+							{#if failedDelegates.length > 0}
+                                <p class="font-medium text-destructive">Delegated work needs attention. This task cannot resume yet.</p>
+                                {#each failedDelegates as item}<p><a class="underline" href="/tasks/{item.task_id}">{delegatedAgentName(item)}: {item.title}</a> — {item.activity_status.replaceAll('_', ' ')}</p>{/each}
+                            {:else if blockingDelegates.length === 1}
 								<p>Waiting for {delegatedAgentName(blockingDelegates[0])}: <a class="underline" href="/tasks/{blockingDelegates[0].task_id}">{blockingDelegates[0].title}</a>.</p>
 							{:else}
 								<p>Waiting for {blockingDelegates.length} required delegated tasks shown above.</p>
 							{/if}
-							{#if queuedAttempt?.trigger_message_id}<p class="text-xs text-muted-foreground">Your reply is saved and will be handled after the required work is resolved.</p>
+							{#if queuedAttempt?.trigger_message_id}<p class="text-xs text-muted-foreground">Your message is saved and will be handled after the required work is resolved.</p>
 							{:else if queuedAttempt}<p class="text-xs text-muted-foreground">Queued work will continue after the required work is resolved.</p>{/if}
 						</div>
 					{:else if queuedAttempt}

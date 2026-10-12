@@ -119,6 +119,7 @@ pub fn routes() -> Router<AppState> {
         .route("/planning", get(list_planning))
         .route("/{id}/planning", get(get_planning).patch(change_planning))
         .route("/recent-by-agent", get(list_recent_tasks_by_agent))
+        .route("/attention", get(list_attention_tasks))
         .route(
             "/{id}",
             get(get_task).patch(update_task).delete(delete_task),
@@ -396,6 +397,17 @@ fn parse_comma_separated(value: Option<&str>) -> Vec<&str> {
         .unwrap_or_default()
 }
 
+async fn list_attention_tasks(
+    State(state): State<AppState>,
+    Query(params): Query<ListParams>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let board = TaskBoard::new(state.db.clone());
+    let tasks = board
+        .list_attention(params.agent_id.as_deref())
+        .map_err(internal_error)?;
+    Ok(Json(json!({ "tasks": enrich_tasks(&board, &tasks) })))
+}
+
 async fn list_recent_tasks_by_agent(
     State(state): State<AppState>,
     Query(params): Query<RecentByAgentParams>,
@@ -407,11 +419,17 @@ async fn list_recent_tasks_by_agent(
     Ok(Json(json!({ "tasks": enrich_tasks(&board, &tasks) })))
 }
 
-fn enrich_tasks(board: &TaskBoard, tasks: &[Task]) -> Vec<Value> {
+pub(super) fn enrich_tasks(board: &TaskBoard, tasks: &[Task]) -> Vec<Value> {
     tasks
         .iter()
         .map(|t| {
             let mut v = json!(t);
+            v["error_message"] = json!(board.current_error(t).unwrap_or_default());
+            v["parent_title"] = json!(t
+                .parent_task_id
+                .as_deref()
+                .and_then(|id| board.get(id).ok())
+                .map(|parent| parent.title));
             v["depends_on"] = json!(board.get_dependencies(&t.id).unwrap_or_default());
             v["blocked_by"] = json!(board.get_blockers(&t.id).unwrap_or_default());
             v["ready"] = json!(board.is_ready(&t.id).unwrap_or(true));
@@ -466,6 +484,12 @@ async fn get_task(
     let blocked_by = board.get_blockers(&id).unwrap_or_default();
     let ready = board.is_ready(&id).unwrap_or(true);
     let mut result = json!(task);
+    result["error_message"] = json!(board.current_error(&task).map_err(internal_error)?);
+    result["parent_title"] = json!(task
+        .parent_task_id
+        .as_deref()
+        .and_then(|id| board.get(id).ok())
+        .map(|parent| parent.title));
     result["depends_on"] = json!(depends_on);
     result["dependents"] = json!(dependents);
     result["blocked_by"] = json!(blocked_by);
@@ -1813,6 +1837,72 @@ mod tests {
             Ok::<_, xpressclaw_core::error::Error>(())
         })
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn delegated_task_attention_is_not_hidden_by_history_or_native_steps() {
+        let (app, db) = test_app_with_db();
+        db.conn().execute_batch("INSERT INTO tasks(id,title,status) VALUES('parent','Benchmark','in_progress');
+            INSERT INTO tasks(id,title,status,agent_id,parent_task_id,provenance) VALUES
+              ('review','Review','blocked','reviewer','parent','durable'),
+              ('plan','Checklist','blocked','reviewer','parent','native_plan');
+            INSERT INTO logical_sessions(id,agent_id) VALUES('reviewer','reviewer');
+            INSERT INTO work_attempts(id,session_id,task_id,runner,status,error_message)
+              VALUES('failed','reviewer','review','codex','failed','Preserved environment needs attention');").unwrap();
+        for path in [
+            "/tasks?agent_id=reviewer",
+            "/tasks?agent_id=reviewer&sort=recent",
+            "/tasks/attention?agent_id=reviewer",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = body_json(response.into_body()).await;
+            assert_eq!(body["tasks"].as_array().unwrap().len(), 1, "{path}");
+            assert_eq!(body["tasks"][0]["id"], "review");
+            assert_eq!(body["tasks"][0]["parent_title"], "Benchmark");
+            assert_eq!(
+                body["tasks"][0]["error_message"],
+                "Preserved environment needs attention"
+            );
+        }
+        // More than a page of old work must not hide the unresolved child.
+        for i in 0..110 {
+            db.conn().execute("INSERT INTO tasks(id,title,status,agent_id) VALUES(?1,'Old work','completed','reviewer')", [format!("old-{i}")]).unwrap();
+        }
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/tasks/attention?agent_id=reviewer")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            body_json(response.into_body()).await["tasks"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        db.conn()
+            .execute("UPDATE tasks SET status='cancelled' WHERE id='review'", [])
+            .unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/tasks/review")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(body_json(response.into_body()).await["error_message"].is_null());
     }
 
     #[tokio::test]

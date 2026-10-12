@@ -868,7 +868,7 @@
 	async function loadWorkspaceSummary() {
 		const startingProjectMutationVersion = projectMutationVersion;
 		try {
-			const [nextProjects, nextConversations, nextAgents, taskResult, sidebarTaskResult, nextWorkflows, nextSchedules] = await Promise.all([
+			const [nextProjects, nextConversations, nextAgents, taskResult, sidebarTaskResult, nextWorkflows, nextSchedules, attentionResult] = await Promise.all([
 				projectsApi.list().catch(() => projectList),
 				conversationsApi.list(undefined, 200).catch(() => conversationList),
 				agents.list().catch(() => agentList),
@@ -876,6 +876,7 @@
 				tasksApi.recentByAgent().catch(() => null),
 				workflowsApi.list().catch(() => workflowList),
 				schedulesApi.list().catch(() => scheduleList),
+				tasksApi.attention().catch(() => null),
 			]);
 			projectList = [...projectMutations.values()]
 				.filter(({ version }) => version > startingProjectMutationVersion)
@@ -883,7 +884,7 @@
 			conversationList = nextConversations;
 			agentList = nextAgents;
 			taskList = taskResult.tasks;
-			sidebarTaskList = sidebarTaskResult?.tasks ?? taskResult.tasks;
+			sidebarTaskList = [...new Map([...(sidebarTaskResult?.tasks ?? taskResult.tasks), ...(attentionResult?.tasks ?? [])].map(task => [task.id, task])).values()];
 			workflowList = nextWorkflows;
 			scheduleList = nextSchedules;
 			refreshTabMetadata();

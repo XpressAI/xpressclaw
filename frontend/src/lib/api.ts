@@ -778,6 +778,8 @@ export const workspaces = {
 // -- Tasks --
 
 export interface Task {
+	parent_title?: string | null;
+	error_message?: string | null;
 	start_after?: string | null;
 	backlog?: boolean;
 	position?: number;
@@ -824,6 +826,7 @@ export interface TaskActivity {
 }
 
 export interface DelegatedWork {
+	error_message?: string | null;
 	task_id: string;
 	title: string;
 	agent_id: string | null;
@@ -849,6 +852,7 @@ export interface TaskListOptions {
 
 export type PlanningAction = { action: 'schedule'; start_after: string | null; activate?: boolean } | { action: 'backlog' | 'queue' } | { action: 'assign'; agent_id: string } | { action: 'priority'; priority: number } | { action: 'reorder'; before_id?: string; after_id?: string };
 export const tasks = {
+	attention: (agentId?: string) => request<{ tasks: Task[] }>(`/api/tasks/attention${agentId ? `?agent_id=${encodeURIComponent(agentId)}` : ''}`),
     planning: (options: { project_id?: string; agent_id?: string; status?: string; search?: string; limit?: number; offset?: number }) => {
         const query = new URLSearchParams();
         for (const [key, value] of Object.entries(options)) if (value !== undefined && value !== '') query.set(key, String(value));

@@ -160,15 +160,20 @@ impl SessionManager {
 
     pub fn get(&self, session_id: &str) -> Result<LogicalSession> {
         self.db.with_conn(|conn| {
-            conn.query_row(
-                "SELECT id, agent_id, title, status, latest_summary, created_at, updated_at
+            let mut session = conn
+                .query_row(
+                    "SELECT id, agent_id, title, status, latest_summary, created_at, updated_at
                  FROM logical_sessions WHERE id = ?1",
-                [session_id],
-                row_to_session,
-            )
-            .map_err(|_| Error::AgentNotFound {
-                name: session_id.to_string(),
-            })
+                    [session_id],
+                    row_to_session,
+                )
+                .map_err(|_| Error::AgentNotFound {
+                    name: session_id.to_string(),
+                })?;
+            // Stored status is a cache. Reads must reflect current unresolved
+            // work, including tasks cancelled/completed since an earlier failure.
+            session.status = self.derive_status_with_conn(conn, session_id)?;
+            Ok(session)
         })
     }
 
@@ -1102,8 +1107,9 @@ impl SessionManager {
             return Ok("queued".to_string());
         }
         let waiting: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM tasks
-             WHERE agent_id = ?1 AND status = 'waiting_for_input'",
+            "SELECT EXISTS(SELECT 1 FROM tasks
+             WHERE agent_id = ?1 AND status = 'waiting_for_input' AND hidden=0 AND provenance!='native_plan')
+             OR EXISTS(SELECT 1 FROM work_attempts WHERE session_id=?1 AND status='waiting_for_input')",
             [session_id],
             |row| row.get(0),
         )?;
@@ -1112,7 +1118,7 @@ impl SessionManager {
         }
         let blocked: i64 = conn.query_row(
             "SELECT COUNT(*) FROM tasks
-             WHERE agent_id = ?1 AND status = 'blocked'",
+             WHERE agent_id = ?1 AND status = 'blocked' AND hidden=0 AND provenance!='native_plan'",
             [session_id],
             |row| row.get(0),
         )?;
@@ -1203,6 +1209,31 @@ mod tests {
             )
         })
         .unwrap();
+    }
+
+    #[test]
+    fn session_reads_clear_stale_failure_flags_without_erasing_history() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        insert_agent(&db, "reviewer");
+        let manager = SessionManager::new(db.clone());
+        manager.ensure("reviewer", None).unwrap();
+        db.conn().execute_batch("UPDATE logical_sessions SET status='blocked';
+            INSERT INTO tasks(id,title,status,agent_id) VALUES('cancelled','Old work','cancelled','reviewer');
+            INSERT INTO work_attempts(id,session_id,task_id,runner,status,error_message)
+              VALUES('old','reviewer','cancelled','codex','failed','Historical failure');").unwrap();
+        assert_eq!(manager.get("reviewer").unwrap().status, "idle");
+        assert_eq!(
+            manager.get_attempt("old").unwrap().error_message.as_deref(),
+            Some("Historical failure")
+        );
+        db.conn().execute_batch("INSERT INTO tasks(id,title,status,agent_id) VALUES('review','Review','blocked','reviewer');").unwrap();
+        assert_eq!(manager.get("reviewer").unwrap().status, "blocked");
+        db.conn()
+            .execute("UPDATE tasks SET status='completed' WHERE id='review'", [])
+            .unwrap();
+        assert_eq!(manager.overview("reviewer").unwrap().session.status, "idle");
+        db.conn().execute_batch("INSERT INTO work_attempts(id,session_id,runner,status) VALUES('active','reviewer','codex','running');").unwrap();
+        assert_eq!(manager.get("reviewer").unwrap().status, "running");
     }
 
     #[test]

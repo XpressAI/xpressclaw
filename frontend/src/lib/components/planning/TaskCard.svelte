@@ -71,7 +71,7 @@
           : task.priority < 0
             ? "Low"
             : "Normal"}</span
-    >{#if task.parent_task_id}<span>Subtask</span>{/if}
+    >{#if task.parent_task_id}<a href={`/tasks/${task.parent_task_id}`} class="hover:underline">Delegated · open parent</a>{/if}
   </div>
   {#if task.start_after}<p class="date">
       Earliest {dateLabel(task.start_after)}

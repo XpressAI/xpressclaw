@@ -289,3 +289,20 @@ boundary: use only runner images you control or have audited.
 - ADR-021: Agent Sessions / Actor Model (superseded)
 - ADR-022: Workflow execution retained; connector runtime deferred
 - ADR-024: Android device capability work (designed to attach as a resource)
+
+### Delegated task and failure visibility
+
+Durable child tasks appear in assigned-Agent, project, search, recent-work, and
+status-count views, with links back to their parent. Only hidden idle work and
+native harness checklist rows are excluded from ordinary task lists; checklist
+rows remain visible as parent steps. A required child that needs attention must
+not make its queued parent appear to be executing.
+
+Unresolved blocked/input tasks have a separate read-only attention snapshot, so
+recent-history limits cannot hide the work responsible for an indicator. Project
+warnings lead to the affected task or Agent. Delegated progress includes the
+current attempt's failure reason, not an older failure after retry or resolution.
+Session status is derived on reads from current attempts and unresolved tasks;
+cached failure flags from cancelled/completed work do not keep projects red.
+Historical attempts and their errors remain intact. These are presentation changes;
+execution admission and required-review completion gates remain unchanged.

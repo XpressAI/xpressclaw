@@ -37,10 +37,9 @@ async fn list_project_tasks(
     ProjectManager::new(state.db.clone())
         .get(&id)
         .map_err(project_error)?;
-    let tasks = TaskBoard::new(state.db.clone())
-        .list_for_project(&id, 100)
-        .map_err(project_error)?;
-    Ok(Json(json!(tasks)))
+    let board = TaskBoard::new(state.db.clone());
+    let tasks = board.list_for_project(&id, 100).map_err(project_error)?;
+    Ok(Json(json!(super::tasks::enrich_tasks(&board, &tasks))))
 }
 
 async fn list_projects(

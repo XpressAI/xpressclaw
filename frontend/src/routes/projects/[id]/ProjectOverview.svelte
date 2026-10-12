@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
 	import { onMount } from 'svelte';
-	import { agents, conversations, projects, type Agent, type Conversation, type Project, type Task } from '$lib/api';
+	import { agents, conversations, projects, tasks, type Agent, type Conversation, type Project, type Task } from '$lib/api';
 	import { PROJECT_MUTATION_EVENT, publishProjectMutation, type ProjectMutation } from '$lib/projectEvents';
 	import { agentRuntimeSummary, harnessMark, timeAgo } from '$lib/utils';
 	import AgentLoading from '$lib/components/AgentLoading.svelte';
@@ -12,6 +12,7 @@
 	let projectConversations = $state<Conversation[]>([]);
 	let agentList = $state<Agent[]>([]);
 	let taskList = $state<Task[]>([]);
+	let attentionTasks = $state<Task[]>([]);
 	let loading = $state(true);
 	let creatingConversation = $state(false);
 	let addingAgent = $state(false);
@@ -37,23 +38,30 @@
 		};
 		window.addEventListener(PROJECT_MUTATION_EVENT, handleProjectMutation);
 		void load();
-		return () => window.removeEventListener(PROJECT_MUTATION_EVENT, handleProjectMutation);
+		const poll = setInterval(() => void load(), 5000);
+		return () => {
+			clearInterval(poll);
+			window.removeEventListener(PROJECT_MUTATION_EVENT, handleProjectMutation);
+		};
 	});
 
 	async function load() {
 		const mutationVersionAtStart = projectMutationVersion;
 		try {
-			const [loadedProject, loadedConversations, loadedAgents, loadedTasks] = await Promise.all([
+			const [loadedProject, loadedConversations, loadedAgents, loadedTasks, attention] = await Promise.all([
 				projects.get(projectId),
 				conversations.list(projectId),
 				agents.list(),
 				projects.tasks(projectId),
+				tasks.attention(),
 			]);
 			if (projectMutationVersion === mutationVersionAtStart) project = loadedProject;
 			projectConversations = loadedConversations;
 			agentList = loadedAgents;
 			taskList = loadedTasks;
-			if (selectedAgents.length === 0) selectedAgents = project?.agent_ids.slice() ?? [];
+			attentionTasks = (attention.tasks ?? []).filter(task => task.project_id === projectId);
+			error = '';
+			if (loading && selectedAgents.length === 0) selectedAgents = project?.agent_ids.slice() ?? [];
 		} catch (cause) {
 			error = cause instanceof Error ? cause.message : 'Could not load this project.';
 		} finally {
@@ -125,9 +133,17 @@
 		});
 	}
 
+	function agentState(agent: Agent): string {
+		const attention = attentionTasks.filter(task => task.agent_id === agent.id);
+		if (attention.some(task => task.status === 'blocked')) return 'blocked';
+		if (attention.some(task => task.status === 'waiting_for_input')) return 'waiting_for_input';
+		return agent.status;
+	}
+
 	function taskDot(status: string): string {
-		if (status === 'failed' || status === 'blocked') return 'bg-red-500';
+		if (['failed', 'blocked', 'error'].includes(status)) return 'bg-red-500';
 		if (status === 'in_progress' || status === 'running') return 'bg-blue-500 animate-pulse';
+		if (['waiting_for_input', 'waiting_for_subtasks'].includes(status)) return 'bg-orange-500';
 		if (status === 'pending' || status === 'queued') return 'bg-amber-400';
 		return 'bg-emerald-500';
 	}
@@ -154,7 +170,24 @@
 
 			{#if error}<div class="rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</div>{/if}
 
-			{#if creatingConversation}
+			{#if attentionTasks.length > 0 || projectAgents.some(agent => ['blocked', 'failed', 'error', 'waiting_for_input'].includes(agent.status))}
+                <section aria-label="Project needs attention" class="rounded-xl border border-orange-500/40 bg-orange-500/5 p-4 space-y-3">
+                    <h2 class="font-semibold">Needs attention</h2>
+                    {#each attentionTasks as task (task.id)}
+                        <div class="min-w-0">
+                            <a href="/tasks/{task.id}" class="text-sm font-medium text-primary underline">{task.title}</a>
+                            <p class="text-xs text-muted-foreground">{task.status === 'waiting_for_input' ? 'Needs input' : 'Blocked'} · {projectAgents.find(agent => agent.id === task.agent_id)?.title || task.agent_id || 'Unassigned'}</p>
+                            {#if task.parent_task_id}<a href="/tasks/{task.parent_task_id}" class="text-xs text-muted-foreground underline">Parent: {task.parent_title || 'Open parent task'}</a>{/if}
+                            {#if task.error_message}<p class="mt-1 whitespace-pre-wrap break-words text-xs text-destructive">{task.error_message}</p>{/if}
+                        </div>
+                    {/each}
+                    {#each projectAgents.filter(agent => ['blocked', 'failed', 'error', 'waiting_for_input'].includes(agent.status) && !attentionTasks.some(task => task.agent_id === agent.id)) as agent}
+                        <a href="/agents/{encodeURIComponent(agent.id)}" class="block text-sm text-primary underline">{agent.title || agent.name} — open work needing attention</a>
+                    {/each}
+                </section>
+            {/if}
+
+            {#if creatingConversation}
 				<form onsubmit={(event) => { event.preventDefault(); void createConversation(); }} class="ai-card space-y-4 p-4">
 					<div><label for="conversation-title" class="text-xs font-medium">Conversation name</label><input id="conversation-title" bind:value={conversationTitle} placeholder="What are we working through?" class="mt-1 w-full rounded-lg border border-input bg-background px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring" /></div>
 					<div><p class="mb-2 text-xs font-medium">Agents in this conversation</p><div class="flex flex-wrap gap-2">{#each projectAgents as agent (agent.id)}<button type="button" onclick={() => toggleAgent(agent.id)} class="flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs {selectedAgents.includes(agent.id) ? 'border-primary bg-primary/10 text-primary' : 'border-border text-muted-foreground'}"><span class="flex h-5 w-5 items-center justify-center rounded-full bg-muted text-[9px]">{harnessMark(agent.backend)}</span>{agent.title || agent.name}</button>{/each}</div></div>
@@ -174,13 +207,13 @@
 			<div class="grid gap-8 lg:grid-cols-[minmax(0,1fr)_minmax(18rem,0.65fr)]">
 				<section>
 					<div class="mb-3 flex items-center justify-between"><div><h2 class="font-semibold">Recent tasks</h2><p class="text-xs text-muted-foreground">Work created here or from a conversation.</p></div><a href="/tasks" class="text-xs text-primary hover:underline">All tasks</a></div>
-					<div class="ai-card overflow-hidden">{#if taskList.length === 0}<p class="p-5 text-sm text-muted-foreground">No tasks in this project yet.</p>{:else}{#each taskList.slice(0, 8) as task (task.id)}<a href="/tasks/{task.id}" class="flex items-center gap-3 border-b border-border/70 px-4 py-3 last:border-0 hover:bg-[hsl(var(--hover))]"><span class="h-2 w-2 shrink-0 rounded-full {taskDot(task.status)}"></span><span class="min-w-0 flex-1"><span class="block truncate text-sm">{task.title}</span><span class="text-[11px] text-muted-foreground">{task.status.replaceAll('_', ' ')} · {timeAgo(task.updated_at)}</span></span><span class="text-muted-foreground">→</span></a>{/each}{/if}</div>
+					<div class="ai-card overflow-hidden">{#if taskList.length === 0}<p class="p-5 text-sm text-muted-foreground">No tasks in this project yet.</p>{:else}{#each taskList.slice(0, 8) as task (task.id)}<a href="/tasks/{task.id}" class="flex items-center gap-3 border-b border-border/70 px-4 py-3 last:border-0 hover:bg-[hsl(var(--hover))]"><span class="h-2 w-2 shrink-0 rounded-full {taskDot(task.activity_status ?? task.status)}"></span><span class="min-w-0 flex-1"><span class="block truncate text-sm">{task.title}</span><span class="text-[11px] text-muted-foreground">{(task.activity_status ?? task.status).replaceAll('_', ' ')} · {timeAgo(task.updated_at)}</span></span><span class="text-muted-foreground">→</span></a>{/each}{/if}</div>
 				</section>
 
 				<section>
 					<div class="mb-3 flex items-center justify-between"><div><h2 class="font-semibold">Agents</h2><p class="text-xs text-muted-foreground">Durable harnesses and workspaces available here.</p></div><button type="button" onclick={() => (addingAgent = !addingAgent)} class="text-xs text-primary">+ Add</button></div>
 					{#if addingAgent}<div class="mb-3 space-y-2 rounded-lg border border-border bg-card p-2"><div class="flex gap-2"><select bind:value={selectedAgentToMove} class="min-w-0 flex-1 rounded-md border border-input bg-background px-2 py-1.5 text-xs"><option value="">Choose an existing Agent…</option>{#each availableAgents as agent}<option value={agent.id}>{agent.title || agent.name}</option>{/each}</select><button type="button" onclick={() => void moveAgent()} disabled={!selectedAgentToMove} class="rounded-md bg-primary px-3 text-xs text-primary-foreground disabled:opacity-40">Move here</button></div><a href="/setup?mode=add-session&amp;project_id={encodeURIComponent(projectId)}" class="block rounded-md border border-dashed border-border px-3 py-2 text-center text-xs text-muted-foreground hover:border-primary/40 hover:text-foreground">Create a new Agent in this Project</a></div>{/if}
-					<div class="space-y-2">{#each projectAgents as agent (agent.id)}<a href="/agents/{encodeURIComponent(agent.id)}" class="flex items-center gap-3 rounded-xl border border-border bg-card p-3 hover:border-primary/40"><span class="flex h-9 w-9 items-center justify-center rounded-xl bg-muted text-xs font-semibold">{harnessMark(agent.backend)}</span><span class="min-w-0 flex-1"><span class="block truncate text-sm font-medium">{agent.title || agent.name}</span><span class="block truncate text-[11px] text-muted-foreground">{agentRuntimeSummary(agent)}</span></span><span class="h-2 w-2 rounded-full {agent.status === 'running' ? 'bg-blue-500 animate-pulse' : agent.status === 'error' ? 'bg-red-500' : 'bg-emerald-500'}"></span></a>{/each}{#if projectAgents.length === 0}<a href="/setup?mode=add-session&amp;project_id={encodeURIComponent(projectId)}" class="block rounded-xl border border-dashed border-border p-5 text-center text-sm text-muted-foreground">Create an Agent in this Project</a>{/if}</div>
+					<div class="space-y-2">{#each projectAgents as agent (agent.id)}<a href="/agents/{encodeURIComponent(agent.id)}" class="flex items-center gap-3 rounded-xl border border-border bg-card p-3 hover:border-primary/40"><span class="flex h-9 w-9 items-center justify-center rounded-xl bg-muted text-xs font-semibold">{harnessMark(agent.backend)}</span><span class="min-w-0 flex-1"><span class="block truncate text-sm font-medium">{agent.title || agent.name}</span><span class="block truncate text-[11px] text-muted-foreground">{agentRuntimeSummary(agent)}{#if ['blocked', 'error', 'failed'].includes(agentState(agent))} · Needs attention{:else if agentState(agent) === 'waiting_for_input'} · Needs input{/if}</span></span><span class="h-2 w-2 rounded-full {taskDot(agentState(agent))}"></span></a>{/each}{#if projectAgents.length === 0}<a href="/setup?mode=add-session&amp;project_id={encodeURIComponent(projectId)}" class="block rounded-xl border border-dashed border-border p-5 text-center text-sm text-muted-foreground">Create an Agent in this Project</a>{/if}</div>
 				</section>
 			</div>
 		</div>
