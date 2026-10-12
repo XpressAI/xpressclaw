@@ -35,8 +35,10 @@ use crate::conversations::runtime::{ConversationTurn, ConversationTurnQueue};
 use crate::conversations::{ConversationManager, NewConversationAttachment, SendMessage};
 use crate::dashboard::DashboardManager;
 use crate::db::Database;
+#[cfg(test)]
+use crate::docker::manager::container_spec_fingerprint;
 use crate::docker::manager::{
-    container_spec_fingerprint, ContainerSpec, DockerManager, SelinuxRelabel, VolumeMount,
+    retained_process_fingerprint, ContainerSpec, DockerManager, SelinuxRelabel, VolumeMount,
 };
 use crate::docker::ssh_forwarding::ssh_agent_forwarding;
 use crate::error::{Error, Result};
@@ -214,7 +216,7 @@ impl ConversationAcpProcesses {
         spec: &ContainerSpec,
         process_environment: &[String],
     ) -> Result<ConversationAcpProcess> {
-        let fingerprint = container_spec_fingerprint(spec)?;
+        let fingerprint = retained_process_fingerprint(spec)?;
         let slot = self.slot(conversation_id, agent_id);
         let mut entry = slot.lock().await;
         if entry.as_ref().is_some_and(|current| {
@@ -350,14 +352,17 @@ impl ProjectAcpProcesses {
         agent_id: &str,
         spec: &ContainerSpec,
     ) -> Result<ProjectAcpProcess> {
-        let fingerprint = container_spec_fingerprint(spec)?;
+        let fingerprint = retained_process_fingerprint(spec)?;
         let slot = self.slot(agent_id);
         let mut entry = slot.lock().await;
+        let retained_id = docker
+            .validate_project_configuration(agent_id, spec)
+            .await?;
         let reusable = if let Some(current) = entry.as_ref() {
             current.fingerprint == fingerprint
                 && current.process.is_alive()
                 && docker.is_running(agent_id).await
-                && docker.project_container_matches(agent_id, spec).await
+                && retained_id.as_deref() == Some(current.container_id.as_str())
         } else {
             false
         };
@@ -751,7 +756,9 @@ async fn execute_conversation_turn(
         agent,
     );
     let built_in_image = is_builtin_runner_image_for_kind(&spec.image, &kind);
-    if !runner_image_ready(&docker, &spec.image, built_in_image, agent).await {
+    let image_ready =
+        retained_runner_image_ready(&docker, agent, &mut spec, built_in_image).await?;
+    if !image_ready {
         let local_fallback = match local_runner_image_alias(&spec.image) {
             Some(image) if runner_image_ready(&docker, image, built_in_image, agent).await => {
                 Some(image)
@@ -1357,7 +1364,8 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
         agent,
     );
     let built_in_image = is_builtin_runner_image_for_kind(&spec.image, &kind);
-    let image_ready = runner_image_ready(&docker, &spec.image, built_in_image, agent).await;
+    let image_ready =
+        retained_runner_image_ready(&docker, agent, &mut spec, built_in_image).await?;
     if !image_ready {
         let local_fallback = match local_runner_image_alias(&spec.image) {
             Some(image) if runner_image_ready(&docker, image, built_in_image, agent).await => {
@@ -2200,6 +2208,23 @@ fn session_start(db: &Arc<Database>, item: &QueueItem, runner: &str) -> Result<A
             AcpSessionStart::Fork(session_id)
         }),
     )
+}
+
+async fn retained_runner_image_ready(
+    docker: &DockerManager,
+    agent: &AgentConfig,
+    spec: &mut ContainerSpec,
+    built_in_image: bool,
+) -> Result<bool> {
+    let retained = docker.retained_project_image(&agent.name).await?;
+    if let Some(image) = retained.as_ref() {
+        spec.image.clone_from(image);
+    }
+    let ready = runner_image_ready(docker, &spec.image, built_in_image, agent).await;
+    if retained.is_some() && !ready {
+        return Err(Error::Backend("This Agent's retained environment does not support the selected harness capabilities. It has been preserved; restore the previous settings or explicitly rebuild it in Agent settings > Harness.".into()));
+    }
+    Ok(ready)
 }
 
 async fn runner_image_ready(
@@ -4239,6 +4264,79 @@ fn truncate(value: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Exercise the worker's actual image-update path with a live ACP process
+    /// and an unlabelled agent-created container sharing its network namespace.
+    #[tokio::test]
+    #[ignore = "requires Docker/Podman and XPRESSCLAW_RETENTION_TEST_IMAGE"]
+    async fn image_update_retains_installed_files_and_dependent_container() {
+        use bollard::{
+            container::{Config, CreateContainerOptions, RemoveContainerOptions},
+            models::HostConfig,
+            Docker,
+        };
+        use futures_util::{FutureExt, StreamExt};
+        let Ok(image) = std::env::var("XPRESSCLAW_RETENTION_TEST_IMAGE") else {
+            eprintln!("skipping retained runner integration test; set XPRESSCLAW_RETENTION_TEST_IMAGE to the built fixture image to run it");
+            return;
+        };
+        let installation = format!("retention-test-{}", uuid::Uuid::new_v4());
+        let docker = DockerManager::connect_for_installation(&installation)
+            .await
+            .unwrap();
+        let engine = Docker::connect_with_defaults().unwrap();
+        let spec = ContainerSpec { image: image.clone(), expose_port: None, cmd: Some(vec!["node".into(), "-e".into(), r#"require('readline').createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);if(m.method==='initialize')console.log(JSON.stringify({jsonrpc:'2.0',id:m.id,result:{protocolVersion:1,agentCapabilities:{},authMethods:[]}}));});"#.into()]), ..Default::default() };
+        let processes = ProjectAcpProcesses::default();
+        let parent = processes
+            .get_or_start(&docker, "agent", &spec)
+            .await
+            .unwrap();
+        let parent_id = parent.container_id.clone();
+        let child_name = format!("{installation}-experiment");
+        let child = engine.create_container(Some(CreateContainerOptions { name: child_name.as_str(), platform: None }), Config {
+            image: Some(image), cmd: Some(vec!["node".into(), "-e".into(), "require('http').createServer((q,s)=>s.end('experiment')).listen(19738,'127.0.0.1')".into()]),
+            host_config: Some(HostConfig { network_mode: Some(format!("container:{parent_id}")), ..Default::default() }), ..Default::default()
+        }).await.unwrap();
+        let result = std::panic::AssertUnwindSafe(async {
+            engine.start_container::<String>(&child.id, None).await.unwrap();
+            async fn exec_text(docker: &DockerManager, script: &str) -> String {
+                let attached = docker.open_project_process("agent", &["node".into(), "-e".into(), script.into()], None, &[]).await.unwrap();
+                let output = tokio::time::timeout(Duration::from_secs(15), attached.output.collect::<Vec<_>>()).await.unwrap();
+                output.into_iter().map(|frame| frame.unwrap().to_string()).collect()
+            }
+            let network_probe = "let n=0; function probe(){require('http').get('http://127.0.0.1:19738',r=>r.pipe(process.stdout)).on('error',e=>{if(++n<30)setTimeout(probe,100);else{console.log(e.message);process.exitCode=1;}})}probe();";
+            assert_eq!(exec_text(&docker, network_probe).await, "experiment");
+            exec_text(&docker, "require('fs').writeFileSync('/tmp/package-installed-later','installed')").await;
+            let updated = ContainerSpec { image: "not-pulled:future-update".into(), ..spec };
+            let resumed = processes.get_or_start(&docker, "agent", &updated).await.unwrap();
+            assert_eq!(resumed.container_id, parent_id);
+            assert!(resumed.process.same_process(&parent.process), "an image update must not restart ACP or its container");
+            assert_eq!(exec_text(&docker, "console.log(require('fs').readFileSync('/tmp/package-installed-later','utf8'))").await.trim(), "installed");
+            assert_eq!(exec_text(&docker, network_probe).await, "experiment");
+            assert!(docker.remove_owned_workload("agent").await.unwrap_err().to_string().contains(&child_name));
+            assert!(docker.is_container_running(&parent_id).await);
+            assert!(docker.is_container_running(&child.id).await);
+            engine.remove_container(&child.id, Some(RemoveContainerOptions { force: true, ..Default::default() })).await.unwrap();
+            // A separate, explicit process recovery still preserves the
+            // writable layer, even when the selected image has since changed.
+            docker.stop_preserving("agent").await.unwrap();
+            let recovered = processes.get_or_start(&docker, "agent", &updated).await.unwrap();
+            assert_eq!(recovered.container_id, parent_id);
+            assert_eq!(exec_text(&docker, "console.log(require('fs').readFileSync('/tmp/package-installed-later','utf8'))").await.trim(), "installed");
+        }).catch_unwind().await;
+        let _ = engine
+            .remove_container(
+                &child.id,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+        docker.remove_owned_workload("agent").await.unwrap();
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
     #[tokio::test]
     async fn stages_non_image_uploads_outside_the_container_workspace() {
         let mut prompt = super::AgentPrompt {
@@ -7220,6 +7318,23 @@ flows:
             session_start(&db, &old_task_follow_up, "codex").unwrap(),
             AcpSessionStart::Fork("thread-1".into())
         );
+
+        // Rebuilding destroys unmounted harness storage. Ordinary follow-ups,
+        // project forks, and dependency forks must all start fresh afterward.
+        SessionManager::new(db.clone())
+            .invalidate_native_sessions("atlas")
+            .unwrap();
+        for item in [
+            regular_item,
+            dependent_item,
+            active_follow_up,
+            old_task_follow_up,
+        ] {
+            assert_eq!(
+                session_start(&db, &item, "codex").unwrap(),
+                AcpSessionStart::New
+            );
+        }
     }
 
     #[test]

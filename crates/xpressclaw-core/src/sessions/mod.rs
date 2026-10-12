@@ -923,6 +923,32 @@ impl SessionManager {
         })
     }
 
+    /// Forget harness sessions after an explicit environment rebuild. Callers
+    /// must hold the Agent runtime boundary until this commits. Logical task
+    /// and conversation history remains available to seed fresh ACP sessions.
+    pub fn invalidate_native_sessions(&self, agent_id: &str) -> Result<()> {
+        self.db.with_conn(|conn| {
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            transaction.execute(
+                "UPDATE work_attempts SET native_session_id = NULL
+                 WHERE session_id IN (SELECT id FROM logical_sessions WHERE agent_id = ?1)
+                   AND native_session_id IS NOT NULL",
+                [agent_id],
+            )?;
+            transaction.execute(
+                "UPDATE conversation_agent_sessions SET native_session_id = NULL,
+                        updated_at = CURRENT_TIMESTAMP
+                 WHERE agent_id = ?1 AND native_session_id IS NOT NULL",
+                [agent_id],
+            )?;
+            transaction.commit()?;
+            Ok(())
+        })
+    }
+
     /// Store the latest ACP context-window counters without adding a noisy
     /// timeline event. Task activity polling returns attempts on every request,
     /// so clients still receive live usage updates while a turn is running.
