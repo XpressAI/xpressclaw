@@ -1322,6 +1322,10 @@ impl TaskBoard {
                 [task_id],
                 |row| row.get(0),
             )?;
+            super::delegation_notifications::retire_stale_in_transaction(
+                &transaction,
+                Some(task_id),
+            )?;
             let has_open_attempt: bool = transaction.query_row(
                 "SELECT EXISTS(
                     SELECT 1 FROM work_attempts WHERE task_id = ?1

@@ -5290,6 +5290,22 @@ mod tests {
                 )
                 .unwrap();
             assert!(build_prompt(&db, &item, attempt).is_err());
+            // Resolution after claim must preserve the live response and user
+            // guidance, without requiring/replaying the obsolete failure text.
+            board.update_status(&child.id, "completed", None).unwrap();
+            assert!(queue.claim("atlas").unwrap().is_none());
+            assert_eq!(queue.get(item.id).unwrap().status, "running");
+            let mut prompt = build_prompt(&db, &item, attempt).unwrap();
+            prepend_unresumed_interrupted_prompt(&db, &item, attempt, &mut prompt).unwrap();
+            assert!(prompt.content.contains("no longer current"));
+            assert!(!prompt.content.contains("Container settings differ"));
+            assert!(!prompt.content.contains("Launch 1190 cases"));
+            assert_eq!(
+                prompt
+                    .content
+                    .contains("Benchmark is done. Do not restart it."),
+                with_guidance
+            );
         }
     }
 

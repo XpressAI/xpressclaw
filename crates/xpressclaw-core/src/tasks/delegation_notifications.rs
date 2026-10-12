@@ -41,9 +41,50 @@ pub(super) fn recovery_grant_sql() -> String {
     )
 }
 
+/// Drop only unstarted turns created solely to deliver a now obsolete alert.
+/// Journal and transcript history remain intact, and active worker leases are
+/// never touched. Called before dispatch and inside parent completion roll-up.
+pub(super) fn retire_stale_in_transaction(
+    tx: &Transaction<'_>,
+    task_id: Option<&str>,
+) -> Result<()> {
+    let mut stmt = tx.prepare(&format!("SELECT candidate.id, q.id, t.id, candidate.session_id
+        FROM task_delegation_automatic_responses automatic
+        JOIN work_attempts candidate ON candidate.id=automatic.response_attempt_id
+        JOIN task_queue q ON q.attempt_id=candidate.id
+        JOIN tasks t ON t.id=q.task_id AND t.id=candidate.task_id
+        WHERE (?1 IS NULL OR t.id=?1) AND q.status='queued' AND candidate.status='queued'
+          AND candidate.started_at IS NULL AND candidate.container_id IS NULL
+          AND NOT EXISTS (SELECT 1 FROM workflow_step_executions e WHERE e.continuation_attempt_id=candidate.id)
+          AND (t.status IN ('completed','cancelled') OR NOT ({}))", recovery_grant_sql()))?;
+    let stale = stmt
+        .query_map([task_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let reason = "Delegated blocker is no longer current; unused notification response superseded";
+    for (attempt, queue, task, agent) in stale {
+        tx.execute("UPDATE work_attempts SET status='cancelled', completed_at=CURRENT_TIMESTAMP, result=?2 WHERE id=?1", params![attempt,reason])?;
+        tx.execute("UPDATE task_queue SET status='failed', completed_at=CURRENT_TIMESTAMP, harness_response=?2 WHERE id=?1", params![queue,reason])?;
+        tx.execute(
+            "UPDATE tasks SET active_attempt_id=NULL WHERE id=?1 AND active_attempt_id=?2",
+            params![task, attempt],
+        )?;
+        tx.execute("INSERT INTO session_events(session_id,attempt_id,task_id,source_type,source_id,event_type,summary)
+            VALUES(?1,?2,?3,'task',?3,'delegation_superseded',?4)", params![agent,attempt,task,reason])?;
+    }
+    Ok(())
+}
+
 /// Runs with the dispatch writer lock. Notifications, prompt messages and their
 /// response attempt commit together; retries and restart scans are idempotent.
 pub(super) fn reconcile_in_transaction(tx: &Transaction<'_>) -> Result<()> {
+    retire_stale_in_transaction(tx, None)?;
     let mut stmt = tx.prepare(&format!(
         "SELECT outcome.child_id, outcome.parent_id, outcome.title, outcome.agent_id,
                 outcome.attempt_id, outcome.outcome, outcome.error_message, parent.agent_id
@@ -135,17 +176,30 @@ pub(super) fn reconcile_in_transaction(tx: &Transaction<'_>) -> Result<()> {
 /// missing/deleted message must fail closed instead of rerunning the task brief.
 pub(crate) fn prompt(db: &Database, task_id: &str, attempt_id: &str) -> Result<Option<String>> {
     db.with_conn(|conn| {
-        let mut stmt = conn.prepare(
-            "SELECT m.content FROM task_delegation_notifications n
+        let mut stmt = conn.prepare(&format!(
+            "SELECT m.content, EXISTS(SELECT 1 FROM ({OUTCOMES}) outcome
+                WHERE outcome.child_id=n.child_task_id AND outcome.parent_id=n.parent_task_id
+                  AND outcome.attempt_id=n.child_attempt_id AND outcome.outcome=n.child_status
+                  AND t.agent_id=n.parent_agent_id AND a.session_id=n.parent_agent_id)
+             FROM task_delegation_notifications n
              JOIN task_delegation_responses r ON r.notification_id=n.id
+             JOIN tasks t ON t.id=n.parent_task_id
+             JOIN work_attempts a ON a.id=r.response_attempt_id AND a.task_id=t.id
              LEFT JOIN task_messages m ON m.id=n.message_id AND m.task_id=n.parent_task_id AND m.role='system'
              WHERE n.parent_task_id=?1 AND r.response_attempt_id=?2 ORDER BY n.id"
-        )?;
-        let rows = stmt.query_map(params![task_id, attempt_id], |row| row.get::<_, Option<String>>(0))?
+        ))?;
+        let rows = stmt.query_map(params![task_id, attempt_id], |row| Ok((row.get::<_, Option<String>>(0)?,row.get::<_,bool>(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         if rows.is_empty() { return Ok(None); }
-        let content = rows.into_iter().collect::<Option<Vec<_>>>().ok_or_else(||
+        let content = rows.into_iter().filter(|(_,current)| *current).map(|(text,_)| text)
+            .collect::<Option<Vec<_>>>().ok_or_else(||
             Error::Task("Delegation recovery is missing its notification message".into()))?;
+        if content.is_empty() {
+            // The child may resolve after claim, or this response may also own
+            // user guidance. Preserve that work without replaying stale errors
+            // or falling back to the original task description.
+            return Ok(Some("Previously reported delegated blockers are no longer current. Check current task state and handle any pending user guidance. Do not retry or replace work based on the old failure notification, or restart the parent's original work. Keep required reviews and completion gates intact.".into()));
+        }
         Ok(Some(format!("A delegated task reported a problem. Handle this notification in the existing parent task. Inspect each child's latest state before acting. Diagnose the cause; do not blindly retry or create replacement tasks. If safe recovery needs user input or an environment/settings change, report the blocker and ask the user. Keep required reviews and completion gates intact. Do not restart the parent's original work just to handle this notification.\n\n{}", content.join("\n\n"))))
     })
 }
@@ -536,12 +590,13 @@ mod tests {
         let (db, board, queue, parent, child) = setup();
         fail(&db, &board, &queue, &child);
         reconcile(&db);
-        board.delete(&child.id).unwrap();
         let item = queue.claim("parent").unwrap().unwrap();
+        board.delete(&child.id).unwrap();
         assert!(prompt(&db, &parent.id, item.attempt_id.as_deref().unwrap())
             .unwrap()
             .unwrap()
-            .contains(&child.id));
+            .contains("no longer current"));
+        assert!(is_recovery(&db, item.attempt_id.as_deref().unwrap()).unwrap());
     }
 
     #[test]
@@ -579,5 +634,309 @@ mod tests {
         finish(&db, &queue, &resumed);
         assert!(queue.claim("parent").unwrap().is_none());
         assert_eq!(count(&db, "task_delegation_notifications"), 1);
+    }
+    #[test]
+    fn resolved_delegation_retires_unstarted_notification_only_responses() {
+        for resolution in ["completed", "retry", "deleted"] {
+            for by_agent in [false, true] {
+                let (db, board, queue, parent, child) = setup();
+                fail(&db, &board, &queue, &child);
+                reconcile(&db);
+                let attempt: String = db
+                    .conn()
+                    .query_row(
+                        "SELECT response_attempt_id FROM task_delegation_responses",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                match resolution {
+                    "completed" => {
+                        board.update_status(&child.id, "completed", None).unwrap();
+                    }
+                    "retry" => {
+                        queue.enqueue(&child.id, "reviewer").unwrap();
+                    }
+                    _ => {
+                        board.delete(&child.id).unwrap();
+                    }
+                }
+                let next = if by_agent {
+                    queue.claim("parent")
+                } else {
+                    queue.claim_next()
+                }
+                .unwrap();
+                assert!(
+                    next.is_none_or(|item| item.task_id != parent.id),
+                    "{resolution} by_agent={by_agent}"
+                );
+                assert_eq!(
+                    SessionManager::new(db.clone())
+                        .get_attempt(&attempt)
+                        .unwrap()
+                        .status,
+                    "cancelled"
+                );
+                assert_eq!(
+                    count(&db, "task_delegation_notifications"),
+                    1,
+                    "history preserved"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resolved_delegation_does_not_block_parent_roll_up() {
+        let (db, board, queue, parent, child) = setup();
+        fail(&db, &board, &queue, &child);
+        reconcile(&db);
+        let retry = queue.enqueue(&child.id, "reviewer").unwrap();
+        finish(&db, &queue, &retry);
+        let completed = board
+            .complete_and_roll_up(&child.id, Some("reviewer"))
+            .unwrap();
+        assert!(
+            completed.iter().any(|t| t.id == parent.id),
+            "obsolete recovery cannot hold the completed review open"
+        );
+        assert!(queue.claim_next().unwrap().is_none());
+    }
+
+    #[test]
+    fn resolved_alert_preserves_ordinary_admission_and_user_guidance() {
+        for admission in ["before", "after", "enqueue", "continuation", "ensure"] {
+            let (db, board, queue, parent, child) = setup();
+            let conversation = TaskConversation::new(db.clone());
+            if admission == "before" {
+                conversation
+                    .add_user_message_with_attachments_and_enqueue(
+                        &parent.id,
+                        Some("parent"),
+                        "Read the completed benchmark",
+                        &[],
+                    )
+                    .unwrap();
+            }
+            fail(&db, &board, &queue, &child);
+            reconcile(&db);
+            let original: String = db
+                .conn()
+                .query_row(
+                    "SELECT response_attempt_id FROM task_delegation_responses",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            match admission {
+                "after" => {
+                    conversation
+                        .add_user_message_with_attachments_and_enqueue(
+                            &parent.id,
+                            Some("parent"),
+                            "Read the completed benchmark",
+                            &[],
+                        )
+                        .unwrap();
+                }
+                "enqueue" => {
+                    queue.enqueue(&parent.id, "parent").unwrap();
+                }
+                "continuation" => {
+                    queue.enqueue_continuation(&parent.id, "parent").unwrap();
+                }
+                "ensure" => {
+                    queue.ensure_enqueued(&parent.id, "parent").unwrap();
+                }
+                _ => {}
+            }
+            board.update_status(&child.id, "completed", None).unwrap();
+            assert!(
+                board
+                    .complete_and_roll_up(&parent.id, None)
+                    .unwrap()
+                    .is_empty(),
+                "{admission} owns a real response"
+            );
+            let item = queue.claim("parent").unwrap().unwrap();
+            assert_eq!(item.attempt_id.as_deref(), Some(original.as_str()));
+            let text = prompt(&db, &parent.id, &original).unwrap().unwrap();
+            assert!(text.contains("no longer current"));
+            assert!(!text.contains("container settings"));
+            assert_eq!(count(&db, "task_delegation_notifications"), 1);
+            if matches!(admission, "before" | "after") {
+                assert!(conversation
+                    .get_messages(&parent.id)
+                    .unwrap()
+                    .iter()
+                    .any(|m| m.role == "user" && m.content == "Read the completed benchmark"));
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_prompt_filters_resolved_children_but_preserves_live_outcomes() {
+        let (db, board, queue, parent, child) = setup();
+        let second = board
+            .create(&CreateTask {
+                title: "Still blocked review".into(),
+                agent_id: Some("reviewer".into()),
+                parent_task_id: Some(parent.id.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        fail(&db, &board, &queue, &child);
+        fail(&db, &board, &queue, &second);
+        reconcile(&db);
+        board.update_status(&child.id, "completed", None).unwrap();
+        // Historical transcript can be removed without invalidating a different,
+        // still-current alert. Missing current messages continue to fail closed.
+        db.conn().execute("DELETE FROM task_messages WHERE id=(SELECT message_id FROM task_delegation_notifications WHERE child_task_id=?1)",[&child.id]).unwrap();
+        let item = queue.claim("parent").unwrap().unwrap();
+        let attempt = item.attempt_id.as_deref().unwrap();
+        let text = prompt(&db, &parent.id, attempt).unwrap().unwrap();
+        assert!(!text.contains(&child.id));
+        assert!(text.contains(&second.id));
+        assert!(text.contains("container settings"));
+        board.update_status(&second.id, "completed", None).unwrap();
+        reconcile(&db);
+        assert_eq!(
+            queue.get(item.id).unwrap().status,
+            "running",
+            "claimed dispatch lease is untouched"
+        );
+        assert_eq!(
+            SessionManager::new(db.clone())
+                .get_attempt(attempt)
+                .unwrap()
+                .status,
+            "queued"
+        );
+        assert!(prompt(&db, &parent.id, attempt)
+            .unwrap()
+            .unwrap()
+            .contains("no longer current"));
+    }
+
+    #[test]
+    fn stale_notification_only_response_retires_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let (db, board, queue, parent, child) = setup_db(Arc::new(Database::open(&path).unwrap()));
+        fail(&db, &board, &queue, &child);
+        reconcile(&db);
+        board.update_status(&child.id, "completed", None).unwrap();
+        drop(queue);
+        drop(board);
+        drop(db);
+        let db = Arc::new(Database::open(&path).unwrap());
+        let queue = TaskQueue::new(db.clone());
+        assert!(queue.claim("parent").unwrap().is_none());
+        assert_eq!(count(&db, "task_delegation_notifications"), 1);
+        assert_eq!(count(&db, "task_messages"), 1);
+        assert!(TaskBoard::new(db)
+            .complete_and_roll_up(&parent.id, None)
+            .unwrap()
+            .iter()
+            .any(|t| t.id == parent.id));
+    }
+
+    #[test]
+    fn stale_cleanup_preserves_started_and_workflow_owned_responses() {
+        for owner in ["started", "workflow"] {
+            let (db, board, queue, parent, child) = setup();
+            fail(&db, &board, &queue, &child);
+            reconcile(&db);
+            let attempt: String = db
+                .conn()
+                .query_row(
+                    "SELECT response_attempt_id FROM task_delegation_responses",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            if owner == "started" {
+                db.conn()
+                    .execute(
+                        "UPDATE work_attempts SET started_at=CURRENT_TIMESTAMP WHERE id=?1",
+                        [&attempt],
+                    )
+                    .unwrap();
+            } else {
+                db.conn().execute_batch("INSERT INTO workflows(id,name,yaml_content) VALUES('wf','wf',''); INSERT INTO workflow_instances(id,workflow_id) VALUES('run','wf');").unwrap();
+                db.conn().execute("INSERT INTO workflow_step_executions(id,instance_id,flow_name,step_id,status,continuation_attempt_id) VALUES('step','run','main','check','running',?1)",[&attempt]).unwrap();
+            }
+            board.update_status(&child.id, "completed", None).unwrap();
+            reconcile(&db);
+            assert!(board
+                .complete_and_roll_up(&parent.id, None)
+                .unwrap()
+                .is_empty());
+            assert_eq!(
+                SessionManager::new(db.clone())
+                    .get_attempt(&attempt)
+                    .unwrap()
+                    .status,
+                "queued"
+            );
+        }
+    }
+
+    #[test]
+    fn migration_keeps_unknown_response_origin_and_filters_obsolete_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let (db, board, queue, parent, child) = setup_db(Arc::new(Database::open(&path).unwrap()));
+        fail(&db, &board, &queue, &child);
+        reconcile(&db);
+        // Recreate the immediately preceding persisted schema: origin was
+        // unknown, so upgrading must not guess that a response is disposable.
+        db.conn().execute_batch("DROP TABLE task_delegation_automatic_responses; UPDATE config SET value='52' WHERE key='schema_version';").unwrap();
+        board.update_status(&child.id, "completed", None).unwrap();
+        drop(queue);
+        drop(board);
+        drop(db);
+        let db = Arc::new(Database::open(&path).unwrap());
+        assert_eq!(count(&db, "task_delegation_automatic_responses"), 0);
+        let queue = TaskQueue::new(db.clone());
+        let item = queue.claim("parent").unwrap().unwrap();
+        assert!(prompt(&db, &parent.id, item.attempt_id.as_deref().unwrap())
+            .unwrap()
+            .unwrap()
+            .contains("no longer current"));
+        assert_eq!(count(&db, "task_delegation_notifications"), 1);
+    }
+
+    #[test]
+    fn retry_failure_creates_new_response_after_stale_alert_is_retired() {
+        let (db, board, queue, parent, child) = setup();
+        fail(&db, &board, &queue, &child);
+        reconcile(&db);
+        let old: String = db
+            .conn()
+            .query_row(
+                "SELECT response_attempt_id FROM task_delegation_responses",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        queue.enqueue(&child.id, "reviewer").unwrap();
+        reconcile(&db);
+        assert_eq!(
+            SessionManager::new(db.clone())
+                .get_attempt(&old)
+                .unwrap()
+                .status,
+            "cancelled"
+        );
+        fail(&db, &board, &queue, &child);
+        let item = queue.claim("parent").unwrap().unwrap();
+        assert_ne!(item.attempt_id.as_deref(), Some(old.as_str()));
+        assert!(prompt(&db, &parent.id, item.attempt_id.as_deref().unwrap())
+            .unwrap()
+            .unwrap()
+            .contains("container settings"));
+        assert_eq!(count(&db, "task_delegation_notifications"), 2);
     }
 }

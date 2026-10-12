@@ -98,7 +98,10 @@ impl TaskQueue {
         if let Some(item) = transaction.query_row(
             "SELECT * FROM task_queue WHERE task_id = ?1 AND status = 'queued' ORDER BY id LIMIT 1",
             [task_id], |row| Ok(row_to_item(row)),
-        ).optional()?.transpose()? { return Ok(item); }
+        ).optional()?.transpose()? {
+            Self::preserve_queued_response(transaction, task_id)?;
+            return Ok(item);
+        }
         Self::enqueue_new_in_transaction(transaction, task_id, agent_id)
     }
 
@@ -227,6 +230,7 @@ impl TaskQueue {
                 )
                 .optional()?;
             if let Some((id, attempt_id)) = active {
+                Self::preserve_queued_response(&transaction, task_id)?;
                 transaction.commit()?;
                 return Ok::<_, Error>(attempt_id.is_none().then_some(id));
             }
@@ -263,6 +267,7 @@ impl TaskQueue {
                 rusqlite::params![task_id, agent_id],
             )?;
             let id = (changed == 1).then(|| transaction.last_insert_rowid());
+            Self::preserve_queued_response(&transaction, task_id)?;
             transaction.commit()?;
             Ok::<_, Error>(id)
         })?;
@@ -356,6 +361,12 @@ impl TaskQueue {
                 (Some(item), attempt_id)
             }
         };
+        // This response now also owns a reply or scheduled message, even if
+        // a delegation notification originally created it.
+        transaction.execute(
+            "DELETE FROM task_delegation_automatic_responses WHERE response_attempt_id=?1",
+            [&response_attempt_id],
+        )?;
         Self::adopt_waiting_workflow_continuation_in_transaction(
             transaction,
             task_id,
@@ -455,9 +466,13 @@ impl TaskQueue {
             .optional()?;
         let attempt_id = match queued {
             Some(id) => id,
-            None => Self::enqueue_new_in_transaction(transaction, task_id, agent_id)?
-                .attempt_id
-                .ok_or_else(|| Error::Task("Recovery response has no attempt".into()))?,
+            None => {
+                let id = Self::enqueue_new_in_transaction(transaction, task_id, agent_id)?
+                    .attempt_id
+                    .ok_or_else(|| Error::Task("Recovery response has no attempt".into()))?;
+                transaction.execute("INSERT INTO task_delegation_automatic_responses(response_attempt_id) VALUES(?1)", [&id])?;
+                id
+            }
         };
         Self::associate_response_trigger_in_transaction(
             transaction,
@@ -466,6 +481,17 @@ impl TaskQueue {
             message_timestamp,
         )?;
         Ok(attempt_id)
+    }
+
+    /// Ordinary admission adopts any existing automatic response. A later
+    /// child resolution must not discard this independently requested work.
+    fn preserve_queued_response(
+        transaction: &rusqlite::Transaction<'_>,
+        task_id: &str,
+    ) -> Result<()> {
+        transaction.execute("DELETE FROM task_delegation_automatic_responses
+            WHERE response_attempt_id IN (SELECT attempt_id FROM task_queue WHERE task_id=?1 AND status='queued')", [task_id])?;
+        Ok(())
     }
 
     /// Find the newest queued response that may absorb another user message.

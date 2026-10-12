@@ -330,3 +330,16 @@ Agent work. Parent completion still requires the original review/child gates.
 The recovery prompt carries the child identity and error, asks the parent to
 diagnose or seek user input, and does not replay the original task description.
 Completed/cancelled parents are never reopened by this mechanism.
+
+Notification-only responses are recorded separately from ordinary work. If all
+of their child outcomes resolve before execution, dispatch reconciliation and
+parent completion roll-up cancel these unused responses atomically, retaining
+the journal and transcript. A user reply, scheduled message, explicit resume,
+or independent continuation adopts the response and prevents automatic removal.
+Started work, container leases, and workflow-owned responses are never retired
+by this cleanup. Migration 53 leaves older responses with unknown origin intact.
+
+Recovery prompts recheck each child outcome and omit resolved failures. If a
+child resolves after claim or alongside pending user guidance, the parent gets
+current-state guidance instead of the obsolete error or original task brief.
+This does not waive required-child completion gates or retry children.
