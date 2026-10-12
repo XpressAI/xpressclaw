@@ -308,5 +308,25 @@ warnings lead to the affected task or Agent. Delegated progress includes the
 current attempt's failure reason, not an older failure after retry or resolution.
 Session status is derived on reads from current attempts and unresolved tasks;
 cached failure flags from cancelled/completed work do not keep projects red.
-Historical attempts and their errors remain intact. These are presentation changes;
-execution admission and required-review completion gates remain unchanged.
+Historical attempts and their errors remain intact.
+
+### Delegation failure propagation
+
+A durable child that fails, is cancelled, or needs input must notify its active
+parent. Before claiming native work, reconcile these states into a transactional
+notification journal, a system message on the parent, and one queued parent
+response. Repeated polls and control-plane restarts must not repeat delivery for
+the same child attempt/state and parent assignment. Coalesce ordinary queued parent
+guidance, but never take over a workflow-owned response. Do not create replacement
+tasks or retry children automatically. User replies, resumes, and scheduled checks may reuse the
+journal for the same unresolved blocker without creating another alert or turn.
+A reassigned parent gets a notification for its new owner.
+
+Only an attempt backed by this journal may run a recovery turn while required
+children remain incomplete. The grant is scoped to its current parent assignment
+and an unresolved child outcome. All other admission constraints still apply,
+including dependencies, scheduling, project deletion, Connect ownership and active
+Agent work. Parent completion still requires the original review/child gates.
+The recovery prompt carries the child identity and error, asks the parent to
+diagnose or seek user input, and does not replay the original task description.
+Completed/cancelled parents are never reopened by this mechanism.

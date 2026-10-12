@@ -1993,9 +1993,10 @@ fn prepend_unresumed_interrupted_prompt(
 ) -> Result<()> {
     // Each platform command supplies its own authorized context. A fresh native
     // session must not revive an earlier command's interrupted instructions.
-    if crate::connect::ConnectJournal::new(db.clone())
-        .command_for_execution(attempt_id)?
-        .is_some()
+    if crate::tasks::delegation_notifications::is_recovery(db, attempt_id)?
+        || crate::connect::ConnectJournal::new(db.clone())
+            .command_for_execution(attempt_id)?
+            .is_some()
     {
         return Ok(());
     }
@@ -2054,6 +2055,7 @@ fn build_prompt(db: &Arc<Database>, item: &QueueItem, attempt_id: &str) -> Resul
             attachments: Vec::new(),
         });
     }
+    let recovery = crate::tasks::delegation_notifications::prompt(db, &item.task_id, attempt_id)?;
     let task = TaskBoard::new(db.clone()).get(&item.task_id)?;
     let (previous_trigger_message_id, previous_started, trigger_message_id) =
         db.with_conn(|conn| {
@@ -2066,9 +2068,15 @@ fn build_prompt(db: &Arc<Database>, item: &QueueItem, attempt_id: &str) -> Resul
                 .query_row(
                     "SELECT trigger_message_id, started_at FROM work_attempts
                      WHERE task_id = ?1 AND id != ?2 AND started_at IS NOT NULL
-                       AND NOT (status = 'interrupted' AND native_session_id IS NULL)
-                     ORDER BY created_at DESC, rowid DESC LIMIT 1",
-                    rusqlite::params![item.task_id, attempt_id],
+                       AND (?4 OR NOT (status = 'interrupted' AND native_session_id IS NULL))
+                       AND (?3 IS NULL OR trigger_message_id IS NULL OR trigger_message_id < ?3)
+                     ORDER BY trigger_message_id DESC, created_at DESC, rowid DESC LIMIT 1",
+                    rusqlite::params![
+                        item.task_id,
+                        attempt_id,
+                        trigger_message_id,
+                        recovery.is_some()
+                    ],
                     |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, String>(1)?)),
                 )
                 .optional()?;
@@ -2081,14 +2089,15 @@ fn build_prompt(db: &Arc<Database>, item: &QueueItem, attempt_id: &str) -> Resul
                 trigger_message_id,
             ))
         })?;
-    let pending_user_messages = TaskConversation::new(db.clone()).get_user_messages_for_response(
+    let pending_user_messages = TaskConversation::new(db.clone()).get_user_messages_for_attempt(
         &item.task_id,
         previous_trigger_message_id,
         previous_started.as_deref(),
         trigger_message_id,
+        Some(attempt_id),
     )?;
-    if !pending_user_messages.is_empty() {
-        let content = pending_user_messages
+    if recovery.is_some() || !pending_user_messages.is_empty() {
+        let guidance = pending_user_messages
             .iter()
             .map(|message| message.content.as_str())
             .collect::<Vec<_>>()
@@ -2097,6 +2106,13 @@ fn build_prompt(db: &Arc<Database>, item: &QueueItem, attempt_id: &str) -> Resul
             .into_iter()
             .flat_map(|message| message.attachments)
             .collect();
+        let content = match recovery {
+            Some(notification) if guidance.is_empty() => notification,
+            Some(notification) => {
+                format!("{notification}\n\nPending guidance from the user:\n{guidance}")
+            }
+            None => guidance,
+        };
         return Ok(AgentPrompt {
             content,
             attachments,
@@ -5172,6 +5188,211 @@ mod tests {
             assert!(messages[0].content.contains("Obsolete request"));
             assert!(messages[1].content.contains("Only inspect the new build"));
         }
+    }
+
+    #[test]
+    fn delegation_recovery_prompt_preserves_pending_guidance_without_replaying_work() {
+        use crate::{agents::registry::AgentRegistry, tasks::board::CreateTask};
+        for with_guidance in [false, true] {
+            let db = Arc::new(Database::open_memory().unwrap());
+            AgentRegistry::new(db.clone())
+                .ensure("atlas", "native")
+                .unwrap();
+            let board = TaskBoard::new(db.clone());
+            let parent = board
+                .create(&CreateTask {
+                    title: "Original benchmark".into(),
+                    description: Some("Launch 1190 cases".into()),
+                    agent_id: Some("atlas".into()),
+                    ..Default::default()
+                })
+                .unwrap();
+            let queue = TaskQueue::new(db.clone());
+            let (_, initial) = TaskConversation::new(db.clone())
+                .add_user_message_with_attachments_and_enqueue(
+                    &parent.id,
+                    Some("atlas"),
+                    "Launch 1190 cases",
+                    &[],
+                )
+                .unwrap();
+            let initial = initial.unwrap();
+            SessionManager::new(db.clone())
+                .transition_attempt(
+                    initial.attempt_id.as_deref().unwrap(),
+                    "running",
+                    "Benchmark launched",
+                    None,
+                    None,
+                )
+                .unwrap();
+            SessionManager::new(db.clone())
+                .transition_attempt(
+                    initial.attempt_id.as_deref().unwrap(),
+                    "interrupted",
+                    "Restart",
+                    None,
+                    None,
+                )
+                .unwrap();
+            queue.fail(initial.id, "Restart").unwrap();
+            let child = board
+                .create(&CreateTask {
+                    title: "Independent review".into(),
+                    agent_id: Some("atlas".into()),
+                    parent_task_id: Some(parent.id.clone()),
+                    ..Default::default()
+                })
+                .unwrap();
+            let child_turn = queue.enqueue(&child.id, "atlas").unwrap();
+            SessionManager::new(db.clone())
+                .transition_attempt(
+                    child_turn.attempt_id.as_deref().unwrap(),
+                    "failed",
+                    "Setup failed",
+                    None,
+                    Some("Container settings differ; tools preserved"),
+                )
+                .unwrap();
+            queue.fail(child_turn.id, "Setup failed").unwrap();
+            board.update_status(&child.id, "blocked", None).unwrap();
+            if with_guidance {
+                TaskConversation::new(db.clone())
+                    .add_user_message_with_attachments_and_enqueue(
+                        &parent.id,
+                        Some("atlas"),
+                        "Benchmark is done. Do not restart it.",
+                        &[],
+                    )
+                    .unwrap();
+            }
+            let item = queue.claim("atlas").unwrap().unwrap();
+            assert_eq!(item.task_id, parent.id);
+            let attempt = item.attempt_id.as_deref().unwrap();
+            let mut prompt = build_prompt(&db, &item, attempt).unwrap();
+            prepend_unresumed_interrupted_prompt(&db, &item, attempt, &mut prompt).unwrap();
+            assert!(prompt.content.contains(&child.id));
+            assert!(prompt
+                .content
+                .contains("Container settings differ; tools preserved"));
+            assert!(!prompt.content.contains("Launch 1190 cases"));
+            assert_eq!(
+                prompt
+                    .content
+                    .contains("Benchmark is done. Do not restart it."),
+                with_guidance
+            );
+            // Missing notification never falls back to the original benchmark.
+            db.conn()
+                .execute(
+                    "DELETE FROM task_messages WHERE task_id=?1 AND role='system'",
+                    [&parent.id],
+                )
+                .unwrap();
+            assert!(build_prompt(&db, &item, attempt).is_err());
+        }
+    }
+
+    #[test]
+    fn delegation_recovery_keeps_workflow_prompts_and_later_guidance_separate() {
+        use crate::{agents::registry::AgentRegistry, tasks::board::CreateTask};
+        let db = Arc::new(Database::open_memory().unwrap());
+        AgentRegistry::new(db.clone())
+            .ensure("atlas", "native")
+            .unwrap();
+        let board = TaskBoard::new(db.clone());
+        let parent = board
+            .create(&CreateTask {
+                title: "Parent".into(),
+                agent_id: Some("atlas".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let child = board
+            .create(&CreateTask {
+                title: "Review".into(),
+                agent_id: Some("atlas".into()),
+                parent_task_id: Some(parent.id.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        let conversation = TaskConversation::new(db.clone());
+        let (fixed, workflow) = conversation
+            .add_user_message_with_attachments_and_enqueue(
+                &parent.id,
+                Some("atlas"),
+                "Exclusive workflow check",
+                &[],
+            )
+            .unwrap();
+        let workflow = workflow.unwrap();
+        db.conn()
+            .execute_batch(
+                "INSERT INTO workflows(id,name,yaml_content) VALUES('wf','wf','');
+            INSERT INTO workflow_instances(id,workflow_id) VALUES('run','wf');",
+            )
+            .unwrap();
+        db.conn().execute("INSERT INTO workflow_step_executions(id,instance_id,flow_name,step_id,status,continuation_attempt_id,continuation_prompt_message_id) VALUES('step','run','main','check','running',?1,?2)",rusqlite::params![workflow.attempt_id,fixed.id]).unwrap();
+        board.update_status(&child.id, "blocked", None).unwrap();
+        let queue = TaskQueue::new(db.clone());
+        let recovery = queue.claim("atlas").unwrap().unwrap();
+        assert_ne!(recovery.id, workflow.id);
+        let attempt = recovery.attempt_id.as_deref().unwrap();
+        let prompt = build_prompt(&db, &recovery, attempt).unwrap();
+        assert!(prompt.content.contains(&child.id));
+        assert!(!prompt.content.contains("Exclusive workflow check"));
+        assert_eq!(queue.get(workflow.id).unwrap().status, "queued");
+        let sessions = SessionManager::new(db.clone());
+        sessions
+            .transition_attempt(attempt, "running", "Handling notification", None, None)
+            .unwrap();
+        sessions
+            .transition_attempt(attempt, "completed", "Notification handled", None, None)
+            .unwrap();
+        queue.complete(recovery.id, "Handled").unwrap();
+        board.update_status(&child.id, "completed", None).unwrap();
+        let resumed = queue.claim("atlas").unwrap().unwrap();
+        assert_eq!(resumed.id, workflow.id);
+        assert_eq!(
+            build_prompt(&db, &resumed, resumed.attempt_id.as_deref().unwrap())
+                .unwrap()
+                .content,
+            "Exclusive workflow check"
+        );
+        sessions
+            .transition_attempt(
+                resumed.attempt_id.as_deref().unwrap(),
+                "running",
+                "Workflow running",
+                None,
+                None,
+            )
+            .unwrap();
+        let (_, later) = conversation
+            .add_user_message_with_attachments_and_enqueue(
+                &parent.id,
+                Some("atlas"),
+                "Only the later guidance",
+                &[],
+            )
+            .unwrap();
+        let later = later.unwrap();
+        sessions
+            .transition_attempt(
+                resumed.attempt_id.as_deref().unwrap(),
+                "completed",
+                "Workflow finished",
+                None,
+                None,
+            )
+            .unwrap();
+        queue.complete(resumed.id, "Done").unwrap();
+        assert_eq!(
+            build_prompt(&db, &later, later.attempt_id.as_deref().unwrap())
+                .unwrap()
+                .content,
+            "Only the later guidance"
+        );
     }
 
     #[test]

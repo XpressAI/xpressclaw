@@ -1097,15 +1097,6 @@ impl SessionManager {
         if running > 0 {
             return Ok("running".to_string());
         }
-        let queued: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM work_attempts
-             WHERE session_id = ?1 AND status = 'queued'",
-            [session_id],
-            |row| row.get(0),
-        )?;
-        if queued > 0 {
-            return Ok("queued".to_string());
-        }
         let waiting: i64 = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM tasks
              WHERE agent_id = ?1 AND status = 'waiting_for_input' AND hidden=0 AND provenance!='native_plan')
@@ -1117,12 +1108,31 @@ impl SessionManager {
             return Ok("waiting_for_input".to_string());
         }
         let blocked: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM tasks
-             WHERE agent_id = ?1 AND status = 'blocked' AND hidden=0 AND provenance!='native_plan'",
+            "SELECT COUNT(*) FROM tasks t
+             WHERE t.agent_id = ?1 AND t.hidden=0 AND t.provenance!='native_plan'
+               AND (t.status='blocked' OR (
+                 t.status IN ('pending','in_progress') AND t.backlog=0
+                 AND (t.start_after IS NULL OR julianday(t.start_after)<=julianday('now'))
+                 AND NOT EXISTS (SELECT 1 FROM task_queue q WHERE q.task_id=t.id AND q.status='running')
+                 AND NOT EXISTS (SELECT 1 FROM task_pull_requests pr WHERE pr.task_id=t.id AND pr.status IN ('waiting','attention'))
+                 AND EXISTS (SELECT 1 FROM tasks child WHERE child.parent_task_id=t.id
+                   AND child.blocks_parent=1 AND child.status IN ('blocked','waiting_for_input','cancelled'))))",
             [session_id],
             |row| row.get(0),
         )?;
-        Ok(if blocked > 0 { "blocked" } else { "idle" }.to_string())
+        if blocked > 0 {
+            return Ok("blocked".into());
+        }
+        let queued: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM work_attempts
+             WHERE session_id = ?1 AND status = 'queued'",
+            [session_id],
+            |row| row.get(0),
+        )?;
+        if queued > 0 {
+            return Ok("queued".to_string());
+        }
+        Ok("idle".into())
     }
 }
 
@@ -1234,6 +1244,58 @@ mod tests {
         assert_eq!(manager.overview("reviewer").unwrap().session.status, "idle");
         db.conn().execute_batch("INSERT INTO work_attempts(id,session_id,runner,status) VALUES('active','reviewer','codex','running');").unwrap();
         assert_eq!(manager.get("reviewer").unwrap().status, "running");
+    }
+
+    #[test]
+    fn session_status_includes_required_child_blockers_ahead_of_saved_wakeups() {
+        for child_status in ["blocked", "waiting_for_input", "cancelled"] {
+            let db = Arc::new(Database::open_memory().unwrap());
+            insert_agent(&db, "owner");
+            let manager = SessionManager::new(db.clone());
+            manager.ensure("owner", None).unwrap();
+            db.conn().execute_batch("INSERT INTO tasks(id,title,status,agent_id) VALUES('parent','Parent','in_progress','owner');
+                INSERT INTO tasks(id,title,status,parent_task_id) VALUES('child','Review','blocked','parent');").unwrap();
+            db.conn()
+                .execute(
+                    "UPDATE tasks SET status=?1 WHERE id='child'",
+                    [child_status],
+                )
+                .unwrap();
+            assert_eq!(manager.get("owner").unwrap().status, "blocked");
+            db.conn().execute_batch("INSERT INTO work_attempts(id,session_id,task_id,runner,status) VALUES('saved','owner','parent','codex','queued');").unwrap();
+            assert_eq!(manager.get("owner").unwrap().status, "blocked");
+            db.conn()
+                .execute(
+                    "UPDATE work_attempts SET status='running' WHERE id='saved'",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(manager.get("owner").unwrap().status, "running");
+            db.conn()
+                .execute(
+                    "UPDATE work_attempts SET status='queued' WHERE id='saved'",
+                    [],
+                )
+                .unwrap();
+            db.conn()
+                .execute("UPDATE tasks SET blocks_parent=0 WHERE id='child'", [])
+                .unwrap();
+            assert_eq!(manager.get("owner").unwrap().status, "queued");
+            db.conn()
+                .execute(
+                    "UPDATE tasks SET blocks_parent=1,status='completed' WHERE id='child'",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(manager.get("owner").unwrap().status, "queued");
+            db.conn()
+                .execute(
+                    "UPDATE work_attempts SET status='completed' WHERE id='saved'",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(manager.get("owner").unwrap().status, "idle");
+        }
     }
 
     #[test]

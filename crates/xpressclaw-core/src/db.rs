@@ -2769,6 +2769,7 @@ UPDATE task_messages SET agent_id = (
 
 const MIGRATION_V50: &str = include_str!("connect/schema.sql");
 const MIGRATION_V51: &str = include_str!("connect/task_dispatch.sql");
+const MIGRATION_V52: &str = include_str!("tasks/delegation_notifications.sql");
 
 fn schema_migrations() -> &'static [(u32, &'static str)] {
     &[
@@ -2823,6 +2824,7 @@ fn schema_migrations() -> &'static [(u32, &'static str)] {
         (49, MIGRATION_V49),
         (50, MIGRATION_V50),
         (51, MIGRATION_V51),
+        (52, MIGRATION_V52),
     ]
 }
 
@@ -2960,7 +2962,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "51");
+        assert_eq!(version, "52");
         let visualization_table: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
