@@ -64,10 +64,10 @@ pub(super) const ELIGIBLE: &str = "
       SELECT 1 FROM task_dependencies d JOIN tasks dependency ON dependency.id = d.depends_on_id
       WHERE d.task_id = t.id AND dependency.status != 'completed'
     )
-    AND NOT EXISTS (
+    AND (NOT EXISTS (
       SELECT 1 FROM tasks child
       WHERE child.parent_task_id = t.id AND child.blocks_parent = 1 AND child.status != 'completed'
-    )";
+    ) OR ({recovery_grant}))";
 
 const SNAPSHOT: &str = "WITH facts AS (
  SELECT tasks.*,
@@ -497,13 +497,10 @@ mod tests {
         };
         let (board, queue, planner) = setup(Arc::new(Database::open(&filename).unwrap()));
         queue.recover_in_progress().unwrap();
-        for status in [
-            "pending",
-            "in_progress",
-            "waiting_for_input",
-            "blocked",
-            "cancelled",
-        ] {
+        // Actionable child failures have a separate journal-backed recovery
+        // exception, covered by delegation_notifications tests. Ordinary waiting
+        // continuations still cannot bypass pending/running required work.
+        for status in ["pending", "in_progress"] {
             board.update_status(&child_id, status, None).unwrap();
             assert_eq!(planner.get(&parent_id).unwrap().planning.lane, "blocked");
             assert!(

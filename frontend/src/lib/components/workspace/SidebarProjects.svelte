@@ -41,14 +41,22 @@
 		const agentIds = new Set(agents.map((agent) => agent.id));
 		const statuses = [
 			...agents.map((agent) => agent.status),
-			...taskList.filter((task) => task.agent_id && agentIds.has(task.agent_id) && !['completed', 'cancelled'].includes(task.status)).map((task) => task.status),
+			...taskList.filter((task) => (task.project_id ? task.project_id === project.id : task.agent_id && agentIds.has(task.agent_id)) && !['completed', 'cancelled'].includes(task.status)).map((task) => task.activity_status ?? task.status),
 		];
 		if (statuses.some((status) => status === 'failed' || status === 'error' || status === 'blocked')) return 'error';
-		if (statuses.some((status) => status === 'waiting_for_input')) return 'waiting';
+		if (statuses.some((status) => ['waiting_for_input', 'waiting_for_subtasks'].includes(status))) return 'waiting';
 		if (statuses.some((status) => ['running', 'in_progress', 'preparing'].includes(status))) return 'working';
 		if (statuses.some((status) => ['queued', 'pending'].includes(status))) return 'queued';
 		return 'ready';
 	}
+
+    function projectExplanation(project: Project): string {
+        const tasks = taskList.filter(task => task.project_id === project.id && ['blocked', 'waiting_for_input'].includes(task.activity_status ?? task.status));
+        const agents = agentList.filter(agent => agent.project_id === project.id && ['blocked', 'error', 'failed', 'waiting_for_input'].includes(agent.status));
+        const reasons = [...tasks.map(task => task.title), ...agents.filter(agent => !tasks.some(task => task.agent_id === agent.id)).map(agent => agent.title || agent.name)];
+        if (reasons.length) return 'Needs attention: ' + reasons.join('; ');
+        return { working: 'Work is running', queued: 'Work is queued', waiting: 'Waiting for delegated work or input', ready: 'No work needs attention', error: 'Open project to inspect blocked work' }[projectStatus(project)] ?? 'Open project';
+    }
 
 	function dot(status: string): string {
 		if (status === 'error') return 'bg-red-500';
@@ -58,8 +66,15 @@
 		return 'bg-emerald-500';
 	}
 
+    function agentNeedsAttention(agent: Agent): boolean {
+        return ['error', 'failed', 'blocked'].includes(agent.status)
+            || taskList.some(task => task.agent_id === agent.id && (task.activity_status ?? task.status) === 'blocked');
+    }
+
 	function agentDot(agent: Agent): string {
-		if (agent.status === 'error' || agent.status === 'failed') return 'bg-red-500';
+		if (agentNeedsAttention(agent)) return 'bg-red-500';
+		if (agent.status === 'waiting_for_input') return 'bg-orange-500';
+		if (agent.status === 'queued') return 'bg-amber-400';
 		if (agent.status === 'running') return 'bg-blue-500 animate-pulse';
 		return 'bg-emerald-500';
 	}
@@ -72,7 +87,7 @@
 {#if compact}
 	<div class="flex flex-col items-center gap-1">
 		{#each projectList as project (project.id)}
-			<a href="/projects/{encodeURIComponent(project.id)}" onclick={onnavigate} class="relative flex h-9 w-9 items-center justify-center rounded-lg text-xs font-semibold {activeProjectId === project.id ? 'bg-[hsl(var(--sidebar-active))]' : 'bg-muted/60 hover:bg-accent'}" title={project.name}>
+			<a href="/projects/{encodeURIComponent(project.id)}" onclick={onnavigate} class="relative flex h-9 w-9 items-center justify-center rounded-lg text-xs font-semibold {activeProjectId === project.id ? 'bg-[hsl(var(--sidebar-active))]' : 'bg-muted/60 hover:bg-accent'}" title={`${project.name} — ${projectExplanation(project)}`} aria-label={`${project.name} — ${projectExplanation(project)}`}>
 				{project.icon || project.name.slice(0, 1).toUpperCase()}<span class="absolute bottom-0 right-0 h-2.5 w-2.5 rounded-full border-2 border-[hsl(var(--sidebar))] {dot(projectStatus(project))}"></span>
 			</a>
 		{/each}
@@ -81,7 +96,7 @@
 	<div class="space-y-4">
 		<section>
 			<div class="mb-1 flex items-center justify-between px-2"><span class="text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Projects</span><a href="/projects" onclick={onnavigate} title="Create project" class="text-sm text-muted-foreground hover:text-foreground">+</a></div>
-			<div class="space-y-0.5">{#each projectList as project (project.id)}<a href="/projects/{encodeURIComponent(project.id)}" onclick={onnavigate} class={link(activeProjectId === project.id)}><span class="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-muted text-[10px] font-semibold">{project.icon || project.name.slice(0, 1).toUpperCase()}</span><span class="min-w-0 flex-1 truncate">{project.name}</span><span class="h-2 w-2 shrink-0 rounded-full {dot(projectStatus(project))}"></span></a>{/each}</div>
+			<div class="space-y-0.5">{#each projectList as project (project.id)}<a href="/projects/{encodeURIComponent(project.id)}" onclick={onnavigate} class={link(activeProjectId === project.id)} title={projectExplanation(project)}><span class="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-muted text-[10px] font-semibold">{project.icon || project.name.slice(0, 1).toUpperCase()}</span><span class="min-w-0 flex-1"><span class="block truncate">{project.name}</span>{#if ['error', 'waiting'].includes(projectStatus(project))}<span class="block text-[10px] text-orange-600 dark:text-orange-400">{projectStatus(project) === 'error' ? 'Needs attention' : 'Waiting for work or input'}</span>{/if}</span><span class="h-2 w-2 shrink-0 rounded-full {dot(projectStatus(project))}"></span></a>{/each}</div>
 		</section>
 
 		<section>
@@ -91,7 +106,7 @@
 
 		<section>
 			<div class="mb-1 flex items-center justify-between px-2"><span class="text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Agents</span><a href="/agents" onclick={onnavigate} class="text-[10px] text-muted-foreground hover:text-foreground">All agents</a></div>
-			<div class="space-y-0.5">{#each visibleAgents as agent (agent.id)}<a href="/agents/{encodeURIComponent(agent.id)}" onclick={onnavigate} oncontextmenu={(event) => onagentcontext?.(event, agent)} class={link(activeAgentId === agent.id)}><span class="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-muted text-[9px] font-semibold">{harnessMark(agent.backend)}</span><span class="min-w-0 flex-1"><span class="block truncate">{agent.title || agent.name}</span><span class="block truncate text-[9px] text-muted-foreground">{agentRuntimeSummary(agent)}</span></span><span class="h-2 w-2 shrink-0 rounded-full {agentDot(agent)}"></span></a>{/each}{#if visibleAgents.length === 0}<a href={createAgentHref} onclick={onnavigate} class="block rounded-lg border border-dashed border-border p-2 text-center text-[11px] text-muted-foreground">+ Create Agent</a>{/if}</div>
+			<div class="space-y-0.5">{#each visibleAgents as agent (agent.id)}<a href="/agents/{encodeURIComponent(agent.id)}" onclick={onnavigate} oncontextmenu={(event) => onagentcontext?.(event, agent)} class={link(activeAgentId === agent.id)}><span class="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-muted text-[9px] font-semibold">{harnessMark(agent.backend)}</span><span class="min-w-0 flex-1"><span class="block truncate">{agent.title || agent.name}</span><span class="block truncate text-[9px] text-muted-foreground">{agentRuntimeSummary(agent)}{#if agentNeedsAttention(agent)} · Needs attention{:else if agent.status === 'waiting_for_input'} · Needs input{/if}</span></span><span class="h-2 w-2 shrink-0 rounded-full {agentDot(agent)}"></span></a>{/each}{#if visibleAgents.length === 0}<a href={createAgentHref} onclick={onnavigate} class="block rounded-lg border border-dashed border-border p-2 text-center text-[11px] text-muted-foreground">+ Create Agent</a>{/if}</div>
 		</section>
 	</div>
 {/if}

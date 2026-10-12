@@ -289,3 +289,57 @@ boundary: use only runner images you control or have audited.
 - ADR-021: Agent Sessions / Actor Model (superseded)
 - ADR-022: Workflow execution retained; connector runtime deferred
 - ADR-024: Android device capability work (designed to attach as a resource)
+
+### Delegated task and failure visibility
+
+Durable child tasks appear in assigned-Agent, project, search, recent-work, and
+status-count views, with links back to their parent. Only hidden idle work and
+native harness checklist rows are excluded from ordinary task lists; checklist
+rows remain visible as parent steps. A required child that needs attention must
+not make its queued parent appear to be executing.
+
+Unresolved blocked/input tasks have a separate read-only attention snapshot, so
+recent-history limits cannot hide the work responsible for an indicator. This
+includes active parents blocked by a cancelled required child, using the same
+derived activity state as the task view; cancelled optional work and resolved
+parents are not new failures. The global attention panel uses this snapshot and
+can expand beyond its five-row preview. Project
+warnings lead to the affected task or Agent. Delegated progress includes the
+current attempt's failure reason, not an older failure after retry or resolution.
+Session status is derived on reads from current attempts and unresolved tasks;
+cached failure flags from cancelled/completed work do not keep projects red.
+Historical attempts and their errors remain intact.
+
+### Delegation failure propagation
+
+A durable child that fails, is cancelled, or needs input must notify its active
+parent. Before claiming native work, reconcile these states into a transactional
+notification journal, a system message on the parent, and one queued parent
+response. Repeated polls and control-plane restarts must not repeat delivery for
+the same child attempt/state and parent assignment. Coalesce ordinary queued parent
+guidance, but never take over a workflow-owned response. Do not create replacement
+tasks or retry children automatically. User replies, resumes, and scheduled checks may reuse the
+journal for the same unresolved blocker without creating another alert or turn.
+A reassigned parent gets a notification for its new owner.
+
+Only an attempt backed by this journal may run a recovery turn while required
+children remain incomplete. The grant is scoped to its current parent assignment
+and an unresolved child outcome. All other admission constraints still apply,
+including dependencies, scheduling, project deletion, Connect ownership and active
+Agent work. Parent completion still requires the original review/child gates.
+The recovery prompt carries the child identity and error, asks the parent to
+diagnose or seek user input, and does not replay the original task description.
+Completed/cancelled parents are never reopened by this mechanism.
+
+Notification-only responses are recorded separately from ordinary work. If all
+of their child outcomes resolve before execution, dispatch reconciliation and
+parent completion roll-up cancel these unused responses atomically, retaining
+the journal and transcript. A user reply, scheduled message, explicit resume,
+or independent continuation adopts the response and prevents automatic removal.
+Started work, container leases, and workflow-owned responses are never retired
+by this cleanup. Migration 53 leaves older responses with unknown origin intact.
+
+Recovery prompts recheck each child outcome and omit resolved failures. If a
+child resolves after claim or alongside pending user guidance, the parent gets
+current-state guidance instead of the obsolete error or original task brief.
+This does not waive required-child completion gates or retry children.

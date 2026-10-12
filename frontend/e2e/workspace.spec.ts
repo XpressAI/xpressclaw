@@ -1130,6 +1130,8 @@ async function mockApi(
 					counts: filteredCounts,
 				};
 			}
+		} else if (path === '/api/tasks/attention') {
+			response = { tasks: listedTasks.filter(task => ['blocked', 'waiting_for_input'].includes(task.status) && (!url.searchParams.get('agent_id') || task.agent_id === url.searchParams.get('agent_id'))) };
 		} else if (path === '/api/tasks/recent-by-agent') {
 			const limit = Number.parseInt(url.searchParams.get('limit') ?? '5', 10);
 			const countsByAgent = new Map<string, number>();
@@ -6660,7 +6662,7 @@ for (const width of [390, 1440]) {
 		await expect(panel.getByText(/Tool activity ·/)).toBeVisible();
 		await expect(panel.getByRole('link')).toHaveAttribute('href', '/tasks/review-child');
 		await expect(page.locator('[data-delegation-wait]')).toContainText('Waiting for senior-reviewer: Review authorized recovery and SDK retries');
-		await expect(page.locator('[data-delegation-wait]')).toContainText('Your reply is saved');
+		await expect(page.locator('[data-delegation-wait]')).toContainText('Your message is saved');
 		await expect(page.getByText('The agent is queued to respond', { exact: true })).toHaveCount(0);
 		await expect(page.locator('[data-task-activity-status="waiting_for_subtasks"]').first()).toBeVisible();
 		await expect(panel.getByText('Validate the implementation')).toHaveCount(0);
@@ -6721,7 +6723,7 @@ test('delegated work explains an idle parent without claiming a reply was saved'
 	state.attempts = [];
 	await page.goto(`/tasks/${taskId}`);
 	await expect(page.locator('[data-delegation-wait]')).toBeVisible();
-	await expect(page.getByText(/Your reply is saved/)).toHaveCount(0);
+	await expect(page.getByText(/Your message is saved/)).toHaveCount(0);
 });
 
 test('delegated work does not replace the parent approval prompt', async ({ page }) => {
@@ -6765,5 +6767,90 @@ for (const mobile of [false, true]) {
   blocked = false;
   await page.getByRole('button', { name: 'Discard environment and rebuild', exact: true }).click();
   await expect(page.getByText('New work will create an environment using your saved settings.', { exact: false })).toBeVisible();
+ });
+}
+
+for (const width of [390, 1440]) {
+ test(`blocked delegated work exposes the failure and saved wakeup at ${width}px`, async ({ page }) => {
+  await page.setViewportSize({ width, height: 900 });
+  const state = await delegatedApi(page, { child: { status: 'blocked', activity_status: 'blocked', finished_at: recentSqliteTimestamp(5 * 60 * 60_000), error_message: 'The reviewer environment needs different container settings. Installed files are preserved.' } });
+  await page.goto(`/tasks/${taskId}`);
+  await expect(page.locator('[data-delegation-wait]')).toContainText('Delegated work needs attention');
+  await expect(page.locator('[data-delegation-wait]')).toContainText('Your message is saved');
+  await expect(page.locator('[data-delegated-error]')).toContainText('Installed files are preserved');
+  await expect(page.getByText('The agent is queued to respond', { exact: true })).toHaveCount(0);
+  await expect(page.locator('[data-delegation-wait] a')).toHaveAttribute('href', '/tasks/review-child');
+  if (width === 1440) await page.screenshot({ path: '/tmp/delegated-state-parent.png', fullPage: true });
+  // A quiet poll must remove the current error when retry starts, keeping history elsewhere.
+  Object.assign(state.children[0], { status: 'in_progress', activity_status: 'running', error_message: null });
+  await expect(page.locator('[data-delegated-error]')).toHaveCount(0, { timeout: 10_000 });
+  await expect(page.locator('[data-delegation-wait]')).toContainText('Waiting for');
+ });
+
+ test(`delegated reviewer failure is visible from agent and project at ${width}px`, async ({ page }) => {
+  await page.setViewportSize({ width, height: 900 });
+  await mockApi(page, { projectTaskUpdates: [10, 20, 30, 40, 50, 60] });
+  const child = {
+   id: 'review-child', title: 'Blocked independent benchmark review', status: 'blocked', activity_status: 'blocked',
+   agent_id: agentId, project_id: projectId, parent_task_id: taskId, parent_title: 'Finished benchmark',
+   error_message: 'Reviewer could not start: environment settings mismatch.', provenance: 'durable',
+   created_at: timestamp(1), updated_at: timestamp(2), priority: 0, description: null,
+  };
+  let unresolved = true;
+  await page.route('**/api/tasks/attention*', route => route.fulfill({ json: { tasks: unresolved ? [child] : [] } }));
+  await page.goto(`/agents/${agentId}`);
+  await expect(page.getByRole('heading', { name: 'Needs attention', exact: true })).toBeVisible();
+  await expect(page.getByText(child.error_message, { exact: true })).toBeVisible();
+  await expect(page.getByText('Delegated from Finished benchmark', { exact: true })).toBeVisible();
+  await page.goto(`/projects/${projectId}`);
+  const panel = page.getByRole('region', { name: 'Project needs attention' });
+  await expect(panel.getByText(child.error_message, { exact: true })).toBeVisible();
+  await expect(panel.getByRole('link', { name: 'Parent: Finished benchmark' })).toHaveAttribute('href', `/tasks/${taskId}`);
+  await expect(panel.getByRole('link', { name: child.title })).toHaveAttribute('href', '/tasks/review-child');
+  const agentCard = page.locator('a.border.bg-card').filter({ hasText: 'Needs attention' });
+  await expect(agentCard).toHaveAttribute('href', `/agents/${agentId}`);
+  if (width === 1440) {
+   await expect(page.locator('aside').getByText('Needs attention', { exact: true })).toBeVisible();
+   await page.screenshot({ path: '/tmp/delegated-state-project.png', fullPage: true });
+  }
+  unresolved = false;
+  await expect(panel).toHaveCount(0, { timeout: 12_000 });
+  await expect(agentCard).toHaveCount(0);
+ });
+}
+
+for (const width of [390, 1440]) {
+ test(`global attention includes a cancelled-review blocker beyond task history at ${width}px`, async ({ page }) => {
+  await page.setViewportSize({ width, height: 900 });
+  await mockApi(page, { projectTaskUpdates: Array.from({ length: 110 }, (_, i) => i + 1) });
+  const parent = {
+   id: 'older-parent', title: 'Benchmark blocked by cancelled review', status: 'in_progress', activity_status: 'blocked',
+   agent_id: agentId, project_id: projectId, priority: 0, description: null,
+   created_at: timestamp(1), updated_at: timestamp(1),
+  };
+  let attention = [parent];
+  await page.route('**/api/tasks/attention*', route => route.fulfill({ json: { tasks: attention } }));
+  await page.goto(`/agents/${agentId}`);
+  await expect(page.getByRole('heading', { name: 'Needs attention', exact: true })).toBeVisible();
+  await expect(page.locator('section').filter({ has: page.getByRole('heading', { name: 'Needs attention', exact: true }) }).getByRole('link', { name: parent.title, exact: false })).toBeVisible();
+  await page.goto(`/projects/${projectId}`);
+  const projectAttention = page.getByRole('region', { name: 'Project needs attention' });
+  await expect(projectAttention.getByRole('link', { name: parent.title })).toBeVisible();
+  await expect(projectAttention).toContainText('Blocked');
+  await page.goto('/projects');
+  if (width === 390) await page.getByRole('button', { name: 'Browse workspace', exact: true }).click();
+  const sidebar = page.locator('aside:visible');
+  await expect(sidebar.getByText('Needs you', { exact: true })).toBeVisible();
+  await expect(sidebar.getByRole('link', { name: parent.title, exact: false })).toBeVisible();
+  const projectLink = sidebar.locator(`a[href="/projects/${projectId}"]`).filter({ hasText: 'Browser collaboration project' });
+  await expect(projectLink).toContainText('Needs attention');
+  // More than five blockers remain reachable from this panel.
+  attention = [...Array.from({ length: 6 }, (_, i) => ({ ...parent, id: `new-blocker-${i}`, title: `New blocker ${i}`, updated_at: timestamp(i + 10) })), parent];
+  await expect(sidebar.getByRole('button', { name: 'Show all 7 tasks', exact: true })).toBeVisible({ timeout: 12_000 });
+  await sidebar.getByRole('button', { name: 'Show all 7 tasks', exact: true }).click();
+  await expect(sidebar.getByRole('link', { name: parent.title, exact: false })).toBeVisible();
+  attention = [];
+  await expect(sidebar.getByText('Needs you', { exact: true })).toHaveCount(0, { timeout: 12_000 });
+  await expect(projectLink).not.toContainText('Needs attention');
  });
 }

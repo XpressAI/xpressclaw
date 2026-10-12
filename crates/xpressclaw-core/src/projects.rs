@@ -147,7 +147,7 @@ impl ProjectManager {
             let mut statement = conn.prepare(
                 "SELECT p.*,
                         (SELECT COUNT(*) FROM conversations c WHERE c.project_id = p.id) AS conversation_count,
-                        (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.hidden = 0) AS task_count
+                        (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.hidden = 0 AND t.provenance != 'native_plan') AS task_count
                  FROM projects p
                  ORDER BY p.updated_at DESC, p.name COLLATE NOCASE ASC",
             )?;
@@ -163,7 +163,7 @@ impl ProjectManager {
             conn.query_row(
                 "SELECT p.*,
                         (SELECT COUNT(*) FROM conversations c WHERE c.project_id = p.id) AS conversation_count,
-                        (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.hidden = 0) AS task_count
+                        (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.hidden = 0 AND t.provenance != 'native_plan') AS task_count
                  FROM projects p WHERE p.id = ?1",
                 [id],
                 |row| row_to_project(conn, row),

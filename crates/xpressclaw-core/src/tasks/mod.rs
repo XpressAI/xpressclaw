@@ -2,6 +2,7 @@ pub mod attachments;
 pub mod board;
 pub mod conversation;
 pub mod delegation;
+pub(crate) mod delegation_notifications;
 pub mod dispatcher;
 pub mod procedure_runner;
 pub mod queue;

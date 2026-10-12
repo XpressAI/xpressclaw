@@ -519,6 +519,23 @@ impl TaskConversation {
         since: Option<&str>,
         through_message_id: Option<i64>,
     ) -> Result<Vec<PromptTaskMessage>> {
+        self.get_user_messages_for_attempt(
+            task_id,
+            after_message_id,
+            since,
+            through_message_id,
+            None,
+        )
+    }
+
+    pub(crate) fn get_user_messages_for_attempt(
+        &self,
+        task_id: &str,
+        after_message_id: Option<i64>,
+        since: Option<&str>,
+        through_message_id: Option<i64>,
+        attempt_id: Option<&str>,
+    ) -> Result<Vec<PromptTaskMessage>> {
         let conn = self.db.conn();
         let mut stmt = conn.prepare(
             "SELECT id, content FROM task_messages
@@ -528,11 +545,20 @@ impl TaskConversation {
                    OR (?2 IS NULL AND (?3 IS NULL OR timestamp >= ?3))
                )
                AND (?4 IS NULL OR id <= ?4)
+               AND (?5 IS NULL OR NOT EXISTS (SELECT 1 FROM workflow_step_executions e
+                   WHERE e.continuation_prompt_message_id=task_messages.id
+                     AND e.continuation_attempt_id IS NOT ?5))
              ORDER BY id ASC",
         )?;
         let rows: Vec<(i64, String)> = stmt
             .query_map(
-                rusqlite::params![task_id, after_message_id, since, through_message_id],
+                rusqlite::params![
+                    task_id,
+                    after_message_id,
+                    since,
+                    through_message_id,
+                    attempt_id
+                ],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )?
             .collect::<std::result::Result<_, _>>()?;

@@ -541,12 +541,12 @@ impl TaskBoard {
         })
     }
 
-    /// List visible top-level tasks owned by a project, newest first.
+    /// List visible durable tasks owned by a project, newest first.
     pub fn list_for_project(&self, project_id: &str, limit: i64) -> Result<Vec<Task>> {
         self.db.with_conn(|conn| {
             let mut statement = conn.prepare(
                 "SELECT * FROM tasks
-                 WHERE project_id = ?1 AND hidden = 0 AND parent_task_id IS NULL
+                 WHERE project_id = ?1 AND hidden = 0 AND provenance != 'native_plan'
                  ORDER BY updated_at DESC, created_at DESC LIMIT ?2",
             )?;
             let mut rows = statement.query(rusqlite::params![project_id, limit])?;
@@ -626,7 +626,7 @@ impl TaskBoard {
         )
     }
 
-    /// List the most recently updated top-level tasks for each agent.
+    /// List the most recently updated durable tasks for each agent.
     pub fn list_recent_per_agent(&self, limit: i64) -> Result<Vec<Task>> {
         let conn = self.db.conn();
         let mut stmt = conn.prepare(
@@ -637,7 +637,7 @@ impl TaskBoard {
                         ORDER BY updated_at DESC, created_at DESC, id DESC
                     ) AS recency_rank
                 FROM tasks
-                WHERE hidden = 0 AND parent_task_id IS NULL
+                WHERE hidden = 0 AND provenance != 'native_plan'
             )
             SELECT *
             FROM ranked_tasks
@@ -690,8 +690,9 @@ impl TaskBoard {
             sql.push_str(" AND hidden = 0");
         }
 
-        // Subtasks belong inside their parent, not the top-level list.
-        sql.push_str(" AND parent_task_id IS NULL");
+        // Durable delegated work is real assigned work. Only harness checklist
+        // rows stay within the parent transcript.
+        sql.push_str(" AND provenance != 'native_plan'");
 
         if !filter.statuses.is_empty() {
             sql.push_str(" AND status IN (");
@@ -1221,7 +1222,12 @@ impl TaskBoard {
                 [&task.id], |row| row.get(0),
             )?;
             if awaiting_subtasks {
-                return Ok("waiting_for_subtasks".to_string());
+                let needs_attention: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM tasks WHERE parent_task_id=?1 AND blocks_parent=1
+                     AND status IN ('blocked','waiting_for_input','cancelled'))",
+                    [&task.id], |row| row.get(0),
+                )?;
+                return Ok(if needs_attention { "blocked" } else { "waiting_for_subtasks" }.to_string());
             }
             let queued: bool = conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM work_attempts WHERE task_id=?1 AND status='queued')
@@ -1316,6 +1322,10 @@ impl TaskBoard {
                 [task_id],
                 |row| row.get(0),
             )?;
+            super::delegation_notifications::retire_stale_in_transaction(
+                &transaction,
+                Some(task_id),
+            )?;
             let has_open_attempt: bool = transaction.query_row(
                 "SELECT EXISTS(
                     SELECT 1 FROM work_attempts WHERE task_id = ?1
@@ -1369,16 +1379,69 @@ impl TaskBoard {
         Ok(count as i64)
     }
 
+    pub fn current_error(&self, task: &Task) -> Result<Option<String>> {
+        if matches!(task.status, TaskStatus::Completed | TaskStatus::Cancelled) {
+            return Ok(None);
+        }
+        self.db.with_conn(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT CASE WHEN status='failed' THEN error_message END FROM work_attempts
+                 WHERE task_id=?1 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                    [&task.id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten())
+        })
+    }
+
+    /// All unresolved work is available independently of recent-history limits.
+    pub fn list_attention(&self, agent_id: Option<&str>) -> Result<Vec<Task>> {
+        let candidates = self.db.with_conn(|conn| -> Result<Vec<Task>> {
+            let mut statement = conn.prepare(
+                "SELECT * FROM tasks WHERE hidden=0 AND provenance!='native_plan'
+                 AND (?1 IS NULL OR agent_id=?1)
+                 AND (status IN ('blocked','waiting_for_input')
+                   OR (status IN ('pending','in_progress') AND (
+                     EXISTS(SELECT 1 FROM tasks child WHERE child.parent_task_id=tasks.id
+                       AND child.blocks_parent=1 AND child.status IN ('blocked','waiting_for_input','cancelled'))
+                     OR EXISTS(SELECT 1 FROM work_attempts WHERE task_id=tasks.id AND status='waiting_for_input'))))
+                 ORDER BY updated_at DESC, created_at DESC, id DESC",
+            )?;
+            let mut rows = statement.query([agent_id])?;
+            let mut tasks = Vec::new();
+            while let Some(row) = rows.next()? {
+                tasks.push(row_to_task(row)?);
+            }
+            Ok(tasks)
+        })?;
+        let mut attention = Vec::new();
+        for task in candidates {
+            // A cancelled required review still blocks its active parent. Show
+            // the parent needing intervention, without treating resolved or
+            // optional cancelled work as a new error. Reuse activity precedence
+            // so a running worker or deferred task is not mislabeled blocked.
+            if matches!(
+                self.activity_status(&task)?.as_str(),
+                "blocked" | "waiting_for_input"
+            ) {
+                attention.push(task);
+            }
+        }
+        Ok(attention)
+    }
+
     pub fn counts(&self) -> Result<TaskCounts> {
         self.counts_for_search(None)
     }
 
-    /// Count top-level tasks by status, optionally restricted to tasks whose
+    /// Count durable tasks by status, optionally restricted to tasks whose
     /// visible task text or conversation contains every search term.
     pub fn counts_for_search(&self, search: Option<&str>) -> Result<TaskCounts> {
         let conn = self.db.conn();
         let mut sql = "SELECT status, COUNT(*) as count FROM tasks
-             WHERE hidden = 0 AND parent_task_id IS NULL"
+             WHERE hidden = 0 AND provenance != 'native_plan'"
             .to_string();
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         append_task_search(&mut sql, &mut params, search);
@@ -2017,6 +2080,88 @@ mod tests {
             Ok::<_, rusqlite::Error>(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn attention_includes_parent_blocked_by_cancelled_required_review() {
+        let (db, board) = setup();
+        db.conn()
+            .execute_batch(
+                "INSERT INTO tasks(id,title,status,agent_id) VALUES
+            ('parent','Benchmark','in_progress','owner'),
+            ('optional-parent','Optional review','in_progress','owner'),
+            ('finished-parent','Finished','completed','owner');
+            INSERT INTO tasks(id,title,status,agent_id,parent_task_id,blocks_parent) VALUES
+            ('required','Required review','cancelled','reviewer','parent',1),
+            ('optional','Optional review','cancelled','reviewer','optional-parent',0),
+            ('finished-child','Old review','cancelled','reviewer','finished-parent',1);",
+            )
+            .unwrap();
+        for i in 0..110 {
+            db.conn().execute("INSERT INTO tasks(id,title,status,agent_id) VALUES(?1,'Newer history','completed','owner')", [format!("history-{i}")]).unwrap();
+        }
+        let attention = board.list_attention(Some("owner")).unwrap();
+        assert_eq!(
+            attention
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["parent"]
+        );
+        assert_eq!(board.activity_status(&attention[0]).unwrap(), "blocked");
+        assert!(board.current_error(&attention[0]).unwrap().is_none());
+        assert!(board.list_attention(Some("reviewer")).unwrap().is_empty());
+        db.conn()
+            .execute("UPDATE tasks SET blocks_parent=0 WHERE id='required'", [])
+            .unwrap();
+        assert!(board.list_attention(None).unwrap().is_empty());
+        db.conn()
+            .execute(
+                "UPDATE tasks SET blocks_parent=1,status='completed' WHERE id='required'",
+                [],
+            )
+            .unwrap();
+        assert!(board.list_attention(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn delegated_tasks_appear_in_lists_counts_and_attention() {
+        let (db, board) = setup();
+        db.conn().execute_batch("INSERT INTO projects(id,name) VALUES('p','Project');
+            INSERT INTO tasks(id,title,status,project_id) VALUES('parent','Parent','in_progress','p');
+            INSERT INTO tasks(id,title,status,agent_id,project_id,parent_task_id,provenance,hidden) VALUES
+              ('child','Review','blocked','reviewer','p','parent','durable',0),
+              ('plan','Step','blocked','reviewer','p','parent','native_plan',0),
+              ('hidden','Idle','blocked','reviewer','p',NULL,'durable',1);").unwrap();
+        let list = board
+            .list_page(&[], Some("reviewer"), None, 100, 0)
+            .unwrap();
+        assert_eq!(
+            list.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            vec!["child"]
+        );
+        assert_eq!(board.list_recent_per_agent(5).unwrap().len(), 2);
+        assert_eq!(board.list_for_project("p", 100).unwrap().len(), 2);
+        assert_eq!(board.counts().unwrap().blocked, 1);
+        assert_eq!(board.counts_for_search(Some("Review")).unwrap().blocked, 1);
+        assert_eq!(board.list_attention(Some("reviewer")).unwrap().len(), 1);
+        assert!(board
+            .list_attention(Some("different-agent"))
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            board
+                .activity_status(&board.get("parent").unwrap())
+                .unwrap(),
+            "blocked"
+        );
+        db.conn()
+            .execute(
+                "UPDATE tasks SET status='completed' WHERE id IN ('child','plan')",
+                [],
+            )
+            .unwrap();
+        assert!(board.list_attention(None).unwrap().is_empty());
     }
 
     #[test]
@@ -3204,13 +3349,13 @@ mod tests {
             .unwrap();
 
         let all = board.list(None, None, 100).unwrap();
-        assert_eq!(all.len(), 2);
+        assert_eq!(all.len(), 3);
 
         let by_agent = board.list(None, Some("atlas"), 100).unwrap();
         assert_eq!(by_agent.len(), 2);
 
         let counts = board.counts().unwrap();
-        assert_eq!(counts.pending, 2);
+        assert_eq!(counts.pending, 3);
     }
 
     #[test]
@@ -3290,11 +3435,13 @@ mod tests {
         let conversation_matches = board
             .list_recent_page(&[], None, &[], Some("jira CALLBACK"), 100, 0)
             .unwrap();
-        assert_eq!(conversation_matches.len(), 1);
-        assert_eq!(conversation_matches[0].id, discussed.id);
+        assert_eq!(conversation_matches.len(), 2);
+        assert!(conversation_matches
+            .iter()
+            .any(|task| task.id == discussed.id));
 
         let counts = board.counts_for_search(Some("jira callback")).unwrap();
-        assert_eq!(counts.pending, 1);
+        assert_eq!(counts.pending, 2);
     }
 
     #[test]

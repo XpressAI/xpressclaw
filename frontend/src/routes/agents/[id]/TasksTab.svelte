@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, onDestroy } from 'svelte';
 	import { tasks as tasksApi } from '$lib/api';
 	import type { Task } from '$lib/api';
 	import { statusColor, timeAgo } from '$lib/utils';
@@ -12,6 +12,7 @@
 
 	let taskList = $state<Task[]>([]);
 	let loading = $state(true);
+	let pollTimer: ReturnType<typeof setInterval> | null = null;
 	let error = $state<string | null>(null);
 
 	// Create task form
@@ -22,13 +23,15 @@
 
 	onMount(() => {
 		loadTasks();
+		pollTimer = setInterval(() => loadTasks(false), 5000);
 	});
+	onDestroy(() => { if (pollTimer) clearInterval(pollTimer); });
 
-	async function loadTasks() {
-		loading = true;
+	async function loadTasks(initial = true) {
+		if (initial) loading = true;
 		error = null;
 		try {
-			const result = await tasksApi.list(undefined, agentId);
+			const result = await tasksApi.list(undefined, agentId, { sort: 'recent' });
 			taskList = result.tasks;
 		} catch (e) {
 			error = `Failed to load tasks: ${e}`;
@@ -111,7 +114,9 @@
 								<td class="py-2 pr-4">
 									<a href="/tasks/{task.id}" class="text-foreground hover:text-primary transition-colors">
 										{task.title}
-									</a>
+                                    </a>
+                                    {#if task.parent_task_id}<a href="/tasks/{task.parent_task_id}" class="mt-1 block text-xs text-muted-foreground hover:underline">Parent: {task.parent_title || 'Open parent task'}</a>{/if}
+                                    {#if task.error_message}<p class="mt-1 whitespace-pre-wrap break-words text-xs text-destructive">{task.error_message}</p>{/if}
 								</td>
 								<td class="py-2 pr-4">
 									<span class="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium {statusColor(task.status)}">

@@ -18,6 +18,7 @@ pub struct DelegatedWork {
     pub finished_at: Option<String>,
     pub latest_event_type: Option<String>,
     pub latest_event_at: Option<String>,
+    pub error_message: Option<String>,
 }
 
 /// Read one snapshot; indexed task/attempt/event lookups avoid transferring
@@ -33,7 +34,8 @@ pub fn list(db: &Database, parent_task_id: &str) -> Result<Vec<DelegatedWork>> {
                 EXISTS(SELECT 1 FROM tasks child WHERE child.parent_task_id=t.id
                        AND child.blocks_parent=1 AND child.status!='completed') AS child_pending,
                 EXISTS(SELECT 1 FROM task_dependencies d JOIN tasks dependency ON dependency.id=d.depends_on_id
-                       WHERE d.task_id=t.id AND dependency.status!='completed') AS dependency_pending
+                       WHERE d.task_id=t.id AND dependency.status!='completed') AS dependency_pending,
+                CASE WHEN t.status NOT IN ('completed','cancelled') AND a.status='failed' THEN a.error_message END
          FROM tasks t
          LEFT JOIN work_attempts a ON a.id=(
              SELECT id FROM work_attempts WHERE task_id=t.id
@@ -42,7 +44,7 @@ pub fn list(db: &Database, parent_task_id: &str) -> Result<Vec<DelegatedWork>> {
                       created_at DESC, rowid DESC LIMIT 1)
          LEFT JOIN session_events e ON e.id=(
              SELECT id FROM session_events WHERE task_id=t.id ORDER BY id DESC LIMIT 1)
-         WHERE t.parent_task_id=?1 AND t.provenance!='native_plan'
+         WHERE t.parent_task_id=?1 AND t.hidden=0 AND t.provenance!='native_plan'
          ORDER BY (t.status='completed'), t.blocks_parent DESC, t.created_at, t.id",
     )?;
     let rows = stmt.query_map([parent_task_id], |row| {
@@ -102,6 +104,7 @@ pub fn list(db: &Database, parent_task_id: &str) -> Result<Vec<DelegatedWork>> {
             status,
             latest_event_type: row.get(13)?,
             latest_event_at: row.get(14)?,
+            error_message: row.get(18)?,
         })
     })?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -129,6 +132,29 @@ mod tests {
                 ('session',NULL,'unrelated','native','agent_thought','Private other task','2026-10-11 10:31:00');"
         ).unwrap();
         db
+    }
+
+    #[test]
+    fn delegated_failure_is_visible_until_retry_or_resolution() {
+        let db = fixture();
+        db.conn().execute_batch("UPDATE work_attempts SET status='completed' WHERE id='running';
+            UPDATE work_attempts SET status='failed',error_message='Environment settings mismatch' WHERE id='queued';
+            UPDATE tasks SET status='blocked' WHERE id='child';").unwrap();
+        assert_eq!(
+            list(&db, "parent").unwrap()[0].error_message.as_deref(),
+            Some("Environment settings mismatch")
+        );
+        for status in ["queued", "running", "completed"] {
+            db.conn()
+                .execute(
+                    "UPDATE work_attempts SET status=?1 WHERE id='queued'",
+                    [status],
+                )
+                .unwrap();
+            assert!(list(&db, "parent").unwrap()[0].error_message.is_none());
+        }
+        db.conn().execute_batch("UPDATE work_attempts SET status='failed' WHERE id='queued'; UPDATE tasks SET status='completed' WHERE id='child';").unwrap();
+        assert!(list(&db, "parent").unwrap()[0].error_message.is_none());
     }
 
     #[test]
