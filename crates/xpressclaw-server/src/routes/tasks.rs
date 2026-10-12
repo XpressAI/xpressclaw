@@ -1894,6 +1894,7 @@ mod tests {
             .execute("UPDATE tasks SET status='cancelled' WHERE id='review'", [])
             .unwrap();
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/tasks/review")
@@ -1903,6 +1904,22 @@ mod tests {
             .await
             .unwrap();
         assert!(body_json(response.into_body()).await["error_message"].is_null());
+        // Cancellation does not satisfy a required review gate. Surface the
+        // parent that still needs an explicit resolution.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/tasks/attention")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body_json(response.into_body()).await;
+        assert_eq!(body["tasks"].as_array().unwrap().len(), 1);
+        assert_eq!(body["tasks"][0]["id"], "parent");
+        assert_eq!(body["tasks"][0]["status"], "in_progress");
+        assert_eq!(body["tasks"][0]["activity_status"], "blocked");
     }
 
     #[tokio::test]

@@ -1394,20 +1394,38 @@ impl TaskBoard {
 
     /// All unresolved work is available independently of recent-history limits.
     pub fn list_attention(&self, agent_id: Option<&str>) -> Result<Vec<Task>> {
-        self.list_inner(
-            TaskListFilter {
-                statuses: &["blocked", "waiting_for_input"],
-                agent_id,
-                excluded_statuses: &[],
-                search: None,
-            },
-            TaskListPage {
-                limit: -1,
-                offset: 0,
-            },
-            false,
-            TaskListOrder::Recent,
-        )
+        let candidates = self.db.with_conn(|conn| -> Result<Vec<Task>> {
+            let mut statement = conn.prepare(
+                "SELECT * FROM tasks WHERE hidden=0 AND provenance!='native_plan'
+                 AND (?1 IS NULL OR agent_id=?1)
+                 AND (status IN ('blocked','waiting_for_input')
+                   OR (status IN ('pending','in_progress') AND (
+                     EXISTS(SELECT 1 FROM tasks child WHERE child.parent_task_id=tasks.id
+                       AND child.blocks_parent=1 AND child.status IN ('blocked','waiting_for_input','cancelled'))
+                     OR EXISTS(SELECT 1 FROM work_attempts WHERE task_id=tasks.id AND status='waiting_for_input'))))
+                 ORDER BY updated_at DESC, created_at DESC, id DESC",
+            )?;
+            let mut rows = statement.query([agent_id])?;
+            let mut tasks = Vec::new();
+            while let Some(row) = rows.next()? {
+                tasks.push(row_to_task(row)?);
+            }
+            Ok(tasks)
+        })?;
+        let mut attention = Vec::new();
+        for task in candidates {
+            // A cancelled required review still blocks its active parent. Show
+            // the parent needing intervention, without treating resolved or
+            // optional cancelled work as a new error. Reuse activity precedence
+            // so a running worker or deferred task is not mislabeled blocked.
+            if matches!(
+                self.activity_status(&task)?.as_str(),
+                "blocked" | "waiting_for_input"
+            ) {
+                attention.push(task);
+            }
+        }
+        Ok(attention)
     }
 
     pub fn counts(&self) -> Result<TaskCounts> {
@@ -2058,6 +2076,48 @@ mod tests {
             Ok::<_, rusqlite::Error>(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn attention_includes_parent_blocked_by_cancelled_required_review() {
+        let (db, board) = setup();
+        db.conn()
+            .execute_batch(
+                "INSERT INTO tasks(id,title,status,agent_id) VALUES
+            ('parent','Benchmark','in_progress','owner'),
+            ('optional-parent','Optional review','in_progress','owner'),
+            ('finished-parent','Finished','completed','owner');
+            INSERT INTO tasks(id,title,status,agent_id,parent_task_id,blocks_parent) VALUES
+            ('required','Required review','cancelled','reviewer','parent',1),
+            ('optional','Optional review','cancelled','reviewer','optional-parent',0),
+            ('finished-child','Old review','cancelled','reviewer','finished-parent',1);",
+            )
+            .unwrap();
+        for i in 0..110 {
+            db.conn().execute("INSERT INTO tasks(id,title,status,agent_id) VALUES(?1,'Newer history','completed','owner')", [format!("history-{i}")]).unwrap();
+        }
+        let attention = board.list_attention(Some("owner")).unwrap();
+        assert_eq!(
+            attention
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["parent"]
+        );
+        assert_eq!(board.activity_status(&attention[0]).unwrap(), "blocked");
+        assert!(board.current_error(&attention[0]).unwrap().is_none());
+        assert!(board.list_attention(Some("reviewer")).unwrap().is_empty());
+        db.conn()
+            .execute("UPDATE tasks SET blocks_parent=0 WHERE id='required'", [])
+            .unwrap();
+        assert!(board.list_attention(None).unwrap().is_empty());
+        db.conn()
+            .execute(
+                "UPDATE tasks SET blocks_parent=1,status='completed' WHERE id='required'",
+                [],
+            )
+            .unwrap();
+        assert!(board.list_attention(None).unwrap().is_empty());
     }
 
     #[test]

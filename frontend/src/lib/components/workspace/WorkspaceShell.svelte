@@ -77,6 +77,8 @@
 	let conversationList = $state<Conversation[]>([]);
 	let taskList = $state<Task[]>([]);
 	let sidebarTaskList = $state<Task[]>([]);
+	let attentionSnapshot = $state<Task[]>([]);
+	let showAllAttention = $state(false);
 	let workflowList = $state<Workflow[]>([]);
 	let scheduleList = $state<Schedule[]>([]);
 	let contextMenu = $state<WorkspaceContextMenu | null>(null);
@@ -109,9 +111,8 @@
 			: sidebarCategory === 'settings' ? 'Settings' : 'Projects');
 	let focusedTaskId = $derived(focusedTab?.kind === 'task' ? focusedTab.resourceId : null);
 	let focusedWorkflowId = $derived(focusedTab?.kind === 'workflow' ? focusedTab.resourceId : null);
-	let attentionTasks = $derived(taskList
-		.filter((task) => task.status === 'waiting_for_input' || task.status === 'blocked')
-		.sort((left, right) => statusPriority(right.status) - statusPriority(left.status)
+	let attentionTasks = $derived([...attentionSnapshot]
+		.sort((left, right) => statusPriority(right.activity_status ?? right.status) - statusPriority(left.activity_status ?? left.status)
 			|| (serverTimestampMs(right.updated_at) ?? 0) - (serverTimestampMs(left.updated_at) ?? 0)));
 	let focusedAgent = $derived((() => {
 		if (!focusedTab) return null;
@@ -884,7 +885,8 @@
 			conversationList = nextConversations;
 			agentList = nextAgents;
 			taskList = taskResult.tasks;
-			sidebarTaskList = [...new Map([...(sidebarTaskResult?.tasks ?? taskResult.tasks), ...(attentionResult?.tasks ?? [])].map(task => [task.id, task])).values()];
+			if (attentionResult?.tasks) attentionSnapshot = attentionResult.tasks;
+			sidebarTaskList = [...new Map([...(sidebarTaskResult?.tasks ?? taskResult.tasks), ...attentionSnapshot].map(task => [task.id, task])).values()];
 			workflowList = nextWorkflows;
 			scheduleList = nextSchedules;
 			refreshTabMetadata();
@@ -1096,13 +1098,14 @@
 								<span>Needs you</span><span>{attentionTasks.length}</span>
 							</div>
 							<div class="space-y-0.5">
-								{#each attentionTasks.slice(0, 5) as task (task.id)}
+								{#each (showAllAttention ? attentionTasks : attentionTasks.slice(0, 5)) as task (task.id)}
 									{@const agent = taskAgent(task)}
 									<a href="/tasks/{task.id}" class="group flex items-start gap-2 rounded-lg px-2 py-2 text-left hover:bg-accent/50">
-										<span class="mt-1.5 h-2 w-2 shrink-0 rounded-full {task.status === 'blocked' ? 'bg-red-500' : 'bg-orange-500 animate-pulse'}"></span>
+										<span class="mt-1.5 h-2 w-2 shrink-0 rounded-full {(task.activity_status ?? task.status) === 'blocked' ? 'bg-red-500' : 'bg-orange-500 animate-pulse'}"></span>
 										<span class="min-w-0 flex-1"><span class="block truncate text-xs text-foreground">{task.title}</span><span class="mt-0.5 block truncate text-[10px] text-muted-foreground">{agent?.title || agent?.name || 'Unassigned'} · {timeAgo(task.updated_at)}</span></span>
 									</a>
 								{/each}
+								{#if attentionTasks.length > 5}<button type="button" onclick={() => showAllAttention = !showAllAttention} class="px-2 py-1 text-xs text-primary">{showAllAttention ? 'Show fewer tasks' : `Show all ${attentionTasks.length} tasks`}</button>{/if}
 							</div>
 						</div>
 					{/if}
@@ -1223,7 +1226,7 @@
 			{:else}
 				<div data-mobile-sidebar-scroll class="workspace-scroll-y flex-1">
 				{#if attentionTasks.length > 0}
-					<div class="mb-4 shrink-0"><div class="mb-1 px-2 text-[10px] font-semibold uppercase tracking-[0.14em] text-orange-400">Needs you</div>{#each attentionTasks.slice(0, 5) as task (task.id)}<a href="/tasks/{task.id}" onclick={closeMobileMenu} class="flex items-center gap-2 rounded-lg px-2 py-2 hover:bg-accent"><span class="h-2 w-2 rounded-full {task.status === 'blocked' ? 'bg-red-500' : 'bg-orange-500'}"></span><span class="min-w-0 flex-1 truncate text-sm">{task.title}</span></a>{/each}</div>
+					<div class="mb-4 shrink-0"><div class="mb-1 px-2 text-[10px] font-semibold uppercase tracking-[0.14em] text-orange-400">Needs you</div>{#each (showAllAttention ? attentionTasks : attentionTasks.slice(0, 5)) as task (task.id)}<a href="/tasks/{task.id}" onclick={closeMobileMenu} class="flex items-center gap-2 rounded-lg px-2 py-2 hover:bg-accent"><span class="h-2 w-2 rounded-full {(task.activity_status ?? task.status) === 'blocked' ? 'bg-red-500' : 'bg-orange-500'}"></span><span class="min-w-0 flex-1 truncate text-sm">{task.title}</span></a>{/each}{#if attentionTasks.length > 5}<button type="button" onclick={() => showAllAttention = !showAllAttention} class="px-2 py-1 text-xs text-primary">{showAllAttention ? 'Show fewer tasks' : `Show all ${attentionTasks.length} tasks`}</button>{/if}</div>
 				{/if}
 					<SidebarProjects {projectList} {conversationList} {agentList} taskList={sidebarTaskList} {activeProjectId} activeConversationId={focusedConversation?.id ?? null} activeAgentId={focusedAgent?.id ?? null} onagentcontext={showProjectContextMenu} onnavigate={closeMobileMenu} />
 				</div>

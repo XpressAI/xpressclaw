@@ -299,7 +299,11 @@ rows remain visible as parent steps. A required child that needs attention must
 not make its queued parent appear to be executing.
 
 Unresolved blocked/input tasks have a separate read-only attention snapshot, so
-recent-history limits cannot hide the work responsible for an indicator. Project
+recent-history limits cannot hide the work responsible for an indicator. This
+includes active parents blocked by a cancelled required child, using the same
+derived activity state as the task view; cancelled optional work and resolved
+parents are not new failures. The global attention panel uses this snapshot and
+can expand beyond its five-row preview. Project
 warnings lead to the affected task or Agent. Delegated progress includes the
 current attempt's failure reason, not an older failure after retry or resolution.
 Session status is derived on reads from current attempts and unresolved tasks;

@@ -135,8 +135,8 @@
 
 	function agentState(agent: Agent): string {
 		const attention = attentionTasks.filter(task => task.agent_id === agent.id);
-		if (attention.some(task => task.status === 'blocked')) return 'blocked';
-		if (attention.some(task => task.status === 'waiting_for_input')) return 'waiting_for_input';
+		if (attention.some(task => (task.activity_status ?? task.status) === 'blocked')) return 'blocked';
+		if (attention.some(task => (task.activity_status ?? task.status) === 'waiting_for_input')) return 'waiting_for_input';
 		return agent.status;
 	}
 
@@ -176,7 +176,7 @@
                     {#each attentionTasks as task (task.id)}
                         <div class="min-w-0">
                             <a href="/tasks/{task.id}" class="text-sm font-medium text-primary underline">{task.title}</a>
-                            <p class="text-xs text-muted-foreground">{task.status === 'waiting_for_input' ? 'Needs input' : 'Blocked'} · {projectAgents.find(agent => agent.id === task.agent_id)?.title || task.agent_id || 'Unassigned'}</p>
+                            <p class="text-xs text-muted-foreground">{(task.activity_status ?? task.status) === 'waiting_for_input' ? 'Needs input' : 'Blocked'} · {projectAgents.find(agent => agent.id === task.agent_id)?.title || task.agent_id || 'Unassigned'}</p>
                             {#if task.parent_task_id}<a href="/tasks/{task.parent_task_id}" class="text-xs text-muted-foreground underline">Parent: {task.parent_title || 'Open parent task'}</a>{/if}
                             {#if task.error_message}<p class="mt-1 whitespace-pre-wrap break-words text-xs text-destructive">{task.error_message}</p>{/if}
                         </div>

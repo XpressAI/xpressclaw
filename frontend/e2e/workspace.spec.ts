@@ -6818,3 +6818,39 @@ for (const width of [390, 1440]) {
   await expect(agentCard).toHaveCount(0);
  });
 }
+
+for (const width of [390, 1440]) {
+ test(`global attention includes a cancelled-review blocker beyond task history at ${width}px`, async ({ page }) => {
+  await page.setViewportSize({ width, height: 900 });
+  await mockApi(page, { projectTaskUpdates: Array.from({ length: 110 }, (_, i) => i + 1) });
+  const parent = {
+   id: 'older-parent', title: 'Benchmark blocked by cancelled review', status: 'in_progress', activity_status: 'blocked',
+   agent_id: agentId, project_id: projectId, priority: 0, description: null,
+   created_at: timestamp(1), updated_at: timestamp(1),
+  };
+  let attention = [parent];
+  await page.route('**/api/tasks/attention*', route => route.fulfill({ json: { tasks: attention } }));
+  await page.goto(`/agents/${agentId}`);
+  await expect(page.getByRole('heading', { name: 'Needs attention', exact: true })).toBeVisible();
+  await expect(page.locator('section').filter({ has: page.getByRole('heading', { name: 'Needs attention', exact: true }) }).getByRole('link', { name: parent.title, exact: false })).toBeVisible();
+  await page.goto(`/projects/${projectId}`);
+  const projectAttention = page.getByRole('region', { name: 'Project needs attention' });
+  await expect(projectAttention.getByRole('link', { name: parent.title })).toBeVisible();
+  await expect(projectAttention).toContainText('Blocked');
+  await page.goto('/projects');
+  if (width === 390) await page.getByRole('button', { name: 'Browse workspace', exact: true }).click();
+  const sidebar = page.locator('aside:visible');
+  await expect(sidebar.getByText('Needs you', { exact: true })).toBeVisible();
+  await expect(sidebar.getByRole('link', { name: parent.title, exact: false })).toBeVisible();
+  const projectLink = sidebar.locator(`a[href="/projects/${projectId}"]`).filter({ hasText: 'Browser collaboration project' });
+  await expect(projectLink).toContainText('Needs attention');
+  // More than five blockers remain reachable from this panel.
+  attention = [...Array.from({ length: 6 }, (_, i) => ({ ...parent, id: `new-blocker-${i}`, title: `New blocker ${i}`, updated_at: timestamp(i + 10) })), parent];
+  await expect(sidebar.getByRole('button', { name: 'Show all 7 tasks', exact: true })).toBeVisible({ timeout: 12_000 });
+  await sidebar.getByRole('button', { name: 'Show all 7 tasks', exact: true }).click();
+  await expect(sidebar.getByRole('link', { name: parent.title, exact: false })).toBeVisible();
+  attention = [];
+  await expect(sidebar.getByText('Needs you', { exact: true })).toHaveCount(0, { timeout: 12_000 });
+  await expect(projectLink).not.toContainText('Needs attention');
+ });
+}

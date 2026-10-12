@@ -65,8 +65,8 @@
 			]);
 			overview = nextOverview;
 			taskList = result.tasks;
-			recentWorkTasks = recentWork.tasks;
-			attentionTasks = attention.tasks ?? result.tasks.filter(task => ATTENTION_STATUSES.includes(task.status));
+			recentWorkTasks = recentWork.tasks.filter(task => !ATTENTION_STATUSES.includes(task.activity_status ?? task.status));
+			attentionTasks = attention.tasks ?? result.tasks.filter(task => ATTENTION_STATUSES.includes(task.activity_status ?? task.status));
 			error = null;
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
@@ -234,13 +234,13 @@
 					<span class="text-xs text-muted-foreground">{attentionTasks.length}</span>
 				</div>
 				{#each attentionTasks as task (task.id)}
-					<a href="/tasks/{task.id}" class="flex items-center gap-3 rounded-xl border p-4 transition-colors hover:border-primary/40 {taskTone(task.status)}">
+					<a href="/tasks/{task.id}" class="flex items-center gap-3 rounded-xl border p-4 transition-colors hover:border-primary/40 {taskTone(task.activity_status ?? task.status)}">
 						<span class="h-2.5 w-2.5 shrink-0 rounded-full bg-orange-500 animate-pulse"></span>
 						<div class="min-w-0 flex-1">
 							<div class="break-words text-sm font-medium">{task.title}</div>
 							{#if task.parent_task_id}<div class="text-xs text-muted-foreground">Delegated from {task.parent_title || 'another task'}</div>{/if}
 							{#if task.error_message}<p class="mt-1 whitespace-pre-wrap break-words text-xs text-destructive">{task.error_message}</p>{/if}
-							<div class="mt-0.5 text-xs text-muted-foreground">{task.status === 'waiting_for_input' ? 'Waiting for your reply' : 'Blocked'} · {timeAgo(task.updated_at)}</div>
+							<div class="mt-0.5 text-xs text-muted-foreground">{(task.activity_status ?? task.status) === 'waiting_for_input' ? 'Waiting for your reply' : 'Blocked'} · {timeAgo(task.updated_at)}</div>
 						</div>
 						<span class="text-muted-foreground">→</span>
 					</a>

@@ -51,7 +51,7 @@
 	}
 
     function projectExplanation(project: Project): string {
-        const tasks = taskList.filter(task => task.project_id === project.id && ['blocked', 'waiting_for_input'].includes(task.status));
+        const tasks = taskList.filter(task => task.project_id === project.id && ['blocked', 'waiting_for_input'].includes(task.activity_status ?? task.status));
         const agents = agentList.filter(agent => agent.project_id === project.id && ['blocked', 'error', 'failed', 'waiting_for_input'].includes(agent.status));
         const reasons = [...tasks.map(task => task.title), ...agents.filter(agent => !tasks.some(task => task.agent_id === agent.id)).map(agent => agent.title || agent.name)];
         if (reasons.length) return 'Needs attention: ' + reasons.join('; ');
@@ -68,7 +68,7 @@
 
     function agentNeedsAttention(agent: Agent): boolean {
         return ['error', 'failed', 'blocked'].includes(agent.status)
-            || taskList.some(task => task.agent_id === agent.id && task.status === 'blocked');
+            || taskList.some(task => task.agent_id === agent.id && (task.activity_status ?? task.status) === 'blocked');
     }
 
 	function agentDot(agent: Agent): string {
