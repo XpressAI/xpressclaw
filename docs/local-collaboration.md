@@ -118,8 +118,10 @@ release does not claim automatic GitHub outage failover.
 - Port conflict: choose different ports, then use Restart & apply configuration.
 - Image unavailable: verify registry access and the explicit tag.
 - Starting/unhealthy: inspect redacted service logs in Settings.
-- Agent cannot resolve a service: assign access, save, and let its retained
-  container recreate at the next safe launch.
+- Agent cannot resolve a service: assign access and save. If an environment
+  already exists, explicitly rebuild it from Agent settings > Harness to apply
+  the changed container settings; existing installed tools are not discarded
+  automatically.
 - Jenkins reports a missing script: commit .xpressclaw/jenkins.sh to the ref.
 - Private build fails: use a public local repository in this first slice.
 

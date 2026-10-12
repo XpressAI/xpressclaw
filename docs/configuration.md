@@ -259,7 +259,8 @@ survive retained-container recreation. Mounted SSH files reflect host changes
 directly. When an agent is forwarded, a runner-only config overlay points all
 SSH client commands at that socket even if the host config names a host-only
 `IdentityAgent` path; config changes refresh that overlay on the next turn.
-Replacing a forwarded agent socket also recreates the retained container.
+Replacing a forwarded agent socket changes its mount. Existing environments are
+preserved; rebuild explicitly from Agent settings > Harness to apply that change.
 
 On macOS, when the selected daemon identifies itself as Docker Desktop,
 XpressClaw uses Docker Desktop's `/run/host-services/ssh-auth.sock` bridge

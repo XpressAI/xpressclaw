@@ -882,7 +882,7 @@ async function mockApi(
 				image: `ghcr.io/xpressai/xpressclaw-runner-${agentRunnerKind}@sha256:${'a'.repeat(64)}`,
 				version: '9.9.9',
 				changed: true,
-				environment_stopped: true,
+				environment_stopped: false, environment_preserved: true,
 			};
 		} else if (path === `/api/agents/${agentId}`) {
 			response = options.agentKind ? {
@@ -4219,12 +4219,12 @@ test('a supported host shows no SSH forwarding limitation in Agent settings', as
 	await expect(checkbox).not.toBeChecked();
 });
 
-test('built-in harness images can be updated to the latest published digest', async ({ page }) => {
+test('harness image downloads preserve the existing environment', async ({ page }) => {
 	const runnerImageUpdateRequests: string[] = [];
 	await mockApi(page, { runnerImageUpdateRequests });
 	await page.goto(`/agents/${agentId}?tab=runner`);
 
-	await page.getByRole('button', { name: 'Update harness' }).click();
+	await page.getByRole('button', { name: 'Download harness update' }).click();
 	await expect.poll(() => runnerImageUpdateRequests).toEqual([agentId]);
 	await expect(page.locator('#runner-image')).toHaveValue(
 		`ghcr.io/xpressai/xpressclaw-runner-codex@sha256:${'a'.repeat(64)}`,
@@ -4233,7 +4233,8 @@ test('built-in harness images can be updated to the latest published digest', as
 	const status = page
 		.getByRole('status')
 		.filter({ has: page.getByRole('button', { name: 'Dismiss harness update message' }) });
-	await expect(status).toContainText('Updated to the latest published harness 9.9.9');
+	await expect(status).toContainText('Downloaded the latest published harness 9.9.9');
+	await expect(status).toContainText('Your existing environment is preserved');
 	await status.getByRole('button', { name: 'Dismiss harness update message' }).click();
 	await expect(status).toHaveCount(0);
 });
@@ -4248,7 +4249,7 @@ test('custom runner kinds containing a built-in name stay custom in Agent settin
 		'Other ACP harness (codex-proxy)',
 	);
 	await expect(page.locator('#runner-image')).toHaveValue('xpressclaw-runner-codex-proxy:latest');
-	await expect(page.getByRole('button', { name: 'Update harness' })).toHaveCount(0);
+	await expect(page.getByRole('button', { name: 'Download harness update' })).toHaveCount(0);
 });
 
 test('mobile connection recovery stays non-blocking and does not reload the workspace', async ({ page }) => {
@@ -6740,3 +6741,29 @@ test('delegated work still refreshes optional children after the parent complete
 	await expect(panel.getByText('Completed delegated work (1)', { exact: true })).toBeVisible({ timeout: 10_000 });
 	await expect(page.locator('[data-delegation-wait]')).toHaveCount(0);
 });
+
+for (const mobile of [false, true]) {
+ test(`environment rebuild requires confirmation and preserves dependency errors (${mobile ? 'mobile' : 'desktop'})`, async ({ page }) => {
+  if (mobile) await page.setViewportSize({ width: 390, height: 844 });
+  await mockApi(page);
+  const requests: unknown[] = [];
+  let blocked = true;
+  await page.route(`**/api/agents/${agentId}/environment/rebuild`, async route => {
+   requests.push(route.request().postDataJSON());
+   await route.fulfill(blocked ? { status: 409, json: { error: 'Cannot remove environment: dependent container experiment is still running. The environment has been preserved.' } } : { json: { rebuilt: true } });
+  });
+  await page.goto(`/agents/${agentId}?tab=runner`);
+  await page.getByRole('button', { name: 'Rebuild environment…', exact: true }).click();
+  await expect(page.getByText('Rebuilding permanently deletes installed tools', { exact: false })).toBeVisible();
+  expect(requests).toHaveLength(0);
+  await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+  expect(requests).toHaveLength(0);
+  await page.getByRole('button', { name: 'Rebuild environment…', exact: true }).click();
+  await page.getByRole('button', { name: 'Discard environment and rebuild', exact: true }).click();
+  await expect(page.getByText('Cannot remove environment: dependent container experiment', { exact: false })).toBeVisible();
+  expect(requests).toEqual([{ discard_installed_tools: true }]);
+  blocked = false;
+  await page.getByRole('button', { name: 'Discard environment and rebuild', exact: true }).click();
+  await expect(page.getByText('New work will create an environment using your saved settings.', { exact: false })).toBeVisible();
+ });
+}

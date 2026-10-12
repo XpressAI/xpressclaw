@@ -141,7 +141,11 @@ export const agents = {
 		version: string | null;
 		changed: boolean;
 		environment_stopped: boolean;
+		environment_preserved: boolean;
 	}>(`/api/agents/${id}/runner-image/update`, { method: 'POST', body: '{}' }),
+	rebuildEnvironment: (id: string) => request<{ rebuilt: boolean }>(
+		`/api/agents/${id}/environment/rebuild`, { method: 'POST', body: JSON.stringify({ discard_installed_tools: true }) }
+	),
 	logs: (id: string, tail = 100) =>
 		request<{ logs: string }>(`/api/agents/${id}/logs?tail=${tail}`)
 };
