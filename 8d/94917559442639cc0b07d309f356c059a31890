@@ -1,0 +1,5 @@
+User requested that delegated tasks not be fire-and-forget: child errors must reach the parent instead of leaving scheduled checks stuck behind the child gate. ADR-025 now describes durable, deduplicated notification and recovery responses. The completion gate and other scheduling/authority checks remain intact. No containers or production tasks were changed.
+
+Implemented transactionally journaled child outcomes and parent messages/responses; subsequent replies and explicit resumes can use the same current blocker. Added prompt isolation from old task briefs and workflow-owned prompts. Addressed Codex comment 4247675439 by including derived required-child blockers in Agent session status.
+
+Validation: 903 core tests, 32 task routes, 6 session routes; final rerun 17 delegation tests and 179 workflow tests; all-target Clippy core/server/CLI, scoped rustfmt, diff check; actual Podman retained-environment test. Existing frontend feature checks remain as recorded on the earlier commits. PR left unmerged for review and CI.
