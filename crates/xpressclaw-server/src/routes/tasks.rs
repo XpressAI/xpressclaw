@@ -856,7 +856,10 @@ async fn get_activity(
             20,
         )
         .map_err(internal_error)?;
-    Ok(Json(json!(activity)))
+    let mut result = json!(activity);
+    result["delegated_work"] =
+        json!(xpressclaw_core::tasks::delegation::list(&state.db, &id).map_err(internal_error)?);
+    Ok(Json(result))
 }
 
 async fn respond_to_elicitation(
@@ -3078,6 +3081,38 @@ flows:
             .unwrap()
             .iter()
             .any(|event| event["event_type"] == "attempt_queued"));
+    }
+
+    #[tokio::test]
+    async fn incremental_task_activity_refreshes_delegated_work_without_parent_events() {
+        let (app, db) = test_app_with_db();
+        db.conn().execute_batch("INSERT INTO tasks(id,title,status) VALUES('parent','Parent','in_progress');
+            INSERT INTO tasks(id,title,parent_task_id,status,agent_id) VALUES('child','Review','parent','pending','website-codex');").unwrap();
+        for status in ["pending", "completed"] {
+            db.conn()
+                .execute("UPDATE tasks SET status=?1 WHERE id='child'", [status])
+                .unwrap();
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/tasks/parent/activity?after=99999")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = body_json(response.into_body()).await;
+            assert!(body["events"].as_array().unwrap().is_empty());
+            assert_eq!(body["delegated_work"][0]["task_id"], "child");
+            assert_eq!(body["delegated_work"][0]["agent_id"], "website-codex");
+            assert_eq!(body["delegated_work"][0]["status"], status);
+            assert_eq!(
+                body["delegated_work"][0]["blocks_parent"],
+                status != "completed"
+            );
+        }
     }
 
     #[tokio::test]

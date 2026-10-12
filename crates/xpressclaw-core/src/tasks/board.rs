@@ -1184,59 +1184,57 @@ impl TaskBoard {
                 return Ok(if task.backlog { "backlog" } else { "scheduled" }.into());
             }
         }
-        if task.status != TaskStatus::InProgress {
+        if !matches!(task.status, TaskStatus::Pending | TaskStatus::InProgress) {
             return Ok(task.status.as_str().to_string());
         }
         self.db.with_conn(|conn| {
-            let has_active_work: bool = conn.query_row(
-                "WITH RECURSIVE required_tasks(id) AS (
-                     SELECT ?1
-                     UNION ALL
-                     SELECT child.id
-                     FROM tasks child
-                     JOIN required_tasks parent ON child.parent_task_id = parent.id
-                     WHERE child.blocks_parent = 1
-                 )
-                 SELECT EXISTS(
-                     SELECT 1 FROM work_attempts attempt
-                     JOIN required_tasks required ON required.id = attempt.task_id
-                     WHERE attempt.status IN ('queued', 'preparing', 'running', 'review')
-                     UNION ALL
-                     SELECT 1 FROM task_queue queued
-                     JOIN required_tasks required ON required.id = queued.task_id
-                     WHERE queued.status IN ('queued', 'running')
-                 )",
-                [&task.id],
-                |row| row.get(0),
+            // Descendant work keeps the parent alive, but does not mean the
+            // parent's worker is running. Keep list/sidebar and detail labels
+            // consistent with the same completion gate used by the scheduler.
+            let executing: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM work_attempts WHERE task_id=?1
+                    AND status IN ('preparing','running'))
+                 OR EXISTS(SELECT 1 FROM task_queue WHERE task_id=?1 AND status='running')",
+                [&task.id], |row| row.get(0),
             )?;
-            if has_active_work {
+            if executing {
                 return Ok("in_progress".to_string());
             }
+            let input_pending: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM work_attempts WHERE task_id=?1 AND status='waiting_for_input')",
+                [&task.id], |row| row.get(0),
+            )?;
+            if input_pending {
+                return Ok("waiting_for_input".to_string());
+            }
             let awaiting_review: bool = conn.query_row(
-                "SELECT EXISTS(
-                     SELECT 1 FROM task_pull_requests
-                     WHERE task_id = ?1 AND status IN ('waiting', 'attention')
-                 )",
-                [&task.id],
-                |row| row.get(0),
+                "SELECT EXISTS(SELECT 1 FROM task_pull_requests WHERE task_id=?1 AND status IN ('waiting','attention'))
+                 OR EXISTS(SELECT 1 FROM work_attempts WHERE task_id=?1 AND status='review')",
+                [&task.id], |row| row.get(0),
             )?;
             if awaiting_review {
                 return Ok("awaiting_review".to_string());
             }
             let awaiting_subtasks: bool = conn.query_row(
-                "SELECT EXISTS(
-                     SELECT 1 FROM tasks
-                     WHERE parent_task_id = ?1 AND blocks_parent = 1
-                       AND status != 'completed'
-                 )",
-                [&task.id],
-                |row| row.get(0),
+                "SELECT EXISTS(SELECT 1 FROM tasks WHERE parent_task_id=?1
+                    AND blocks_parent=1 AND status!='completed')",
+                [&task.id], |row| row.get(0),
             )?;
-            Ok(if awaiting_subtasks {
-                "waiting_for_subtasks".to_string()
+            if awaiting_subtasks {
+                return Ok("waiting_for_subtasks".to_string());
+            }
+            let queued: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM work_attempts WHERE task_id=?1 AND status='queued')
+                 OR EXISTS(SELECT 1 FROM task_queue WHERE task_id=?1 AND status='queued')",
+                [&task.id], |row| row.get(0),
+            )?;
+            Ok(if queued && task.status == TaskStatus::InProgress {
+                "in_progress"
+            } else if task.status == TaskStatus::Pending {
+                "pending"
             } else {
-                "idle".to_string()
-            })
+                "idle"
+            }.to_string())
         })
     }
 
@@ -3010,14 +3008,54 @@ mod tests {
             "waiting_for_subtasks"
         );
 
-        crate::tasks::queue::TaskQueue::new(db)
+        crate::tasks::queue::TaskQueue::new(db.clone())
             .enqueue(&child.id, "developer")
             .unwrap();
         assert_eq!(
             board
                 .activity_status(&board.get(&parent.id).unwrap())
                 .unwrap(),
-            "in_progress"
+            "waiting_for_subtasks"
+        );
+        let own = crate::tasks::queue::TaskQueue::new(db.clone())
+            .enqueue(&parent.id, "developer")
+            .unwrap();
+        assert_eq!(
+            board
+                .activity_status(&board.get(&parent.id).unwrap())
+                .unwrap(),
+            "waiting_for_subtasks"
+        );
+        for (attempt_status, expected) in [
+            ("running", "in_progress"),
+            ("waiting_for_input", "waiting_for_input"),
+            ("review", "awaiting_review"),
+        ] {
+            db.conn()
+                .execute(
+                    "UPDATE work_attempts SET status=?1 WHERE id=?2",
+                    rusqlite::params![attempt_status, own.attempt_id],
+                )
+                .unwrap();
+            assert_eq!(
+                board
+                    .activity_status(&board.get(&parent.id).unwrap())
+                    .unwrap(),
+                expected
+            );
+        }
+        db.conn()
+            .execute(
+                "UPDATE work_attempts SET status='queued' WHERE id=?1",
+                [own.attempt_id],
+            )
+            .unwrap();
+        board.update_status(&parent.id, "pending", None).unwrap();
+        assert_eq!(
+            board
+                .activity_status(&board.get(&parent.id).unwrap())
+                .unwrap(),
+            "waiting_for_subtasks"
         );
     }
 

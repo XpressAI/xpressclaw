@@ -8,12 +8,13 @@
 	import { dateLabel, planningViewport } from '$lib/taskPlanning';
 	import { goto } from '$app/navigation';
 	import { tasks, agents, sessions, workspaces } from '$lib/api';
-	import type { AcpCommand, AcpConfigOption, AcpModeState, Task, TaskMessage, Agent, WorkAttempt, SessionEvent, ImageAttachmentUpload, GitChange, WorkspaceGitStatus, MessageVisualization } from '$lib/api';
+	import type { AcpCommand, AcpConfigOption, AcpModeState, DelegatedWork, Task, TaskMessage, Agent, WorkAttempt, SessionEvent, ImageAttachmentUpload, GitChange, WorkspaceGitStatus, MessageVisualization } from '$lib/api';
 	import { timeAgo } from '$lib/utils';
 	import { serverTimestampMs } from '$lib/serverTime';
 	import { renderContent } from '$lib/formatMessage';
 	import ActivityEventRow from '$lib/components/ActivityEventRow.svelte';
 	import AgentLoading from '$lib/components/AgentLoading.svelte';
+	import DelegatedWorkPanel from '$lib/components/DelegatedWorkPanel.svelte';
 	import AiMessage from '$lib/components/AiMessage.svelte';
 	import ImageAttachmentPreviews from '$lib/components/ImageAttachmentPreviews.svelte';
 	import { clearComposerDraft, loadComposerDraft, saveComposerDraft } from '$lib/composerDrafts';
@@ -142,6 +143,8 @@
 	let attempts = $state<WorkAttempt[]>([]);
 	let activityEvents = $state<SessionEvent[]>([]);
 	let subtaskList = $state<Task[]>([]);
+	let delegatedWork = $state<DelegatedWork[]>([]);
+	let planSteps = $derived(subtaskList.filter(item => item.provenance === 'native_plan'));
 	let agentList = $state<Agent[]>([]);
 	let allTasks = $state<Task[]>([]);
 	let workspaceGit = $state<WorkspaceGitStatus | null>(null);
@@ -337,7 +340,17 @@
 			: null
 	);
 	let platformManaged = $derived(task?.provenance === 'xpress_ai_connect');
-	let taskActivityStatus = $derived(task?.activity_status ?? task?.status ?? '');
+	let blockingDelegates = $derived(delegatedWork.filter(item => item.blocks_parent));
+	let waitingForDelegation = $derived(
+		blockingDelegates.length > 0 && !runningAttempt && !pendingElicitation
+		&& ['pending', 'in_progress'].includes(task?.status ?? '')
+		&& !['awaiting_review', 'backlog', 'scheduled'].includes(task?.activity_status ?? '')
+	);
+	let taskActivityStatus = $derived(waitingForDelegation ? 'waiting_for_subtasks' : task?.activity_status ?? task?.status ?? '');
+	function delegatedAgentName(item: DelegatedWork): string {
+		const agent = agentList.find(agent => agent.id === item.agent_id);
+		return agent?.title || agent?.name || item.agent_id || 'an assigned Agent';
+	}
 	let messagePlaceholder = $derived(
 		!task?.agent_id
 			? 'Assign an agent to chat about this task'
@@ -849,7 +862,8 @@
 		loading = false;
 		// Auto-poll while task is in progress
 		pollTimer = setInterval(async () => {
-			if (task && (task.status === 'in_progress' || task.status === 'pending' || task.status === 'waiting_for_input')) {
+			if (task && (['in_progress', 'pending', 'waiting_for_input'].includes(task.status)
+				|| delegatedWork.some(item => !['completed', 'cancelled'].includes(item.status)))) {
 				await poll();
 			}
 		}, 3000);
@@ -874,6 +888,7 @@
 			agentList = loadedAgents;
 			messages = loadedMessages;
 			attempts = activity.attempts;
+			delegatedWork = activity.delegated_work ?? [];
 			activityEvents = activity.events;
 			hasEarlierActivity = activity.has_more_before;
 			prevMessageCount = messages.length;
@@ -945,6 +960,7 @@
 			// Update task status/details in-place
 			task = newTask;
 			attempts = newActivity.attempts;
+			delegatedWork = newActivity.delegated_work ?? [];
 			let shouldScroll = false;
 			// Only update messages and scroll if count changed
 			if (newMessages.length !== prevMessageCount) {
@@ -1243,7 +1259,7 @@
 		if (status === 'pending') return 'to do';
 		if (status === 'in_progress') return 'working';
 		if (status === 'awaiting_review') return 'awaiting review';
-		if (status === 'waiting_for_subtasks') return 'waiting on subtasks';
+		if (status === 'waiting_for_subtasks') return 'waiting for delegated work';
 		if (status === 'idle') return 'not running';
 		return status.replaceAll('_', ' ');
 	}
@@ -1253,11 +1269,11 @@
 	}
 
 	function completedStepCount(): number {
-		return subtaskList.filter((step) => step.status === 'completed').length;
+		return planSteps.filter((step) => step.status === 'completed').length;
 	}
 
 	function deferredStepCount(): number {
-		return subtaskList.filter(isDeferredPlanItem).length;
+		return planSteps.filter(isDeferredPlanItem).length;
 	}
 
 	function statusBg(status: string): string {
@@ -1404,13 +1420,13 @@
 				{/if}
 
 				<!-- Subtasks -->
-				{#if subtaskList.length > 0}
+				{#if planSteps.length > 0}
 					<div class="space-y-2">
 						<h3 class="text-xs font-medium text-muted-foreground uppercase tracking-wide">
 							Steps ({completedStepCount()} complete{deferredStepCount() ? `, ${deferredStepCount()} deferred` : ''})
 						</h3>
 						<div class="space-y-1.5">
-							{#each subtaskList as sub}
+							{#each planSteps as sub}
 								{@const deferred = isDeferredPlanItem(sub)}
 								<div class="flex items-start gap-2 rounded p-1.5 text-sm">
 									<span class="mt-0.5 flex-shrink-0 h-4 w-4 rounded border flex items-center justify-center
@@ -1708,13 +1724,13 @@
 						</div>
 					{/if}
 
-					{#if subtaskList.length > 0}
+					{#if planSteps.length > 0}
 					<section class="rounded-lg border border-border/60 bg-card/30 p-3" hidden={showDetailsSidebar}>
 							<div class="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
 								Steps ({completedStepCount()} complete{deferredStepCount() ? `, ${deferredStepCount()} deferred` : ''})
 							</div>
 							<div class="space-y-2">
-								{#each subtaskList as subtask}
+								{#each planSteps as subtask}
 									{@const deferred = isDeferredPlanItem(subtask)}
 									<div class="flex items-start gap-2 text-sm">
 										<span class="mt-0.5 {subtask.status === 'completed' ? 'text-emerald-400' : subtask.status === 'in_progress' ? 'text-blue-400' : 'text-muted-foreground'}">{subtask.status === 'completed' ? '✓' : subtask.status === 'in_progress' ? '●' : deferred ? '↳' : '○'}</span>
@@ -1922,6 +1938,8 @@
 						</section>
 					{/if}
 
+					<DelegatedWorkPanel items={delegatedWork} agents={agentList} />
+
 					<!-- Live indicator -->
 					{#if workingAttempt}
 						<div class="space-y-2 py-2 pl-10">
@@ -1939,6 +1957,16 @@
 									startedAt={queuedAttempt.response_queued_at ?? queuedAttempt.created_at}
 								/>
 							{/if}
+						</div>
+					{:else if waitingForDelegation}
+						<div role="status" class="space-y-1 py-2 text-sm text-amber-600 dark:text-amber-400" data-delegation-wait>
+							{#if blockingDelegates.length === 1}
+								<p>Waiting for {delegatedAgentName(blockingDelegates[0])}: <a class="underline" href="/tasks/{blockingDelegates[0].task_id}">{blockingDelegates[0].title}</a>.</p>
+							{:else}
+								<p>Waiting for {blockingDelegates.length} required delegated tasks shown above.</p>
+							{/if}
+							{#if queuedAttempt?.trigger_message_id}<p class="text-xs text-muted-foreground">Your reply is saved and will be handled after the required work is resolved.</p>
+							{:else if queuedAttempt}<p class="text-xs text-muted-foreground">Queued work will continue after the required work is resolved.</p>{/if}
 						</div>
 					{:else if queuedAttempt}
 						<div class="py-2 pl-10"><AgentLoading label="The agent is queued to respond" phase="queued" startedAt={queuedAttempt.response_queued_at ?? queuedAttempt.created_at} /></div>

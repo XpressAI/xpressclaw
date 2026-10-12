@@ -201,6 +201,26 @@ remains responsible for permissions and execution and emits the normal ACP
 tool-call activity; XpressClaw does not independently verify the call. A future deterministic control-plane MCP step
 would belong to the workflow runtime rather than the ACP client.
 
+### Delegated work visibility
+
+Durable child Tasks are displayed separately from native harness plan/checklist
+rows. The task activity API includes a read-only snapshot of each delegated
+Task's assigned Agent, current execution state, blocking relationship, timestamps,
+and latest event kind. The UI links to the child's existing task transcript; it
+does not copy that transcript or launch another execution. Incremental activity
+polls refresh this snapshot even when the parent has emitted no new events.
+
+A queued parent explains when required child work is preventing its next turn,
+and confirms that queued guidance is saved. A parent that is actively executing
+or awaiting an answer keeps that more immediate status. Cancelled or failed
+required work remains visible as needing attention, matching the scheduler's
+existing completion gate. Completed child Tasks are retained in a collapsed
+history, while native plan rows remain under Steps.
+
+This view represents XpressClaw's durable delegation model. Harness-owned native
+subagents require separate lifecycle/session integration and are not inferred
+from generic tool output or represented as newly scheduled Tasks here.
+
 ## Consequences
 
 ### Positive

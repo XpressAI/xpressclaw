@@ -820,6 +820,22 @@ export interface TaskActivity {
 	events: SessionEvent[];
 	has_more_before: boolean;
 	has_more_after: boolean;
+	delegated_work?: DelegatedWork[];
+}
+
+export interface DelegatedWork {
+	task_id: string;
+	title: string;
+	agent_id: string | null;
+	status: string;
+	activity_status: string;
+	blocks_parent: boolean;
+	created_at: string;
+	updated_at: string;
+	started_at: string | null;
+	finished_at: string | null;
+	latest_event_type: string | null;
+	latest_event_at: string | null;
 }
 
 export interface TaskListOptions {
