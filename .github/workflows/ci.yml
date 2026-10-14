@@ -124,6 +124,13 @@ jobs:
           XPRESSCLAW_ENVIRONMENT_TEST_IMAGE=xpressclaw-environment-test:local cargo test -p xpressclaw-core --lib "$test_name" -- --ignored --exact --nocapture
           test_name=workers::native::tests::image_update_retains_installed_files_and_dependent_container
           XPRESSCLAW_RETENTION_TEST_IMAGE=xpressclaw-environment-test:local cargo test -p xpressclaw-core --lib "$test_name" -- --ignored --exact --nocapture
+          for test_name in \
+            docker::manager::recovery::tests::automatic_recovery_preserves_files_volumes_and_rolls_back_failures \
+            docker::manager::recovery::tests::stopped_helpers_preserve_their_files_without_blocking_recovery_or_rebuild \
+            workers::native::tests::automatic_recovery_waits_for_turns_and_rolls_back_failed_acp_initialization; do
+            cargo test -p xpressclaw-core --lib "$test_name" -- --ignored --exact --list | grep -Fx "$test_name: test"
+            XPRESSCLAW_RETENTION_TEST_IMAGE=node:22-bookworm-slim cargo test -p xpressclaw-core --lib "$test_name" -- --ignored --exact --nocapture
+          done
           test_name=routes::agents::tests::rebuild_and_delete_preserve_session_and_container_boundaries
           XPRESSCLAW_RETENTION_TEST_IMAGE=xpressclaw-environment-test:local cargo test -p xpressclaw-server --lib "$test_name" -- --ignored --exact --nocapture
 

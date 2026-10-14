@@ -73,6 +73,9 @@ include owned recovery backups in their dependency preflight and cleanup.
 Snapshots require local disk space; snapshot failure preserves the original.
 
 Downloading a harness update only pins the selected image for a future environment.
+It needs no idle runtime boundary and does not hold the configuration lock during
+registry access. Concurrent changes to the selected harness are rechecked before
+pinning the downloaded digest; unrelated configuration changes are retained.
 Applying it to an existing environment requires a separate, confirmed rebuild.
 Rebuild requires no running work under the runtime lifecycle barrier, and warns
 that installed tools and unmounted files will be lost. It removes the old
@@ -86,15 +89,36 @@ Queued tasks and Conversation turns do not prevent maintenance; they use the
 updated environment when dispatched. Running queue leases still prevent it,
 including the cleanup interval after an attempt reaches a terminal state.
 
-Before recovery or explicit removal, inspect all containers (including stopped and unlabelled
-containers) for namespace, volume-source, and link dependencies. If any reference
-the environment, preserve it and report their names. Do not stop the environment
-first and never recursively remove agent-created dependent containers. Engine
-inspection failures fail closed. Check every owned candidate, including legacy
-containers from an older installation layout, before deleting any environment.
-The engine remains authoritative if another
+Before recovery or explicit removal, inspect all containers (including stopped and
+unlabelled containers) for namespace, volume-source, and link dependencies. Running
+helpers block replacement with their names and an instruction to stop them. Stopped
+helpers bound to the parent ID no longer block recovery or rebuild: preserve the
+old parent under `<canonical>-preserved-<full-container-id>` and let the Agent use a
+replacement. Keep the helper containers and all their files unchanged. Recovery
+archives its backup only after the replacement ACP handshake succeeds; failures
+still roll back to the original container. Preserved parents stay stopped and
+helpers are not automatically restarted. Restarting those helpers later requires
+starting their preserved parent first. Name-based references cannot safely follow
+a renamed parent and are reported explicitly instead of silently repointed.
+
+Harness settings list preserved environments and their dependent helpers, including
+after a server restart. Archives retain disk space and are never automatically
+pruned. Subsequent rebuilds affect only the current environment and any unfinished
+recovery. Agent deletion preflights archives too and remains blocked by dependencies.
+Never recursively remove helper containers. Engine inspection failures fail closed;
+check every candidate before any mutation. The engine remains authoritative if a
 trusted host-engine client changes dependencies during removal. Host-engine access
 remains opt-in as specified in ADR-027.
+
+Dispatchers register cancellable workers by durable queue/turn ID. Before rebuilding
+an otherwise idle Agent, cancel only registered workers whose dispatch is no longer
+running and wait for their actual runtime guards to drop. Never infer idleness just
+from a completed task or forcibly replace a held lock. Running dispatches remain
+protected, and unrelated Agents are unaffected. A bounded wait reports runtime
+contention separately from active work; active work errors include task/conversation
+names. This repairs a finished dispatch that left a worker holding the runtime
+boundary without requiring the user to find or cancel nonexistent active tasks.
+
 Agent deletion must also stop if cleanup of an active legacy attempt container
 fails, retaining the Agent's configuration and records for repair and retry.
 
@@ -132,6 +156,13 @@ containers whose ownership cannot be proven—are never included in that cleanup
 snapshot recovery, anonymous volume identity, revoked environment credentials,
 failed startup, and interrupted recovery against Docker/Podman. Run with
 `XPRESSCLAW_RETENTION_TEST_IMAGE=node:22-bookworm-slim` and `--ignored`.
+
+`stopped_helpers_preserve_their_files_without_blocking_recovery_or_rebuild`
+reproduces the idle-Agent/stopped-helper case against Docker/Podman. It verifies
+rollback, parent/helper writable-layer retention, subsequent fresh rebuilds,
+archive discovery, and deletion protection. Worker tests prove that only finished
+dispatches release their leases; route tests distinguish runtime contention from
+named active work and expose persistent archive inventory.
 
 Dependency preflight tests cover running and stopped unlabelled containers,
 namespace/volume/link references, and failed engine inspection. Mixed retained

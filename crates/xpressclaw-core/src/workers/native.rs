@@ -11,6 +11,7 @@ use std::time::Duration;
 use agent_client_protocol::schema::v1::{
     EnvVariable, HttpHeader, McpServer, McpServerHttp, McpServerSse, McpServerStdio,
 };
+use futures_util::future::{AbortHandle, AbortRegistration, Abortable};
 use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -143,9 +144,85 @@ pub struct ConversationAcpProcesses {
 #[derive(Default)]
 pub struct NativeRuntimeLifecycle {
     slots: StdMutex<HashMap<String, Arc<AsyncRwLock<()>>>>,
+    workers: StdMutex<HashMap<String, RegisteredNativeWorker>>,
+}
+
+struct RegisteredNativeWorker {
+    agent: String,
+    source: NativeWorkerSource,
+    abort: AbortHandle,
+}
+
+enum NativeWorkerSource {
+    Task(i64),
+    Conversation(String),
+}
+
+struct NativeWorkerRegistration {
+    lifecycle: Arc<NativeRuntimeLifecycle>,
+    key: String,
+}
+
+impl Drop for NativeWorkerRegistration {
+    fn drop(&mut self) {
+        self.lifecycle.workers.lock().unwrap().remove(&self.key);
+    }
 }
 
 impl NativeRuntimeLifecycle {
+    fn register_worker(
+        self: &Arc<Self>,
+        agent: &str,
+        source: NativeWorkerSource,
+    ) -> (NativeWorkerRegistration, AbortRegistration) {
+        let (abort, cancellation) = AbortHandle::new_pair();
+        let key = uuid::Uuid::new_v4().to_string();
+        self.workers.lock().unwrap().insert(
+            key.clone(),
+            RegisteredNativeWorker {
+                agent: agent.into(),
+                source,
+                abort,
+            },
+        );
+        (
+            NativeWorkerRegistration {
+                lifecycle: self.clone(),
+                key,
+            },
+            cancellation,
+        )
+    }
+
+    /// Only cancel workers whose durable dispatch is already finished. A task
+    /// title/status alone is not sufficient: a running dispatch remains a lease.
+    /// Cancellation drops the worker future, releasing its actual runtime guard;
+    /// we never replace the lock or pretend a still-held lease is idle.
+    pub fn release_finished_workers(&self, db: &Database, agent: &str) -> Result<usize> {
+        // Never interrupt an exclusive repository/environment transaction. Keep
+        // a read lease until all cancellation signals are sent, so a worker
+        // cannot escalate into recovery between this check and cancellation.
+        let Ok(_boundary) = self.slot(agent).try_read_owned() else {
+            return Ok(0);
+        };
+        let workers = self.workers.lock().unwrap();
+        let mut aborted = 0;
+        for worker in workers.values().filter(|worker| worker.agent == agent) {
+            let running = db.with_conn(|conn| {
+                let (sql, value): (&str, &dyn rusqlite::ToSql) = match &worker.source {
+                    NativeWorkerSource::Task(id) => ("SELECT EXISTS(SELECT 1 FROM task_queue WHERE id=?1 AND status='running')", id),
+                    NativeWorkerSource::Conversation(id) => ("SELECT EXISTS(SELECT 1 FROM conversation_turns WHERE id=?1 AND status='running')", id),
+                };
+                conn.query_row(sql, [value], |row| row.get::<_, bool>(0))
+            })?;
+            if !running {
+                worker.abort.abort();
+                aborted += 1;
+            }
+        }
+        Ok(aborted)
+    }
+
     fn slot(&self, agent_id: &str) -> Arc<AsyncRwLock<()>> {
         self.slots
             .lock()
@@ -539,29 +616,35 @@ pub async fn start_dispatcher(
                 if let Some(attempt_id) = item.attempt_id.as_deref() {
                     turn_controls.begin_attempt(attempt_id);
                 }
+                let (registration, cancellation) = runtime_lifecycle
+                    .register_worker(&item.agent_id, NativeWorkerSource::Task(item.id));
                 tokio::spawn(async move {
                     let _permit = permit;
-                    let result = execute_item(
-                        NativeAttemptRuntime {
-                            db: db.clone(),
-                            config,
-                            docker,
-                            event_bus: event_bus.clone(),
-                            elicitation_broker,
-                            turn_controls: turn_controls.clone(),
-                            processes,
-                            conversation_processes,
-                            runtime_lifecycle,
-                            control_plane_port,
-                            control_plane_token,
-                        },
-                        item.clone(),
+                    let _registration = registration;
+                    let result = Abortable::new(
+                        execute_item(
+                            NativeAttemptRuntime {
+                                db: db.clone(),
+                                config,
+                                docker,
+                                event_bus: event_bus.clone(),
+                                elicitation_broker,
+                                turn_controls: turn_controls.clone(),
+                                processes,
+                                conversation_processes,
+                                runtime_lifecycle,
+                                control_plane_port,
+                                control_plane_token,
+                            },
+                            item.clone(),
+                        ),
+                        cancellation,
                     )
                     .await;
                     if let Some(attempt_id) = item.attempt_id.as_deref() {
                         turn_controls.finish_attempt(attempt_id);
                     }
-                    if let Err(error) = result {
+                    if let Ok(Err(error)) = result {
                         error!(
                             queue_id = item.id,
                             task_id = item.task_id,
@@ -645,9 +728,19 @@ async fn start_conversation_dispatcher(
                 };
                 let failure_db = runtime.db.clone();
                 let failure_bus = runtime.event_bus.clone();
+                let (registration, cancellation) = runtime_lifecycle.register_worker(
+                    &turn.agent_id,
+                    NativeWorkerSource::Conversation(turn.id.clone()),
+                );
                 tokio::spawn(async move {
                     let _permit = permit;
-                    if let Err(error) = execute_conversation_turn(runtime, turn.clone()).await {
+                    let _registration = registration;
+                    if let Ok(Err(error)) = Abortable::new(
+                        execute_conversation_turn(runtime, turn.clone()),
+                        cancellation,
+                    )
+                    .await
+                    {
                         warn!(
                             conversation_id = turn.conversation_id,
                             agent_id = turn.agent_id,
@@ -4773,6 +4866,91 @@ mod tests {
             1
         );
         assert_eq!(processes.slot_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn maintenance_releases_finished_workers_without_aborting_running_dispatches() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        AgentRegistry::new(db.clone())
+            .ensure("atlas", "codex")
+            .unwrap();
+        AgentRegistry::new(db.clone())
+            .ensure("other", "codex")
+            .unwrap();
+        db.with_conn(|conn| {
+            conn.execute("INSERT INTO tasks(id,title) VALUES ('task','already completed')", [])?;
+            conn.execute("INSERT INTO task_queue(id,task_id,agent_id,status) VALUES (1,'task','atlas','failed'), (2,'task','atlas','running'), (3,'task','other','failed')", [])?;
+            conn.execute("INSERT INTO conversations(id,title) VALUES ('chat','finished chat')", [])?;
+            conn.execute("INSERT INTO conversation_turns(id,conversation_id,agent_id,status) VALUES ('turn','chat','atlas','completed')", [])?;
+            Ok::<_, Error>(())
+        }).unwrap();
+        let lifecycle = Arc::new(NativeRuntimeLifecycle::default());
+        async fn worker(
+            lifecycle: &Arc<NativeRuntimeLifecycle>,
+            agent: &str,
+            source: NativeWorkerSource,
+        ) -> tokio::task::JoinHandle<()> {
+            let (registration, cancellation) = lifecycle.register_worker(agent, source);
+            let lease = lifecycle.enter(agent).await;
+            tokio::spawn(async move {
+                let _registration = registration;
+                let _ = Abortable::new(
+                    async move {
+                        let _lease = lease;
+                        std::future::pending::<()>().await;
+                    },
+                    cancellation,
+                )
+                .await;
+            })
+        }
+        let finished = worker(&lifecycle, "atlas", NativeWorkerSource::Task(1)).await;
+        let active = worker(&lifecycle, "atlas", NativeWorkerSource::Task(2)).await;
+        let other = worker(&lifecycle, "other", NativeWorkerSource::Task(3)).await;
+        let chat = worker(
+            &lifecycle,
+            "atlas",
+            NativeWorkerSource::Conversation("turn".into()),
+        )
+        .await;
+        assert_eq!(lifecycle.release_finished_workers(&db, "atlas").unwrap(), 2);
+        tokio::time::timeout(Duration::from_secs(1), finished)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), chat)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!active.is_finished());
+        assert!(!other.is_finished());
+        assert!(lifecycle.try_quiesce_agent("atlas").is_none());
+        db.with_conn(|conn| {
+            conn.execute("UPDATE task_queue SET status='completed' WHERE id=2", [])
+        })
+        .unwrap();
+        assert_eq!(lifecycle.release_finished_workers(&db, "atlas").unwrap(), 1);
+        tokio::time::timeout(Duration::from_secs(1), active)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(lifecycle.try_quiesce_agent("atlas").is_some());
+        assert_eq!(lifecycle.release_finished_workers(&db, "other").unwrap(), 1);
+        tokio::time::timeout(Duration::from_secs(1), other)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(lifecycle.workers.lock().unwrap().is_empty());
+        let (registration, cancellation) =
+            lifecycle.register_worker("atlas", NativeWorkerSource::Task(1));
+        let transaction = lifecycle.quiesce_agents(&["atlas".into()]).await;
+        assert_eq!(lifecycle.release_finished_workers(&db, "atlas").unwrap(), 0);
+        drop(transaction);
+        assert_eq!(lifecycle.release_finished_workers(&db, "atlas").unwrap(), 1);
+        assert!(Abortable::new(std::future::pending::<()>(), cancellation)
+            .await
+            .is_err());
+        drop(registration);
     }
 
     #[tokio::test]

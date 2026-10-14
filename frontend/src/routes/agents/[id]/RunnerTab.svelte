@@ -4,7 +4,7 @@
 	import { canonicalHarnessKind, harnessName, inferHarnessKindFromBackend, openExternal } from '$lib/utils';
 	import DirectoryPicker from '$lib/components/DirectoryPicker.svelte';
 	import HostSshAccess from '$lib/components/HostSshAccess.svelte';
-	import type { AcpAgentCatalogEntry, AcpConfigOption, AcpModeState, LiveConfig, McpServerDefinition, McpVerificationResult, NativeRunnerConfig } from '$lib/api';
+	import type { AcpAgentCatalogEntry, AcpConfigOption, AcpModeState, LiveConfig, McpServerDefinition, McpVerificationResult, NativeRunnerConfig, PreservedEnvironment } from '$lib/api';
 
 	interface Props {
 		agentConfig: LiveConfig['agents'][0] | null;
@@ -47,6 +47,7 @@
 	let mcpVerification = $state<Record<string, McpVerificationResult>>({});
 	let updatingRunnerImage = $state(false);
 	let confirmingRebuild = $state(false);
+	let preservedEnvironments = $state<PreservedEnvironment[]>([]);
 	let rebuildingEnvironment = $state(false);
 	let rebuildResult = $state<{ message: string; error: boolean } | null>(null);
 	let runnerImageUpdate = $state<{ message: string; error: boolean } | null>(null);
@@ -134,10 +135,12 @@
 
 	async function updateRunnerImage() {
 		if (updatingRunnerImage) return;
+		const id = agentId;
 		updatingRunnerImage = true;
 		runnerImageUpdate = null;
 		try {
-			const result = await agents.updateRunnerImage(agentId);
+			const result = await agents.updateRunnerImage(id);
+			if (id !== agentId) return;
 			image = result.image;
 			const version = result.version ? ` ${result.version}` : '';
 			runnerImageUpdate = {
@@ -147,27 +150,32 @@
 				error: false
 			};
 		} catch (cause) {
+			if (id !== agentId) return;
 			runnerImageUpdate = {
 				message: cause instanceof Error ? cause.message : 'Could not update the harness image.',
 				error: true
 			};
 		} finally {
-			updatingRunnerImage = false;
+			if (id === agentId) updatingRunnerImage = false;
 		}
 	}
 
 	async function rebuildEnvironment() {
 		if (!confirmingRebuild || rebuildingEnvironment) return;
+		const id = agentId;
 		rebuildingEnvironment = true;
 		rebuildResult = null;
 		try {
-			await agents.rebuildEnvironment(agentId);
+			const result = await agents.rebuildEnvironment(id);
+			if (id !== agentId) return;
+			preservedEnvironments = result.preserved_environments;
 			confirmingRebuild = false;
-			rebuildResult = { message: 'The old environment was removed. New work will create an environment using your saved settings.', error: false };
+			rebuildResult = { message: 'Ready for a fresh environment. New work will use your saved settings and selected image.', error: false };
 		} catch (error) {
+			if (id !== agentId) return;
 			rebuildResult = { message: error instanceof Error ? error.message : String(error), error: true };
 		} finally {
-			rebuildingEnvironment = false;
+			if (id === agentId) rebuildingEnvironment = false;
 		}
 	}
 
@@ -219,6 +227,21 @@
 			configOptions = [];
 			serverCatalog = [];
 		}
+	});
+
+	$effect(() => {
+		const id = agentId;
+		let disposed = false;
+		updatingRunnerImage = false;
+		rebuildingEnvironment = false;
+		preservedEnvironments = [];
+		rebuildResult = null;
+		runnerImageUpdate = null;
+		confirmingRebuild = false;
+		void agents.environment(id).then((result) => {
+			if (!disposed) preservedEnvironments = result.preserved_environments;
+		}).catch(() => {});
+		return () => { disposed = true; };
 	});
 
 	let initializedAgentId = '';
@@ -474,7 +497,7 @@
 				<p class="text-xs text-muted-foreground">Saved settings are applied automatically on the next turn, preserving installed tools and files. Rebuild only to start fresh or apply a downloaded image. Finish active work before rebuilding; queued work can remain.</p>
 				{#if confirmingRebuild}
 					<div role="alert" class="mt-2 rounded-md border border-destructive/30 p-3 text-xs">
-						<p>Rebuilding permanently deletes installed tools and files outside mounted folders. Workspace folders and mounted volumes are retained. Agent-created dependent containers must be migrated or explicitly removed first.</p>
+						<p>Rebuilding permanently deletes installed tools and files outside mounted folders. Workspace folders and mounted volumes are retained. Stopped helper containers and the old environment they depend on are preserved separately. Running helpers must be stopped first.</p>
 						<div class="mt-3 flex flex-wrap gap-2">
 							<button type="button" onclick={rebuildEnvironment} disabled={rebuildingEnvironment} class="rounded-md bg-destructive px-3 py-2 text-destructive-foreground disabled:opacity-50">{rebuildingEnvironment ? 'Rebuilding…' : 'Discard environment and rebuild'}</button>
 							<button type="button" onclick={() => confirmingRebuild = false} disabled={rebuildingEnvironment} class="rounded-md border border-border px-3 py-2">Cancel</button>
@@ -484,6 +507,18 @@
 					<button type="button" onclick={() => { confirmingRebuild = true; rebuildResult = null; }} class="mt-2 rounded-md border border-border px-3 py-2 text-xs">Rebuild environment…</button>
 				{/if}
 				{#if rebuildResult}<p role={rebuildResult.error ? 'alert' : 'status'} class="mt-2 text-xs {rebuildResult.error ? 'text-destructive' : 'text-muted-foreground'}">{rebuildResult.message}</p>{/if}
+				{#if preservedEnvironments.length > 0}
+					<details class="mt-3 rounded-md border border-border p-3 text-xs">
+						<summary class="cursor-pointer">Preserved environments ({preservedEnvironments.length})</summary>
+						<p class="mt-2 text-muted-foreground">Stopped helpers keep their files and their original environment. The Agent uses its replacement. These copies continue to use disk space and are kept until explicitly removed.</p>
+						{#each preservedEnvironments as saved (saved.container_id)}
+							<div class="mt-3">
+								<p>{saved.dependents.length ? saved.dependents.join(', ') : 'No remaining helper dependencies'}</p>
+								<p class="mt-1 break-all font-mono text-muted-foreground">{saved.name}</p>
+							</div>
+						{/each}
+					</details>
+				{/if}
 			</div>
 		</div>
 	</div>

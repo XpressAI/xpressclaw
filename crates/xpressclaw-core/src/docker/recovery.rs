@@ -4,9 +4,229 @@ use super::*;
 use bollard::container::RenameContainerOptions;
 use bollard::image::{CommitContainerOptions, RemoveImageOptions};
 
+/// An old environment retained because stopped helpers still refer to its ID.
+/// These are visible in Harness settings and are never pruned automatically.
+#[derive(Debug, Clone, Serialize)]
+pub struct PreservedEnvironment {
+    pub name: String,
+    pub container_id: String,
+    pub dependents: Vec<String>,
+}
+
 const RECOVERY_SOURCE_LABEL: &str = "io.xpressclaw.recovery-source";
 
 impl DockerManager {
+    /// Rebuild only the current environment. Historical environments with
+    /// helper dependencies stay discoverable and retain their writable layers.
+    pub async fn rebuild_project_environment(
+        &self,
+        agent: &str,
+    ) -> Result<Vec<PreservedEnvironment>> {
+        let mut preserved = self.preserved_project_environments(agent).await?;
+        let name = self.owned_project_container_name(agent)?;
+        let mut candidates = Vec::new();
+        for reference in [
+            name.clone(),
+            format!("{name}-recovery"),
+            format!("xpressclaw-{agent}"),
+        ] {
+            let Some(container) = self.inspect_optional(&reference).await? else {
+                continue;
+            };
+            let labels = container
+                .config
+                .as_ref()
+                .and_then(|config| config.labels.as_ref())
+                .cloned()
+                .unwrap_or_default();
+            if !workload_ownership_matches(
+                &reference,
+                &labels,
+                self.installation_id.as_deref(),
+                agent,
+            ) {
+                return Err(Error::Container(format!("Cannot rebuild environment {reference}: ownership does not match this Agent. Its files have been preserved.")));
+            }
+            if !self.ensure_dependents_stopped(&reference).await?.is_empty() {
+                self.validate_recovery_owner(&container, agent)?;
+            }
+            candidates.push(
+                container
+                    .id
+                    .ok_or_else(|| Error::Container("Environment has no container ID".into()))?,
+            );
+        }
+        // Preflight the entire set before stopping or renaming anything.
+        for id in candidates {
+            if let Some(saved) = self.remove_or_preserve_environment(&id, agent).await? {
+                preserved.push(saved);
+            }
+        }
+        self.stop_agent_forwards(agent).await;
+        Ok(preserved)
+    }
+
+    pub async fn preserved_project_environments(
+        &self,
+        agent: &str,
+    ) -> Result<Vec<PreservedEnvironment>> {
+        let Some(installation) = self.installation_id.as_deref() else {
+            return Ok(Vec::new());
+        };
+        let prefix = format!("{}-preserved-", project_container_name(installation, agent));
+        let containers = self
+            .docker
+            .list_containers(Some(ListContainersOptions::<String> {
+                all: true,
+                filters: HashMap::from([(
+                    "label".into(),
+                    vec![
+                        format!("{INSTALLATION_LABEL}={installation}"),
+                        format!("{AGENT_ID_LABEL}={agent}"),
+                    ],
+                )]),
+                ..Default::default()
+            }))
+            .await
+            .map_err(|error| {
+                Error::Container(format!("Could not list preserved environments: {error}"))
+            })?;
+        let mut saved = Vec::new();
+        for entry in containers {
+            let Some(name) = entry.names.as_ref().and_then(|names| {
+                names
+                    .iter()
+                    .map(|name| name.trim_start_matches('/'))
+                    .find(|name| name.starts_with(&prefix))
+            }) else {
+                continue;
+            };
+            let Some(container) = self.inspect_optional(name).await? else {
+                continue;
+            };
+            self.validate_recovery_owner(&container, agent)?;
+            let container_id = container.id.unwrap();
+            if name != format!("{prefix}{container_id}") {
+                continue;
+            }
+            let dependents = self
+                .container_dependents(&container_id)
+                .await?
+                .iter()
+                .map(dependent_name)
+                .collect();
+            saved.push(PreservedEnvironment {
+                name: name.into(),
+                container_id,
+                dependents,
+            });
+        }
+        saved.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(saved)
+    }
+
+    async fn ensure_dependents_stopped(
+        &self,
+        reference: &str,
+    ) -> Result<Vec<ContainerInspectResponse>> {
+        let dependents = self.container_dependents(reference).await?;
+        let active = dependents
+            .iter()
+            .filter(|container| {
+                container.state.as_ref().is_none_or(|state| {
+                    state.running != Some(false)
+                        || state.paused == Some(true)
+                        || state.restarting == Some(true)
+                })
+            })
+            .map(dependent_name)
+            .collect::<Vec<_>>();
+        if !active.is_empty() {
+            return Err(Error::Container(format!("Stop these helper containers before changing the environment: {}. Their files will be preserved automatically; no tasks need to be completed or deleted.", active.join(", "))));
+        }
+        if !dependents.is_empty() {
+            let parent = self.inspect_optional(reference).await?.ok_or_else(|| {
+                Error::Container("Environment disappeared while checking helpers".into())
+            })?;
+            let name = parent
+                .name
+                .as_deref()
+                .unwrap_or(reference)
+                .trim_start_matches('/');
+            // A name-based reference would silently attach to the replacement
+            // after renaming. Only ID-bound helpers can safely keep the parent.
+            let named = dependents
+                .iter()
+                .filter(|container| {
+                    container
+                        .host_config
+                        .as_ref()
+                        .is_some_and(|host| container_depends_on(host, "", name))
+                })
+                .map(dependent_name)
+                .collect::<Vec<_>>();
+            if !named.is_empty() {
+                return Err(Error::Container(format!("These helper containers refer to the environment by name and need to be recreated using its container ID before replacement: {}. All files have been preserved.", named.join(", "))));
+            }
+        }
+        Ok(dependents)
+    }
+
+    async fn remove_or_preserve_environment(
+        &self,
+        reference: &str,
+        agent: &str,
+    ) -> Result<Option<PreservedEnvironment>> {
+        let dependents = self.ensure_dependents_stopped(reference).await?;
+        if dependents.is_empty() {
+            return self
+                .remove_container_reference(reference, agent)
+                .await
+                .map(|_| None);
+        }
+        let container = self.inspect_optional(reference).await?.ok_or_else(|| {
+            Error::Container("Environment disappeared while preserving helper containers".into())
+        })?;
+        let id = container
+            .id
+            .as_deref()
+            .ok_or_else(|| Error::Container("Environment has no container ID".into()))?;
+        let name = format!(
+            "{}-preserved-{id}",
+            self.owned_project_container_name(agent)?
+        );
+        // Keep the exact parent ID, helper containers, and all their mounted
+        // and unmounted files. Never use recursive removal or clone helpers
+        // whose launch configuration the Agent may have changed independently.
+        match self
+            .docker
+            .stop_container(id, Some(StopContainerOptions { t: 10 }))
+            .await
+        {
+            Ok(())
+            | Err(BollardError::DockerResponseServerError {
+                status_code: 304, ..
+            }) => {}
+            Err(error) => {
+                return Err(Error::Container(format!(
+                    "Could not preserve old environment: {error}"
+                )))
+            }
+        }
+        self.docker.rename_container(id, RenameContainerOptions { name: name.as_str() }).await
+            .map_err(|error| Error::Container(format!("Could not preserve old environment as {name}: {error}. Its files and helper containers remain intact.")))?;
+        info!(
+            agent_id = agent,
+            environment = name,
+            "preserved old environment for stopped helper containers"
+        );
+        Ok(Some(PreservedEnvironment {
+            name,
+            container_id: id.into(),
+            dependents: dependents.iter().map(dependent_name).collect(),
+        }))
+    }
+
     pub async fn project_configuration_needs_recovery(
         &self,
         agent: &str,
@@ -48,7 +268,7 @@ impl DockerManager {
         let id = original.id.as_deref().ok_or_else(|| {
             Error::Container("Cannot recover an environment without its container ID".into())
         })?;
-        self.ensure_no_container_dependents(&name).await?;
+        self.ensure_dependents_stopped(&name).await?;
         // Check the new mounts and image before interrupting the old process.
         runtime_mounts(&requested.volumes, self.selinux)?;
         let base_image = original
@@ -245,8 +465,9 @@ impl DockerManager {
             )
         })?;
         self.validate_recovery_pair(&backup, &replacement, agent)?;
-        self.remove_container_reference(backup.id.as_deref().unwrap(), agent)
+        self.remove_or_preserve_environment(backup.id.as_deref().unwrap(), agent)
             .await
+            .map(|_| ())
     }
 
     pub async fn rollback_project_recovery(&self, agent: &str) -> Result<()> {
@@ -371,6 +592,16 @@ impl DockerManager {
     }
 }
 
+fn dependent_name(container: &ContainerInspectResponse) -> String {
+    container
+        .name
+        .as_deref()
+        .or(container.id.as_deref())
+        .unwrap_or("unknown")
+        .trim_start_matches('/')
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -395,6 +626,137 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    async fn exec_output(docker: &DockerManager, container: &str, script: &str) -> String {
+        let exec = docker
+            .docker
+            .create_exec(
+                container,
+                CreateExecOptions {
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    cmd: Some(vec!["node", "-e", script]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let StartExecResults::Attached { mut output, .. } =
+            docker.docker.start_exec(&exec.id, None).await.unwrap()
+        else {
+            panic!("expected output")
+        };
+        let mut text = String::new();
+        while let Some(chunk) = output.next().await {
+            text.push_str(&chunk.unwrap().to_string());
+        }
+        text
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Docker/Podman and XPRESSCLAW_RETENTION_TEST_IMAGE"]
+    async fn stopped_helpers_preserve_their_files_without_blocking_recovery_or_rebuild() {
+        let image = std::env::var("XPRESSCLAW_RETENTION_TEST_IMAGE").unwrap();
+        let installation = format!("helpers-test-{}", uuid::Uuid::new_v4());
+        let docker = DockerManager::connect_for_installation(&installation)
+            .await
+            .unwrap();
+        let spec = ContainerSpec {
+            image: image.clone(),
+            expose_port: None,
+            cmd: Some(vec![
+                "node".into(),
+                "-e".into(),
+                "setInterval(()=>{},1000)".into(),
+            ]),
+            ..Default::default()
+        };
+        let original = docker
+            .launch_project_attached("agent", &spec)
+            .await
+            .unwrap();
+        let name = docker.owned_project_container_name("agent").unwrap();
+        let child = docker
+            .docker
+            .create_container(
+                Some(CreateContainerOptions {
+                    name: format!("helper-{installation}"),
+                    platform: None,
+                }),
+                ContainerConfig {
+                    image: Some(image),
+                    cmd: spec.cmd.clone(),
+                    host_config: Some(HostConfig {
+                        network_mode: Some(format!("container:{}", original.info.container_id)),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mut snapshots = Vec::new();
+        let result = std::panic::AssertUnwindSafe(async {
+            docker.docker.start_container::<String>(&child.id, None).await.unwrap();
+            exec_output(&docker, &child.id, "require('fs').writeFileSync('/tmp/helper-file','helper-saved-data')").await;
+            run(&docker, "require('fs').writeFileSync('/tmp/agent-file','agent-saved-data')").await;
+            let changed = ContainerSpec { environment: vec!["NEW_SETTING=yes".into()], ..spec.clone() };
+            let error = docker.recover_project_configuration("agent", &changed).await.unwrap_err();
+            assert!(error.to_string().contains(&format!("helper-{installation}")));
+            assert!(docker.is_container_running(&original.info.container_id).await);
+            docker.docker.stop_container(&child.id, Some(StopContainerOptions { t: 1 })).await.unwrap();
+
+            // Failed replacement restores the exact original, with its helper
+            // still pointing to the same ID and with no archive yet committed.
+            let broken = ContainerSpec { network_mode: Some(format!("missing-{installation}")), ..changed.clone() };
+            assert!(docker.recover_project_configuration("agent", &broken).await.is_err());
+            assert_eq!(docker.inspect_optional(&name).await.unwrap().unwrap().id.as_deref(), Some(original.info.container_id.as_str()));
+            assert!(docker.preserved_project_environments("agent").await.unwrap().is_empty());
+
+            docker.recover_project_configuration("agent", &changed).await.unwrap();
+            snapshots.push(docker.inspect_optional(&name).await.unwrap().unwrap().image.unwrap());
+            docker.finish_project_recovery("agent").await.unwrap();
+            assert_eq!(run(&docker, "console.log(require('fs').readFileSync('/tmp/agent-file','utf8'),process.env.NEW_SETTING)").await.trim(), "agent-saved-data yes");
+            let saved = docker.preserved_project_environments("agent").await.unwrap();
+            assert_eq!(saved.len(), 1);
+            assert_eq!(saved[0].container_id, original.info.container_id);
+            assert_eq!(saved[0].dependents, vec![format!("helper-{installation}")]);
+            assert!(!docker.project_configuration_needs_recovery("agent", &changed).await.unwrap());
+            assert!(docker.inspect_optional(&format!("{name}-recovery")).await.unwrap().is_none());
+
+            // A subsequent rebuild ignores historical helper dependencies and
+            // uses a genuinely new filesystem. The old helper can still be
+            // restarted against its original parent without any data loss.
+            docker.rebuild_project_environment("agent").await.unwrap();
+            docker.launch_project_attached("agent", &spec).await.unwrap();
+            assert_eq!(run(&docker, "console.log(require('fs').existsSync('/tmp/agent-file'))").await.trim(), "false");
+            docker.docker.start_container::<String>(&saved[0].container_id, None).await.unwrap();
+            docker.docker.start_container::<String>(&child.id, None).await.unwrap();
+            assert_eq!(exec_output(&docker, &child.id, "console.log(require('fs').readFileSync('/tmp/helper-file','utf8'))").await.trim(), "helper-saved-data");
+            assert_eq!(exec_output(&docker, &saved[0].container_id, "console.log(require('fs').readFileSync('/tmp/agent-file','utf8'))").await.trim(), "agent-saved-data");
+            // Agent deletion must continue to protect every preserved helper.
+            assert!(docker.remove_owned_workload("agent").await.is_err());
+            assert!(docker.is_running("agent").await);
+        }).catch_unwind().await;
+        let _ = docker
+            .docker
+            .remove_container(
+                &child.id,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+        let _ = docker.rollback_project_recovery("agent").await;
+        docker.remove_owned_workload("agent").await.unwrap();
+        for snapshot in snapshots {
+            docker.discard_unused_snapshot(&snapshot).await;
+        }
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     #[tokio::test]

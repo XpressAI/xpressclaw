@@ -104,6 +104,12 @@ export interface Agent {
 	restart_count: number;
 }
 
+export interface PreservedEnvironment {
+	name: string;
+	container_id: string;
+	dependents: string[];
+}
+
 export const agents = {
 	list: () => request<Agent[]>('/api/agents'),
 	get: (id: string) => request<Agent>(`/api/agents/${id}`),
@@ -143,7 +149,8 @@ export const agents = {
 		environment_stopped: boolean;
 		environment_preserved: boolean;
 	}>(`/api/agents/${id}/runner-image/update`, { method: 'POST', body: '{}' }),
-	rebuildEnvironment: (id: string) => request<{ rebuilt: boolean }>(
+	environment: (id: string) => request<{ preserved_environments: PreservedEnvironment[] }>(`/api/agents/${id}/environment`),
+	rebuildEnvironment: (id: string) => request<{ rebuilt: boolean; preserved_environments: PreservedEnvironment[] }>(
 		`/api/agents/${id}/environment/rebuild`, { method: 'POST', body: JSON.stringify({ discard_installed_tools: true }) }
 	),
 	logs: (id: string, tail = 100) =>

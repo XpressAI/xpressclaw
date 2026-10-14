@@ -24,6 +24,7 @@ use crate::external_tools::path_for_external_tool;
 
 #[path = "recovery.rs"]
 mod recovery;
+pub use recovery::PreservedEnvironment;
 
 const LIFECYCLE_LABEL: &str = "io.xpressclaw.lifecycle";
 const PROJECT_LIFECYCLE: &str = "project";
@@ -804,6 +805,12 @@ impl DockerManager {
             candidates.push(format!("{name}-recovery"));
             candidates.push(name);
         }
+        candidates.extend(
+            self.preserved_project_environments(agent_id)
+                .await?
+                .into_iter()
+                .map(|saved| saved.name),
+        );
         candidates.push(format!("xpressclaw-{agent_id}"));
         candidates.sort();
         candidates.dedup();
@@ -922,12 +929,12 @@ impl DockerManager {
             return Ok(());
         }
         Err(Error::Container(format!(
-            "Cannot remove environment {reference}: dependent containers {} still reference it. The environment and dependents have been preserved. Migrate or explicitly remove those containers before rebuilding or deleting this Agent; stopping them alone does not remove the dependency.",
-            dependents.join(", ")
+            "Cannot remove environment {reference}: dependent containers {} still reference it. The environment and dependents have been preserved. Migrate or explicitly remove those containers before deleting this environment. Rebuilding can preserve stopped helpers separately.",
+            dependents.iter().map(|container| container.name.as_deref().unwrap_or("unknown").trim_start_matches('/')).collect::<Vec<_>>().join(", ")
         )))
     }
 
-    async fn container_dependents(&self, reference: &str) -> Result<Vec<String>> {
+    async fn container_dependents(&self, reference: &str) -> Result<Vec<ContainerInspectResponse>> {
         let Some(parent) = self.inspect_optional(reference).await? else {
             return Ok(Vec::new());
         };
@@ -972,16 +979,10 @@ impl DockerManager {
                 ))
             })?;
             if container_depends_on(host, parent_id, parent_name) {
-                dependents.push(
-                    container
-                        .name
-                        .unwrap_or(id)
-                        .trim_start_matches('/')
-                        .to_string(),
-                );
+                dependents.push(container);
             }
         }
-        dependents.sort();
+        dependents.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(dependents)
     }
 
@@ -2167,6 +2168,9 @@ mod tests {
                     serde_json::json!({"message":"no recovery in progress"}),
                 ));
         }
+        responses
+            .entry("GET /containers/json".into())
+            .or_insert((200, serde_json::json!([])));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -2300,16 +2304,18 @@ mod tests {
                 .to_string();
             assert!(error.contains("experiment"), "{error}");
             assert!(error.contains("preserved"));
-            let changed = ContainerSpec {
-                environment: vec!["NEW_KEY=value".into()],
-                ..spec
-            };
-            let recovery_error = docker
-                .recover_project_configuration("agent", &changed)
-                .await
-                .unwrap_err()
-                .to_string();
-            assert!(recovery_error.contains("experiment"), "{recovery_error}");
+            if running {
+                let changed = ContainerSpec {
+                    environment: vec!["NEW_KEY=value".into()],
+                    ..spec
+                };
+                let recovery_error = docker
+                    .recover_project_configuration("agent", &changed)
+                    .await
+                    .unwrap_err()
+                    .to_string();
+                assert!(recovery_error.contains("experiment"), "{recovery_error}");
+            }
             assert!(requests
                 .lock()
                 .unwrap()
@@ -2320,20 +2326,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovery_does_not_repoint_stopped_helpers_that_reference_the_parent_name() {
+        let spec = ContainerSpec::default();
+        let name = project_container_name("installation", "agent");
+        let parent = serde_json::to_value(retained_fixture(&spec)).unwrap();
+        let (docker, requests, server) = mock_engine(HashMap::from([
+            (format!("GET /containers/{name}/json"), (200, parent)),
+            ("GET /containers/json".into(), (200, serde_json::json!([{"Id":"child"}]))),
+            ("GET /containers/child/json".into(), (200, serde_json::json!({"Id":"child", "Name":"/named-helper", "State":{"Running":false}, "HostConfig":{"NetworkMode":"container:retained-agent"}}))),
+        ])).await;
+        let changed = ContainerSpec {
+            environment: vec!["NEW_KEY=value".into()],
+            ..spec
+        };
+        let error = docker
+            .recover_project_configuration("agent", &changed)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("by name"), "{error}");
+        assert!(error.contains("named-helper"));
+        assert!(requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|request| request.starts_with("GET ")));
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn dependency_scan_errors_do_not_authorize_removal() {
         let name = project_container_name("installation", "agent");
         let parent = serde_json::to_value(retained_fixture(&ContainerSpec::default())).unwrap();
-        let (docker, requests, server) = mock_engine(HashMap::from([(
-            format!("GET /containers/{name}/json"),
-            (200, parent),
-        )]))
+        let (docker, requests, server) = mock_engine(HashMap::from([
+            (format!("GET /containers/{name}/json"), (200, parent)),
+            (
+                "GET /containers/json".into(),
+                (500, serde_json::json!({"message":"engine unavailable"})),
+            ),
+        ]))
         .await;
         assert!(docker
             .remove_owned_workload("agent")
             .await
             .unwrap_err()
             .to_string()
-            .contains("could not check"));
+            .contains("Could not list preserved"));
         assert!(requests
             .lock()
             .unwrap()
