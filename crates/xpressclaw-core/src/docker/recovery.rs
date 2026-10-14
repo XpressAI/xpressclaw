@@ -14,6 +14,7 @@ pub struct PreservedEnvironment {
 }
 
 const RECOVERY_SOURCE_LABEL: &str = "io.xpressclaw.recovery-source";
+const RECOVERY_SNAPSHOT_LABEL: &str = "io.xpressclaw.recovery-snapshot";
 
 impl DockerManager {
     /// Rebuild only the current environment. Historical environments with
@@ -295,6 +296,10 @@ impl DockerManager {
                 .map_err(|error| Error::Container(error.to_string()))?,
         )
         .map_err(|error| Error::Container(error.to_string()))?;
+        snapshot_config
+            .labels
+            .get_or_insert_with(HashMap::new)
+            .insert(BASE_IMAGE_LABEL.into(), base_image.clone());
         // Commit merges configuration with the source. Explicitly clear old
         // overrides that no longer exist, including revoked credentials.
         let mut environment = original
@@ -476,10 +481,8 @@ impl DockerManager {
             return Ok(());
         };
         self.validate_recovery_owner(&backup, agent)?;
-        let mut snapshot = None;
         if let Some(replacement) = self.inspect_optional(&name).await? {
             self.validate_recovery_pair(&backup, &replacement, agent)?;
-            snapshot = replacement.image;
             self.remove_container_reference(&name, agent).await?;
         }
         self.docker.rename_container(backup.id.as_deref().unwrap(), RenameContainerOptions { name: name.as_str() })
@@ -492,9 +495,6 @@ impl DockerManager {
                     "Original environment preserved, but could not restart it: {error}"
                 ))
             })?;
-        if let Some(snapshot) = snapshot {
-            self.discard_unused_snapshot(&snapshot).await;
-        }
         Ok(())
     }
 
@@ -540,31 +540,79 @@ impl DockerManager {
         Ok(())
     }
 
-    async fn discard_unused_snapshot(&self, image: &str) {
-        // Never force deletion of an image still used by any container.
-        let _ = self
-            .docker
-            .remove_image(
-                image,
-                Some(RemoveImageOptions {
-                    force: false,
-                    noprune: true,
-                }),
-                None,
-            )
-            .await;
+    pub(super) async fn discard_unused_snapshot(&self, image: &str) {
+        let mut current = image.to_string();
+        let mut visited = std::collections::HashSet::new();
+        while !current.is_empty() && visited.insert(current.clone()) {
+            let Ok(snapshot) = self.docker.inspect_image(&current).await else {
+                break;
+            };
+            let labels = snapshot
+                .config
+                .as_ref()
+                .and_then(|config| config.labels.as_ref());
+            let Some(reference) = labels.and_then(|labels| labels.get(RECOVERY_SNAPSHOT_LABEL))
+            else {
+                break;
+            };
+            if !reference.starts_with("localhost/xpressclaw-recovery:")
+                || snapshot.repo_tags.as_ref().is_some_and(|tags| {
+                    tags.iter()
+                        .any(|tag| tag != reference && tag != "<none>:<none>")
+                })
+            {
+                break;
+            }
+            let options = Some(RemoveImageOptions {
+                force: false,
+                noprune: true,
+            });
+            // Docker may keep a snapshot as an intermediate parent of a newer
+            // commit. Drop its unique tag now, then retry the parent when its
+            // last descendant is removed. Never prune unrelated/base images.
+            if snapshot
+                .repo_tags
+                .as_ref()
+                .is_some_and(|tags| tags.contains(reference))
+            {
+                let _ = self.docker.remove_image(reference, options, None).await;
+            }
+            match self.docker.remove_image(&current, options, None).await {
+                Ok(_)
+                | Err(BollardError::DockerResponseServerError {
+                    status_code: 404, ..
+                }) => {}
+                Err(_) => break, // A container, child image, or external tag still needs it.
+            }
+            let parent = snapshot.parent.unwrap_or_default();
+            // Podman returns Parent without the sha256: prefix even when the
+            // inspected image ID (and therefore our base label) includes it.
+            if labels
+                .and_then(|labels| labels.get(BASE_IMAGE_LABEL))
+                .is_some_and(|base| {
+                    base.trim_start_matches("sha256:") == parent.trim_start_matches("sha256:")
+                })
+            {
+                break;
+            }
+            current = parent;
+        }
     }
 
     async fn snapshot_environment(
         &self,
         container: &str,
-        config: ContainerConfig<String>,
+        mut config: ContainerConfig<String>,
     ) -> Result<String> {
         // Podman's compatibility API can return `ID` instead of Docker's
         // `Id`. Resolve a unique tag instead of relying on that response field.
         let tag = uuid::Uuid::new_v4().to_string();
         let repo = "localhost/xpressclaw-recovery";
         let reference = format!("{repo}:{tag}");
+        config
+            .labels
+            .get_or_insert_with(HashMap::new)
+            .insert(RECOVERY_SNAPSHOT_LABEL.into(), reference.clone());
         self.docker
             .commit_container(
                 CommitContainerOptions {
@@ -590,6 +638,14 @@ impl DockerManager {
             .filter(|id| !id.is_empty())
             .ok_or_else(|| Error::Container("Environment snapshot has no image ID".into()))
     }
+}
+
+pub(super) fn container_snapshot(container: &ContainerInspectResponse) -> Option<&str> {
+    let labels = container.config.as_ref()?.labels.as_ref()?;
+    let image = container.image.as_deref()?;
+    (labels.contains_key(RECOVERY_SOURCE_LABEL)
+        && labels.get(BASE_IMAGE_LABEL).map(String::as_str) != Some(image))
+    .then_some(image)
 }
 
 fn dependent_name(container: &ContainerInspectResponse) -> String {
@@ -672,11 +728,33 @@ mod tests {
             ]),
             ..Default::default()
         };
-        let original = docker
+        docker
             .launch_project_attached("agent", &spec)
             .await
             .unwrap();
+        // Start with a recovered parent, so preserving it for helpers must
+        // also preserve its snapshot until the archive itself is removed.
+        let initial = ContainerSpec {
+            environment: vec!["INITIAL=yes".into()],
+            ..spec.clone()
+        };
+        docker
+            .recover_project_configuration("agent", &initial)
+            .await
+            .unwrap();
+        docker.finish_project_recovery("agent").await.unwrap();
+        let original = docker
+            .launch_project_attached("agent", &initial)
+            .await
+            .unwrap();
         let name = docker.owned_project_container_name("agent").unwrap();
+        let parent_snapshot = docker
+            .inspect_optional(&name)
+            .await
+            .unwrap()
+            .unwrap()
+            .image
+            .unwrap();
         let child = docker
             .docker
             .create_container(
@@ -696,7 +774,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let mut snapshots = Vec::new();
+        let mut snapshots = vec![parent_snapshot.clone()];
         let result = std::panic::AssertUnwindSafe(async {
             docker.docker.start_container::<String>(&child.id, None).await.unwrap();
             exec_output(&docker, &child.id, "require('fs').writeFileSync('/tmp/helper-file','helper-saved-data')").await;
@@ -729,6 +807,7 @@ mod tests {
             // uses a genuinely new filesystem. The old helper can still be
             // restarted against its original parent without any data loss.
             docker.rebuild_project_environment("agent").await.unwrap();
+            assert!(docker.docker.inspect_image(&parent_snapshot).await.is_ok());
             docker.launch_project_attached("agent", &spec).await.unwrap();
             assert_eq!(run(&docker, "console.log(require('fs').existsSync('/tmp/agent-file'))").await.trim(), "false");
             docker.docker.start_container::<String>(&saved[0].container_id, None).await.unwrap();
@@ -751,6 +830,17 @@ mod tests {
             .await;
         let _ = docker.rollback_project_recovery("agent").await;
         docker.remove_owned_workload("agent").await.unwrap();
+        if result.is_ok() {
+            for snapshot in &snapshots {
+                assert!(matches!(
+                    docker.docker.inspect_image(snapshot).await,
+                    Err(BollardError::DockerResponseServerError {
+                        status_code: 404,
+                        ..
+                    })
+                ));
+            }
+        }
         for snapshot in snapshots {
             docker.discard_unused_snapshot(&snapshot).await;
         }
@@ -803,11 +893,11 @@ mod tests {
             .await
             .unwrap();
         let mut snapshots = Vec::new();
-        let mut volume = None;
+        let mut volumes = Vec::new();
         let result = std::panic::AssertUnwindSafe(async {
             run(&docker, "const fs=require('fs');fs.writeFileSync('/tmp/installed-tool','keep');fs.writeFileSync('/persist/session','native-session');").await;
             let before = docker.inspect_optional(&name).await.unwrap().unwrap();
-            volume = before.mounts.as_ref().unwrap().iter().find(|mount| mount.destination.as_deref()==Some("/persist")).unwrap().name.clone();
+            volumes.push(before.mounts.as_ref().unwrap().iter().find(|mount| mount.destination.as_deref()==Some("/persist")).unwrap().name.clone().unwrap());
             let changed = ContainerSpec { environment: vec!["VALUE=new".into()], ..spec.clone() };
             assert!(docker.project_configuration_needs_recovery("agent", &changed).await.unwrap());
             docker.recover_project_configuration("agent", &changed).await.unwrap();
@@ -842,11 +932,36 @@ mod tests {
             docker.finish_project_recovery("agent").await.unwrap();
             assert_eq!(run(&docker, "console.log(process.env.VALUE)").await.trim(), "next");
             assert_eq!(docker.retained_project_image("agent").await.unwrap().as_deref(), Some(fixture.as_str()));
+            // Superseded snapshots may remain as Docker intermediate parents,
+            // but their unique tags must no longer keep them alive forever.
+            for snapshot in &snapshots[..snapshots.len() - 1] {
+                match docker.docker.inspect_image(snapshot).await {
+                    Ok(image) => assert!(image.repo_tags.unwrap_or_default().iter().all(|tag| tag == "<none>:<none>")),
+                    Err(BollardError::DockerResponseServerError { status_code: 404, .. }) => {}
+                    other => panic!("unexpected snapshot inspection: {other:?}"),
+                }
+            }
+            docker.rebuild_project_environment("agent").await.unwrap();
+            for snapshot in &snapshots {
+                assert!(matches!(docker.docker.inspect_image(snapshot).await, Err(BollardError::DockerResponseServerError { status_code: 404, .. })));
+            }
+            assert!(docker.docker.inspect_image(&fixture).await.is_ok());
+            // Agent deletion uses the same cleanup, without deleting its base.
+            docker.launch_project_attached("agent", &spec).await.unwrap();
+            let fresh = docker.inspect_optional(&name).await.unwrap().unwrap();
+            volumes.push(fresh.mounts.as_ref().unwrap().iter().find(|mount| mount.destination.as_deref()==Some("/persist")).unwrap().name.clone().unwrap());
+            docker.recover_project_configuration("agent", &changed).await.unwrap();
+            let deleted_snapshot = docker.inspect_optional(&name).await.unwrap().unwrap().image.unwrap();
+            snapshots.push(deleted_snapshot.clone());
+            docker.finish_project_recovery("agent").await.unwrap();
+            docker.remove_owned_workload("agent").await.unwrap();
+            assert!(matches!(docker.docker.inspect_image(&deleted_snapshot).await, Err(BollardError::DockerResponseServerError { status_code: 404, .. })));
+            assert!(docker.docker.inspect_image(&fixture).await.is_ok());
         }).catch_unwind().await;
         // Cleanup only this test installation's containers, volume and images.
         let _ = docker.rollback_project_recovery("agent").await;
         let _ = docker.remove_owned_workload("agent").await;
-        if let Some(volume) = volume {
+        for volume in volumes {
             let _ = docker.docker.remove_volume(&volume, None).await;
         }
         for snapshot in snapshots.iter().rev() {

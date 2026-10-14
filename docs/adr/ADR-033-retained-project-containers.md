@@ -71,6 +71,10 @@ before retrying on the next turn. Ownership labels bind each replacement to its
 backup; unknown containers are never removed. Explicit rebuild and deletion
 include owned recovery backups in their dependency preflight and cleanup.
 Snapshots require local disk space; snapshot failure preserves the original.
+After removing a recovered container, clean up its unused snapshot and any
+superseded snapshot parents. Cleanup never forces image removal or prunes the
+original base image. Preserved helper environments retain their snapshots;
+images with user-added tags remain under user control.
 
 Downloading a harness update only pins the selected image for a future environment.
 It needs no idle runtime boundary and does not hold the configuration lock during

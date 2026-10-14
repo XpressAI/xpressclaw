@@ -882,6 +882,12 @@ impl DockerManager {
         // and its dependents offline. Never use Podman's recursive --depend.
         self.ensure_no_container_dependents(container_reference)
             .await?;
+        // Capture the image before removing the container. Only recovery
+        // snapshots are eligible; ordinary runner images are user-managed.
+        let snapshot = self
+            .inspect_optional(container_reference)
+            .await?
+            .and_then(|container| recovery::container_snapshot(&container).map(str::to_owned));
         let opts = RemoveContainerOptions {
             force: true,
             ..Default::default()
@@ -894,7 +900,12 @@ impl DockerManager {
             Ok(())
             | Err(BollardError::DockerResponseServerError {
                 status_code: 404, ..
-            }) => Ok(()),
+            }) => {
+                if let Some(snapshot) = snapshot {
+                    self.discard_unused_snapshot(&snapshot).await;
+                }
+                Ok(())
+            }
             Err(error) => Err(Error::Container(format!(
                 "failed to remove owned runtime '{workload_id}': {error}"
             ))),

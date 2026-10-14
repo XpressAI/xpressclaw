@@ -124,6 +124,8 @@ jobs:
           XPRESSCLAW_ENVIRONMENT_TEST_IMAGE=xpressclaw-environment-test:local cargo test -p xpressclaw-core --lib "$test_name" -- --ignored --exact --nocapture
           test_name=workers::native::tests::image_update_retains_installed_files_and_dependent_container
           XPRESSCLAW_RETENTION_TEST_IMAGE=xpressclaw-environment-test:local cargo test -p xpressclaw-core --lib "$test_name" -- --ignored --exact --nocapture
+          # BuildKit's base-image cache does not load this tag into the daemon.
+          docker pull node:22-bookworm-slim
           for test_name in \
             docker::manager::recovery::tests::automatic_recovery_preserves_files_volumes_and_rolls_back_failures \
             docker::manager::recovery::tests::stopped_helpers_preserve_their_files_without_blocking_recovery_or_rebuild \
