@@ -65,6 +65,10 @@ unmounted files, and native session storage. Mounted data is not included in a
 snapshot; configured mounts and retained anonymous image volumes are reattached.
 Old environment overrides are cleared before applying the current values, so
 rotated or removed credentials are not silently inherited from the snapshot.
+Recovery also checks the retained image's declared harness identity. Switching
+to a different harness requires an explicit rebuild; recovery never tries to
+run the new harness command in an incompatible retained image. Unlabelled custom
+images remain available for custom-image configurations.
 
 The old container remains under a deterministic recovery name until the new ACP
 process initializes successfully. Failed creation, startup, or initialization

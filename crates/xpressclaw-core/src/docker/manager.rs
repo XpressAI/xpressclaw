@@ -2049,8 +2049,37 @@ fn recorded_container_id_matches(actual_id: Option<&str>, recorded_id: &str) -> 
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// Exercise worker readiness through the engine API without a live daemon.
+    pub(crate) async fn mock_retained_image(
+        labels: serde_json::Value,
+    ) -> (
+        DockerManager,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let mut retained = retained_fixture(&ContainerSpec::default());
+        retained.image = Some("retained-image".into());
+        mock_engine(HashMap::from([
+            (
+                format!(
+                    "GET /containers/{}/json",
+                    project_container_name("installation", "agent")
+                ),
+                (200, serde_json::to_value(retained).unwrap()),
+            ),
+            (
+                "GET /images/retained-image/json".into(),
+                (
+                    200,
+                    serde_json::json!({"Id": "retained-image", "Config": {"Labels": labels}}),
+                ),
+            ),
+        ]))
+        .await
+    }
 
     fn retained_fixture(spec: &ContainerSpec) -> ContainerInspectResponse {
         serde_json::from_value(serde_json::json!({

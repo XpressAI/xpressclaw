@@ -2441,6 +2441,18 @@ async fn retained_runner_image_ready(
 ) -> Result<bool> {
     let retained = docker.retained_project_image(&agent.name).await?;
     if let Some(image) = retained.as_ref() {
+        let requested_kind = resolve_runner_kind(agent)?;
+        let retained_kind = docker.image_label(image, "io.xpressclaw.agent").await;
+        if retained_kind
+            .as_deref()
+            .is_some_and(|kind| kind != requested_kind)
+            || (built_in_image && retained_kind.is_none())
+        {
+            return Err(Error::Backend(format!(
+                "This Agent's retained environment uses {} and cannot be reused for the selected {requested_kind} harness. Installed tools and files have been preserved. Rebuild the environment in Agent settings > Harness to use the selected harness, or restore the previous harness settings.",
+                retained_kind.as_deref().map(|kind| format!("the {kind} harness")).unwrap_or_else(|| "an image without a declared harness".into())
+            )));
+        }
         spec.image.clone_from(image);
     }
     let ready = runner_image_ready(docker, &spec.image, built_in_image, agent).await;
@@ -4487,6 +4499,49 @@ fn truncate(value: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn retained_images_require_the_selected_harness_before_recovery() {
+        for (identity, built_in, allowed) in [
+            (Some("codex"), true, false),
+            (Some("codex"), false, false),
+            (Some("claude"), true, true),
+            (None, true, false),
+            (None, false, true),
+        ] {
+            let mut labels = json!({"io.xpressclaw.protocol": BUILT_IN_RUNNER_PROTOCOL});
+            if let Some(identity) = identity {
+                labels["io.xpressclaw.agent"] = json!(identity);
+            }
+            let (docker, requests, server) =
+                crate::docker::manager::tests::mock_retained_image(labels).await;
+            let mut agent = AgentConfig {
+                name: "agent".into(),
+                ..Default::default()
+            };
+            agent.runner.kind = "claude".into();
+            let mut spec = ContainerSpec {
+                image: "selected-claude-image".into(),
+                ..Default::default()
+            };
+            let result = retained_runner_image_ready(&docker, &agent, &mut spec, built_in).await;
+            if allowed {
+                assert!(result.unwrap());
+                assert_eq!(spec.image, "retained-image");
+            } else {
+                let message = result.unwrap_err().to_string();
+                assert!(message.contains("Rebuild the environment"));
+                assert!(message.contains("selected claude harness"));
+                assert_eq!(spec.image, "selected-claude-image");
+            }
+            assert!(requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|request| request.starts_with("GET ")));
+            server.abort();
+        }
+    }
+
     #[tokio::test]
     #[ignore = "requires Docker/Podman and XPRESSCLAW_RETENTION_TEST_IMAGE"]
     async fn automatic_recovery_waits_for_turns_and_rolls_back_failed_acp_initialization() {
