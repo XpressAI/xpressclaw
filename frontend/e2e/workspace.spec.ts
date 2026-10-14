@@ -876,6 +876,8 @@ async function mockApi(
 			response = {};
 		} else if (path === '/api/agents') {
 			response = availableAgents;
+		} else if (path === `/api/agents/${agentId}/environment`) {
+			response = { preserved_environments: [] };
 		} else if (path === `/api/agents/${agentId}/runner-image/update`) {
 			options.runnerImageUpdateRequests?.push(agentId);
 			response = {
@@ -6750,9 +6752,11 @@ for (const mobile of [false, true]) {
   await mockApi(page);
   const requests: unknown[] = [];
   let blocked = true;
+  const preserved = [{ name: 'previous-agent-environment', container_id: 'saved-environment-id', dependents: ['experiment'] }];
+  await page.route(`**/api/agents/${agentId}/environment`, route => route.fulfill({ json: { preserved_environments: blocked ? [] : preserved } }));
   await page.route(`**/api/agents/${agentId}/environment/rebuild`, async route => {
    requests.push(route.request().postDataJSON());
-   await route.fulfill(blocked ? { status: 409, json: { error: 'Cannot remove environment: dependent container experiment is still running. The environment has been preserved.' } } : { json: { rebuilt: true } });
+   await route.fulfill(blocked ? { status: 409, json: { error: 'Cannot remove environment: dependent container experiment is still running. The environment has been preserved.' } } : { json: { rebuilt: true, preserved_environments: preserved } });
   });
   await page.goto(`/agents/${agentId}?tab=runner`);
   await page.getByRole('button', { name: 'Rebuild environment…', exact: true }).click();
@@ -6766,7 +6770,15 @@ for (const mobile of [false, true]) {
   expect(requests).toEqual([{ discard_installed_tools: true }]);
   blocked = false;
   await page.getByRole('button', { name: 'Discard environment and rebuild', exact: true }).click();
-  await expect(page.getByText('New work will create an environment using your saved settings.', { exact: false })).toBeVisible();
+  await expect(page.getByText('Ready for a fresh environment.', { exact: false })).toBeVisible();
+  expect(requests).toEqual([{ discard_installed_tools: true }, { discard_installed_tools: true }]);
+  await page.getByText('Preserved environments (1)', { exact: true }).click();
+  await expect(page.getByText('experiment', { exact: true })).toBeVisible();
+  await expect(page.getByText('previous-agent-environment', { exact: true })).toBeVisible();
+  await page.reload();
+  await page.getByText('Preserved environments (1)', { exact: true }).click();
+  await expect(page.getByText('experiment', { exact: true })).toBeVisible();
+  await expect(page.getByText('previous-agent-environment', { exact: true })).toBeVisible();
  });
 }
 

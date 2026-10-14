@@ -22,12 +22,18 @@ use tracing::{debug, info, warn};
 use crate::error::{Error, Result};
 use crate::external_tools::path_for_external_tool;
 
+#[path = "recovery.rs"]
+mod recovery;
+pub use recovery::PreservedEnvironment;
+
 const LIFECYCLE_LABEL: &str = "io.xpressclaw.lifecycle";
 const PROJECT_LIFECYCLE: &str = "project";
 const SPEC_FINGERPRINT_LABEL: &str = "io.xpressclaw.spec-fingerprint";
 const IMAGE_REFERENCE_LABEL: &str = "io.xpressclaw.image-reference";
 const INSTALLATION_LABEL: &str = "io.xpressclaw.installation";
 const AGENT_ID_LABEL: &str = "io.xpressclaw.agent-id";
+const BASE_IMAGE_LABEL: &str = "io.xpressclaw.base-image";
+const CONFIGURED_MOUNTS_LABEL: &str = "io.xpressclaw.configured-mount-targets";
 
 /// Specification for an agent container.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -447,8 +453,9 @@ impl DockerManager {
 
     /// Start a project-owned ACP container, retaining and reusing its writable
     /// layer between attempts. Image updates never replace an existing
-    /// environment. Incompatible configuration requires an explicit rebuild;
-    /// reject it before stopping the old environment.
+    /// environment. The dispatcher recovers incompatible settings under its
+    /// exclusive runtime boundary before launching; reject an unreconciled
+    /// specification here before stopping the old environment.
     pub async fn launch_project_attached(
         &self,
         agent_id: &str,
@@ -544,8 +551,12 @@ impl DockerManager {
     pub async fn retained_project_image(&self, agent_id: &str) -> Result<Option<String>> {
         let installation = self.installation_id()?;
         let name = project_container_name(installation, agent_id);
-        let Some(container) = self.inspect_optional(&name).await? else {
-            return Ok(None);
+        let container = match self.inspect_optional(&name).await? {
+            Some(container) => container,
+            None => match self.inspect_optional(&format!("{name}-recovery")).await? {
+                Some(container) => container,
+                None => return Ok(None),
+            },
         };
         let labels = container
             .config
@@ -556,8 +567,10 @@ impl DockerManager {
                 "refusing access to Agent {agent_id}'s environment with mismatched ownership"
             )));
         }
-        container
-            .image
+        labels
+            .get(BASE_IMAGE_LABEL)
+            .cloned()
+            .or(container.image)
             .map(Some)
             .ok_or_else(|| Error::Container("retained environment has no image ID".into()))
     }
@@ -574,7 +587,19 @@ impl DockerManager {
         }) {
             // Podman can canonicalize Config.Image (e.g. node:22 becomes
             // docker.io/library/node:22). Retain the exact fingerprint input.
-            labels.insert(IMAGE_REFERENCE_LABEL.to_string(), spec.image.clone());
+            labels
+                .entry(IMAGE_REFERENCE_LABEL.to_string())
+                .or_insert_with(|| spec.image.clone());
+            labels.entry(CONFIGURED_MOUNTS_LABEL.to_string()).or_insert(
+                serde_json::to_string(
+                    &spec
+                        .volumes
+                        .iter()
+                        .map(|mount| &mount.target)
+                        .collect::<Vec<_>>(),
+                )
+                .map_err(|error| Error::Container(error.to_string()))?,
+            );
         }
         if let Some(installation_id) = self.installation_id.as_deref() {
             labels
@@ -774,10 +799,18 @@ impl DockerManager {
     }
 
     async fn removable_owned_workload(&self, agent_id: &str) -> Result<Vec<String>> {
-        let mut candidates = Vec::with_capacity(2);
+        let mut candidates = Vec::with_capacity(3);
         if let Some(installation_id) = self.installation_id.as_deref() {
-            candidates.push(project_container_name(installation_id, agent_id));
+            let name = project_container_name(installation_id, agent_id);
+            candidates.push(format!("{name}-recovery"));
+            candidates.push(name);
         }
+        candidates.extend(
+            self.preserved_project_environments(agent_id)
+                .await?
+                .into_iter()
+                .map(|saved| saved.name),
+        );
         candidates.push(format!("xpressclaw-{agent_id}"));
         candidates.sort();
         candidates.dedup();
@@ -849,6 +882,12 @@ impl DockerManager {
         // and its dependents offline. Never use Podman's recursive --depend.
         self.ensure_no_container_dependents(container_reference)
             .await?;
+        // Capture the image before removing the container. Only recovery
+        // snapshots are eligible; ordinary runner images are user-managed.
+        let snapshot = self
+            .inspect_optional(container_reference)
+            .await?
+            .and_then(|container| recovery::container_snapshot(&container).map(str::to_owned));
         let opts = RemoveContainerOptions {
             force: true,
             ..Default::default()
@@ -861,7 +900,12 @@ impl DockerManager {
             Ok(())
             | Err(BollardError::DockerResponseServerError {
                 status_code: 404, ..
-            }) => Ok(()),
+            }) => {
+                if let Some(snapshot) = snapshot {
+                    self.discard_unused_snapshot(&snapshot).await;
+                }
+                Ok(())
+            }
             Err(error) => Err(Error::Container(format!(
                 "failed to remove owned runtime '{workload_id}': {error}"
             ))),
@@ -896,12 +940,12 @@ impl DockerManager {
             return Ok(());
         }
         Err(Error::Container(format!(
-            "Cannot remove environment {reference}: dependent containers {} still reference it. The environment and dependents have been preserved. Migrate or explicitly remove those containers before rebuilding or deleting this Agent; stopping them alone does not remove the dependency.",
-            dependents.join(", ")
+            "Cannot remove environment {reference}: dependent containers {} still reference it. The environment and dependents have been preserved. Migrate or explicitly remove those containers before deleting this environment. Rebuilding can preserve stopped helpers separately.",
+            dependents.iter().map(|container| container.name.as_deref().unwrap_or("unknown").trim_start_matches('/')).collect::<Vec<_>>().join(", ")
         )))
     }
 
-    async fn container_dependents(&self, reference: &str) -> Result<Vec<String>> {
+    async fn container_dependents(&self, reference: &str) -> Result<Vec<ContainerInspectResponse>> {
         let Some(parent) = self.inspect_optional(reference).await? else {
             return Ok(Vec::new());
         };
@@ -946,16 +990,10 @@ impl DockerManager {
                 ))
             })?;
             if container_depends_on(host, parent_id, parent_name) {
-                dependents.push(
-                    container
-                        .name
-                        .unwrap_or(id)
-                        .trim_start_matches('/')
-                        .to_string(),
-                );
+                dependents.push(container);
             }
         }
-        dependents.sort();
+        dependents.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(dependents)
     }
 
@@ -1822,6 +1860,21 @@ fn validate_retained_spec(
     installation: &str,
     agent: &str,
 ) -> Result<()> {
+    if retained_spec_matches(container, requested, installation, agent)? {
+        Ok(())
+    } else {
+        Err(Error::Container(format!(
+            "Agent {agent}'s environment needs updated settings. Its installed tools and files have been preserved; retry the work to recover automatically."
+        )))
+    }
+}
+
+fn retained_spec_matches(
+    container: &ContainerInspectResponse,
+    requested: &ContainerSpec,
+    installation: &str,
+    agent: &str,
+) -> Result<bool> {
     let labels = container
         .config
         .as_ref()
@@ -1867,12 +1920,7 @@ fn validate_retained_spec(
             break;
         }
     }
-    if !matches {
-        return Err(Error::Container(format!(
-            "Agent {agent}'s environment needs different container settings. Its installed tools and files have been preserved. Restore the previous settings, or explicitly rebuild the environment in Agent settings > Harness."
-        )));
-    }
-    Ok(())
+    Ok(matches)
 }
 
 fn container_depends_on(host: &HostConfig, parent_id: &str, parent_name: &str) -> bool {
@@ -2001,8 +2049,37 @@ fn recorded_container_id_matches(actual_id: Option<&str>, recorded_id: &str) -> 
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// Exercise worker readiness through the engine API without a live daemon.
+    pub(crate) async fn mock_retained_image(
+        labels: serde_json::Value,
+    ) -> (
+        DockerManager,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let mut retained = retained_fixture(&ContainerSpec::default());
+        retained.image = Some("retained-image".into());
+        mock_engine(HashMap::from([
+            (
+                format!(
+                    "GET /containers/{}/json",
+                    project_container_name("installation", "agent")
+                ),
+                (200, serde_json::to_value(retained).unwrap()),
+            ),
+            (
+                "GET /images/retained-image/json".into(),
+                (
+                    200,
+                    serde_json::json!({"Id": "retained-image", "Config": {"Labels": labels}}),
+                ),
+            ),
+        ]))
+        .await
+    }
 
     fn retained_fixture(spec: &ContainerSpec) -> ContainerInspectResponse {
         serde_json::from_value(serde_json::json!({
@@ -2105,7 +2182,7 @@ mod tests {
         }
     }
 
-    async fn mock_engine(
+    pub(super) async fn mock_engine(
         mut responses: HashMap<String, (u16, serde_json::Value)>,
     ) -> (
         DockerManager,
@@ -2120,6 +2197,20 @@ mod tests {
                 serde_json::json!({"message":"absent legacy container"}),
             ),
         );
+        for agent in ["agent", "zed", "attempt-test"] {
+            responses
+                .entry(format!(
+                    "GET /containers/{}-recovery/json",
+                    project_container_name("installation", agent)
+                ))
+                .or_insert((
+                    404,
+                    serde_json::json!({"message":"no recovery in progress"}),
+                ));
+        }
+        responses
+            .entry("GET /containers/json".into())
+            .or_insert((200, serde_json::json!([])));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -2132,8 +2223,9 @@ mod tests {
                 let mut fields = first.split_whitespace();
                 let method = fields.next().unwrap_or_default();
                 let url = fields.next().unwrap_or_default();
-                let path = url
-                    .find("/containers")
+                let path = ["/containers", "/images"]
+                    .iter()
+                    .find_map(|prefix| url.find(prefix))
                     .map(|i| &url[i..])
                     .unwrap_or(url)
                     .split('?')
@@ -2202,6 +2294,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn automatic_recovery_refuses_foreign_environments_and_backups() {
+        for foreign_backup in [false, true] {
+            let spec = ContainerSpec::default();
+            let name = project_container_name("installation", "agent");
+            let mut foreign = serde_json::to_value(retained_fixture(&spec)).unwrap();
+            foreign["Config"]["Labels"][INSTALLATION_LABEL] = "another-installation".into();
+            let reference = if foreign_backup {
+                format!("{name}-recovery")
+            } else {
+                name
+            };
+            let (docker, requests, server) = mock_engine(HashMap::from([(
+                format!("GET /containers/{reference}/json"),
+                (200, foreign),
+            )]))
+            .await;
+            assert!(docker
+                .project_configuration_needs_recovery("agent", &spec)
+                .await
+                .is_err());
+            assert!(docker
+                .recover_project_configuration("agent", &spec)
+                .await
+                .is_err());
+            assert!(requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|request| request.starts_with("GET ")));
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
     async fn removal_checks_running_and_stopped_unlabelled_dependents_before_any_stop() {
         for running in [true, false] {
             let spec = ContainerSpec::default();
@@ -2219,6 +2345,18 @@ mod tests {
                 .to_string();
             assert!(error.contains("experiment"), "{error}");
             assert!(error.contains("preserved"));
+            if running {
+                let changed = ContainerSpec {
+                    environment: vec!["NEW_KEY=value".into()],
+                    ..spec
+                };
+                let recovery_error = docker
+                    .recover_project_configuration("agent", &changed)
+                    .await
+                    .unwrap_err()
+                    .to_string();
+                assert!(recovery_error.contains("experiment"), "{recovery_error}");
+            }
             assert!(requests
                 .lock()
                 .unwrap()
@@ -2229,20 +2367,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovery_does_not_repoint_stopped_helpers_that_reference_the_parent_name() {
+        let spec = ContainerSpec::default();
+        let name = project_container_name("installation", "agent");
+        let parent = serde_json::to_value(retained_fixture(&spec)).unwrap();
+        let (docker, requests, server) = mock_engine(HashMap::from([
+            (format!("GET /containers/{name}/json"), (200, parent)),
+            ("GET /containers/json".into(), (200, serde_json::json!([{"Id":"child"}]))),
+            ("GET /containers/child/json".into(), (200, serde_json::json!({"Id":"child", "Name":"/named-helper", "State":{"Running":false}, "HostConfig":{"NetworkMode":"container:retained-agent"}}))),
+        ])).await;
+        let changed = ContainerSpec {
+            environment: vec!["NEW_KEY=value".into()],
+            ..spec
+        };
+        let error = docker
+            .recover_project_configuration("agent", &changed)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("by name"), "{error}");
+        assert!(error.contains("named-helper"));
+        assert!(requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|request| request.starts_with("GET ")));
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn dependency_scan_errors_do_not_authorize_removal() {
         let name = project_container_name("installation", "agent");
         let parent = serde_json::to_value(retained_fixture(&ContainerSpec::default())).unwrap();
-        let (docker, requests, server) = mock_engine(HashMap::from([(
-            format!("GET /containers/{name}/json"),
-            (200, parent),
-        )]))
+        let (docker, requests, server) = mock_engine(HashMap::from([
+            (format!("GET /containers/{name}/json"), (200, parent)),
+            (
+                "GET /containers/json".into(),
+                (500, serde_json::json!({"message":"engine unavailable"})),
+            ),
+        ]))
         .await;
         assert!(docker
             .remove_owned_workload("agent")
             .await
             .unwrap_err()
             .to_string()
-            .contains("could not check"));
+            .contains("Could not list preserved"));
         assert!(requests
             .lock()
             .unwrap()

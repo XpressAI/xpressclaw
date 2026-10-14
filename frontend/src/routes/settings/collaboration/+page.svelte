@@ -234,7 +234,7 @@
 					</label>
 				{/each}
 			</div>
-			<p class="text-xs text-muted-foreground">Save after changing assignments. Existing Agent environments are preserved. Changed container settings require an explicit rebuild from Agent settings > Harness.</p>
+			<p class="text-xs text-muted-foreground">Save after changing assignments. Agents apply changed settings automatically on their next turn, preserving installed tools and files.</p>
 		</section>
 
 		<section class="rounded-lg border border-border bg-card p-4 space-y-3">
