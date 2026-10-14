@@ -865,9 +865,17 @@ async fn execute_conversation_turn(
         return Ok(());
     }
 
-    let base = project_processes
-        .get_or_start(&docker, &agent.name, &spec)
-        .await?;
+    let (_runtime_lifecycle_guard, base) = start_project_with_recovery(
+        &db,
+        &docker,
+        &agent.name,
+        &spec,
+        &project_processes,
+        &conversation_processes,
+        &runtime_lifecycle,
+        _runtime_lifecycle_guard,
+    )
+    .await?;
     docker.restore_forwards(&db, &agent.name).await;
     let live = conversation_processes
         .get_or_start(
@@ -1162,6 +1170,53 @@ async fn enter_agent_runtime_config(
     let guard = runtime_lifecycle.enter(agent_id).await;
     let config_snapshot = config.read().unwrap().clone();
     (guard, config_snapshot)
+}
+
+/// Settings recovery replaces the container, so it must wait for every Task
+/// and Conversation lane to leave the shared runtime. Ordinary turns retain
+/// their concurrent read lease. The backup is removed only after ACP starts.
+#[allow(clippy::too_many_arguments)]
+async fn start_project_with_recovery(
+    db: &Arc<Database>,
+    docker: &DockerManager,
+    agent: &str,
+    spec: &ContainerSpec,
+    processes: &ProjectAcpProcesses,
+    conversations: &ConversationAcpProcesses,
+    lifecycle: &NativeRuntimeLifecycle,
+    guard: OwnedRwLockReadGuard<()>,
+) -> Result<(OwnedRwLockReadGuard<()>, ProjectAcpProcess)> {
+    if !docker
+        .project_configuration_needs_recovery(agent, spec)
+        .await?
+    {
+        return Ok((guard, processes.get_or_start(docker, agent, spec).await?));
+    }
+    drop(guard);
+    let exclusive = lifecycle.slot(agent).write_owned().await;
+    // Deletion may have won the write lease while this turn was waiting.
+    AgentRegistry::new(db.clone()).get(agent)?;
+    if docker
+        .project_configuration_needs_recovery(agent, spec)
+        .await?
+    {
+        docker.recover_project_configuration(agent, spec).await?;
+        conversations.retire_agent_everywhere(agent).await;
+        processes.retire_agent(agent).await;
+    }
+    let process = match processes.get_or_start(docker, agent, spec).await {
+        Ok(process) => process,
+        Err(error) => {
+            if let Err(rollback) = docker.rollback_project_recovery(agent).await {
+                return Err(Error::Container(format!(
+                    "Could not start the recovered environment: {error}. {rollback}"
+                )));
+            }
+            return Err(error);
+        }
+    };
+    docker.finish_project_recovery(agent).await?;
+    Ok((OwnedRwLockWriteGuard::downgrade(exclusive), process))
 }
 
 async fn prepare_repository_for_turn(
@@ -1498,7 +1553,17 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
         return Ok(());
     }
     let workload_id = agent.name.as_str();
-    let live = processes.get_or_start(&docker, workload_id, &spec).await?;
+    let (_runtime_lifecycle_guard, live) = start_project_with_recovery(
+        &db,
+        &docker,
+        workload_id,
+        &spec,
+        &processes,
+        &conversation_processes,
+        &runtime_lifecycle,
+        _runtime_lifecycle_guard,
+    )
+    .await?;
     docker.restore_forwards(&db, workload_id).await;
     if let Err(error) = sessions.set_container(attempt_id, &live.container_id) {
         processes.invalidate(workload_id, &live.process).await;
@@ -4280,6 +4345,70 @@ fn truncate(value: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    #[ignore = "requires Docker/Podman and XPRESSCLAW_RETENTION_TEST_IMAGE"]
+    async fn automatic_recovery_waits_for_turns_and_rolls_back_failed_acp_initialization() {
+        use futures_util::FutureExt;
+        let image = std::env::var("XPRESSCLAW_RETENTION_TEST_IMAGE").unwrap();
+        let db = Arc::new(Database::open_memory().unwrap());
+        AgentRegistry::new(db.clone())
+            .ensure("agent", "codex")
+            .unwrap();
+        SessionManager::new(db.clone())
+            .ensure("agent", None)
+            .unwrap();
+        db.with_conn(|conn| conn.execute("INSERT INTO work_attempts (id,session_id,runner,status,native_session_id) VALUES ('history','agent','codex','completed','native-preserved')", [])).unwrap();
+        let docker = DockerManager::connect_for_installation(&db.installation_id().unwrap())
+            .await
+            .unwrap();
+        let engine = bollard::Docker::connect_with_defaults().unwrap();
+        let processes = ProjectAcpProcesses::default();
+        let conversations = ConversationAcpProcesses::default();
+        let lifecycle = NativeRuntimeLifecycle::default();
+        let command = r#"require('readline').createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);if(m.method==='initialize')console.log(JSON.stringify({jsonrpc:'2.0',id:m.id,result:{protocolVersion:1,agentCapabilities:{},authMethods:[]}}));});"#;
+        let spec = ContainerSpec {
+            image,
+            expose_port: None,
+            cmd: Some(vec!["node".into(), "-e".into(), command.into()]),
+            ..Default::default()
+        };
+        let parent = processes
+            .get_or_start(&docker, "agent", &spec)
+            .await
+            .unwrap();
+        let mut snapshots = Vec::new();
+        let result = std::panic::AssertUnwindSafe(async {
+            let busy_turn = lifecycle.enter("agent").await;
+            let requested_turn = lifecycle.enter("agent").await;
+            let changed = ContainerSpec { environment: vec!["UPDATED=1".into()], ..spec.clone() };
+            let mut recovery = Box::pin(start_project_with_recovery(&db, &docker, "agent", &changed, &processes, &conversations, &lifecycle, requested_turn));
+            assert!(tokio::time::timeout(Duration::from_millis(100), &mut recovery).await.is_err());
+            assert!(docker.is_container_running(&parent.container_id).await);
+            drop(busy_turn);
+            let (guard, updated) = recovery.await.unwrap();
+            assert_ne!(updated.container_id, parent.container_id);
+            snapshots.push(engine.inspect_container(&updated.container_id, None).await.unwrap().image.unwrap());
+            drop(guard);
+            let fail_initialize = r#"require('readline').createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);console.log(JSON.stringify({jsonrpc:'2.0',id:m.id,error:{code:-32603,message:'fixture initialization failed'}}));});"#;
+            let broken = ContainerSpec { cmd: Some(vec!["node".into(), "-e".into(), fail_initialize.into()]), ..changed.clone() };
+            let failed = start_project_with_recovery(&db, &docker, "agent", &broken, &processes, &conversations, &lifecycle, lifecycle.enter("agent").await).await;
+            assert!(failed.is_err());
+            assert_eq!(docker.validate_project_configuration("agent", &changed).await.unwrap().as_deref(), Some(updated.container_id.as_str()));
+            assert!(docker.is_container_running(&updated.container_id).await);
+            assert_eq!(SessionManager::new(db.clone()).get_attempt("history").unwrap().native_session_id.as_deref(), Some("native-preserved"));
+        }).catch_unwind().await;
+        conversations.retire_agent_everywhere("agent").await;
+        processes.retire_agent("agent").await;
+        let _ = docker.rollback_project_recovery("agent").await;
+        let _ = docker.remove_owned_workload("agent").await;
+        for image in snapshots.iter().rev() {
+            let _ = engine.remove_image(image, None, None).await;
+        }
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
     /// Exercise the worker's actual image-update path with a live ACP process
     /// and an unlabelled agent-created container sharing its network namespace.
     #[tokio::test]

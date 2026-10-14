@@ -11,7 +11,6 @@ use xpressclaw_core::config::{
     AgentConfig, AgentLlmConfig, BudgetConfig, HooksConfig, NativeRunnerConfig, RateLimitConfig,
     WakeOnConfig,
 };
-use xpressclaw_core::conversations::runtime::ConversationTurnQueue;
 use xpressclaw_core::sessions::LogicalSession;
 use xpressclaw_core::sessions::SessionManager;
 use xpressclaw_core::workers::acp::AcpInterruptMode;
@@ -407,13 +406,23 @@ fn ensure_agent_has_no_active_work(
     state: &AppState,
     agent_id: &str,
 ) -> Result<(), (StatusCode, Json<Value>)> {
-    let attempts = SessionManager::new(state.db.clone())
-        .has_active_attempts(agent_id)
+    // Queued work has not entered the runtime and will use the new settings
+    // once this exclusive lifecycle guard is released. A running queue row
+    // remains a lease even after its attempt becomes terminal during cleanup.
+    let active = state
+        .db
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM work_attempts WHERE session_id = ?1
+             AND status NOT IN ('queued', 'completed', 'failed', 'cancelled', 'interrupted'))
+         OR EXISTS(SELECT 1 FROM task_queue WHERE agent_id = ?1 AND status = 'running')
+         OR EXISTS(SELECT 1 FROM conversation_turns WHERE agent_id = ?1 AND status = 'running')",
+                [agent_id],
+                |row| row.get::<_, bool>(0),
+            )
+        })
         .map_err(internal_error)?;
-    let conversation_turns = ConversationTurnQueue::new(state.db.clone())
-        .has_active_for_agent(agent_id)
-        .map_err(internal_error)?;
-    if attempts || conversation_turns {
+    if active {
         Err(agent_busy())
     } else {
         Ok(())
@@ -715,6 +724,9 @@ mod tests {
         let attempt = sessions
             .get_attempt(item.attempt_id.as_deref().unwrap())
             .unwrap();
+        sessions
+            .transition_attempt(&attempt.id, "preparing", "Preparing", None, None)
+            .unwrap();
         let response = app
             .oneshot(
                 Request::builder()
@@ -727,7 +739,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::CONFLICT);
-        assert_eq!(sessions.get_attempt(&attempt.id).unwrap().status, "queued");
+        assert_eq!(
+            sessions.get_attempt(&attempt.id).unwrap().status,
+            "preparing"
+        );
+    }
+
+    #[test]
+    fn environment_maintenance_allows_queued_work_but_preserves_running_leases() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let state = AppState::new(
+            Arc::new(Config::default()),
+            db.clone(),
+            None,
+            "test.yaml".into(),
+            true,
+        );
+        AgentRegistry::new(db.clone())
+            .ensure("atlas", "codex")
+            .unwrap();
+        SessionManager::new(db.clone())
+            .ensure("atlas", None)
+            .unwrap();
+        db.with_conn(|conn| {
+            conn.execute("INSERT INTO work_attempts (id, session_id, runner, status) VALUES ('attempt', 'atlas', 'codex', 'queued')", [])?;
+            conn.execute("INSERT INTO conversations (id,title) VALUES ('chat','Queued chat')", [])?;
+            conn.execute("INSERT INTO conversation_turns (id,conversation_id,agent_id,status) VALUES ('turn','chat','atlas','queued')", [])?;
+            Ok::<_, xpressclaw_core::error::Error>(())
+        }).unwrap();
+        assert!(ensure_agent_has_no_active_work(&state, "atlas").is_ok());
+        for status in ["preparing", "running", "waiting_for_input", "review"] {
+            db.with_conn(|conn| conn.execute("UPDATE work_attempts SET status=?1", [status]))
+                .unwrap();
+            assert!(
+                ensure_agent_has_no_active_work(&state, "atlas").is_err(),
+                "{status}"
+            );
+        }
+        db.with_conn(|conn| conn.execute("UPDATE work_attempts SET status='failed'", []))
+            .unwrap();
+        assert!(ensure_agent_has_no_active_work(&state, "atlas").is_ok());
+        db.with_conn(|conn| conn.execute("UPDATE conversation_turns SET status='running'", []))
+            .unwrap();
+        assert!(ensure_agent_has_no_active_work(&state, "atlas").is_err());
+        db.with_conn(|conn| conn.execute("UPDATE conversation_turns SET status='failed'", []))
+            .unwrap();
+        db.with_conn(|conn| {
+            conn.execute("INSERT INTO tasks (id,title) VALUES ('task','Failed task')", [])?;
+            conn.execute("INSERT INTO task_queue (task_id,agent_id,status,attempt_id) VALUES ('task','atlas','running','attempt')", [])?;
+            Ok::<_, xpressclaw_core::error::Error>(())
+        }).unwrap();
+        assert!(ensure_agent_has_no_active_work(&state, "atlas").is_err());
     }
 
     /// Exercise the HTTP lifecycle against the engine, including writable-layer

@@ -471,7 +471,7 @@
 				</div>
 			{/if}
 			<div class="mt-4 border-t border-border pt-3">
-				<p class="text-xs text-muted-foreground">Save any settings changes first. Rebuilding applies the saved image, mounts, credentials, and startup configuration. It requires an idle Agent and no dependent containers.</p>
+				<p class="text-xs text-muted-foreground">Saved settings are applied automatically on the next turn, preserving installed tools and files. Rebuild only to start fresh or apply a downloaded image. Finish active work before rebuilding; queued work can remain.</p>
 				{#if confirmingRebuild}
 					<div role="alert" class="mt-2 rounded-md border border-destructive/30 p-3 text-xs">
 						<p>Rebuilding permanently deletes installed tools and files outside mounted folders. Workspace folders and mounted volumes are retained. Agent-created dependent containers must be migrated or explicitly removed first.</p>

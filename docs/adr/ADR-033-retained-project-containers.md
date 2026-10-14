@@ -34,7 +34,7 @@ including `/home/node` and `/tmp`, remains available throughout.
 ACP session identifiers are persisted before each prompt is dispatched. If the
 process or control plane crashes, the next task restarts the retained container
 and resumes or loads the persisted session. Hard cancellation, explicit
-environment rebuild, project deletion, and control-plane shutdown are process
+environment recovery or rebuild, project deletion, and control-plane shutdown are process
 boundaries. Normal successful turns and available image updates are not.
 
 Agent task-queue dispatch remains serialized. A running queue row is also the
@@ -52,13 +52,29 @@ the existing environment even when the selected image or its local tag changes. 
 image ID, not a newer tag. Reuse validates the original specification with the
 container's original image reference; mounts, credentials, command, working
 directory, user identity, resource limits, and networking must still match.
-Incompatible settings fail before stopping the old process, with instructions
-to restore those settings or explicitly rebuild from Agent settings > Harness.
 The fingerprint is SHA-256 so secrets are not written to labels or logs.
+
+Changed launch settings trigger automatic recovery on the next Task or
+Conversation turn. Recovery takes the exclusive Agent runtime boundary and
+waits for other turns to finish. It checks ownership and container dependencies
+before stopping anything, snapshots the filesystem, and starts a replacement
+with the saved settings. It retains the existing base image, installed tools,
+unmounted files, and native session storage. Mounted data is not included in a
+snapshot; configured mounts and retained anonymous image volumes are reattached.
+Old environment overrides are cleared before applying the current values, so
+rotated or removed credentials are not silently inherited from the snapshot.
+
+The old container remains under a deterministic recovery name until the new ACP
+process initializes successfully. Failed creation, startup, or initialization
+restores the old container. An interrupted recovery is detected and rolled back
+before retrying on the next turn. Ownership labels bind each replacement to its
+backup; unknown containers are never removed. Explicit rebuild and deletion
+include owned recovery backups in their dependency preflight and cleanup.
+Snapshots require local disk space; snapshot failure preserves the original.
 
 Downloading a harness update only pins the selected image for a future environment.
 Applying it to an existing environment requires a separate, confirmed rebuild.
-Rebuild requires an idle Agent under the runtime lifecycle barrier, and warns
+Rebuild requires no running work under the runtime lifecycle barrier, and warns
 that installed tools and unmounted files will be lost. It removes the old
 environment; the next turn creates one using the saved settings. No automatic
 update is allowed to discard a retained writable layer.
@@ -66,8 +82,11 @@ After successful removal, clear the Agent's persisted task and conversation
 native session IDs while still holding the runtime boundary. Their harness
 storage may have lived in the deleted layer. Preserve logical history and start
 fresh harness sessions on subsequent turns. A rejected rebuild leaves IDs intact.
+Queued tasks and Conversation turns do not prevent maintenance; they use the
+updated environment when dispatched. Running queue leases still prevent it,
+including the cleanup interval after an attempt reaches a terminal state.
 
-Before explicit removal, inspect all containers (including stopped and unlabelled
+Before recovery or explicit removal, inspect all containers (including stopped and unlabelled
 containers) for namespace, volume-source, and link dependencies. If any reference
 the environment, preserve it and report their names. Do not stop the environment
 first and never recursively remove agent-created dependent containers. Engine
@@ -82,7 +101,7 @@ fails, retaining the Agent's configuration and records for repair and retry.
 Configured startup commands initialize a retained environment once. A marker is
 written only after every command succeeds; a failed initialization is retried
 on the next process start. Changing a startup command changes the container
-specification and therefore requires a confirmed rebuild before it takes effect.
+specification and runs the new initialization during automatic recovery.
 
 Control-plane shutdown and startup stop configured Agent containers but retain
 them. Deleting an Agent removes its container and writable layer.
@@ -98,8 +117,8 @@ containers whose ownership cannot be proven—are never included in that cleanup
   addition to disk. It should consume negligible CPU while waiting on stdio.
   Projects that have never run a task allocate no container.
 - Image updates leave the current environment and installed tools intact. Changed
-  mounts, credentials, environment, or commands require explicit user action; they
-  never silently reuse stale authority or discard installed tools. Workspace and
+  launch settings are recovered automatically without discarding installed tools
+  or silently reusing stale authority. Workspace and
   explicitly mounted host or named-volume data survive a confirmed rebuild.
 - Project deletion is destructive for unmounted container state. The existing
   deletion confirmation is therefore the user-visible cleanup boundary.
@@ -108,6 +127,11 @@ containers whose ownership cannot be proven—are never included in that cleanup
   the unavoidable restart boundaries above.
 
 ## Validation
+
+`automatic_recovery_preserves_files_volumes_and_rolls_back_failures` exercises
+snapshot recovery, anonymous volume identity, revoked environment credentials,
+failed startup, and interrupted recovery against Docker/Podman. Run with
+`XPRESSCLAW_RETENTION_TEST_IMAGE=node:22-bookworm-slim` and `--ignored`.
 
 Dependency preflight tests cover running and stopped unlabelled containers,
 namespace/volume/link references, and failed engine inspection. Mixed retained
