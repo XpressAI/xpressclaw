@@ -780,7 +780,10 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires Docker/Podman and XPRESSCLAW_RETENTION_TEST_IMAGE"]
     async fn stopped_helpers_preserve_their_files_without_blocking_recovery_or_rebuild() {
-        let image = std::env::var("XPRESSCLAW_RETENTION_TEST_IMAGE").unwrap();
+        let Ok(image) = std::env::var("XPRESSCLAW_RETENTION_TEST_IMAGE") else {
+            eprintln!("skipping helper recovery integration test; set XPRESSCLAW_RETENTION_TEST_IMAGE to run it");
+            return;
+        };
         let installation = format!("helpers-test-{}", uuid::Uuid::new_v4());
         let docker = DockerManager::connect_for_installation(&installation)
             .await
@@ -919,7 +922,10 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires Docker/Podman and XPRESSCLAW_RETENTION_TEST_IMAGE"]
     async fn automatic_recovery_preserves_files_volumes_and_rolls_back_failures() {
-        let image = std::env::var("XPRESSCLAW_RETENTION_TEST_IMAGE").unwrap();
+        let Ok(image) = std::env::var("XPRESSCLAW_RETENTION_TEST_IMAGE") else {
+            eprintln!("skipping environment recovery integration test; set XPRESSCLAW_RETENTION_TEST_IMAGE to run it");
+            return;
+        };
         let installation = format!("recovery-test-{}", uuid::Uuid::new_v4());
         let docker = DockerManager::connect_for_installation(&installation)
             .await

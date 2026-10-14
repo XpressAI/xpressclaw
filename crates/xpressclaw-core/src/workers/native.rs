@@ -4546,7 +4546,10 @@ mod tests {
     #[ignore = "requires Docker/Podman and XPRESSCLAW_RETENTION_TEST_IMAGE"]
     async fn automatic_recovery_waits_for_turns_and_rolls_back_failed_acp_initialization() {
         use futures_util::FutureExt;
-        let image = std::env::var("XPRESSCLAW_RETENTION_TEST_IMAGE").unwrap();
+        let Ok(image) = std::env::var("XPRESSCLAW_RETENTION_TEST_IMAGE") else {
+            eprintln!("skipping worker recovery integration test; set XPRESSCLAW_RETENTION_TEST_IMAGE to run it");
+            return;
+        };
         let db = Arc::new(Database::open_memory().unwrap());
         AgentRegistry::new(db.clone())
             .ensure("agent", "codex")
