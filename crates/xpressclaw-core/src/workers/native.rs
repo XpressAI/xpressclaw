@@ -91,6 +91,7 @@ const BUNDLED_CONTROL_MCP_SOURCE: &str = concat!(
     "\nawait main();\n"
 );
 
+#[derive(Clone)]
 struct NativeAttemptRuntime {
     db: Arc<Database>,
     config: Arc<RwLock<Arc<Config>>>,
@@ -773,6 +774,7 @@ async fn start_conversation_dispatcher(
     }
 }
 
+#[derive(Clone)]
 struct ConversationAttemptRuntime {
     db: Arc<Database>,
     config: Arc<RwLock<Arc<Config>>>,
@@ -787,13 +789,30 @@ struct ConversationAttemptRuntime {
     control_plane_token: Arc<str>,
 }
 
+enum TurnOutcome {
+    Finished,
+    RetryPreparation,
+}
+
 async fn execute_conversation_turn(
     runtime: ConversationAttemptRuntime,
     turn: ConversationTurn,
 ) -> Result<()> {
+    loop {
+        match execute_conversation_turn_once(runtime.clone(), turn.clone()).await? {
+            TurnOutcome::Finished => return Ok(()),
+            TurnOutcome::RetryPreparation => continue,
+        }
+    }
+}
+
+async fn execute_conversation_turn_once(
+    runtime: ConversationAttemptRuntime,
+    turn: ConversationTurn,
+) -> Result<TurnOutcome> {
     let ConversationAttemptRuntime {
         db,
-        config,
+        config: config_source,
         docker,
         event_bus,
         elicitation_broker,
@@ -806,13 +825,13 @@ async fn execute_conversation_turn(
     } = runtime;
     let queue = ConversationTurnQueue::new(db.clone());
     if !queue.is_running(&turn.id)? {
-        return Ok(());
+        return Ok(TurnOutcome::Finished);
     }
     let manager = ConversationManager::new(db.clone());
     let conversation = manager.get(&turn.conversation_id)?;
     let (_runtime_lifecycle_guard, config, repository) = prepare_repository_for_turn(
         &db,
-        &config,
+        &config_source,
         &turn.agent_id,
         &docker,
         &project_processes,
@@ -829,7 +848,7 @@ async fn execute_conversation_turn(
         })?;
     let kind = resolve_runner_kind(agent)?;
     if !queue.is_running(&turn.id)? {
-        return Ok(());
+        return Ok(TurnOutcome::Finished);
     }
     let github = if repository.active {
         discover_github_access(&db, &repository.active_root).await?
@@ -955,10 +974,10 @@ async fn execute_conversation_turn(
     };
 
     if !queue.is_running(&turn.id)? {
-        return Ok(());
+        return Ok(TurnOutcome::Finished);
     }
 
-    let (_runtime_lifecycle_guard, base) = start_project_with_recovery(
+    let Some((_runtime_lifecycle_guard, base)) = start_project_with_recovery(
         &db,
         &docker,
         &agent.name,
@@ -967,8 +986,13 @@ async fn execute_conversation_turn(
         &conversation_processes,
         &runtime_lifecycle,
         _runtime_lifecycle_guard,
+        &config_source,
+        &config,
     )
-    .await?;
+    .await?
+    else {
+        return Ok(TurnOutcome::RetryPreparation);
+    };
     docker.restore_forwards(&db, &agent.name).await;
     let live = conversation_processes
         .get_or_start(
@@ -1008,14 +1032,14 @@ async fn execute_conversation_turn(
         conversation_processes
             .retire_agent(&turn.conversation_id, &turn.agent_id)
             .await;
-        return Ok(());
+        return Ok(TurnOutcome::Finished);
     }
     if !queue.start_response(&turn.id)? {
         turn_controls.finish_attempt(&turn.id);
         conversation_processes
             .retire_agent(&turn.conversation_id, &turn.agent_id)
             .await;
-        return Ok(());
+        return Ok(TurnOutcome::Finished);
     }
     event_bus.send(
         &turn.conversation_id,
@@ -1070,7 +1094,7 @@ async fn execute_conversation_turn(
                 .invalidate(&turn.conversation_id, &turn.agent_id, &live.process)
                 .await;
             if !queue.is_running(&turn.id)? {
-                return Ok(());
+                return Ok(TurnOutcome::Finished);
             }
             return Err(error);
         }
@@ -1093,7 +1117,7 @@ async fn execute_conversation_turn(
     )?
     else {
         event_bus.send(&turn.conversation_id, ConversationEvent::Done);
-        return Ok(());
+        return Ok(TurnOutcome::Finished);
     };
     let mut message_value = json!(message);
     message_value["attachments"] = json!(manager.attachments(message.id).unwrap_or_default());
@@ -1105,7 +1129,7 @@ async fn execute_conversation_turn(
         },
     );
     event_bus.send(&turn.conversation_id, ConversationEvent::Done);
-    Ok(())
+    Ok(TurnOutcome::Finished)
 }
 
 /// Materialize only the triggering message's attachments. Older history keeps
@@ -1278,17 +1302,28 @@ async fn start_project_with_recovery(
     conversations: &ConversationAcpProcesses,
     lifecycle: &NativeRuntimeLifecycle,
     guard: OwnedRwLockReadGuard<()>,
-) -> Result<(OwnedRwLockReadGuard<()>, ProjectAcpProcess)> {
+    config: &Arc<RwLock<Arc<Config>>>,
+    prepared_config: &Arc<Config>,
+) -> Result<Option<(OwnedRwLockReadGuard<()>, ProjectAcpProcess)>> {
     if !docker
         .project_configuration_needs_recovery(agent, spec)
         .await?
     {
-        return Ok((guard, processes.get_or_start(docker, agent, spec).await?));
+        return Ok(Some((
+            guard,
+            processes.get_or_start(docker, agent, spec).await?,
+        )));
     }
     drop(guard);
     let exclusive = lifecycle.slot(agent).write_owned().await;
     // Deletion may have won the write lease while this turn was waiting.
     AgentRegistry::new(db.clone()).get(agent)?;
+    // Every prepared setting (mounts, credentials, MCP and session options)
+    // came from this snapshot. If it changed during escalation, restart the
+    // entire preparation path under a fresh lease before mutating the runtime.
+    if !Arc::ptr_eq(&config.read().unwrap(), prepared_config) {
+        return Ok(None);
+    }
     if docker
         .project_configuration_needs_recovery(agent, spec)
         .await?
@@ -1309,7 +1344,7 @@ async fn start_project_with_recovery(
         }
     };
     docker.finish_project_recovery(agent).await?;
-    Ok((OwnedRwLockWriteGuard::downgrade(exclusive), process))
+    Ok(Some((OwnedRwLockWriteGuard::downgrade(exclusive), process)))
 }
 
 async fn prepare_repository_for_turn(
@@ -1408,9 +1443,18 @@ async fn apply_repository_boundary_for_turn(
 }
 
 async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<()> {
+    loop {
+        match execute_item_once(runtime.clone(), item.clone()).await? {
+            TurnOutcome::Finished => return Ok(()),
+            TurnOutcome::RetryPreparation => continue,
+        }
+    }
+}
+
+async fn execute_item_once(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<TurnOutcome> {
     let NativeAttemptRuntime {
         db,
-        config,
+        config: config_source,
         docker,
         event_bus,
         elicitation_broker,
@@ -1427,7 +1471,7 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
         .ok_or_else(|| Error::Task(format!("queue item {} has no work attempt", item.id)))?;
     let (_runtime_lifecycle_guard, config, repository) = prepare_repository_for_turn(
         &db,
-        &config,
+        &config_source,
         &item.agent_id,
         &docker,
         &processes,
@@ -1472,7 +1516,7 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
         None,
     )?;
     if finish_terminal_dispatch_after_worker_exit(&db, &item, &preparing.status)? {
-        return Ok(());
+        return Ok(TurnOutcome::Finished);
     }
     if let Some(conversation_id) = conversation_id(&db, &item.task_id) {
         event_bus.send(
@@ -1532,7 +1576,7 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
                 None,
             )?;
             if finish_terminal_dispatch_after_worker_exit(&db, &item, &pulling.status)? {
-                return Ok(());
+                return Ok(TurnOutcome::Finished);
             }
             docker.pull_image(&spec.image).await?;
             if !runner_image_ready(&docker, &spec.image, built_in_image, agent).await {
@@ -1545,7 +1589,7 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
     }
     let current = sessions.get_attempt(attempt_id)?;
     if finish_terminal_dispatch_after_worker_exit(&db, &item, &current.status)? {
-        return Ok(());
+        return Ok(TurnOutcome::Finished);
     }
     let mut mcp_servers = configured_mcp_servers(&config, agent)?;
     let bundled_control_tools = docker
@@ -1643,10 +1687,10 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
         &item,
         &sessions.get_attempt(attempt_id)?.status,
     )? {
-        return Ok(());
+        return Ok(TurnOutcome::Finished);
     }
     let workload_id = agent.name.as_str();
-    let (_runtime_lifecycle_guard, live) = start_project_with_recovery(
+    let Some((_runtime_lifecycle_guard, live)) = start_project_with_recovery(
         &db,
         &docker,
         workload_id,
@@ -1655,8 +1699,13 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
         &conversation_processes,
         &runtime_lifecycle,
         _runtime_lifecycle_guard,
+        &config_source,
+        &config,
     )
-    .await?;
+    .await?
+    else {
+        return Ok(TurnOutcome::RetryPreparation);
+    };
     docker.restore_forwards(&db, workload_id).await;
     if let Err(error) = sessions.set_container(attempt_id, &live.container_id) {
         processes.invalidate(workload_id, &live.process).await;
@@ -1686,7 +1735,7 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
         }
         let current = sessions.get_attempt(attempt_id)?;
         finish_terminal_dispatch_after_worker_exit(&db, &item, &current.status)?;
-        return Ok(());
+        return Ok(TurnOutcome::Finished);
     }
 
     let attempt = sessions.get_attempt(attempt_id)?;
@@ -1743,7 +1792,7 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
     sessions.clear_container(attempt_id)?;
     let current = sessions.get_attempt(attempt_id)?;
     if finish_terminal_dispatch_after_worker_exit(&db, &item, &current.status)? {
-        return Ok(());
+        return Ok(TurnOutcome::Finished);
     }
     let mut turn = turn?;
     if turn.interrupted {
@@ -1764,7 +1813,7 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
             None,
         )?;
         if interrupted.status != "interrupted" {
-            return Ok(());
+            return Ok(TurnOutcome::Finished);
         }
         let queue = TaskQueue::new(db.clone());
         queue.complete(item.id, "interrupted to apply new guidance")?;
@@ -1782,7 +1831,7 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
         };
         board.update_status(&item.task_id, next_status, Some(&item.agent_id))?;
         sessions.refresh_status(&item.agent_id)?;
-        return Ok(());
+        return Ok(TurnOutcome::Finished);
     }
     let visualizations = prepare_message_visualizations(&turn.summary, &visualization_roots);
     let published = prepare_message_artifacts(&turn.summary, &visualization_roots);
@@ -1817,7 +1866,7 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
         },
     )?
     else {
-        return Ok(());
+        return Ok(TurnOutcome::Finished);
     };
     finalize_successful_task_attempt(
         &db,
@@ -1839,7 +1888,7 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
             published_files: &published.attachments,
         },
     );
-    Ok(())
+    Ok(TurnOutcome::Finished)
 }
 
 fn attempt_is_terminal(status: &str) -> bool {
@@ -4469,22 +4518,52 @@ mod tests {
             .get_or_start(&docker, "agent", &spec)
             .await
             .unwrap();
+        let mut settings = Config::default();
+        let mut agent = AgentConfig {
+            name: "agent".into(),
+            ..Default::default()
+        };
+        agent
+            .runner
+            .environment
+            .insert("UPDATED".into(), "1".into());
+        agent
+            .runner
+            .environment
+            .insert("REVOKED".into(), "secret".into());
+        settings.agents.push(agent);
+        let config = Arc::new(RwLock::new(Arc::new(settings)));
+        let prepared_config = config.read().unwrap().clone();
         let mut snapshots = Vec::new();
         let result = std::panic::AssertUnwindSafe(async {
             let busy_turn = lifecycle.enter("agent").await;
             let requested_turn = lifecycle.enter("agent").await;
-            let changed = ContainerSpec { environment: vec!["UPDATED=1".into()], ..spec.clone() };
-            let mut recovery = Box::pin(start_project_with_recovery(&db, &docker, "agent", &changed, &processes, &conversations, &lifecycle, requested_turn));
+            let changed = ContainerSpec { environment: prepared_config.agents[0].runner.environment.iter().map(|(key,value)| format!("{key}={value}")).collect(), ..spec.clone() };
+            let mut recovery = Box::pin(start_project_with_recovery(&db, &docker, "agent", &changed, &processes, &conversations, &lifecycle, requested_turn, &config, &prepared_config));
             assert!(tokio::time::timeout(Duration::from_millis(100), &mut recovery).await.is_err());
             assert!(docker.is_container_running(&parent.container_id).await);
+            // Settings change while the recovery is waiting. It must not
+            // launch the stale spec, and the caller must prepare afresh.
+            let mut settings = (*prepared_config).clone();
+            settings.agents[0].runner.environment.remove("REVOKED");
+            settings.agents[0].runner.environment.insert("UPDATED".into(), "2".into());
+            *config.write().unwrap() = Arc::new(settings);
             drop(busy_turn);
-            let (guard, updated) = recovery.await.unwrap();
+            assert!(recovery.await.unwrap().is_none());
+            assert!(docker.is_container_running(&parent.container_id).await);
+            let (requested_turn, refreshed) = enter_agent_runtime_config(&config, &lifecycle, "agent").await;
+            let changed = ContainerSpec { environment: refreshed.agents[0].runner.environment.iter().map(|(key,value)| format!("{key}={value}")).collect(), ..changed };
+            let (guard, updated) = start_project_with_recovery(&db, &docker, "agent", &changed, &processes, &conversations, &lifecycle, requested_turn, &config, &refreshed).await.unwrap().unwrap();
+            docker.validate_project_configuration("agent", &changed).await.unwrap();
             assert_ne!(updated.container_id, parent.container_id);
+            let environment = engine.inspect_container(&updated.container_id, None).await.unwrap().config.unwrap().env.unwrap();
+            assert!(environment.contains(&"UPDATED=2".to_string()));
+            assert!(!environment.contains(&"REVOKED=secret".to_string()));
             snapshots.push(engine.inspect_container(&updated.container_id, None).await.unwrap().image.unwrap());
             drop(guard);
             let fail_initialize = r#"require('readline').createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);console.log(JSON.stringify({jsonrpc:'2.0',id:m.id,error:{code:-32603,message:'fixture initialization failed'}}));});"#;
             let broken = ContainerSpec { cmd: Some(vec!["node".into(), "-e".into(), fail_initialize.into()]), ..changed.clone() };
-            let failed = start_project_with_recovery(&db, &docker, "agent", &broken, &processes, &conversations, &lifecycle, lifecycle.enter("agent").await).await;
+            let failed = start_project_with_recovery(&db, &docker, "agent", &broken, &processes, &conversations, &lifecycle, lifecycle.enter("agent").await, &config, &refreshed).await;
             assert!(failed.is_err());
             assert_eq!(docker.validate_project_configuration("agent", &changed).await.unwrap().as_deref(), Some(updated.container_id.as_str()));
             assert!(docker.is_container_running(&updated.container_id).await);

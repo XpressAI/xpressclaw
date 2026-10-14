@@ -56,7 +56,9 @@ The fingerprint is SHA-256 so secrets are not written to labels or logs.
 
 Changed launch settings trigger automatic recovery on the next Task or
 Conversation turn. Recovery takes the exclusive Agent runtime boundary and
-waits for other turns to finish. It checks ownership and container dependencies
+waits for other turns to finish. If configuration changed during that wait,
+restart turn preparation from the current settings before touching the runtime.
+It checks ownership and container dependencies
 before stopping anything, snapshots the filesystem, and starts a replacement
 with the saved settings. It retains the existing base image, installed tools,
 unmounted files, and native session storage. Mounted data is not included in a
@@ -125,6 +127,10 @@ boundary without requiring the user to find or cancel nonexistent active tasks.
 
 Agent deletion must also stop if cleanup of an active legacy attempt container
 fails, retaining the Agent's configuration and records for repair and retry.
+Deletion holds the same exclusive runtime boundary through container cleanup,
+configuration persistence, and record removal. If a turn or recovery keeps that
+boundary busy beyond the bounded wait, deletion returns a conflict without
+removing anything.
 
 Configured startup commands initialize a retained environment once. A marker is
 written only after every command succeeds; a failed initialization is retried

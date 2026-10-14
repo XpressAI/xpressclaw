@@ -130,11 +130,24 @@ async fn delete_agent(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<Value>)> {
+    // Match rebuild/Project deletion lock ordering and keep both boundaries
+    // until the environment, configuration, and durable records are removed.
+    let _config_guard = state.config_write_lock.lock().await;
     let registry = AgentRegistry::new(state.db.clone());
     let record = registry.get(&id).map_err(|e| match &e {
         xpressclaw_core::error::Error::AgentNotFound { .. } => not_found(&e),
         _ => internal_error(e),
     })?;
+    state
+        .native_runtime_lifecycle
+        .release_finished_workers(&state.db, &record.name)
+        .map_err(internal_error)?;
+    let _runtime_guards = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        state.native_runtime_lifecycle.quiesce_agents(std::slice::from_ref(&record.name)),
+    ).await.map_err(|_| environment_conflict(
+        "The Agent runtime is busy. Stop active work or wait for environment recovery to finish, then retry deletion."
+    ))?;
     let sessions = xpressclaw_core::sessions::SessionManager::new(state.db.clone());
     // Cleanup is not a paginated history view: an older active attempt may
     // still own a container even after thousands of newer completed attempts.
@@ -164,7 +177,6 @@ async fn delete_agent(
             .await
             .map_err(environment_conflict)?;
     }
-    let _config_guard = state.config_write_lock.lock().await;
     let old_config = state.config();
     let mut new_config = (*old_config).clone();
     new_config.agents.retain(|agent| agent.name != record.name);
@@ -1097,11 +1109,32 @@ mod tests {
             // Queued work has no legacy container yet. Its absence must not
             // prevent retrying deletion after the dependency is repaired.
             db.with_conn(|conn| conn.execute("INSERT INTO work_attempts (id,session_id,runner,status) VALUES (?1,?2,'codex','queued')", [&format!("queued-{agent}"),&agent])).unwrap();
+            // Deletion must wait across the recovery rename/create boundary,
+            // then remove the replacement too before deleting the Agent row.
+            let recovery = state.native_runtime_lifecycle.quiesce_agents(std::slice::from_ref(&agent)).await;
+            let deleting_app = app.clone();
+            let deleting_agent = agent.clone();
+            let mut deletion = tokio::spawn(async move { request(&deleting_app, &deleting_agent, false).await });
+            assert!(tokio::time::timeout(std::time::Duration::from_millis(50), &mut deletion).await.is_err());
+            assert!(AgentRegistry::new(db.clone()).get(&agent).is_ok());
+            assert!(docker.is_container_running(&retained.info.container_id).await);
+            let changed = ContainerSpec { environment: vec!["RECOVERED=yes".into()], ..spec.clone() };
+            docker.recover_project_configuration(&agent, &changed).await.unwrap();
+            docker.finish_project_recovery(&agent).await.unwrap();
+            let replacement = docker.launch_project_attached(&agent, &changed).await.unwrap();
+            // A busy operation can outlast the bounded HTTP wait. It must
+            // leave both the Agent and its replacement intact for retry.
+            let blocked = deletion.await.unwrap();
+            assert_eq!(blocked.status(), StatusCode::CONFLICT);
+            assert!(AgentRegistry::new(db.clone()).get(&agent).is_ok());
+            assert!(docker.is_container_running(&replacement.info.container_id).await);
+            drop(recovery);
             let deleted = request(&app, &agent, false).await;
             assert_eq!(deleted.status(),StatusCode::NO_CONTENT);
             assert!(AgentRegistry::new(db.clone()).get(&agent).is_err());
             assert!(!docker.is_container_running(&retained.info.container_id).await);
             assert!(!docker.is_container_running(&legacy.container_id).await);
+            assert!(matches!(engine.inspect_container(&replacement.info.container_id, None).await, Err(bollard::errors::Error::DockerResponseServerError { status_code: 404, .. })));
         }).catch_unwind().await;
         let _ = engine
             .remove_container(

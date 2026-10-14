@@ -2153,7 +2153,7 @@ mod tests {
         }
     }
 
-    async fn mock_engine(
+    pub(super) async fn mock_engine(
         mut responses: HashMap<String, (u16, serde_json::Value)>,
     ) -> (
         DockerManager,
@@ -2194,8 +2194,9 @@ mod tests {
                 let mut fields = first.split_whitespace();
                 let method = fields.next().unwrap_or_default();
                 let url = fields.next().unwrap_or_default();
-                let path = url
-                    .find("/containers")
+                let path = ["/containers", "/images"]
+                    .iter()
+                    .find_map(|prefix| url.find(prefix))
                     .map(|i| &url[i..])
                     .unwrap_or(url)
                     .split('?')

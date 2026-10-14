@@ -628,15 +628,38 @@ impl DockerManager {
             .map_err(|error| {
                 Error::Container(format!("Could not snapshot environment: {error}"))
             })?;
-        self.docker
-            .inspect_image(&reference)
-            .await
-            .map_err(|error| {
-                Error::Container(format!("Could not verify environment snapshot: {error}"))
-            })?
-            .id
-            .filter(|id| !id.is_empty())
-            .ok_or_else(|| Error::Container("Environment snapshot has no image ID".into()))
+        self.verified_snapshot_id(&reference).await
+    }
+
+    async fn verified_snapshot_id(&self, reference: &str) -> Result<String> {
+        let verified =
+            self.docker
+                .inspect_image(reference)
+                .await
+                .map_err(|error| {
+                    Error::Container(format!("Could not verify environment snapshot: {error}"))
+                })
+                .and_then(|image| {
+                    image.id.filter(|id| !id.is_empty()).ok_or_else(|| {
+                        Error::Container("Environment snapshot has no image ID".into())
+                    })
+                });
+        if verified.is_err() {
+            // The unique tag is known even if inspection is unavailable. Do
+            // not require another inspection to clean up this failed commit.
+            let _ = self
+                .docker
+                .remove_image(
+                    reference,
+                    Some(RemoveImageOptions {
+                        force: false,
+                        noprune: true,
+                    }),
+                    None,
+                )
+                .await;
+        }
+        verified
     }
 }
 
@@ -662,6 +685,50 @@ fn dependent_name(container: &ContainerInspectResponse) -> String {
 mod tests {
     use super::*;
     use futures_util::FutureExt;
+
+    #[tokio::test]
+    async fn failed_snapshot_verification_removes_the_committed_tag() {
+        for (status, body) in [
+            (
+                500,
+                serde_json::json!({"message": "inspection unavailable"}),
+            ),
+            (200, serde_json::json!({})),
+            (200, serde_json::json!({"Id": ""})),
+            (200, serde_json::json!({"Id": "sha256:verified"})),
+        ] {
+            let (docker, requests, server) = super::super::tests::mock_engine(HashMap::from([
+                (
+                    "GET /images/snapshot-verification/json".into(),
+                    (status, body.clone()),
+                ),
+                (
+                    "DELETE /images/snapshot-verification".into(),
+                    (200, serde_json::json!([])),
+                ),
+            ]))
+            .await;
+            let result = docker.verified_snapshot_id("snapshot-verification").await;
+            let valid = body["Id"] == "sha256:verified";
+            assert_eq!(result.is_ok(), valid);
+            let requests = requests.lock().unwrap();
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|request| request.starts_with("DELETE "))
+                    .count(),
+                usize::from(!valid)
+            );
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|request| request.starts_with("GET "))
+                    .count(),
+                1
+            );
+            server.abort();
+        }
+    }
 
     async fn run(docker: &DockerManager, script: &str) -> String {
         let mut process = docker
