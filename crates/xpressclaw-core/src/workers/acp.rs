@@ -1834,7 +1834,13 @@ async fn run_connected_turn(
         .map_err(agent_client_protocol::Error::into_internal_error)?;
 
     let mut model_changed = false;
-    if let Some(requested_model) = model.as_deref() {
+    // Task/workflow/message controls take precedence over the runner default.
+    // Do not even resolve or set a default that the picker supersedes: it may
+    // have disappeared from the catalog or belong to the broken backend that
+    // the user is trying to leave.
+    let has_model_override = advertised_model_choices(&config_options)
+        .is_some_and(|(config_id, _)| requested_config.contains_key(&config_id));
+    if let Some(requested_model) = model.as_deref().filter(|_| !has_model_override) {
         let (config_id, model_id) = resolve_model_selection(&config_options, requested_model)
             .map_err(agent_client_protocol::util::internal_error)?;
         model_changed |= config_options.iter().find(|option| option.id.to_string() == config_id)
@@ -3369,6 +3375,95 @@ mod tests {
             )
             .category(SessionConfigOptionCategory::ThoughtLevel),
         ]
+    }
+
+    #[tokio::test]
+    async fn picker_model_supersedes_missing_or_broken_runner_defaults() {
+        for (default_model, picker_model, valid_choice) in [
+            ("removed-from-catalog", "reasoner", true),
+            ("broken", "reasoner", true),
+            ("broken", "invalid-explicit-choice", false),
+        ] {
+            let db = Arc::new(Database::open_memory().unwrap());
+            let (recorder, _) = test_recorder(db);
+            let (client_input, agent_input) = tokio::io::duplex(64 * 1024);
+            let (output_tx, output_rx) = tokio::sync::mpsc::channel(8);
+            let mock_agent = tokio::spawn(async move {
+                let mut requests = BufReader::new(agent_input).lines();
+                let mut model_requests = 0;
+                let mut prompts = 0;
+                while let Some(line) = requests.next_line().await.unwrap() {
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    let method = request["method"].as_str().unwrap();
+                    let result = match method {
+                        "initialize" => json!(InitializeResponse::new(ProtocolVersion::V1)),
+                        "session/new" => json!(NewSessionResponse::new("override-session")
+                            .config_options(dynamic_controls("plain"))),
+                        "session/set_config_option" => {
+                            model_requests += 1;
+                            assert_eq!(request["params"]["configId"], "z_model");
+                            assert_eq!(
+                                request["params"]["value"], "reasoner",
+                                "must never try the runner default first"
+                            );
+                            json!(SetSessionConfigOptionResponse::new(dynamic_controls(
+                                "reasoner"
+                            )))
+                        }
+                        "session/prompt" => {
+                            prompts += 1;
+                            json!(PromptResponse::new(StopReason::EndTurn))
+                        }
+                        other => panic!("unexpected ACP method: {other}"),
+                    };
+                    send_json(
+                        &output_tx,
+                        json!({ "jsonrpc": "2.0", "id": request["id"], "result": result }),
+                    )
+                    .await;
+                    if method == "session/prompt" {
+                        break;
+                    }
+                }
+                assert_eq!(model_requests, usize::from(valid_choice));
+                assert_eq!(prompts, usize::from(valid_choice));
+            });
+            let result = run_turn(
+                AttachedContainer {
+                    info: ContainerInfo {
+                        container_id: "override-container".into(),
+                        agent_id: "session-1".into(),
+                        status: "running".into(),
+                        host_port: None,
+                    },
+                    input: Box::pin(client_input),
+                    output: Box::pin(ReceiverStream::new(output_rx)),
+                },
+                AcpTurnRuntime::new(
+                    recorder,
+                    Arc::new(AcpElicitationBroker::new()),
+                    Arc::new(AcpTurnControlBroker::new()),
+                ),
+                AcpSessionStart::New,
+                Path::new("/workspace"),
+                "Use picker model",
+                AcpTurnOptions {
+                    model: Some(default_model.into()),
+                    session_config: [("z_model".into(), json!(picker_model))].into(),
+                    ..AcpTurnOptions::default()
+                },
+            )
+            .await;
+            if valid_choice {
+                result.unwrap();
+            } else {
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("invalid-explicit-choice"));
+            }
+            mock_agent.await.unwrap();
+        }
     }
 
     #[tokio::test]

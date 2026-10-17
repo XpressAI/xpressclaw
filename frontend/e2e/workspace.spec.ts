@@ -1518,6 +1518,53 @@ test('a delayed picker refresh cannot overwrite a newer model change', async ({ 
 	await expect(page.getByRole('button', { name: 'MAX', exact: true })).toHaveCount(0);
 });
 
+for (const pendingRequest of ['none', 'GET', 'POST']) {
+	test(`agent reassignment clears controls with ${pendingRequest} picker request pending`, async ({ page }) => {
+		const postedMessages: Record<string, unknown>[] = [];
+		await mockApi(page, { taskStatus: 'pending', multipleAgents: true, postedMessages });
+		await page.route('**/api/sessions/project-secondary-test/events', (route) => route.fulfill({ json: [] }));
+		let releaseRequest!: () => void;
+		const requestGate = new Promise<void>((resolve) => (releaseRequest = resolve));
+		let requestStarted = false;
+		await page.route(`**/api/tasks/${taskId}/config`, async (route) => {
+			if (route.request().method() === pendingRequest) {
+				requestStarted = true;
+				await requestGate;
+			}
+			await route.fulfill({ json: { ...pickerControls(route.request().method() === 'POST' ? 'local/qwen' : undefined), event_id: 200 } });
+		});
+		await page.goto(`/tasks/${taskId}`);
+		const picker = page.getByTitle('Model and reasoning effort');
+		await picker.click();
+		if (pendingRequest !== 'GET') {
+			await expect(page.getByRole('button', { name: 'MAX', exact: true })).toBeVisible();
+			if (pendingRequest === 'POST') await page.getByRole('button', { name: 'Local Qwen', exact: true }).click();
+		}
+		if (pendingRequest !== 'none') await expect.poll(() => requestStarted).toBe(true);
+
+		await page.getByRole('button', { name: 'Task settings', exact: true }).click();
+		await page.getByRole('menuitem', { name: 'Edit details' }).click();
+		const editor = page.getByRole('dialog', { name: 'Edit task details', exact: true });
+		await editor.getByLabel('Agent', { exact: true }).selectOption('project-secondary-test');
+		await editor.getByRole('button', { name: 'Save', exact: true }).click();
+		await expect(editor).toBeHidden();
+		await expect(picker).toHaveCount(0);
+
+		if (pendingRequest !== 'none') {
+			const oldResponse = page.waitForResponse((response) => response.url().endsWith(`/api/tasks/${taskId}/config`)
+				&& response.request().method() === pendingRequest);
+			releaseRequest();
+			await (await oldResponse).finished();
+			await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+			await expect(picker).toHaveCount(0);
+		}
+		await page.locator(`#task-message-input-${taskId}`).fill('Continue with the new agent');
+		await page.getByRole('button', { name: 'Send message', exact: true }).click();
+		await expect.poll(() => postedMessages.length).toBe(1);
+		expect(postedMessages[0].config_options).toEqual({});
+	});
+}
+
 test('attempt errors can be dismissed', async ({ page }) => {
 	const rawError = '<img src=x onerror="window.__rawHtmlExecuted = true"> ACP process stopped during the turn';
 	await mockApi(page, { attemptError: rawError });

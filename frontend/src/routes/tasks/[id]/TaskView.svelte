@@ -566,12 +566,12 @@
 	async function setConfigOption(option: AcpConfigOption, value: string | boolean) {
 		if (!task || configUpdating) return;
 		const id = task.id;
-		++configRequestVersion; // Ignore a slower picker-open refresh.
+		const version = ++configRequestVersion; // Ignore a slower picker-open refresh.
 		configNotice = '';
 		configUpdating = true;
 		try {
 			const controls = await tasks.setConfig(id, option.id, value);
-			if (task?.id !== id) return;
+			if (version !== configRequestVersion || task?.id !== id) return;
 			delete stagedConfig[option.id];
 			if (isModelOption(option)) {
 				for (const dependent of configOptions.filter((item) => isReasoningOption(item) || isAdditionalModelOption(item))) {
@@ -581,12 +581,12 @@
 			lastControlsEventId = Math.max(lastControlsEventId, controls.event_id ?? 0);
 			applySessionControls(validConfigOptions(controls.config_options), controls.modes);
 		} catch (e) {
-			if (task?.id !== id) return;
+			if (version !== configRequestVersion || task?.id !== id) return;
 			if (e instanceof ApiError && e.status === 409) stageConfigOption(option, value);
 			// Other failures leave the last confirmed selection intact.
 			configNotice = e instanceof Error ? e.message : String(e);
 		} finally {
-			configUpdating = false;
+			if (version === configRequestVersion) configUpdating = false;
 		}
 	}
 
@@ -814,14 +814,28 @@
 		};
 	}
 
+	function resetHarnessControls(agentId: string | null) {
+		const controlsScope = `${taskId}:${agentId ?? ''}`;
+		if (controlsInitializedFor === controlsScope) return;
+		// Invalidate in-flight reads/writes even when only the assignment, not
+		// the task ID, changed. An unadvertised agent starts with no controls.
+		++configRequestVersion;
+		stagedConfig = {};
+		lastControlsEventId = 0;
+		controlsInitializedFor = controlsScope;
+		sessionEvents = [];
+		configOptions = [];
+		selectedConfig = {};
+		availableCommands = [];
+		configNotice = '';
+		configUpdating = false;
+		modelMenuOpen = false;
+		modelSearch = '';
+	}
+
 	function refreshHarnessControls(events: SessionEvent[], agentId: string) {
+		resetHarnessControls(agentId);
 		const advertised = [...events].reverse().find((event) => event.event_type === 'session_config_options');
-		const controlsScope = `${taskId}:${agentId}`;
-		if (controlsInitializedFor !== controlsScope) {
-			stagedConfig = {};
-			lastControlsEventId = 0;
-			controlsInitializedFor = controlsScope;
-		}
 		const options = validConfigOptions(advertised?.payload.config_options);
 		const latestMode = [...events].reverse().find((event) => event.event_type === 'session_mode');
 		const latestModeId = typeof latestMode?.payload.modeId === 'string'
@@ -932,6 +946,7 @@
 	});
 
 	onDestroy(() => {
+		++configRequestVersion;
 		if (pollTimer) clearInterval(pollTimer);
 		taskViewResizeObserver?.disconnect();
 		document.removeEventListener('pointerdown', handleComposerPointerDown);
@@ -947,6 +962,7 @@
 				tasks.activity(id),
 			]);
 			task = loadedTask;
+			resetHarnessControls(loadedTask.agent_id);
 			agentList = loadedAgents;
 			messages = loadedMessages;
 			attempts = activity.attempts;
@@ -960,6 +976,7 @@
 					sessions.events(loadedTask.agent_id).catch(() => []),
 					workspaces.gitStatus(loadedTask.agent_id).catch(() => null),
 				]);
+				if (task?.id !== id || task.agent_id !== loadedTask.agent_id) return;
 				sessionEvents = events;
 				workspaceGit = git;
 				lastWorkspaceGitRefresh = Date.now();
@@ -1021,6 +1038,7 @@
 			]);
 			// Update task status/details in-place
 			task = newTask;
+			resetHarnessControls(newTask.agent_id);
 			attempts = newActivity.attempts;
 			delegatedWork = newActivity.delegated_work ?? [];
 			let shouldScroll = false;
@@ -1041,6 +1059,7 @@
 			}
 			if (newTask.agent_id) {
 				const latestSessionEvents = await sessions.events(newTask.agent_id).catch(() => sessionEvents);
+				if (task?.id !== id || task.agent_id !== newTask.agent_id) return;
 				if (latestSessionEvents.length !== sessionEvents.length || latestSessionEvents.at(-1)?.id !== sessionEvents.at(-1)?.id) {
 					sessionEvents = latestSessionEvents;
 					refreshHarnessControls(sessionEvents, newTask.agent_id);
