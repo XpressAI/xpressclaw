@@ -108,13 +108,14 @@ struct NativeAttemptRuntime {
 
 #[derive(Clone)]
 struct ProjectAcpProcess {
+    runner_kind: String,
     fingerprint: String,
     container_id: String,
     process: AcpProcess,
 }
 
 #[derive(Default)]
-struct ProjectAcpProcesses {
+pub struct ProjectAcpProcesses {
     slots: StdMutex<HashMap<String, Arc<AsyncMutex<Option<ProjectAcpProcess>>>>>,
 }
 
@@ -415,6 +416,17 @@ impl ConversationAcpProcesses {
 }
 
 impl ProjectAcpProcesses {
+    /// Resolve only an existing connection; opening a picker must not launch
+    /// containers, create work attempts, or make a model request.
+    pub async fn connected_process(&self, agent_id: &str, runner_kind: &str) -> Option<AcpProcess> {
+        let slot = self.slots.lock().unwrap().get(agent_id).cloned()?;
+        let entry = slot.lock().await;
+        entry
+            .as_ref()
+            .filter(|entry| entry.runner_kind == runner_kind && entry.process.is_alive())
+            .map(|entry| entry.process.clone())
+    }
+
     fn slot(&self, agent_id: &str) -> Arc<AsyncMutex<Option<ProjectAcpProcess>>> {
         self.slots
             .lock()
@@ -429,6 +441,7 @@ impl ProjectAcpProcesses {
         docker: &DockerManager,
         agent_id: &str,
         spec: &ContainerSpec,
+        runner_kind: &str,
     ) -> Result<ProjectAcpProcess> {
         let fingerprint = retained_process_fingerprint(spec)?;
         let slot = self.slot(agent_id);
@@ -445,7 +458,9 @@ impl ProjectAcpProcesses {
             false
         };
         if reusable {
-            return Ok(entry.as_ref().unwrap().clone());
+            let current = entry.as_mut().unwrap();
+            current.runner_kind = runner_kind.to_string();
+            return Ok(current.clone());
         }
 
         let previous = entry.take();
@@ -464,6 +479,7 @@ impl ProjectAcpProcesses {
             }
         };
         let started = ProjectAcpProcess {
+            runner_kind: runner_kind.to_string(),
             fingerprint,
             container_id,
             process,
@@ -508,6 +524,7 @@ pub struct NativeDispatcherServices {
     pub elicitation_broker: Arc<AcpElicitationBroker>,
     pub turn_controls: Arc<AcpTurnControlBroker>,
     pub conversation_processes: Arc<ConversationAcpProcesses>,
+    pub project_processes: Arc<ProjectAcpProcesses>,
     /// Per-Agent launch/use barrier shared with destructive lifecycle routes.
     pub runtime_lifecycle: Arc<NativeRuntimeLifecycle>,
     /// Ephemeral capability used only on the container callback listener.
@@ -530,6 +547,7 @@ pub async fn start_dispatcher(
         elicitation_broker,
         turn_controls,
         conversation_processes,
+        project_processes: processes,
         runtime_lifecycle,
         control_plane_token,
     } = services;
@@ -541,7 +559,6 @@ pub async fn start_dispatcher(
         }
     };
     let concurrency = Arc::new(Semaphore::new(4));
-    let processes = Arc::new(ProjectAcpProcesses::default());
     let mut docker = initial_docker;
 
     let _ = ConversationTurnQueue::new(db.clone()).recover();
@@ -1305,13 +1322,23 @@ async fn start_project_with_recovery(
     config: &Arc<RwLock<Arc<Config>>>,
     prepared_config: &Arc<Config>,
 ) -> Result<Option<(OwnedRwLockReadGuard<()>, ProjectAcpProcess)>> {
+    let configured = prepared_config
+        .agents
+        .iter()
+        .find(|configured| configured.name == agent)
+        .ok_or_else(|| Error::AgentNotFound {
+            name: agent.to_string(),
+        })?;
+    let runner_kind = resolve_runner_kind(configured)?;
     if !docker
         .project_configuration_needs_recovery(agent, spec)
         .await?
     {
         return Ok(Some((
             guard,
-            processes.get_or_start(docker, agent, spec).await?,
+            processes
+                .get_or_start(docker, agent, spec, &runner_kind)
+                .await?,
         )));
     }
     drop(guard);
@@ -1332,7 +1359,10 @@ async fn start_project_with_recovery(
         conversations.retire_agent_everywhere(agent).await;
         processes.retire_agent(agent).await;
     }
-    let process = match processes.get_or_start(docker, agent, spec).await {
+    let process = match processes
+        .get_or_start(docker, agent, spec, &runner_kind)
+        .await
+    {
         Ok(process) => process,
         Err(error) => {
             if let Err(rollback) = docker.rollback_project_recovery(agent).await {
@@ -1786,7 +1816,10 @@ async fn execute_item_once(runtime: NativeAttemptRuntime, item: QueueItem) -> Re
             warn!(%error, attempt_id, "failed to finalize task Git metrics");
         }
     }
-    if turn.is_err() && processes.invalidate(workload_id, &live.process).await {
+    if turn.is_err()
+        && !live.process.is_alive()
+        && processes.invalidate(workload_id, &live.process).await
+    {
         docker.stop_preserving(workload_id).await?;
     }
     sessions.clear_container(attempt_id)?;
@@ -2358,19 +2391,9 @@ fn session_start(db: &Arc<Database>, item: &QueueItem, runner: &str) -> Result<A
     let board = TaskBoard::new(db.clone());
     let task = board.get(&item.task_id)?;
 
-    let task_session: Option<(String, String)> = db.with_conn(|conn| {
-        conn.query_row(
-            "SELECT id, native_session_id FROM work_attempts
-             WHERE task_id = ?1 AND session_id = ?2 AND runner = ?3
-               AND native_session_id IS NOT NULL
-               AND status IN ('completed', 'interrupted')
-             ORDER BY COALESCE(completed_at, created_at) DESC, rowid DESC LIMIT 1",
-            rusqlite::params![item.task_id, item.agent_id, runner],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()
-        .map_err(Error::from)
-    })?;
+    let task_session = SessionManager::new(db.clone())
+        .task_control_attempt(&item.task_id, &item.agent_id, runner, false)?
+        .and_then(|attempt| attempt.native_session_id.map(|native| (attempt.id, native)));
 
     let project_session: Option<(String, String)> = db.with_conn(|conn| {
         conn.query_row(
@@ -4573,7 +4596,7 @@ mod tests {
             ..Default::default()
         };
         let parent = processes
-            .get_or_start(&docker, "agent", &spec)
+            .get_or_start(&docker, "agent", &spec, "codex")
             .await
             .unwrap();
         let mut settings = Config::default();
@@ -4662,7 +4685,7 @@ mod tests {
         let spec = ContainerSpec { image: image.clone(), expose_port: None, cmd: Some(vec!["node".into(), "-e".into(), r#"require('readline').createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);if(m.method==='initialize')console.log(JSON.stringify({jsonrpc:'2.0',id:m.id,result:{protocolVersion:1,agentCapabilities:{},authMethods:[]}}));});"#.into()]), ..Default::default() };
         let processes = ProjectAcpProcesses::default();
         let parent = processes
-            .get_or_start(&docker, "agent", &spec)
+            .get_or_start(&docker, "agent", &spec, "codex")
             .await
             .unwrap();
         let parent_id = parent.container_id.clone();
@@ -4682,7 +4705,7 @@ mod tests {
             assert_eq!(exec_text(&docker, network_probe).await, "experiment");
             exec_text(&docker, "require('fs').writeFileSync('/tmp/package-installed-later','installed')").await;
             let updated = ContainerSpec { image: "not-pulled:future-update".into(), ..spec };
-            let resumed = processes.get_or_start(&docker, "agent", &updated).await.unwrap();
+            let resumed = processes.get_or_start(&docker, "agent", &updated, "codex").await.unwrap();
             assert_eq!(resumed.container_id, parent_id);
             assert!(resumed.process.same_process(&parent.process), "an image update must not restart ACP or its container");
             assert_eq!(exec_text(&docker, "console.log(require('fs').readFileSync('/tmp/package-installed-later','utf8'))").await.trim(), "installed");
@@ -4694,7 +4717,7 @@ mod tests {
             // A separate, explicit process recovery still preserves the
             // writable layer, even when the selected image has since changed.
             docker.stop_preserving("agent").await.unwrap();
-            let recovered = processes.get_or_start(&docker, "agent", &updated).await.unwrap();
+            let recovered = processes.get_or_start(&docker, "agent", &updated, "codex").await.unwrap();
             assert_eq!(recovered.container_id, parent_id);
             assert_eq!(exec_text(&docker, "console.log(require('fs').readFileSync('/tmp/package-installed-later','utf8'))").await.trim(), "installed");
         }).catch_unwind().await;

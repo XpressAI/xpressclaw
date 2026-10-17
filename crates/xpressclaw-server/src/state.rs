@@ -10,7 +10,9 @@ use xpressclaw_core::docker::manager::DockerManager;
 use xpressclaw_core::llm::router::LlmRouter;
 use xpressclaw_core::tools::mcp_manager::McpManager;
 use xpressclaw_core::workers::acp::{AcpElicitationBroker, AcpInterruptMode, AcpTurnControlBroker};
-use xpressclaw_core::workers::native::{ConversationAcpProcesses, NativeRuntimeLifecycle};
+use xpressclaw_core::workers::native::{
+    ConversationAcpProcesses, NativeRuntimeLifecycle, ProjectAcpProcesses,
+};
 use zeroize::Zeroizing;
 
 use crate::auth::InstanceAuth;
@@ -44,6 +46,8 @@ pub struct AppState {
     pub turn_controls: Arc<AcpTurnControlBroker>,
     /// Retained per-Conversation ACP lanes shared with the native dispatcher.
     pub conversation_processes: Arc<ConversationAcpProcesses>,
+    /// Retained task ACP connections, also used by prompt-free model controls.
+    pub project_processes: Arc<ProjectAcpProcesses>,
     /// Per-Agent barrier shared by native dispatchers and destructive Project
     /// lifecycle operations.
     pub native_runtime_lifecycle: Arc<NativeRuntimeLifecycle>,
@@ -142,6 +146,7 @@ impl AppState {
             elicitations: Arc::new(AcpElicitationBroker::new()),
             turn_controls: Arc::new(AcpTurnControlBroker::new()),
             conversation_processes: Arc::new(ConversationAcpProcesses::default()),
+            project_processes: Arc::new(ProjectAcpProcesses::default()),
             native_runtime_lifecycle: Arc::new(NativeRuntimeLifecycle::default()),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             project_sync_lock: Arc::new(tokio::sync::Mutex::new(())),

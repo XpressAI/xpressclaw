@@ -21,6 +21,7 @@ mod settings_instance;
 mod settings_sync;
 mod setup;
 mod speech;
+mod task_controls;
 mod tasks;
 mod visualizations;
 mod workflows;

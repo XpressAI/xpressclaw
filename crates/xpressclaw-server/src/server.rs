@@ -329,6 +329,7 @@ pub async fn serve_on_with_bound_callback(
     let dispatcher_elicitations = state.elicitations.clone();
     let dispatcher_turn_controls = state.turn_controls.clone();
     let dispatcher_conversation_processes = state.conversation_processes.clone();
+    let dispatcher_project_processes = state.project_processes.clone();
     let dispatcher_runtime_lifecycle = state.native_runtime_lifecycle.clone();
     let dispatcher_control_token = internal_token.clone();
     let dispatcher_shutdown = shutdown.clone();
@@ -343,6 +344,7 @@ pub async fn serve_on_with_bound_callback(
                     elicitation_broker: dispatcher_elicitations,
                     turn_controls: dispatcher_turn_controls,
                     conversation_processes: dispatcher_conversation_processes,
+                    project_processes: dispatcher_project_processes,
                     runtime_lifecycle: dispatcher_runtime_lifecycle,
                     control_plane_token: dispatcher_control_token,
                 },

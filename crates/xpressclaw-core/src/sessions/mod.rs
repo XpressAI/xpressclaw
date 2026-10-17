@@ -356,6 +356,67 @@ impl SessionManager {
         })
     }
 
+    /// Shared task-session selection for dispatch and picker inspection. Busy
+    /// inspection may use the active attempt; it must not borrow an older
+    /// catalog while a new attempt is still opening its session.
+    pub fn task_control_attempt(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+        runner: &str,
+        include_active: bool,
+    ) -> Result<Option<WorkAttempt>> {
+        self.db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT id, session_id, task_id, queue_id, kind, runner, status, prompt,
+                    native_session_id, container_id, result, error_message,
+                    created_at, started_at, completed_at, context_used, context_size,
+                    trigger_message_id, response_queued_at, response_started_at
+             FROM work_attempts WHERE task_id=?1 AND session_id=?2 AND runner=?3
+               AND ((status IN ('completed','interrupted')
+                    AND native_session_id IS NOT NULL AND TRIM(native_session_id) != '')
+                 OR (?4 AND status IN ('preparing','running','waiting_for_input','review')))
+             ORDER BY CASE WHEN status IN ('completed','interrupted') THEN 1 ELSE 0 END,
+                      COALESCE(completed_at,created_at) DESC, rowid DESC LIMIT 1",
+                rusqlite::params![task_id, agent_id, runner, include_active],
+                row_to_attempt,
+            )
+            .optional()
+            .map_err(Error::from)
+        })
+    }
+
+    /// Durable schemas are observations of one native conversation, never task
+    /// preferences. A failed fork is excluded; a later update on the same
+    /// reusable native session remains useful even if that turn failed.
+    pub fn task_control_event(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+        runner: &str,
+        native_id: &str,
+        event_type: &str,
+    ) -> Result<Option<SessionEvent>> {
+        self.db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT e.id,e.session_id,e.attempt_id,e.task_id,e.source_type,e.source_id,
+                    e.event_type,e.summary,e.payload,e.created_at
+             FROM session_events e JOIN work_attempts a ON a.id=e.attempt_id
+             WHERE e.task_id=?1 AND e.session_id=?2 AND a.task_id=?1 AND a.session_id=?2
+               AND a.native_session_id=?4 AND e.event_type=?5
+               AND ((e.source_type='acp' AND e.source_id=?3)
+                 OR (e.source_type='user' AND a.runner=?3))
+               AND (json_extract(e.payload,'$.native_session_id') IS NULL
+                    OR json_extract(e.payload,'$.native_session_id')=?4)
+             ORDER BY e.id DESC LIMIT 1",
+                rusqlite::params![task_id, agent_id, runner, native_id, event_type],
+                row_to_event,
+            )
+            .optional()
+            .map_err(Error::from)
+        })
+    }
+
     pub fn list_attempts(
         &self,
         session_id: &str,
@@ -1219,6 +1280,58 @@ mod tests {
             )
         })
         .unwrap();
+    }
+
+    #[test]
+    fn task_control_context_matches_dispatch_scope_and_resumability() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        for agent in ["a", "b"] {
+            insert_agent(&db, agent);
+        }
+        let sessions = SessionManager::new(db.clone());
+        for agent in ["a", "b"] {
+            sessions.ensure(agent, None).unwrap();
+        }
+        db.conn().execute_batch(
+            "INSERT INTO tasks(id,title,status,agent_id) VALUES('task','Task','pending','a'),('sibling','Sibling','pending','a');
+             INSERT INTO work_attempts(id,session_id,task_id,runner,status,native_session_id,created_at) VALUES
+              ('first','a','task','pi','completed','pi-first','2026-01-01'),
+              ('interrupted','a','task','pi','interrupted','pi-last','2026-01-01'),
+              ('b','b','task','pi','completed','b-native','2026-01-02'),
+              ('runner','a','task','codex','completed','codex-native','2026-01-02'),
+              ('sibling','a','sibling','pi','completed','sibling-native','2026-01-03'),
+              ('failed','a','task','pi','failed','failed-native','2026-01-04'),
+              ('blank','a','task','pi','completed','  ','2026-01-05'),
+              ('opening','a','task','pi','preparing',NULL,'2026-01-06');"
+        ).unwrap();
+        for (agent, runner, id) in [
+            ("a", "pi", "interrupted"),
+            ("b", "pi", "b"),
+            ("a", "codex", "runner"),
+        ] {
+            assert_eq!(
+                sessions
+                    .task_control_attempt("task", agent, runner, false)
+                    .unwrap()
+                    .unwrap()
+                    .id,
+                id
+            );
+        }
+        assert!(sessions
+            .task_control_attempt("task", "a", "claude", false)
+            .unwrap()
+            .is_none());
+        assert!(sessions
+            .task_control_attempt("missing", "a", "pi", false)
+            .unwrap()
+            .is_none());
+        let active = sessions
+            .task_control_attempt("task", "a", "pi", true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.id, "opening");
+        assert!(active.native_session_id.is_none());
     }
 
     #[test]
