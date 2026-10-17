@@ -380,6 +380,32 @@ impl SessionManager {
         })
     }
 
+    /// Resolve this task's initialized conversation within its current Agent.
+    /// Newer attempts for another Agent, or attempts that never obtained a
+    /// native session, must not hide a retained connection after reassignment.
+    pub fn latest_task_native_attempt(
+        &self,
+        task_id: &str,
+        session_id: &str,
+    ) -> Result<Option<WorkAttempt>> {
+        self.db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT id, session_id, task_id, queue_id, kind, runner, status, prompt,
+                        native_session_id, container_id, result, error_message,
+                        created_at, started_at, completed_at, context_used, context_size,
+                        trigger_message_id, response_queued_at, response_started_at
+                 FROM work_attempts
+                 WHERE task_id = ?1 AND session_id = ?2
+                   AND native_session_id IS NOT NULL AND TRIM(native_session_id) != ''
+                 ORDER BY COALESCE(completed_at, created_at) DESC, rowid DESC LIMIT 1",
+                rusqlite::params![task_id, session_id],
+                row_to_attempt,
+            )
+            .optional()
+            .map_err(Error::from)
+        })
+    }
+
     pub fn list_attempts(
         &self,
         session_id: &str,
@@ -1243,6 +1269,56 @@ mod tests {
             )
         })
         .unwrap();
+    }
+
+    #[test]
+    fn task_native_attempt_survives_round_trip_reassignment_and_uninitialized_attempts() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        insert_agent(&db, "agent-a");
+        insert_agent(&db, "agent-b");
+        let manager = SessionManager::new(db.clone());
+        manager.ensure("agent-a", None).unwrap();
+        manager.ensure("agent-b", None).unwrap();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO tasks(id,title,status,agent_id) VALUES
+                    ('task','Reassigned A to B to A','completed','agent-a'),
+                    ('sibling','Another task','completed','agent-a');
+                 INSERT INTO work_attempts
+                    (id,session_id,task_id,runner,status,native_session_id,created_at) VALUES
+                    ('a-old','agent-a','task','pi','completed','native-a-old','2026-01-01 00:00:00'),
+                    ('a-current','agent-a','task','pi','completed','native-a','2026-01-01 00:00:00'),
+                    ('b-newer','agent-b','task','pi','completed','native-b','2026-01-02 00:00:00'),
+                    ('a-queued','agent-a','task','pi','queued',NULL,'2026-01-03 00:00:00'),
+                    ('a-empty','agent-a','task','pi','failed','','2026-01-04 00:00:00'),
+                    ('a-blank','agent-a','task','pi','failed','  ','2026-01-05 00:00:00'),
+                    ('a-sibling','agent-a','sibling','pi','completed','native-sibling','2026-01-06 00:00:00');",
+            )
+        }).unwrap();
+        // Task-wide lookup would select B (or an uninitialized A attempt).
+        // Equal timestamps also need a deterministic newest-row tie breaker.
+        let attempt = manager
+            .latest_task_native_attempt("task", "agent-a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(attempt.id, "a-current");
+        assert_eq!(attempt.native_session_id.as_deref(), Some("native-a"));
+        assert_eq!(
+            manager
+                .latest_task_native_attempt("task", "agent-b")
+                .unwrap()
+                .unwrap()
+                .id,
+            "b-newer"
+        );
+        assert!(manager
+            .latest_task_native_attempt("missing", "agent-a")
+            .unwrap()
+            .is_none());
+        assert!(manager
+            .latest_task_native_attempt("sibling", "agent-b")
+            .unwrap()
+            .is_none());
     }
 
     #[test]

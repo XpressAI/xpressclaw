@@ -202,17 +202,16 @@ async fn task_session_config(
             cached_task_session_config(&sessions, id, agent_id)
         }
     };
-    let activity = sessions
-        .task_activity(id, None, None, 1, 1)
-        .map_err(internal_error)?;
-    let Some(attempt) = activity.attempts.first() else {
+    // A task may have moved A -> B -> A. Resolve within the assigned Agent,
+    // ignoring newer attempts without a native session, rather than letting
+    // another Agent's attempt hide this Agent's retained conversation.
+    let Some(attempt) = sessions
+        .latest_task_native_attempt(id, agent_id)
+        .map_err(internal_error)?
+    else {
         return cached();
     };
-    // Resolve through the task, never accept an arbitrary native session ID
-    // supplied by the browser (another task may own a different conversation).
-    if attempt.session_id != agent_id {
-        return cached();
-    }
+    // Never accept an arbitrary native session ID supplied by the browser.
     let Some(native_session_id) = attempt.native_session_id.as_deref() else {
         return cached();
     };
