@@ -7,8 +7,9 @@
 	import TaskPlanningActions from '$lib/components/planning/TaskActions.svelte';
 	import { dateLabel, planningViewport } from '$lib/taskPlanning';
 	import { goto } from '$app/navigation';
-	import { tasks, agents, sessions, workspaces } from '$lib/api';
-	import type { AcpCommand, AcpConfigOption, AcpModeState, DelegatedWork, Task, TaskMessage, Agent, WorkAttempt, SessionEvent, ImageAttachmentUpload, GitChange, WorkspaceGitStatus, MessageVisualization } from '$lib/api';
+	import { tasks, agents, sessions, workspaces, ApiError } from '$lib/api';
+	import { selectChoices, isModelOption, isReasoningOption, isAdditionalModelOption, reconcileConfig, duplicatesReasoningMode } from '$lib/acpConfig';
+	import type { TaskControlSnapshot, AcpCommand, AcpConfigOption, AcpModeState, DelegatedWork, Task, TaskMessage, Agent, WorkAttempt, SessionEvent, ImageAttachmentUpload, GitChange, WorkspaceGitStatus, MessageVisualization } from '$lib/api';
 	import { timeAgo } from '$lib/utils';
 	import { serverTimestampMs } from '$lib/serverTime';
 	import { renderContent } from '$lib/formatMessage';
@@ -176,6 +177,12 @@
 	let selectedConfig = $state<Record<string, string | boolean>>({});
 	let availableCommands = $state<AcpCommand[]>([]);
 	let modelMenuOpen = $state(false);
+	let modelSearch = $state('');
+	let configUpdating = $state(false);
+	let configNotice = $state('');
+	let controlSnapshot = $state<TaskControlSnapshot | null>(null);
+	let configRequestVersion = 0;
+	let configRefreshVersion: number | null = null;
 	let messageInputFocused = $state(false);
 	let slashMenuDismissed = $state(false);
 	let selectedCommandIndex = $state(0);
@@ -382,9 +389,13 @@
 		messageInputFocused && !slashMenuDismissed && slashCommandQuery !== null && availableCommands.length > 0
 	);
 	let modelOption = $derived(configOptions.find(isModelOption) ?? null);
-	let reasoningOption = $derived(configOptions.find(isReasoningOption) ?? null);
-	let modelConfigOptions = $derived(configOptions.filter(isAdditionalModelOption));
-	let hasModelMenu = $derived(Boolean(modelOption || reasoningOption || modelConfigOptions.length > 0));
+	let modelControlsPending = $derived(controlSnapshot?.model_pending ?? false);
+	let reasoningOption = $derived(modelControlsPending ? null : configOptions.find(isReasoningOption) ?? null);
+	let modelConfigOptions = $derived(modelControlsPending ? [] : configOptions.filter(isAdditionalModelOption));
+	let filteredModels = $derived(modelOption ? selectChoices(modelOption).filter((choice) =>
+		`${choice.name} ${choice.value} ${choice.description ?? ''}`.toLowerCase().includes(modelSearch.toLowerCase())
+	) : []);
+	// selectedConfig is presentation only. Chat messages never echo this map.
 	let otherConfigOptions = $derived(
 		configOptions.filter((option) => !isModelOption(option) && !isReasoningOption(option) && !isAdditionalModelOption(option))
 	);
@@ -499,25 +510,6 @@
 		return new Intl.NumberFormat('en-US').format(value);
 	}
 
-	function selectChoices(option: AcpConfigOption): { value: string; name: string; description?: string | null }[] {
-		if (!Array.isArray(option.options)) return [];
-		return option.options.flatMap((entry) => 'options' in entry ? entry.options : [entry]);
-	}
-
-	function isModelOption(option: AcpConfigOption): boolean {
-		return option.id === 'model' || option.category === 'model';
-	}
-
-	function isReasoningOption(option: AcpConfigOption): boolean {
-		return option.category === 'thought_level'
-			|| option.id === 'reasoning_effort'
-			|| option.id === 'thought_level';
-	}
-
-	function isAdditionalModelOption(option: AcpConfigOption): boolean {
-		return option.category === 'model_config' && !isModelOption(option) && !isReasoningOption(option);
-	}
-
 	function selectedValue(option: AcpConfigOption): string | boolean {
 		return selectedConfig[option.id] ?? option.currentValue;
 	}
@@ -527,8 +519,68 @@
 		return selectChoices(option).find((choice) => choice.value === value)?.name ?? value;
 	}
 
-	function setConfigOption(option: AcpConfigOption, value: string | boolean) {
-		selectedConfig = { ...selectedConfig, [option.id]: value };
+	function applySnapshot(snapshot: TaskControlSnapshot) {
+		if (snapshot.context && snapshot.context.agent_id !== task?.agent_id) return;
+		controlSnapshot = snapshot;
+		const options = validConfigOptions(snapshot.config_options);
+		const mode = legacyModeOption(snapshot.modes);
+		if (mode && !options.some((option) => option.category === 'mode' || option.id === 'mode')
+			&& !duplicatesReasoningMode(mode, options)) options.unshift(mode);
+		configOptions = options;
+		selectedConfig = reconcileConfig(options, snapshot.pending);
+		configNotice = snapshot.notice;
+	}
+
+	async function toggleModelMenu() {
+		modelMenuOpen = !modelMenuOpen;
+		if (!modelMenuOpen || !task || configUpdating) return;
+		modelSearch = '';
+		configNotice = '';
+		++configRequestVersion;
+		await refreshModelMenu(true);
+	}
+
+	async function refreshModelMenu(showErrors = false) {
+		if (!task?.agent_id || configUpdating || configRefreshVersion === configRequestVersion) return;
+		const version = configRequestVersion;
+		configRefreshVersion = version;
+		const id = task.id;
+		try {
+			const controls = await tasks.config(id);
+			if (version === configRequestVersion && task?.id === id) {
+				applySnapshot(controls);
+			}
+		} catch (e) {
+			if (showErrors && version === configRequestVersion && task?.id === id) {
+				configNotice = e instanceof Error ? e.message : String(e);
+			}
+		} finally {
+			if (configRefreshVersion === version) configRefreshVersion = null;
+		}
+	}
+
+	async function setConfigOption(option: AcpConfigOption | null, value: string | boolean) {
+		if (!task || configUpdating || !controlSnapshot?.context) return;
+		const id = task.id;
+		const version = ++configRequestVersion;
+		configNotice = '';
+		configUpdating = true;
+		let conflict = false;
+		let failure = '';
+		try {
+			const controls = await tasks.setConfig(id, option?.id ?? null, value, controlSnapshot.context, controlSnapshot.revision);
+			if (version !== configRequestVersion || task?.id !== id) return;
+			applySnapshot(controls);
+		} catch (e) {
+			if (version !== configRequestVersion || task?.id !== id) return;
+			conflict = e instanceof ApiError && e.status === 409;
+			failure = e instanceof Error ? e.message : String(e);
+		} finally {
+			if (version === configRequestVersion) configUpdating = false;
+		}
+		if (version !== configRequestVersion || task?.id !== id) return;
+		if (conflict) await refreshModelMenu();
+		if (failure) configNotice = failure;
 	}
 
 	function isRecord(value: unknown): value is Record<string, unknown> {
@@ -755,34 +807,34 @@
 		};
 	}
 
+	function resetHarnessControls(agentId: string | null) {
+		const controlsScope = `${taskId}:${agentId ?? ''}`;
+		if (controlsInitializedFor === controlsScope) return;
+		// Invalidate in-flight reads/writes even when only the assignment, not
+		// the task ID, changed. An unadvertised agent starts with no controls.
+		++configRequestVersion;
+		controlSnapshot = null;
+		configRefreshVersion = null;
+		controlsInitializedFor = controlsScope;
+		sessionEvents = [];
+		configOptions = [];
+		selectedConfig = {};
+		availableCommands = [];
+		configNotice = '';
+		configUpdating = false;
+		modelMenuOpen = false;
+		modelSearch = '';
+	}
+
 	function refreshHarnessControls(events: SessionEvent[], agentId: string) {
-		const advertised = [...events].reverse().find((event) => event.event_type === 'session_config_options');
-		const options = validConfigOptions(advertised?.payload.config_options);
-		if (!options.some((option) => option.category === 'mode' || option.id === 'mode')) {
-			const mode = legacyModeOption(advertised?.payload.modes);
-			if (mode) options.unshift(mode);
-		}
-		const latestMode = [...events].reverse().find((event) => event.event_type === 'session_mode');
-		const latestModeId = typeof latestMode?.payload.modeId === 'string'
-			? latestMode.payload.modeId
-			: typeof latestMode?.payload.mode_id === 'string' ? latestMode.payload.mode_id : null;
-		if (latestModeId) {
-			const mode = options.find((option) => option.category === 'mode' || option.id === 'mode');
-			if (mode) mode.currentValue = latestModeId;
-		}
-		configOptions = options;
+		resetHarnessControls(agentId);
+		// Activity is not a second catalog. Only the task snapshot supplies controls.
 
 		const commandsEvent = [...events].reverse().find((event) => event.event_type === 'available_commands');
 		const commands = commandsEvent?.payload.available_commands;
 		availableCommands = Array.isArray(commands)
 			? commands.filter((command): command is AcpCommand => typeof command === 'object' && command !== null && typeof (command as Record<string, unknown>).name === 'string' && typeof (command as Record<string, unknown>).description === 'string')
 			: [];
-
-		if (controlsInitializedFor !== agentId) {
-			const configured = agentList.find((agent) => agent.id === agentId)?.config?.runner?.session_config ?? {};
-			selectedConfig = { ...Object.fromEntries(options.map((option) => [option.id, option.currentValue])), ...configured };
-			controlsInitializedFor = agentId;
-		}
 	}
 
 	function chooseCommand(command: AcpCommand) {
@@ -867,10 +919,14 @@
 				|| delegatedWork.some(item => !['completed', 'cancelled'].includes(item.status)))) {
 				await poll();
 			}
+			// Idle adapters can publish dependent controls after a configuration
+			// response. Keep an open picker live even on a completed task.
+			await refreshModelMenu();
 		}, 3000);
 	});
 
 	onDestroy(() => {
+		++configRequestVersion;
 		if (pollTimer) clearInterval(pollTimer);
 		taskViewResizeObserver?.disconnect();
 		document.removeEventListener('pointerdown', handleComposerPointerDown);
@@ -886,6 +942,8 @@
 				tasks.activity(id),
 			]);
 			task = loadedTask;
+			resetHarnessControls(loadedTask.agent_id);
+			void refreshModelMenu(true);
 			agentList = loadedAgents;
 			messages = loadedMessages;
 			attempts = activity.attempts;
@@ -899,6 +957,7 @@
 					sessions.events(loadedTask.agent_id).catch(() => []),
 					workspaces.gitStatus(loadedTask.agent_id).catch(() => null),
 				]);
+				if (task?.id !== id || task.agent_id !== loadedTask.agent_id) return;
 				sessionEvents = events;
 				workspaceGit = git;
 				lastWorkspaceGitRefresh = Date.now();
@@ -960,6 +1019,7 @@
 			]);
 			// Update task status/details in-place
 			task = newTask;
+			resetHarnessControls(newTask.agent_id);
 			attempts = newActivity.attempts;
 			delegatedWork = newActivity.delegated_work ?? [];
 			let shouldScroll = false;
@@ -980,6 +1040,7 @@
 			}
 			if (newTask.agent_id) {
 				const latestSessionEvents = await sessions.events(newTask.agent_id).catch(() => sessionEvents);
+				if (task?.id !== id || task.agent_id !== newTask.agent_id) return;
 				if (latestSessionEvents.length !== sessionEvents.length || latestSessionEvents.at(-1)?.id !== sessionEvents.at(-1)?.id) {
 					sessionEvents = latestSessionEvents;
 					refreshHarnessControls(sessionEvents, newTask.agent_id);
@@ -1055,7 +1116,7 @@
 	}
 
 	async function sendTaskMessage(immediate = false) {
-		if ((!messageInput.trim() && messageAttachments.length === 0) || !task || platformManaged || composerBlockedByElicitation) return;
+		if ((!messageInput.trim() && messageAttachments.length === 0) || !task || platformManaged || configUpdating || composerBlockedByElicitation) return;
 		const content = messageInput.trim();
 		const attachments = messageAttachments;
 		messageAttachmentError = '';
@@ -1066,10 +1127,11 @@
 		showJumpToLatest = false;
 		try {
 			await tasks.addMessage(task.id, 'user', content, {
-				configOptions: selectedConfig,
 				attachments,
 				delivery: immediate ? 'immediate' : 'after_tool',
 			});
+			// A queued message has not applied its configuration yet. Keep staged
+			// values through pre-configuration snapshots until the agent confirms.
 			messageInput = '';
 			messageAttachments = [];
 			clearComposerDraft(messageDraftScope());
@@ -1085,10 +1147,10 @@
 	async function sendVisualizationFollowUp(prompt: string): Promise<void> {
 		if (!task) throw new Error('This task is no longer available.');
 		if (platformManaged) throw new Error('Continue this task in Xpress AI.');
+		if (configUpdating) throw new Error('Wait for the model settings to finish updating.');
 		followLatest = true;
 		showJumpToLatest = false;
 		await tasks.addMessage(task.id, 'user', prompt, {
-			configOptions: selectedConfig,
 			delivery: 'after_tool',
 		});
 		await poll();
@@ -2048,13 +2110,20 @@
 								</div>
 							{/if}
 
-							{#if modelMenuOpen && hasModelMenu}
-								<div class="ai-raised absolute bottom-full left-0 right-0 z-30 mb-2 max-h-[65vh] overflow-y-auto p-2 sm:right-auto sm:w-80">
+							{#if modelMenuOpen && task.agent_id}
+								<div class="ai-raised absolute bottom-full left-0 right-0 z-30 mb-2 max-h-[65vh] overflow-y-auto p-2 sm:right-auto sm:w-80" data-model-picker aria-busy={configUpdating}>
+									{#if configUpdating}<div class="px-2 py-1 text-xs text-muted-foreground" role="status">Updating model settings…</div>{/if}
+									{#if configNotice}<div class="px-2 py-1 text-xs text-muted-foreground" role="status">{configNotice}</div>{/if}
+									{#if controlSnapshot?.has_preferences}<button type="button" disabled={configUpdating} onclick={() => setConfigOption(null, false)} class="px-2 py-1 text-xs text-muted-foreground hover:text-foreground">Clear task preferences</button>{/if}
+									{#if !controlSnapshot}<div class="px-2 py-1 text-xs text-muted-foreground">Loading model controls…</div>{/if}
+									{#each Object.entries(controlSnapshot?.pending ?? {}) as [id, value]}<div class="px-2 py-1 text-xs text-muted-foreground">Pending: {id} = {String(value)}</div>{/each}
+									{#if modelControlsPending}<div class="px-2 py-1 text-xs text-muted-foreground">Reasoning choices will refresh when the selected model connects.</div>{/if}
 									{#if modelOption}
+										<input type="search" bind:value={modelSearch} aria-label="Search models" placeholder="Search models…" class="mb-2 w-full rounded-lg border border-border bg-transparent px-2 py-1.5 text-xs outline-none focus:border-primary" />
 										<div class="px-2 pb-1 pt-1 text-[10px] font-medium uppercase tracking-[0.14em] text-muted-foreground/60">Model</div>
 										<div class="space-y-0.5">
-											{#each selectChoices(modelOption) as choice}
-												<button type="button" onclick={() => setConfigOption(modelOption!, choice.value)}
+											{#each filteredModels as choice}
+												<button type="button" disabled={configUpdating} onclick={() => setConfigOption(modelOption!, choice.value)}
 													class="flex w-full items-start gap-2 rounded-lg px-2 py-2 text-left transition-colors {String(selectedValue(modelOption!)) === choice.value ? 'bg-accent' : 'hover:bg-accent/60'}">
 													<span class="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full border {String(selectedValue(modelOption!)) === choice.value ? 'border-primary' : 'border-muted-foreground/35'}">
 														{#if String(selectedValue(modelOption!)) === choice.value}<span class="h-2 w-2 rounded-full bg-primary"></span>{/if}
@@ -2062,6 +2131,7 @@
 													<span class="min-w-0"><span class="block text-xs text-foreground">{choice.name}</span>{#if choice.description}<span class="mt-0.5 block text-[11px] leading-snug text-muted-foreground">{choice.description}</span>{/if}</span>
 												</button>
 											{/each}
+											{#if filteredModels.length === 0}<div class="px-2 py-2 text-xs text-muted-foreground">No matching models</div>{/if}
 										</div>
 									{/if}
 
@@ -2070,7 +2140,7 @@
 										<div class="px-2 pb-1 text-[10px] font-medium uppercase tracking-[0.14em] text-muted-foreground/60">Reasoning effort</div>
 										<div class="flex flex-wrap gap-1 px-2 pb-1">
 											{#each selectChoices(reasoningOption) as choice}
-												<button type="button" onclick={() => setConfigOption(reasoningOption!, choice.value)} title={choice.description || choice.name}
+												<button type="button" disabled={configUpdating} onclick={() => setConfigOption(reasoningOption!, choice.value)} title={choice.description || choice.name}
 													class="rounded-md px-2 py-1 text-[11px] transition-colors {String(selectedValue(reasoningOption!)) === choice.value ? 'bg-accent text-foreground' : 'text-muted-foreground hover:bg-accent/60 hover:text-foreground'}">
 													{choice.name}
 												</button>
@@ -2125,7 +2195,7 @@
 									<svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" /></svg>
 								</button>
 								{#key taskId}<DictationButton disabled={messageSending || interrupting || !task.agent_id || composerBlockedByElicitation} ontranscript={(text) => { messageInput = messageInput.trimEnd() ? `${messageInput.trimEnd()} ${text}` : text; composerEl?.querySelector<HTMLTextAreaElement>('textarea')?.focus(); }} />{/key}
-								{#if task.agent_id && (otherConfigOptions.length > 0 || hasModelMenu)}
+								{#if task.agent_id}
 									<div class="flex min-w-0 flex-1 items-center gap-3 overflow-x-auto scrollbar-hide">
 										{#each otherConfigOptions as option}
 											{#if option.type === 'boolean'}
@@ -2145,10 +2215,10 @@
 											{/if}
 										{/each}
 
-										{#if hasModelMenu}
-											<button type="button" onclick={() => (modelMenuOpen = !modelMenuOpen)} aria-expanded={modelMenuOpen} title="Model and reasoning effort"
+										{#if task.agent_id}
+											<button type="button" onclick={toggleModelMenu} aria-expanded={modelMenuOpen} title="Model and reasoning effort"
 												class="flex shrink-0 items-center gap-1 py-1 text-xs text-muted-foreground transition-colors hover:text-foreground">
-												<span>{modelOption ? selectedChoiceName(modelOption) : 'Model settings'}</span>
+												<span>{modelOption ? selectedChoiceName(modelOption) : 'Model settings'}{Object.keys(controlSnapshot?.pending ?? {}).length ? ' (pending)' : ''}</span>
 												<svg class="h-3 w-3 text-muted-foreground/50" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="m6 9 6 6 6-6" /></svg>
 											</button>
 										{/if}
@@ -2175,7 +2245,7 @@
 								<button
 									onclick={() => sendTaskMessage()}
 									aria-label="Send message"
-									disabled={(!messageInput.trim() && messageAttachments.length === 0) || messageSending || interrupting || !task.agent_id || composerBlockedByElicitation}
+									disabled={(!messageInput.trim() && messageAttachments.length === 0) || messageSending || interrupting || configUpdating || !task.agent_id || composerBlockedByElicitation}
 								class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground transition-[background-color,transform] hover:bg-primary/90 enabled:active:scale-95 disabled:cursor-not-allowed disabled:opacity-30"
 							>
 								<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M12 19V5M5 12l7-7 7 7" /></svg>

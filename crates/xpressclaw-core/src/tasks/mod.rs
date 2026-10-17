@@ -1,5 +1,6 @@
 pub mod attachments;
 pub mod board;
+pub mod controls;
 pub mod conversation;
 pub mod delegation;
 pub(crate) mod delegation_notifications;
