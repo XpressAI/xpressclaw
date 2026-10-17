@@ -77,7 +77,10 @@ replays only choices for the currently resolved scope and the claimed attempt's
 trigger-message boundary. Automatic responses snapshot their input boundary when
 queued, including an empty history. The boundary is captured before asynchronous
 repository preparation and shared by prompt construction and control lookup;
-later messages cannot replace either input. Interactive session-created task
+later messages cannot replace either input. Repairing an orphaned queue row also
+publishes its attempt and fence atomically; stale repairs reuse the existing
+owner without advancing its input boundary, or abort if the row disappeared or
+changed ownership. Interactive session-created task
 controls carry the same provenance; legacy unscoped interactive preferences are
 not guessed. Explicit
 workflow/task configuration requirements remain strict. Clients can submit the

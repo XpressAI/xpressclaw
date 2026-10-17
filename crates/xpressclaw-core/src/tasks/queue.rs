@@ -769,7 +769,7 @@ impl TaskQueue {
             }
             _ => title,
         };
-        if let Err(error) = SessionManager::new(self.db.clone()).create_attempt(
+        if let Err(error) = SessionManager::new(self.db.clone()).repair_queue_attempt(
             agent_id,
             task_id,
             id,
@@ -780,7 +780,10 @@ impl TaskQueue {
             &prompt,
         ) {
             self.db
-                .with_conn(|conn| conn.execute("DELETE FROM task_queue WHERE id = ?1", [id]))?;
+                .with_conn(|conn| conn.execute(
+                    "DELETE FROM task_queue WHERE id = ?1 AND task_id = ?2 AND agent_id = ?3 AND attempt_id IS NULL AND status = 'queued'",
+                    rusqlite::params![id, task_id, agent_id]
+                ))?;
             return Err(error);
         }
 

@@ -312,6 +312,8 @@ impl SessionManager {
         })
     }
 
+    /// Attach one attempt and its input fence atomically. A concurrent repair
+    /// reuses an already attached owner rather than replacing its boundary.
     #[allow(clippy::too_many_arguments)]
     pub fn create_attempt(
         &self,
@@ -324,8 +326,58 @@ impl SessionManager {
         source_id: Option<&str>,
         prompt: &str,
     ) -> Result<WorkAttempt> {
-        let id = Uuid::new_v4().to_string();
-        self.db.with_conn(|conn| {
+        self.create_attempt_inner(
+            session_id,
+            task_id,
+            queue_id,
+            runner,
+            kind,
+            source_type,
+            source_id,
+            prompt,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn repair_queue_attempt(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        queue_id: i64,
+        runner: &str,
+        kind: &str,
+        source_type: &str,
+        source_id: Option<&str>,
+        prompt: &str,
+    ) -> Result<WorkAttempt> {
+        self.create_attempt_inner(
+            session_id,
+            task_id,
+            queue_id,
+            runner,
+            kind,
+            source_type,
+            source_id,
+            prompt,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_attempt_inner(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        queue_id: i64,
+        runner: &str,
+        kind: &str,
+        source_type: &str,
+        source_id: Option<&str>,
+        prompt: &str,
+        require_queue: bool,
+    ) -> Result<WorkAttempt> {
+        let id = self.db.with_conn(|conn| {
             let transaction = rusqlite::Transaction::new_unchecked(
                 conn,
                 rusqlite::TransactionBehavior::Immediate,
@@ -343,6 +395,27 @@ impl SessionManager {
             if let Some(project_id) = project_id.as_deref() {
                 ensure_project_accepts_work(&transaction, project_id)?;
             }
+            // Another recovery may have repaired this same orphan after the
+            // caller observed it. Never replace its owner or move its fence.
+            let queue: Option<(String, String, Option<String>)> = transaction.query_row(
+                "SELECT task_id,agent_id,attempt_id FROM task_queue WHERE id=?1", [queue_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ).optional()?;
+            match queue {
+                Some((owner_task, owner_agent, _)) if owner_task != task_id || owner_agent != session_id =>
+                    return Err(Error::Task("Queue ownership changed before attempt repair".into())),
+                Some((_, _, Some(existing))) => {
+                    transaction.commit()?;
+                    return Ok(existing);
+                }
+                None if require_queue => return Err(Error::Task("Queue item disappeared before attempt repair".into())),
+                _ => {}
+            }
+            let id = Uuid::new_v4().to_string();
+            let message_boundary: i64 = transaction.query_row(
+                "SELECT COALESCE(MAX(id),0) FROM task_messages WHERE task_id=?1 AND role='user'",
+                [task_id], |row| row.get(0),
+            )?;
             transaction.execute(
                 "INSERT OR IGNORE INTO logical_sessions (id, agent_id, title)
                  VALUES (?1, ?1, NULL)",
@@ -369,21 +442,14 @@ impl SessionManager {
                  WHERE id = ?1 AND status != 'running'",
                 [session_id],
             )?;
+            Self::append_event_on(&transaction, session_id, NewEvent {
+                attempt_id: Some(&id), task_id: Some(task_id), source_type,
+                source_id: source_id.or(Some(task_id)), event_type: "attempt_queued", summary: "Work queued",
+                payload: json!({"runner":runner,"kind":kind,"queue_id":queue_id,"message_boundary":message_boundary}),
+            })?;
             transaction.commit()?;
-            Ok::<_, Error>(())
+            Ok(id)
         })?;
-        self.append_event(
-            session_id,
-            NewEvent {
-                attempt_id: Some(&id),
-                task_id: Some(task_id),
-                source_type,
-                source_id: source_id.or(Some(task_id)),
-                event_type: "attempt_queued",
-                summary: "Work queued",
-                payload: json!({ "runner": runner, "kind": kind, "queue_id": queue_id }),
-            },
-        )?;
         self.get_attempt(&id)
     }
 
@@ -1292,6 +1358,106 @@ mod tests {
                  VALUES (?1, ?1, 'native', '{}')",
                 [id],
             )
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn attempt_repair_rolls_back_when_its_input_fence_cannot_be_recorded() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        insert_agent(&db, "agent");
+        db.with_conn(|conn| conn.execute_batch(
+            "INSERT INTO tasks(id,title,status,agent_id) VALUES('task','Orphan repair','pending','agent');
+             INSERT INTO task_queue(id,task_id,agent_id,status) VALUES(1,'task','agent','queued');
+             CREATE TRIGGER reject_fence BEFORE INSERT ON session_events WHEN NEW.event_type='attempt_queued'
+             BEGIN SELECT RAISE(ABORT,'fixture fence failure'); END;"
+        )).unwrap();
+        assert!(SessionManager::new(db.clone())
+            .create_attempt("agent", "task", 1, "auto", "task", "task", None, "Prompt")
+            .is_err());
+        db.with_conn(|conn| {
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM work_attempts", [], |row| row
+                    .get::<_, i64>(0))?,
+                0
+            );
+            assert_eq!(
+                conn.query_row("SELECT attempt_id FROM task_queue WHERE id=1", [], |row| {
+                    row.get::<_, Option<String>>(0)
+                })?,
+                None
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT active_attempt_id FROM tasks WHERE id='task'",
+                    [],
+                    |row| row.get::<_, Option<String>>(0)
+                )?,
+                None
+            );
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM session_events", [], |row| row
+                    .get::<_, i64>(0))?,
+                0
+            );
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn stale_queue_repair_cannot_recreate_or_steal_another_owner() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        insert_agent(&db, "agent-a");
+        insert_agent(&db, "agent-b");
+        db.with_conn(|conn| conn.execute_batch(
+            "INSERT INTO tasks(id,title,status,agent_id) VALUES('task','Ownership changed','pending','agent-b');
+             INSERT INTO task_queue(id,task_id,agent_id,status) VALUES(1,'task','agent-b','queued');"
+        )).unwrap();
+        let manager = SessionManager::new(db.clone());
+        assert!(manager
+            .repair_queue_attempt(
+                "agent-a",
+                "task",
+                1,
+                "auto",
+                "task",
+                "task",
+                None,
+                "Stale owner"
+            )
+            .is_err());
+        assert!(manager
+            .repair_queue_attempt(
+                "agent-b",
+                "task",
+                2,
+                "auto",
+                "task",
+                "task",
+                None,
+                "Deleted row"
+            )
+            .is_err());
+        db.with_conn(|conn| {
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM work_attempts", [], |row| row
+                    .get::<_, i64>(0))?,
+                0
+            );
+            assert_eq!(
+                conn.query_row("SELECT agent_id FROM task_queue WHERE id=1", [], |row| {
+                    row.get::<_, String>(0)
+                })?,
+                "agent-b"
+            );
+            assert_eq!(
+                conn.query_row("SELECT attempt_id FROM task_queue WHERE id=1", [], |row| {
+                    row.get::<_, Option<String>>(0)
+                })?,
+                None
+            );
+            Ok::<_, Error>(())
         })
         .unwrap();
     }

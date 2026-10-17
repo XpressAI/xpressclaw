@@ -7331,6 +7331,112 @@ flows:
         }
     }
 
+    #[test]
+    fn repaired_queue_attempt_freezes_inputs_and_stale_repairs_keep_its_owner() {
+        use crate::sessions::SessionControlScope;
+        use crate::tasks::board::CreateTask;
+        for history in [false, true] {
+            let db = Arc::new(Database::open_memory().unwrap());
+            add_test_agent(&db, "atlas");
+            let task = TaskBoard::new(db.clone())
+                .create(&CreateTask {
+                    title: "Repaired response".into(),
+                    agent_id: Some("atlas".into()),
+                    ..Default::default()
+                })
+                .unwrap();
+            let conversation = TaskConversation::new(db.clone());
+            let scope = SessionControlScope {
+                agent_id: "atlas".into(),
+                runner_kind: "pi".into(),
+            };
+            if history {
+                conversation
+                    .add_user_message_with_controls_and_enqueue(
+                        &task.id,
+                        Some("atlas"),
+                        "Previous guidance",
+                        &[],
+                        &HashMap::from([("model".into(), json!("previous-model"))]),
+                        Some(&scope),
+                    )
+                    .unwrap();
+                db.with_conn(|conn| conn.execute_batch(
+                    "UPDATE task_queue SET status='completed';
+                     UPDATE work_attempts SET status='completed',started_at='2026-01-01',completed_at='2026-01-01';"
+                )).unwrap();
+            }
+            let orphan_id = db.with_conn(|conn| {
+                conn.execute("INSERT INTO task_queue(task_id,agent_id,status) VALUES(?1,'atlas','queued')", [&task.id])?;
+                Ok::<_,Error>(conn.last_insert_rowid())
+            }).unwrap();
+            let queue = TaskQueue::new(db.clone());
+            let repaired = queue.ensure_enqueued(&task.id, "atlas").unwrap().unwrap();
+            assert_eq!(repaired.id, orphan_id);
+            let claimed = queue.claim("atlas").unwrap().unwrap();
+            let attempt_id = claimed.attempt_id.as_deref().unwrap();
+            let boundary = message_control_boundary(&db, &task.id, attempt_id).unwrap();
+            assert!(matches!(boundary, MessageControlBoundary::QueuedEvent(_)));
+            conversation
+                .add_user_message_with_controls_and_enqueue(
+                    &task.id,
+                    Some("atlas"),
+                    "Future guidance",
+                    &[],
+                    &HashMap::from([("model".into(), json!("future-model"))]),
+                    Some(&scope),
+                )
+                .unwrap();
+            // A second recovery that observed the old orphan must not create a
+            // second owner or advance the original claimed input fence.
+            let duplicate = SessionManager::new(db.clone())
+                .repair_queue_attempt(
+                    "atlas",
+                    &task.id,
+                    orphan_id,
+                    "auto",
+                    "task",
+                    "task",
+                    None,
+                    "Stale recovery",
+                )
+                .unwrap();
+            assert_eq!(duplicate.id, attempt_id);
+            assert_eq!(
+                message_control_boundary(&db, &task.id, attempt_id).unwrap(),
+                boundary
+            );
+            let mut agent = AgentConfig {
+                name: "atlas".into(),
+                ..Default::default()
+            };
+            agent
+                .runner
+                .session_config
+                .insert("model".into(), json!("default-model"));
+            let requested =
+                super::requested_session_config(&db, &agent, &task.id, "pi", boundary).unwrap();
+            assert_eq!(
+                requested.values["model"],
+                if history {
+                    "previous-model"
+                } else {
+                    "default-model"
+                }
+            );
+            let prompt = build_prompt_at_boundary(&db, &claimed, attempt_id, boundary)
+                .unwrap()
+                .content;
+            assert!(!prompt.contains("Future guidance"));
+            assert!(!prompt.contains("Previous guidance"));
+            db.with_conn(|conn| {
+                assert_eq!(conn.query_row("SELECT COUNT(*) FROM work_attempts WHERE queue_id=?1", [orphan_id], |row| row.get::<_,i64>(0))?, 1);
+                assert_eq!(conn.query_row("SELECT COUNT(*) FROM session_events WHERE attempt_id=?1 AND event_type='attempt_queued'", [attempt_id], |row| row.get::<_,i64>(0))?, 1);
+                Ok::<_,Error>(())
+            }).unwrap();
+        }
+    }
+
     // Scope/precedence fixtures below intentionally see their whole synthetic
     // event history. Dispatch-boundary tests use a real claimed queue item.
     fn requested_session_config(
