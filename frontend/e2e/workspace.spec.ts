@@ -1493,6 +1493,46 @@ test('disconnected model changes omit reasoning advertised for the previous mode
 	expect(postedMessages[0].config_options).toEqual({ model: 'local/qwen' });
 });
 
+for (const selector of [{ id: 'backend_choice', name: 'MoDeL' }, { id: 'MODEL', name: 'Engine' }]) {
+	test(`custom ${selector.id} model selector suppresses stale reasoning when disconnected`, async ({ page }) => {
+		const postedMessages: Record<string, unknown>[] = [];
+		const configRequests: Record<string, unknown>[] = [];
+		await mockApi(page, { postedMessages });
+		const controls = pickerControls();
+		const customControls = {
+			...controls,
+			config_options: controls.config_options.map((option) => option.id === 'model'
+				? { ...option, ...selector, category: undefined }
+				: option),
+		};
+		await page.route(`**/api/sessions/${agentId}/events`, (route) => route.fulfill({ json: [{
+			...activityEvent(100), event_type: 'session_config_options', payload: customControls,
+		}] }));
+		await page.route(`**/api/tasks/${taskId}/config`, async (route) => {
+			if (route.request().method() === 'POST') {
+				configRequests.push(route.request().postDataJSON());
+				await route.fulfill({ status: 409, json: { error: 'Agent disconnected; selection staged' } });
+			} else {
+				await route.fulfill({ json: customControls });
+			}
+		});
+		await page.goto(`/tasks/${taskId}`);
+		const picker = page.getByTitle('Model and reasoning effort');
+		await picker.click();
+		await expect(page.getByRole('button', { name: 'MAX', exact: true })).toBeVisible();
+		await page.getByRole('button', { name: 'Local Qwen', exact: true }).click();
+		await expect(picker).toContainText('Local Qwen');
+		await expect(page.getByRole('button', { name: 'MAX', exact: true })).toHaveCount(0);
+		await expect(page.getByText('Reasoning choices will refresh when the selected model connects.')).toBeVisible();
+		expect(configRequests).toEqual([{ config_id: selector.id, value: 'local/qwen' }]);
+		await picker.click();
+		await page.locator(`#task-message-input-${taskId}`).fill('Continue using the custom selector');
+		await page.getByRole('button', { name: 'Send message', exact: true }).click();
+		await expect.poll(() => postedMessages.length).toBe(1);
+		expect(postedMessages[0].config_options).toEqual({ [selector.id]: 'local/qwen' });
+	});
+}
+
 test('queued model choices survive old snapshots until the agent confirms them', async ({ page }) => {
 	const postedMessages: Record<string, unknown>[] = [];
 	await mockApi(page, { taskStatus: 'pending', postedMessages });

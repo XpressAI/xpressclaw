@@ -6,7 +6,9 @@ export function selectChoices(option: AcpConfigOption): { value: string; name: s
 }
 
 export function isModelOption(option: AcpConfigOption): boolean {
-	return option.id === 'model' || option.category === 'model';
+	// Match the backend's advertised_model_choices fallbacks for custom agents.
+	return option.category === 'model' || option.id.toLowerCase() === 'model'
+		|| option.name.toLowerCase() === 'model';
 }
 
 export function isReasoningOption(option: AcpConfigOption): boolean {

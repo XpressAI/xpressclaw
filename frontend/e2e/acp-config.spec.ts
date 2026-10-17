@@ -1,11 +1,22 @@
 import { expect, test } from '@playwright/test';
-import { duplicatesReasoningMode, reconcileConfig, unconfirmedConfig } from '../src/lib/acpConfig';
+import { duplicatesReasoningMode, isModelOption, reconcileConfig, unconfirmedConfig } from '../src/lib/acpConfig';
 import type { AcpConfigOption } from '../src/lib/api';
 
 const reasoning: AcpConfigOption = {
 	id: 'thought_level', name: 'Thinking', category: 'thought_level', type: 'select', currentValue: 'high',
 	options: [{ group: 'levels', name: 'Supported', options: [{ value: 'high', name: 'High' }, { value: 'max', name: 'Max' }] }],
 };
+
+test('model selector detection matches backend category, ID, and name fallbacks', () => {
+	for (const selector of [
+		{ id: 'opaque-model-id', name: 'Engine', category: 'model' },
+		{ id: 'model', name: 'Engine', category: undefined },
+		{ id: 'MODEL', name: 'Engine', category: undefined },
+		{ id: 'opaque-model-id', name: 'MoDeL', category: undefined },
+	]) expect(isModelOption({ ...reasoning, ...selector })).toBe(true);
+	expect(isModelOption(reasoning)).toBe(false);
+	expect(isModelOption({ ...reasoning, id: 'mode', name: 'Mode', category: 'mode' })).toBe(false);
+});
 
 test('refreshed controls drop invalid and removed settings, retaining valid pending choices', () => {
 	const options: AcpConfigOption[] = [reasoning, {
