@@ -29,7 +29,10 @@ The reusable-task-session selector is shared with dispatch. Idle reads use
 completed/interrupted sessions; busy inspection can use an active attempt. An
 active attempt without a native ID does not borrow a previous catalog. A failed
 fork is not a fallback; updates on the same reusable native session can remain
-valid after a failed turn. Activity history is not another schema source.
+valid after a failed turn. Config-options notifications persist the synchronized
+complete control snapshot, retaining independent legacy mode catalogs while
+updating or removing mirrored reasoning aliases. Activity history is not another
+schema source.
 
 Displayed selections are presentation only: neither normal messages nor
 visualization follow-ups send the displayed control map. Therefore loading a

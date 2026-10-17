@@ -600,6 +600,14 @@ impl AcpEventRecorder {
     }
 
     fn record_notification(&self, notification: SessionNotification) -> Result<()> {
+        self.record_notification_with_modes(notification, None)
+    }
+
+    fn record_notification_with_modes(
+        &self,
+        notification: SessionNotification,
+        modes: Option<&SessionModeState>,
+    ) -> Result<()> {
         let payload = serde_json::to_value(&notification.update)
             .map_err(|error| Error::Backend(format!("failed to serialize ACP update: {error}")))?;
         {
@@ -781,7 +789,10 @@ impl AcpEventRecorder {
             }
             SessionUpdate::ConfigOptionUpdate(update) => {
                 self.flush_prompt_output()?;
-                self.record_session_controls(&update.config_options, None)?;
+                // A config-options delta says nothing about an independent
+                // legacy mode catalog. Persist the synchronized live catalog,
+                // including None when a mirrored reasoning alias was removed.
+                self.record_session_controls(&update.config_options, modes)?;
             }
             SessionUpdate::AvailableCommandsUpdate(update) => {
                 self.flush_prompt_output()?;
@@ -1229,7 +1240,7 @@ async fn serve_process(
         .name("xpressclaw")
         .on_receive_notification(
             async move |notification: SessionNotification, _connection| {
-                if let Some(session) = notification_sessions
+                let modes = if let Some(session) = notification_sessions
                     .lock()
                     .unwrap()
                     .get_mut(&notification.session_id.to_string())
@@ -1245,16 +1256,24 @@ async fn serve_process(
                         }
                         _ => {}
                     }
-                }
+                    session.modes.clone()
+                } else {
+                    None
+                };
                 let active = notification_turn.lock().unwrap().clone();
                 if let Some(active) = active {
                     active
                         .turn_controls
                         .observe_update(&active.recorder.attempt_id, &notification.update);
-                    active
-                        .recorder
-                        .record_notification(notification)
-                        .map_err(agent_client_protocol::Error::into_internal_error)?;
+                    let result =
+                        if matches!(&notification.update, SessionUpdate::ConfigOptionUpdate(_)) {
+                            active
+                                .recorder
+                                .record_notification_with_modes(notification, modes.as_ref())
+                        } else {
+                            active.recorder.record_notification(notification)
+                        };
+                    result.map_err(agent_client_protocol::Error::into_internal_error)?;
                 }
                 Ok(())
             },
@@ -3977,6 +3996,146 @@ mod tests {
                     .contains("invalid-explicit-choice"));
             }
             mock_agent.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn config_notifications_persist_complete_cached_mode_catalogs() {
+        for mode_case in ["independent", "mirrored", "removed"] {
+            let db = Arc::new(Database::open_memory().unwrap());
+            let (recorder, task_id) = test_recorder(db.clone());
+            let attempt_id = recorder.attempt_id.clone();
+            let (client_input, agent_input) = tokio::io::duplex(64 * 1024);
+            let (output_tx, output_rx) = tokio::sync::mpsc::channel(8);
+            let mock_agent = tokio::spawn(async move {
+                let mut requests = BufReader::new(agent_input).lines();
+                while let Some(line) = requests.next_line().await.unwrap() {
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    let method = request["method"].as_str().unwrap();
+                    let result = match method {
+                        "initialize" => json!(InitializeResponse::new(ProtocolVersion::V1)),
+                        "session/new" => json!(NewSessionResponse::new("mode-cache-session")
+                            .config_options(dynamic_controls("reasoner"))
+                            .modes(if mode_case == "independent" {
+                                SessionModeState::new(
+                                    "plan",
+                                    vec![
+                                        SessionMode::new("plan", "Plan"),
+                                        SessionMode::new("build", "Build"),
+                                    ],
+                                )
+                            } else {
+                                SessionModeState::new(
+                                    "high",
+                                    vec![
+                                        SessionMode::new("high", "High"),
+                                        SessionMode::new("max", "Max"),
+                                    ],
+                                )
+                            })),
+                        "session/prompt" => {
+                            let mut options = dynamic_controls("plain");
+                            if mode_case == "removed" {
+                                options.retain(is_model_option);
+                            }
+                            // This delta has NO mode catalog. The recorder must
+                            // use the synchronized connection cache, not null or
+                            // an independently reconstructed older mode catalog.
+                            send_json(&output_tx, json!({"jsonrpc":"2.0","method":"session/update","params":{
+                                "sessionId":"mode-cache-session","update":{"sessionUpdate":"config_option_update","configOptions":options}
+                            }})).await;
+                            json!(PromptResponse::new(StopReason::EndTurn))
+                        }
+                        other => panic!("unexpected ACP request: {other}"),
+                    };
+                    send_json(
+                        &output_tx,
+                        json!({"jsonrpc":"2.0","id":request["id"],"result":result}),
+                    )
+                    .await;
+                    if method == "session/prompt" {
+                        break;
+                    }
+                }
+            });
+            run_turn(
+                AttachedContainer {
+                    info: ContainerInfo {
+                        container_id: "mode-cache-container".into(),
+                        agent_id: "session-1".into(),
+                        status: "running".into(),
+                        host_port: None,
+                    },
+                    input: Box::pin(client_input),
+                    output: Box::pin(ReceiverStream::new(output_rx)),
+                },
+                AcpTurnRuntime::new(
+                    recorder,
+                    Arc::new(AcpElicitationBroker::new()),
+                    Arc::new(AcpTurnControlBroker::new()),
+                ),
+                AcpSessionStart::New,
+                Path::new("/workspace"),
+                "Update controls",
+                AcpTurnOptions::default(),
+            )
+            .await
+            .unwrap();
+            mock_agent.await.unwrap();
+            let sessions = SessionManager::new(db.clone());
+            // Exercise the same durable selection used by busy/disconnected
+            // HTTP reads, rather than inspecting the in-memory cache alone.
+            for status in ["running", "completed"] {
+                db.with_conn(|conn| {
+                    conn.execute(
+                        "UPDATE work_attempts SET runner='codex',status=?1 WHERE id=?2",
+                        [status, attempt_id.as_str()],
+                    )
+                })
+                .unwrap();
+                let target = sessions
+                    .task_control_attempt(&task_id, "session-1", "codex", status == "running")
+                    .unwrap()
+                    .unwrap();
+                let event = sessions
+                    .task_control_event(
+                        &task_id,
+                        "session-1",
+                        "codex",
+                        target.native_session_id.as_deref().unwrap(),
+                        "session_config_options",
+                    )
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(event.payload["config_options"][0]["currentValue"], "plain");
+                match mode_case {
+                    "independent" => {
+                        assert_eq!(event.payload["modes"]["currentModeId"], "plan");
+                        assert_eq!(
+                            event.payload["modes"]["availableModes"]
+                                .as_array()
+                                .unwrap()
+                                .len(),
+                            2
+                        );
+                        assert_eq!(event.payload["modes"]["availableModes"][1]["id"], "build");
+                    }
+                    "mirrored" => {
+                        assert_eq!(event.payload["modes"]["currentModeId"], "off");
+                        assert_eq!(
+                            event.payload["modes"]["availableModes"]
+                                .as_array()
+                                .unwrap()
+                                .len(),
+                            1
+                        );
+                    }
+                    _ => assert!(
+                        event.payload["modes"].is_null(),
+                        "do not resurrect a removed reasoning alias"
+                    ),
+                }
+            }
         }
     }
 
