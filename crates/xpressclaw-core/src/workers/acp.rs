@@ -360,6 +360,7 @@ enum AcpProcessCommand {
     Configure {
         session_id: String,
         change: Option<(String, Value)>,
+        recorder: Option<Box<AcpEventRecorder>>,
         response: oneshot::Sender<Result<AcpSessionControls>>,
     },
 }
@@ -454,6 +455,7 @@ struct ConnectedSession {
     config_options: Vec<SessionConfigOption>,
     modes: Option<SessionModeState>,
     mcp_signature: String,
+    controls_recorder: AcpEventRecorder,
 }
 
 impl AcpTurnRuntime {
@@ -554,6 +556,15 @@ impl AcpEventRecorder {
             runner: runner.into(),
             conversation_id: Some(conversation_id),
             state: Arc::new(Mutex::new(TurnState::default())),
+        }
+    }
+
+    // Retain native-session ownership without retaining a finished prompt's
+    // transcript or letting idle updates publish prompt output.
+    fn controls_only(&self) -> Self {
+        Self {
+            state: Default::default(),
+            ..self.clone()
         }
     }
 
@@ -789,10 +800,11 @@ impl AcpEventRecorder {
             }
             SessionUpdate::ConfigOptionUpdate(update) => {
                 self.flush_prompt_output()?;
-                // A config-options delta says nothing about an independent
-                // legacy mode catalog. Persist the synchronized live catalog,
-                // including None when a mirrored reasoning alias was removed.
-                self.record_session_controls(&update.config_options, modes)?;
+                self.record_native_controls(
+                    &update.config_options,
+                    modes,
+                    Some(&notification.session_id.to_string()),
+                )?;
             }
             SessionUpdate::AvailableCommandsUpdate(update) => {
                 self.flush_prompt_output()?;
@@ -921,6 +933,15 @@ impl AcpEventRecorder {
         options: &[SessionConfigOption],
         modes: Option<&SessionModeState>,
     ) -> Result<()> {
+        self.record_native_controls(options, modes, None)
+    }
+
+    fn record_native_controls(
+        &self,
+        options: &[SessionConfigOption],
+        modes: Option<&SessionModeState>,
+        native_session_id: Option<&str>,
+    ) -> Result<()> {
         let models = advertised_model_choices(options)
             .map(|(_, choices)| choices)
             .unwrap_or_default();
@@ -933,6 +954,7 @@ impl AcpEventRecorder {
             json!({
                 "config_options": options,
                 "modes": modes,
+                "native_session_id": native_session_id,
                 // Retained for older frontends that only understood model
                 // choices before generic ACP controls were exposed.
                 "models": models
@@ -1129,6 +1151,18 @@ impl AcpProcess {
         session_id: &str,
         change: Option<(String, Value)>,
     ) -> Result<AcpSessionControls> {
+        self.configure_with_recorder(session_id, change, None).await
+    }
+
+    /// Bind an explicit edit to its task's native-session owner. Persistence
+    /// happens in the connection actor, never from a potentially stale HTTP
+    /// response after a newer notification has already been recorded.
+    pub async fn configure_with_recorder(
+        &self,
+        session_id: &str,
+        change: Option<(String, Value)>,
+        recorder: Option<AcpEventRecorder>,
+    ) -> Result<AcpSessionControls> {
         let _operation = self.operation.try_lock().map_err(|_| {
             Error::Agent("Agent is busy; configuration is staged for the next message".into())
         })?;
@@ -1140,6 +1174,7 @@ impl AcpProcess {
             .send(AcpProcessCommand::Configure {
                 session_id: session_id.to_string(),
                 change,
+                recorder: recorder.map(Box::new),
                 response,
             })
             .await
@@ -1240,40 +1275,62 @@ async fn serve_process(
         .name("xpressclaw")
         .on_receive_notification(
             async move |notification: SessionNotification, _connection| {
-                let modes = if let Some(session) = notification_sessions
+                let active = notification_turn.lock().unwrap().clone();
+                let recorded_controls = if let Some(session) = notification_sessions
                     .lock()
                     .unwrap()
                     .get_mut(&notification.session_id.to_string())
                 {
-                    match &notification.update {
+                    let is_control = match &notification.update {
                         SessionUpdate::ConfigOptionUpdate(update) => {
                             update_session_options(session, update.config_options.clone());
+                            true
                         }
                         SessionUpdate::CurrentModeUpdate(update) => {
                             if let Some(modes) = session.modes.as_mut() {
                                 modes.current_mode_id = update.current_mode_id.clone();
                             }
+                            true
                         }
-                        _ => {}
+                        _ => false,
+                    };
+                    if is_control {
+                        // Serialize the durable snapshot with cache updates,
+                        // including notifications after the idle RPC grace.
+                        // Ownership follows this native session, not whichever
+                        // task happens to have an active prompt on the process.
+                        let result = if let Some(active) = active.as_ref().filter(|active| {
+                            active.recorder.attempt_id == session.controls_recorder.attempt_id
+                        }) {
+                            // Preserve active-turn transcript/flush behavior,
+                            // but never publish output from an idle recorder.
+                            active.recorder.record_notification_with_modes(
+                                notification.clone(),
+                                session.modes.as_ref(),
+                            )
+                        } else {
+                            session.controls_recorder.record_native_controls(
+                                &session.config_options,
+                                session.modes.as_ref(),
+                                Some(&notification.session_id.to_string()),
+                            )
+                        };
+                        result.map_err(agent_client_protocol::Error::into_internal_error)?;
                     }
-                    session.modes.clone()
+                    is_control
                 } else {
-                    None
+                    false
                 };
-                let active = notification_turn.lock().unwrap().clone();
                 if let Some(active) = active {
                     active
                         .turn_controls
                         .observe_update(&active.recorder.attempt_id, &notification.update);
-                    let result =
-                        if matches!(&notification.update, SessionUpdate::ConfigOptionUpdate(_)) {
-                            active
-                                .recorder
-                                .record_notification_with_modes(notification, modes.as_ref())
-                        } else {
-                            active.recorder.record_notification(notification)
-                        };
-                    result.map_err(agent_client_protocol::Error::into_internal_error)?;
+                    if !recorded_controls {
+                        active
+                            .recorder
+                            .record_notification(notification)
+                            .map_err(agent_client_protocol::Error::into_internal_error)?;
+                    }
                 }
                 Ok(())
             },
@@ -1394,6 +1451,7 @@ async fn serve_process(
                     AcpProcessCommand::Configure {
                         session_id,
                         change,
+                        recorder,
                         response,
                     } => {
                         let result = configure_connected_session(
@@ -1401,6 +1459,7 @@ async fn serve_process(
                             &sessions,
                             &session_id,
                             change,
+                            recorder.map(|recorder| *recorder),
                         )
                         .await;
                         // A rejected configuration is recoverable. Keep the
@@ -1653,17 +1712,23 @@ async fn configure_connected_session(
     sessions: &ConnectedSessions,
     session_id: &str,
     change: Option<(String, Value)>,
+    recorder: Option<AcpEventRecorder>,
 ) -> Result<AcpSessionControls> {
-    let session = sessions
-        .lock()
-        .unwrap()
-        .get(session_id)
-        .cloned()
-        .ok_or_else(|| {
+    let changing = change.is_some();
+    let session = {
+        let mut sessions = sessions.lock().unwrap();
+        let session = sessions.get_mut(session_id).ok_or_else(|| {
             Error::Agent(
                 "This conversation is not connected; choices will apply on the next message".into(),
             )
         })?;
+        if changing {
+            if let Some(recorder) = recorder {
+                session.controls_recorder = recorder.controls_only();
+            }
+        }
+        session.clone()
+    };
     if let Some((config_id, requested)) = change {
         if let Some(option) = session
             .config_options
@@ -1726,15 +1791,20 @@ async fn configure_connected_session(
             )));
         }
     }
+    let sessions = sessions.lock().unwrap();
     let session = sessions
-        .lock()
-        .unwrap()
         .get(session_id)
-        .cloned()
         .ok_or_else(|| Error::Agent("ACP session disconnected".into()))?;
+    if changing {
+        session.controls_recorder.record_native_controls(
+            &session.config_options,
+            session.modes.as_ref(),
+            Some(session_id),
+        )?;
+    }
     Ok(AcpSessionControls {
-        config_options: session.config_options,
-        modes: session.modes,
+        config_options: session.config_options.clone(),
+        modes: session.modes.clone(),
     })
 }
 
@@ -1968,6 +2038,7 @@ async fn run_connected_turn(
             config_options: config_options.clone(),
             modes: modes.clone(),
             mcp_signature,
+            controls_recorder: recorder.controls_only(),
         },
     );
     recorder
@@ -3543,9 +3614,10 @@ mod tests {
 
     #[tokio::test]
     async fn empty_config_responses_accept_response_late_schemas() {
-        for after_grace in [false, true] {
+        for after_grace in [true, false] {
             let db = Arc::new(Database::open_memory().unwrap());
-            let (recorder, _) = test_recorder(db);
+            let (recorder, task_id) = test_recorder(db.clone());
+            let attempt_id = recorder.attempt_id.clone();
             let (client_input, agent_input) = tokio::io::duplex(64 * 1024);
             let (output_tx, output_rx) = tokio::sync::mpsc::channel(8);
             let (response_sent, received_response) = oneshot::channel();
@@ -3612,7 +3684,7 @@ mod tests {
             process
                 .run_turn(
                     AcpTurnRuntime::new(
-                        recorder,
+                        recorder.clone(),
                         Arc::new(AcpElicitationBroker::new()),
                         Arc::new(AcpTurnControlBroker::new()),
                     ),
@@ -3623,11 +3695,33 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            // A second task can have continued the same native conversation.
+            // The explicit edit must bind later idle observations back to its
+            // own task, not the process's most recently finished prompt.
+            let (other_recorder, other_task) = test_recorder(db.clone());
+            process
+                .run_turn(
+                    AcpTurnRuntime::new(
+                        other_recorder,
+                        Arc::new(AcpElicitationBroker::new()),
+                        Arc::new(AcpTurnControlBroker::new()),
+                    ),
+                    AcpSessionStart::Resume("late-session".into()),
+                    Path::new("/workspace"),
+                    "Other task",
+                    AcpTurnOptions::default(),
+                )
+                .await
+                .unwrap();
             let mut change = tokio::spawn({
                 let process = process.clone();
                 async move {
                     process
-                        .configure("late-session", Some(("z_model".into(), json!("plain"))))
+                        .configure_with_recorder(
+                            "late-session",
+                            Some(("z_model".into(), json!("plain"))),
+                            Some(recorder),
+                        )
                         .await
                 }
             });
@@ -3649,6 +3743,21 @@ mod tests {
                 assert!(
                     controls.modes.is_none(),
                     "old mirrored reasoning modes must also disappear"
+                );
+                let before_late = SessionManager::new(db.clone())
+                    .task_control_event(
+                        &task_id,
+                        "session-1",
+                        "codex",
+                        "late-session",
+                        "session_config_options",
+                    )
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    before_late.payload["config_options"],
+                    json!(controls.config_options),
+                    "the conservative reply is durable before the late update"
                 );
                 release_update.send(()).unwrap();
                 // The late notification is cached while idle; a subsequent
@@ -3681,7 +3790,29 @@ mod tests {
                 assert!(resolve_config_value(effort, &json!("off")).is_ok());
                 assert!(resolve_config_value(effort, &json!("high")).is_err());
             }
+            let sessions = SessionManager::new(db.clone());
+            let before_get = sessions
+                .task_control_event(
+                    &task_id,
+                    "session-1",
+                    "codex",
+                    "late-session",
+                    "session_config_options",
+                )
+                .unwrap()
+                .unwrap();
             let controls = process.configure("late-session", None).await.unwrap();
+            let after_get = sessions
+                .task_control_event(
+                    &task_id,
+                    "session-1",
+                    "codex",
+                    "late-session",
+                    "session_config_options",
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(before_get.id, after_get.id, "GET stays read-only");
             let effort = controls
                 .config_options
                 .iter()
@@ -3689,6 +3820,57 @@ mod tests {
                 .unwrap();
             assert!(resolve_config_value(effort, &json!("off")).is_ok());
             process.shutdown();
+            tokio::time::timeout(std::time::Duration::from_secs(1), process.wait_for_exit())
+                .await
+                .unwrap();
+            assert!(!process.is_alive());
+            assert!(process.configure("late-session", None).await.is_err());
+            // Once disconnected, HTTP GET uses this durable lookup, not the
+            // live cache. Merely displaying a late schema must not lose it.
+            db.with_conn(|conn| {
+                conn.execute(
+                    "UPDATE work_attempts SET runner='codex',status='completed' WHERE id=?1",
+                    [&attempt_id],
+                )
+            })
+            .unwrap();
+            let sessions = SessionManager::new(db.clone());
+            let owner = sessions
+                .task_control_attempt(&task_id, "session-1", "codex", false)
+                .unwrap()
+                .unwrap();
+            let cached = sessions
+                .task_control_event(
+                    &task_id,
+                    "session-1",
+                    "codex",
+                    owner.native_session_id.as_deref().unwrap(),
+                    "session_config_options",
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                cached.payload["config_options"],
+                json!(controls.config_options),
+                "late schema must survive disconnect (after_grace={after_grace})"
+            );
+            assert_eq!(cached.payload["modes"], json!(controls.modes));
+            assert_eq!(cached.attempt_id.as_deref(), Some(attempt_id.as_str()));
+            assert_eq!(cached.payload["native_session_id"], "late-session");
+            let other = sessions
+                .task_control_event(
+                    &other_task,
+                    "session-1",
+                    "codex",
+                    "late-session",
+                    "session_config_options",
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                other.payload["config_options"][0]["currentValue"], "reasoner",
+                "idle edits must not be attributed to a different task"
+            );
             tokio::time::timeout(std::time::Duration::from_secs(1), mock_agent)
                 .await
                 .unwrap()

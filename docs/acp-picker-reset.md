@@ -31,8 +31,13 @@ active attempt without a native ID does not borrow a previous catalog. A failed
 fork is not a fallback; updates on the same reusable native session can remain
 valid after a failed turn. Config-options notifications persist the synchronized
 complete control snapshot, retaining independent legacy mode catalogs while
-updating or removing mirrored reasoning aliases. Activity history is not another
-schema source.
+updating or removing mirrored reasoning aliases. The connection retains a control
+recorder for each native session; explicit edits bind it to the requesting task.
+Replies and notifications are persisted in cache-update order, including idle
+notifications after the configuration grace period. HTTP never republishes an
+older response over a newer notification, and GET remains read-only. Only control
+observations are retained, not a completed prompt's transcript or output state.
+Activity history is not another schema source.
 
 Displayed selections are presentation only: neither normal messages nor
 visualization follow-ups send the displayed control map. Therefore loading a
@@ -87,7 +92,8 @@ validate strictly.
 Regressions cover read-only discovery beyond capped history, scope/resumability,
 explicit edit persistence/CAS, invalid/stale edits, pending-model dependency
 suppression, acknowledgement, reset, frozen dispatch preferences, model-default
-precedence, delayed schemas, and browser workflows without message submission.
+precedence, delayed schemas surviving disconnect (including task ownership and
+read-only inspection), and browser workflows without message submission.
 
 A reproducible violation of this contract blocks the PR. General automatic-turn
 prompt fencing, orphaned-queue repair, and legacy message-delivery hardening stay

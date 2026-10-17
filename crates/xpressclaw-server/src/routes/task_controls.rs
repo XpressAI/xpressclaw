@@ -9,12 +9,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use xpressclaw_core::{
-    sessions::{NewEvent, SessionManager},
+    sessions::SessionManager,
     tasks::{
         board::TaskBoard,
         controls::{self, ControlScope},
     },
-    workers::{acp::AcpSessionControls, native},
+    workers::{
+        acp::{AcpEventRecorder, AcpSessionControls},
+        native,
+    },
 };
 
 use crate::state::AppState;
@@ -349,26 +352,36 @@ pub(super) async fn set(
                 .connected_process(&edit.context.agent_id, &edit.context.runner_kind)
                 .await
             {
-                match process
-                    .configure(native_id, Some((edit.config_id, value)))
-                    .await
+                if let Some(owner) = SessionManager::new(state.db.clone())
+                    .task_control_attempt(
+                        &task_id,
+                        &edit.context.agent_id,
+                        &edit.context.runner_kind,
+                        false,
+                    )
+                    .map_err(internal)?
+                    .filter(|owner| owner.native_session_id.as_deref() == Some(native_id))
                 {
-                    Ok(controls) => {
-                        let sessions = SessionManager::new(state.db.clone());
-                        if let Some(owner) = sessions
-                            .task_control_attempt(
-                                &task_id,
-                                &edit.context.agent_id,
-                                &edit.context.runner_kind,
-                                false,
-                            )
-                            .map_err(internal)?
-                            .filter(|owner| owner.native_session_id.as_deref() == Some(native_id))
-                        {
-                            sessions.append_event(&edit.context.agent_id,NewEvent {attempt_id:Some(&owner.id),task_id:Some(&task_id),source_type:"user",source_id:Some("local-user"),event_type:"session_config_options",summary:"Applied explicit picker edit",payload:json!({"config_options":controls.config_options,"modes":controls.modes,"native_session_id":native_id})}).map_err(internal)?;
-                        }
+                    let recorder = AcpEventRecorder::new(
+                        state.db.clone(),
+                        &edit.context.agent_id,
+                        &owner.id,
+                        &task_id,
+                        &edit.context.runner_kind,
+                    );
+                    // The connection persists replies and later notifications
+                    // in order. Appending this HTTP response afterward could
+                    // overwrite a newer idle notification with stale controls.
+                    if let Err(error) = process
+                        .configure_with_recorder(
+                            native_id,
+                            Some((edit.config_id, value)),
+                            Some(recorder),
+                        )
+                        .await
+                    {
+                        failure = Some(format!("Saved, but not applied live: {error}"));
                     }
-                    Err(error) => failure = Some(format!("Saved, but not applied live: {error}")),
                 }
             }
         }
