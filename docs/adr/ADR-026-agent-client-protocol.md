@@ -42,6 +42,21 @@ agent advertises the model selector and its valid values; Xpressclaw does not
 maintain provider-specific model lists or translate the preference into a CLI
 flag. An invalid value fails with the choices reported by that agent.
 
+The task composer can inspect and change controls on an existing idle ACP
+session without sending a prompt. Model changes use `session/set_config_option`
+and immediately replace the picker schema with the agent's response or
+`config_option_update` notification, including model-specific reasoning levels.
+The searchable picker discards removed/invalid settings and avoids displaying
+a duplicate legacy reasoning-mode selector. Failed requests do not by themselves
+retire a healthy connection, allowing users to switch away from a broken backend.
+
+If the process is disconnected or busy, choices are staged for the next message;
+reasoning controls from the previous model are hidden and omitted from that
+message. Opening a picker does not start containers, queue work, or contact an
+LLM. On the next turn, model choices are applied before dependent settings, and
+unsupported stored preferences left over from a model change yield to the agent's
+defaults. Explicit configuration requirements still fail validation.
+
 ### Session lifecycle
 
 > **Updated by ADR-033:** Each project now retains its initialized ACP process

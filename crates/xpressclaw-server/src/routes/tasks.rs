@@ -79,6 +79,12 @@ pub enum MessageDelivery {
 }
 
 #[derive(Deserialize)]
+pub struct SessionConfigInput {
+    pub config_id: String,
+    pub value: Value,
+}
+
+#[derive(Deserialize)]
 pub struct ActivityParams {
     pub after: Option<i64>,
     pub before: Option<i64>,
@@ -135,12 +141,112 @@ pub fn routes() -> Router<AppState> {
             get(get_message_visualization),
         )
         .route("/{id}/activity", get(get_activity))
+        .route(
+            "/{id}/config",
+            get(get_session_config).post(set_session_config),
+        )
         .route("/{id}/pull-requests", post(register_pull_request))
         .route(
             "/{id}/elicitations/{elicitation_id}/response",
             post(respond_to_elicitation),
         )
         .route("/{id}/dependencies", axum::routing::post(add_dependency))
+}
+
+async fn get_session_config(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    task_session_config(&state, &id, None).await
+}
+
+async fn set_session_config(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(input): Json<SessionConfigInput>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    task_session_config(&state, &id, Some((input.config_id, input.value))).await
+}
+
+async fn task_session_config(
+    state: &AppState,
+    id: &str,
+    change: Option<(String, Value)>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let task = TaskBoard::new(state.db.clone()).get(id).map_err(|error| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": error.to_string() })),
+        )
+    })?;
+    if change.is_some() {
+        TaskBoard::new(state.db.clone())
+            .ensure_locally_managed(id)
+            .map_err(bad_request)?;
+    }
+    let unavailable = || {
+        (
+            StatusCode::CONFLICT,
+            Json(
+                json!({ "error": "Live controls are unavailable; choices will apply on the next message" }),
+            ),
+        )
+    };
+    let agent_id = task.agent_id.as_deref().ok_or_else(unavailable)?;
+    let sessions = SessionManager::new(state.db.clone());
+    let activity = sessions
+        .task_activity(id, None, None, 1, 1)
+        .map_err(internal_error)?;
+    let attempt = activity.attempts.first().ok_or_else(unavailable)?;
+    // Resolve through the task, never accept an arbitrary native session ID
+    // supplied by the browser (another task may own a different conversation).
+    if attempt.session_id != agent_id {
+        return Err(unavailable());
+    }
+    let native_session_id = attempt
+        .native_session_id
+        .as_deref()
+        .ok_or_else(unavailable)?;
+    let process = state
+        .project_processes
+        .connected_process(agent_id)
+        .await
+        .ok_or_else(unavailable)?;
+    let changed = change.is_some();
+    let controls = process
+        .configure(native_session_id, change)
+        .await
+        .map_err(|error| {
+            let status = if matches!(error, xpressclaw_core::error::Error::ConfigValidation(_)) {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::CONFLICT
+            };
+            (status, Json(json!({ "error": error.to_string() })))
+        })?;
+    let mut payload = json!(controls);
+    if changed {
+        let event = sessions
+            .append_event(
+                agent_id,
+                xpressclaw_core::sessions::NewEvent {
+                    attempt_id: Some(&attempt.id),
+                    task_id: Some(id),
+                    source_type: "user",
+                    source_id: Some("local-user"),
+                    event_type: "session_config_options",
+                    summary: "Updated session controls without sending a message",
+                    payload: json!({
+                        "config_options": controls.config_options,
+                        "modes": controls.modes,
+                        "native_session_id": native_session_id,
+                    }),
+                },
+            )
+            .map_err(internal_error)?;
+        payload["event_id"] = json!(event.id);
+    }
+    Ok(Json(payload))
 }
 
 async fn register_pull_request(
@@ -1345,6 +1451,12 @@ mod tests {
             }
             // Alternate lifecycle endpoints must reject before touching dispatch.
             for request in [
+                Request::post(format!("/tasks/{task_id}/config"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"config_id":"model", "value":"reasoner"}).to_string(),
+                    ))
+                    .unwrap(),
                 Request::post("/tasks")
                     .header("content-type", "application/json")
                     .body(Body::from(
@@ -1720,6 +1832,61 @@ mod tests {
             2
         );
         assert!(queue.claim("beta").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn disconnected_picker_does_not_create_messages_or_work() {
+        let (app, db) = test_app_with_db();
+        let task = TaskBoard::new(db.clone())
+            .create(&CreateTask {
+                title: "Picker only".into(),
+                agent_id: Some("atlas".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        for method in ["GET", "POST"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(format!("/tasks/{}/config", task.id))
+                        .header("content-type", "application/json")
+                        .body(if method == "POST" {
+                            Body::from(r#"{"config_id":"model","value":"reasoner"}"#)
+                        } else {
+                            Body::empty()
+                        })
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+        }
+        db.with_conn(|conn| {
+            for table in ["task_messages", "task_queue", "work_attempts"] {
+                let count: i64 =
+                    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })?;
+                assert_eq!(
+                    count, 0,
+                    "opening/changing the picker must not write {table}"
+                );
+            }
+            Ok::<_, xpressclaw_core::error::Error>(())
+        })
+        .unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/tasks/missing/config")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

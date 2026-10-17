@@ -629,6 +629,12 @@ export interface ImageAttachmentUpload {
 	data: string;
 }
 
+export interface AcpSessionControls {
+	config_options: AcpConfigOption[];
+	modes?: AcpModeState | null;
+	event_id?: number;
+}
+
 export const sessions = {
 	get: (id: string) => request<SessionOverview>(`/api/sessions/${id}`),
 	readiness: (id: string) => request<RunnerReadiness>(`/api/sessions/${id}/readiness`),
@@ -907,6 +913,11 @@ export const tasks = {
 		const query = params.size ? `?${params}` : '';
 		return request<TaskActivity>(`/api/tasks/${id}/activity${query}`);
 	},
+	config: (id: string) => request<AcpSessionControls>(`/api/tasks/${id}/config`),
+	setConfig: (id: string, configId: string, value: string | boolean) =>
+		request<AcpSessionControls>(`/api/tasks/${id}/config`, {
+			method: 'POST', body: JSON.stringify({ config_id: configId, value }),
+		}),
 	addMessage: (id: string, role: string, content: string, options?: { configOptions?: Record<string, string | boolean>; attachments?: ImageAttachmentUpload[]; delivery?: 'after_tool' | 'immediate' }) =>
 		request<TaskMessageResponse>(`/api/tasks/${id}/messages`, {
 			method: 'POST',

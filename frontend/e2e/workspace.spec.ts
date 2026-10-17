@@ -1389,6 +1389,135 @@ test('activity stays chronological, compact, expandable, and pageable', async ({
 	await expect(page.getByText('Reasoning effort', { exact: true })).toBeVisible();
 });
 
+function pickerControls(model = 'gpt-6.1-sol', effort?: string) {
+	const levels = model === 'local/qwen' ? ['off'] : ['high', 'max'];
+	return {
+		config_options: [
+			{ id: 'model', name: 'Model', category: 'model', type: 'select', currentValue: model, options: [
+				{ value: 'gpt-6.1-sol', name: 'GPT-6.1 Sol' },
+				{ value: 'local/qwen', name: 'Local Qwen' },
+			] },
+			{ id: 'thought_level', name: 'Thinking', category: 'thought_level', type: 'select', currentValue: effort ?? levels[0],
+				options: levels.map((value) => ({ value, name: value.toUpperCase() })) },
+		],
+		// pi-acp advertises this backward-compatible alias as well.
+		modes: { currentModeId: effort ?? levels[0], availableModes: levels.map((id) => ({ id, name: `Thinking: ${id}` })) },
+	};
+}
+
+test('model picker refreshes dependent reasoning choices without sending a message', async ({ page }) => {
+	const postedMessages: Record<string, unknown>[] = [];
+	const changes: Record<string, unknown>[] = [];
+	await mockApi(page, { postedMessages });
+	let controls = pickerControls();
+	await page.route(`**/api/tasks/${taskId}/config`, async (route) => {
+		if (route.request().method() === 'POST') {
+			const change = route.request().postDataJSON();
+			changes.push(change);
+			controls = change.config_id === 'model' ? pickerControls(change.value)
+				: pickerControls(controls.config_options[0].currentValue, change.value);
+		}
+		await route.fulfill({ json: { ...controls, event_id: 100 + changes.length } });
+	});
+	await page.goto(`/tasks/${taskId}`);
+	const picker = page.getByTitle('Model and reasoning effort');
+	await picker.click();
+	await expect(page.getByRole('button', { name: 'MAX', exact: true })).toBeVisible();
+	await expect(page.getByRole('combobox', { name: 'Mode', exact: true })).toHaveCount(0);
+	await page.getByRole('searchbox', { name: 'Search models' }).fill('qwen');
+	await expect(page.locator('[data-model-picker]').getByRole('button', { name: 'GPT-6.1 Sol', exact: true })).toHaveCount(0);
+	await page.getByRole('button', { name: 'Local Qwen', exact: true }).click();
+	await expect(page.getByRole('button', { name: 'OFF', exact: true })).toBeVisible();
+	await expect(page.getByRole('button', { name: 'MAX', exact: true })).toHaveCount(0);
+	await page.getByRole('searchbox', { name: 'Search models' }).fill('sol');
+	await page.getByRole('button', { name: 'GPT-6.1 Sol', exact: true }).click();
+	await expect(page.getByRole('button', { name: 'MAX', exact: true })).toBeVisible();
+	await expect(page.getByRole('button', { name: 'OFF', exact: true })).toHaveCount(0);
+	await page.getByRole('button', { name: 'MAX', exact: true }).click();
+	await expect(page.getByRole('button', { name: 'MAX', exact: true })).toHaveClass(/bg-accent/);
+	expect(postedMessages).toEqual([]);
+	expect(changes).toEqual([
+		{ config_id: 'model', value: 'local/qwen' },
+		{ config_id: 'model', value: 'gpt-6.1-sol' },
+		{ config_id: 'thought_level', value: 'max' },
+	]);
+	await picker.click();
+	await page.locator(`#task-message-input-${taskId}`).fill('Use the selected model');
+	await page.getByRole('button', { name: 'Send message', exact: true }).click();
+	await expect.poll(() => postedMessages.length).toBe(1);
+	expect(postedMessages[0].config_options).toEqual({ model: 'gpt-6.1-sol', thought_level: 'max' });
+});
+
+test('model picker reports rejected changes and preserves the confirmed selection', async ({ page }) => {
+	await mockApi(page);
+	await page.route(`**/api/tasks/${taskId}/config`, async (route) => {
+		if (route.request().method() === 'POST') {
+			await route.fulfill({ status: 400, json: { error: 'Backend does not support that model' } });
+		} else {
+			await route.fulfill({ json: pickerControls() });
+		}
+	});
+	await page.goto(`/tasks/${taskId}`);
+	await page.getByTitle('Model and reasoning effort').click();
+	await page.getByRole('button', { name: 'Local Qwen', exact: true }).click();
+	await expect(page.locator('[data-model-picker]').getByRole('status')).toContainText('Backend does not support that model');
+	await expect(page.getByTitle('Model and reasoning effort')).toContainText('GPT-6.1 Sol');
+	await expect(page.getByRole('button', { name: 'MAX', exact: true })).toBeEnabled();
+});
+
+test('disconnected model changes omit reasoning advertised for the previous model', async ({ page }) => {
+	const postedMessages: Record<string, unknown>[] = [];
+	await mockApi(page, { postedMessages });
+	await page.route(`**/api/tasks/${taskId}/config`, async (route) => {
+		if (route.request().method() === 'POST') {
+			await route.fulfill({ status: 409, json: { error: 'Agent disconnected; choice staged for next message' } });
+		} else {
+			await route.fulfill({ json: pickerControls() });
+		}
+	});
+	await page.goto(`/tasks/${taskId}`);
+	const picker = page.getByTitle('Model and reasoning effort');
+	await picker.click();
+	await page.getByRole('button', { name: 'Local Qwen', exact: true }).click();
+	await expect(picker).toContainText('Local Qwen');
+	await expect(page.getByRole('button', { name: 'MAX', exact: true })).toHaveCount(0);
+	await expect(page.getByText('Reasoning choices will refresh when the selected model connects.')).toBeVisible();
+	await picker.click();
+	// A cached refresh on reopening must not reintroduce the old effort.
+	await picker.click();
+	await expect(page.getByRole('button', { name: 'MAX', exact: true })).toHaveCount(0);
+	await picker.click();
+	await page.locator(`#task-message-input-${taskId}`).fill('Continue');
+	await page.getByRole('button', { name: 'Send message', exact: true }).click();
+	await expect.poll(() => postedMessages.length).toBe(1);
+	expect(postedMessages[0].config_options).toEqual({ model: 'local/qwen' });
+});
+
+test('a delayed picker refresh cannot overwrite a newer model change', async ({ page }) => {
+	await mockApi(page);
+	let releaseRefresh!: () => void;
+	const refreshGate = new Promise<void>((resolve) => (releaseRefresh = resolve));
+	let refreshStarted = false;
+	await page.route(`**/api/tasks/${taskId}/config`, async (route) => {
+		if (route.request().method() === 'GET') {
+			refreshStarted = true;
+			await refreshGate;
+			await route.fulfill({ json: pickerControls() });
+		} else {
+			await route.fulfill({ json: { ...pickerControls('local/qwen'), event_id: 200 } });
+		}
+	});
+	await page.goto(`/tasks/${taskId}`);
+	await page.getByTitle('Model and reasoning effort').click();
+	await expect.poll(() => refreshStarted).toBe(true);
+	// Choose from the previously advertised catalog while GET is pending.
+	await page.locator('[data-model-picker]').getByRole('button', { name: 'Codex Test', exact: true }).click();
+	await expect(page.getByRole('button', { name: 'OFF', exact: true })).toBeVisible();
+	releaseRefresh();
+	await expect(page.getByTitle('Model and reasoning effort')).toContainText('Local Qwen');
+	await expect(page.getByRole('button', { name: 'MAX', exact: true })).toHaveCount(0);
+});
+
 test('attempt errors can be dismissed', async ({ page }) => {
 	const rawError = '<img src=x onerror="window.__rawHtmlExecuted = true"> ACP process stopped during the turn';
 	await mockApi(page, { attemptError: rawError });

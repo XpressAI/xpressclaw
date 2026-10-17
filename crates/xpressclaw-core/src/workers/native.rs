@@ -114,7 +114,7 @@ struct ProjectAcpProcess {
 }
 
 #[derive(Default)]
-struct ProjectAcpProcesses {
+pub struct ProjectAcpProcesses {
     slots: StdMutex<HashMap<String, Arc<AsyncMutex<Option<ProjectAcpProcess>>>>>,
 }
 
@@ -415,6 +415,17 @@ impl ConversationAcpProcesses {
 }
 
 impl ProjectAcpProcesses {
+    /// Resolve only an existing connection; opening a picker must not launch
+    /// containers, create work attempts, or make a model request.
+    pub async fn connected_process(&self, agent_id: &str) -> Option<AcpProcess> {
+        let slot = self.slots.lock().unwrap().get(agent_id).cloned()?;
+        let entry = slot.lock().await;
+        entry
+            .as_ref()
+            .filter(|entry| entry.process.is_alive())
+            .map(|entry| entry.process.clone())
+    }
+
     fn slot(&self, agent_id: &str) -> Arc<AsyncMutex<Option<ProjectAcpProcess>>> {
         self.slots
             .lock()
@@ -508,6 +519,7 @@ pub struct NativeDispatcherServices {
     pub elicitation_broker: Arc<AcpElicitationBroker>,
     pub turn_controls: Arc<AcpTurnControlBroker>,
     pub conversation_processes: Arc<ConversationAcpProcesses>,
+    pub project_processes: Arc<ProjectAcpProcesses>,
     /// Per-Agent launch/use barrier shared with destructive lifecycle routes.
     pub runtime_lifecycle: Arc<NativeRuntimeLifecycle>,
     /// Ephemeral capability used only on the container callback listener.
@@ -530,6 +542,7 @@ pub async fn start_dispatcher(
         elicitation_broker,
         turn_controls,
         conversation_processes,
+        project_processes: processes,
         runtime_lifecycle,
         control_plane_token,
     } = services;
@@ -541,7 +554,6 @@ pub async fn start_dispatcher(
         }
     };
     let concurrency = Arc::new(Semaphore::new(4));
-    let processes = Arc::new(ProjectAcpProcesses::default());
     let mut docker = initial_docker;
 
     let _ = ConversationTurnQueue::new(db.clone()).recover();
@@ -1786,7 +1798,10 @@ async fn execute_item_once(runtime: NativeAttemptRuntime, item: QueueItem) -> Re
             warn!(%error, attempt_id, "failed to finalize task Git metrics");
         }
     }
-    if turn.is_err() && processes.invalidate(workload_id, &live.process).await {
+    if turn.is_err()
+        && !live.process.is_alive()
+        && processes.invalidate(workload_id, &live.process).await
+    {
         docker.stop_preserving(workload_id).await?;
     }
     sessions.clear_container(attempt_id)?;
