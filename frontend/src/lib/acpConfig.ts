@@ -32,6 +32,16 @@ export function reconcileConfig(
 	}));
 }
 
+/** Enqueueing is not acknowledgement: retain intent until advertised as current. */
+export function unconfirmedConfig(
+	options: AcpConfigOption[],
+	pending: Record<string, string | boolean>,
+): Record<string, string | boolean> {
+	return Object.fromEntries(Object.entries(pending).filter(([id, value]) =>
+		options.find((option) => option.id === id)?.currentValue !== value
+	));
+}
+
 /** Some adapters expose reasoning through both modern controls and legacy modes. */
 export function duplicatesReasoningMode(mode: AcpConfigOption, options: AcpConfigOption[]): boolean {
 	const values = selectChoices(mode).map((choice) => choice.value);

@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test';
-import { duplicatesReasoningMode, reconcileConfig } from '../src/lib/acpConfig';
+import { duplicatesReasoningMode, reconcileConfig, unconfirmedConfig } from '../src/lib/acpConfig';
 import type { AcpConfigOption } from '../src/lib/api';
 
 const reasoning: AcpConfigOption = {
@@ -18,6 +18,15 @@ test('refreshed controls drop invalid and removed settings, retaining valid pend
 		thought_level: 'max', fast: true,
 	});
 	expect(reconcileConfig(options)).toEqual({ thought_level: 'high', fast: false });
+});
+
+test('only advertised current values acknowledge staged controls', () => {
+	const pending = { thought_level: 'max', fast: false, not_advertised_yet: 'waiting' };
+	const options: AcpConfigOption[] = [reasoning, { id: 'fast', name: 'Fast', type: 'boolean', currentValue: false }];
+	const retained = unconfirmedConfig(options, pending);
+	expect(retained).toEqual({ thought_level: 'max', not_advertised_yet: 'waiting' });
+	expect(unconfirmedConfig([{ ...reasoning, currentValue: 'max' }], retained)).toEqual({ not_advertised_yet: 'waiting' });
+	expect(pending).toEqual({ thought_level: 'max', fast: false, not_advertised_yet: 'waiting' });
 });
 
 test('legacy reasoning aliases are hidden without hiding an independent mode selector', () => {

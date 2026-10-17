@@ -1493,6 +1493,58 @@ test('disconnected model changes omit reasoning advertised for the previous mode
 	expect(postedMessages[0].config_options).toEqual({ model: 'local/qwen' });
 });
 
+test('queued model choices survive old snapshots until the agent confirms them', async ({ page }) => {
+	const postedMessages: Record<string, unknown>[] = [];
+	await mockApi(page, { taskStatus: 'pending', postedMessages });
+	let advertisedModel = 'gpt-6.1-sol';
+	let revision = 100;
+	await page.route(`**/api/sessions/${agentId}/events`, (route) => route.fulfill({ json: [{
+		...activityEvent(revision), event_type: 'session_config_options', payload: pickerControls(advertisedModel),
+	}] }));
+	await page.route(`**/api/tasks/${taskId}/config`, async (route) => {
+		if (route.request().method() === 'POST') {
+			await route.fulfill({ status: 409, json: { error: 'Agent is busy; selection staged' } });
+		} else {
+			await route.fulfill({ json: pickerControls(advertisedModel) });
+		}
+	});
+	await page.route(`**/api/tasks/${taskId}/messages`, async (route) => {
+		if (route.request().method() === 'POST') ++revision;
+		await route.fallback();
+	});
+	await page.goto(`/tasks/${taskId}`);
+	const picker = page.getByTitle('Model and reasoning effort');
+	const composer = page.locator(`#task-message-input-${taskId}`);
+	await picker.click();
+	await page.getByRole('button', { name: 'Local Qwen', exact: true }).click();
+	await expect(picker).toContainText('Local Qwen');
+	await picker.click();
+	await composer.fill('Switch models');
+	await page.getByRole('button', { name: 'Send message', exact: true }).click();
+	await expect(composer).toBeEnabled();
+	await expect(composer).toHaveValue('');
+	// The turn advertised its old model before a slow set_config_option.
+	await expect(picker).toContainText('Local Qwen');
+	await composer.fill('Additional guidance during the switch');
+	await page.getByRole('button', { name: 'Send message', exact: true }).click();
+	await expect.poll(() => postedMessages.length).toBe(2);
+	for (const message of postedMessages) expect(message.config_options).toEqual({ model: 'local/qwen' });
+	await expect(composer).toBeEnabled();
+
+	// Confirmation releases the staged intent, so a later agent-side change
+	// can update the picker instead of remaining pinned to an old override.
+	advertisedModel = 'local/qwen';
+	++revision;
+	await picker.click();
+	await expect(page.getByRole('button', { name: 'OFF', exact: true })).toBeVisible();
+	await picker.click();
+	advertisedModel = 'gpt-6.1-sol';
+	++revision;
+	await picker.click();
+	await expect(picker).toContainText('GPT-6.1 Sol');
+	await expect(page.getByRole('button', { name: 'MAX', exact: true })).toBeVisible();
+});
+
 test('a delayed picker refresh cannot overwrite a newer model change', async ({ page }) => {
 	await mockApi(page);
 	let releaseRefresh!: () => void;

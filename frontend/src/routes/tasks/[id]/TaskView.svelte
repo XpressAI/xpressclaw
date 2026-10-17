@@ -8,7 +8,7 @@
 	import { dateLabel, planningViewport } from '$lib/taskPlanning';
 	import { goto } from '$app/navigation';
 	import { tasks, agents, sessions, workspaces, ApiError } from '$lib/api';
-	import { selectChoices, isModelOption, isReasoningOption, isAdditionalModelOption, reconcileConfig, duplicatesReasoningMode } from '$lib/acpConfig';
+	import { selectChoices, isModelOption, isReasoningOption, isAdditionalModelOption, reconcileConfig, unconfirmedConfig, duplicatesReasoningMode } from '$lib/acpConfig';
 	import type { AcpCommand, AcpConfigOption, AcpModeState, DelegatedWork, Task, TaskMessage, Agent, WorkAttempt, SessionEvent, ImageAttachmentUpload, GitChange, WorkspaceGitStatus, MessageVisualization } from '$lib/api';
 	import { timeAgo } from '$lib/utils';
 	import { serverTimestampMs } from '$lib/serverTime';
@@ -540,6 +540,7 @@
 		const mode = legacyModeOption(modes);
 		if (mode && !options.some((option) => option.category === 'mode' || option.id === 'mode')
 			&& !duplicatesReasoningMode(mode, options)) options.unshift(mode);
+		stagedConfig = unconfirmedConfig(options, stagedConfig);
 		configOptions = options;
 		selectedConfig = reconcileConfig(options, stagedConfig);
 	}
@@ -1150,7 +1151,8 @@
 				attachments,
 				delivery: immediate ? 'immediate' : 'after_tool',
 			});
-			stagedConfig = {};
+			// A queued message has not applied its configuration yet. Keep staged
+			// values through pre-configuration snapshots until the agent confirms.
 			messageInput = '';
 			messageAttachments = [];
 			clearComposerDraft(messageDraftScope());
