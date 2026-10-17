@@ -183,7 +183,7 @@
 	let stagedConfig: Record<string, string | boolean> = {};
 	let lastControlsEventId = 0;
 	let configRequestVersion = 0;
-	let configRefreshVersion: number | null = null;
+	let configRefreshVersion = $state<number | null>(null);
 	let messageInputFocused = $state(false);
 	let slashMenuDismissed = $state(false);
 	let selectedCommandIndex = $state(0);
@@ -555,15 +555,19 @@
 		await refreshModelMenu(true);
 	}
 
-	async function refreshModelMenu(showErrors = false) {
-		if (!modelMenuOpen || !task || configUpdating || configRefreshVersion === configRequestVersion) return;
+	async function refreshModelMenu(showErrors = false, allowClosed = false) {
+		if ((!modelMenuOpen && !allowClosed) || !task?.agent_id || configUpdating || configRefreshVersion === configRequestVersion) return;
 		const version = configRequestVersion;
+		const eventRevision = lastControlsEventId;
 		configRefreshVersion = version;
 		const id = task.id;
 		try {
 			const controls = await tasks.config(id);
-			if (version === configRequestVersion && task?.id === id) {
+			if (version === configRequestVersion && task?.id === id
+				&& (controls.event_id ?? eventRevision) >= lastControlsEventId) {
+				lastControlsEventId = Math.max(lastControlsEventId, controls.event_id ?? 0);
 				applySessionControls(validConfigOptions(controls.config_options), controls.modes);
+				configNotice = controls.notice ?? '';
 			}
 		} catch (e) {
 			if (showErrors && version === configRequestVersion && task?.id === id) {
@@ -827,7 +831,7 @@
 
 	function resetHarnessControls(agentId: string | null) {
 		const controlsScope = `${taskId}:${agentId ?? ''}`;
-		if (controlsInitializedFor === controlsScope) return;
+		if (controlsInitializedFor === controlsScope) return false;
 		// Invalidate in-flight reads/writes even when only the assignment, not
 		// the task ID, changed. An unadvertised agent starts with no controls.
 		++configRequestVersion;
@@ -840,12 +844,17 @@
 		availableCommands = [];
 		configNotice = '';
 		configUpdating = false;
+		configRefreshVersion = null;
 		modelMenuOpen = false;
 		modelSearch = '';
+		return true;
 	}
 
 	function refreshHarnessControls(events: SessionEvent[], agentId: string) {
 		resetHarnessControls(agentId);
+		// Session history is shared across this Agent's tasks. Never use a
+		// sibling task's model, reasoning modes, or commands in this composer.
+		events = events.filter((event) => event.task_id === taskId && event.session_id === agentId);
 		const advertised = [...events].reverse().find((event) => event.event_type === 'session_config_options');
 		const options = validConfigOptions(advertised?.payload.config_options);
 		const latestMode = [...events].reverse().find((event) => event.event_type === 'session_mode');
@@ -995,6 +1004,9 @@
 				workspaceGit = git;
 				lastWorkspaceGitRefresh = Date.now();
 				refreshHarnessControls(sessionEvents, loadedTask.agent_id);
+				// Controls are durable task state, not a recent-history side effect.
+				// Do not block the composer on a slow live connection.
+				void refreshModelMenu(false, true);
 			} else {
 				sessionEvents = []; configOptions = []; availableCommands = []; workspaceGit = null;
 			}
@@ -1052,7 +1064,7 @@
 			]);
 			// Update task status/details in-place
 			task = newTask;
-			resetHarnessControls(newTask.agent_id);
+			const controlsScopeChanged = resetHarnessControls(newTask.agent_id);
 			attempts = newActivity.attempts;
 			delegatedWork = newActivity.delegated_work ?? [];
 			let shouldScroll = false;
@@ -1078,6 +1090,7 @@
 					sessionEvents = latestSessionEvents;
 					refreshHarnessControls(sessionEvents, newTask.agent_id);
 				}
+				if (controlsScopeChanged) void refreshModelMenu(false, true);
 				if (Date.now() - lastWorkspaceGitRefresh >= 10_000) {
 					workspaceGit = await workspaces.gitStatus(newTask.agent_id).catch(() => workspaceGit);
 					lastWorkspaceGitRefresh = Date.now();
@@ -2145,8 +2158,13 @@
 								</div>
 							{/if}
 
-							{#if modelMenuOpen && hasModelMenu}
-								<div class="ai-raised absolute bottom-full left-0 right-0 z-30 mb-2 max-h-[65vh] overflow-y-auto p-2 sm:right-auto sm:w-80" data-model-picker aria-busy={configUpdating}>
+							{#if modelMenuOpen && task.agent_id}
+								<div class="ai-raised absolute bottom-full left-0 right-0 z-30 mb-2 max-h-[65vh] overflow-y-auto p-2 sm:right-auto sm:w-80" data-model-picker aria-busy={configUpdating || configRefreshVersion !== null}>
+									{#if !hasModelMenu && configRefreshVersion !== null}
+										<div class="px-2 py-1 text-xs text-muted-foreground" role="status">Loading model controls…</div>
+									{:else if !hasModelMenu && !configNotice}
+										<div class="px-2 py-1 text-xs text-muted-foreground" role="status">This task has not advertised model controls yet.</div>
+									{/if}
 									{#if configUpdating}<div class="px-2 py-1 text-xs text-muted-foreground" role="status">Updating model settings…</div>{/if}
 									{#if configNotice}<div class="px-2 py-1 text-xs text-muted-foreground" role="status">{configNotice}</div>{/if}
 									{#if modelControlsPending}<div class="px-2 py-1 text-xs text-muted-foreground">Reasoning choices will refresh when the selected model connects.</div>{/if}
@@ -2227,7 +2245,7 @@
 									<svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" /></svg>
 								</button>
 								{#key taskId}<DictationButton disabled={messageSending || interrupting || !task.agent_id || composerBlockedByElicitation} ontranscript={(text) => { messageInput = messageInput.trimEnd() ? `${messageInput.trimEnd()} ${text}` : text; composerEl?.querySelector<HTMLTextAreaElement>('textarea')?.focus(); }} />{/key}
-								{#if task.agent_id && (otherConfigOptions.length > 0 || hasModelMenu)}
+								{#if task.agent_id}
 									<div class="flex min-w-0 flex-1 items-center gap-3 overflow-x-auto scrollbar-hide">
 										{#each otherConfigOptions as option}
 											{#if option.type === 'boolean'}
@@ -2247,13 +2265,11 @@
 											{/if}
 										{/each}
 
-										{#if hasModelMenu}
-											<button type="button" onclick={toggleModelMenu} aria-expanded={modelMenuOpen} title="Model and reasoning effort"
-												class="flex shrink-0 items-center gap-1 py-1 text-xs text-muted-foreground transition-colors hover:text-foreground">
-												<span>{modelOption ? selectedChoiceName(modelOption) : 'Model settings'}</span>
-												<svg class="h-3 w-3 text-muted-foreground/50" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="m6 9 6 6 6-6" /></svg>
-											</button>
-										{/if}
+										<button type="button" onclick={toggleModelMenu} aria-expanded={modelMenuOpen} title="Model and reasoning effort"
+											class="flex shrink-0 items-center gap-1 py-1 text-xs text-muted-foreground transition-colors hover:text-foreground">
+											<span>{modelOption ? selectedChoiceName(modelOption) : 'Model settings'}</span>
+											<svg class="h-3 w-3 text-muted-foreground/50" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="m6 9 6 6 6-6" /></svg>
+										</button>
 									</div>
 								{:else}
 									<div class="flex-1"></div>

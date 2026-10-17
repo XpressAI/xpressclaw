@@ -194,37 +194,45 @@ async fn task_session_config(
     };
     let agent_id = task.agent_id.as_deref().ok_or_else(unavailable)?;
     let sessions = SessionManager::new(state.db.clone());
+    let changed = change.is_some();
+    let cached = || {
+        if changed {
+            Err(unavailable())
+        } else {
+            cached_task_session_config(&sessions, id, agent_id)
+        }
+    };
     let activity = sessions
         .task_activity(id, None, None, 1, 1)
         .map_err(internal_error)?;
-    let attempt = activity.attempts.first().ok_or_else(unavailable)?;
+    let Some(attempt) = activity.attempts.first() else {
+        return cached();
+    };
     // Resolve through the task, never accept an arbitrary native session ID
     // supplied by the browser (another task may own a different conversation).
     if attempt.session_id != agent_id {
-        return Err(unavailable());
+        return cached();
     }
-    let native_session_id = attempt
-        .native_session_id
-        .as_deref()
-        .ok_or_else(unavailable)?;
-    let process = state
-        .project_processes
-        .connected_process(agent_id)
-        .await
-        .ok_or_else(unavailable)?;
-    let changed = change.is_some();
-    let controls = process
-        .configure(native_session_id, change)
-        .await
-        .map_err(|error| {
+    let Some(native_session_id) = attempt.native_session_id.as_deref() else {
+        return cached();
+    };
+    let Some(process) = state.project_processes.connected_process(agent_id).await else {
+        return cached();
+    };
+    let controls = match process.configure(native_session_id, change).await {
+        Ok(controls) => controls,
+        Err(_) if !changed => return cached(),
+        Err(error) => {
             let status = if matches!(error, xpressclaw_core::error::Error::ConfigValidation(_)) {
                 StatusCode::BAD_REQUEST
             } else {
                 StatusCode::CONFLICT
             };
-            (status, Json(json!({ "error": error.to_string() })))
-        })?;
+            return Err((status, Json(json!({ "error": error.to_string() }))));
+        }
+    };
     let mut payload = json!(controls);
+    payload["live"] = json!(true);
     if changed {
         let event = sessions
             .append_event(
@@ -247,6 +255,53 @@ async fn task_session_config(
         payload["event_id"] = json!(event.id);
     }
     Ok(Json(payload))
+}
+
+fn cached_task_session_config(
+    sessions: &SessionManager,
+    task_id: &str,
+    agent_id: &str,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(mut event) = sessions
+        .latest_task_event(task_id, agent_id, "session_config_options")
+        .map_err(internal_error)?
+    else {
+        return Ok(Json(json!({
+            "config_options": [], "modes": null, "live": false,
+            "notice": "This task has not advertised model controls yet.",
+        })));
+    };
+    // Legacy adapters can change modes without republishing the full schema.
+    // Keep those changes task-scoped and independent of the history window too.
+    if let Some(mode) = sessions
+        .latest_task_event(task_id, agent_id, "session_mode")
+        .map_err(internal_error)?
+        .filter(|mode| mode.id > event.id)
+    {
+        if let Some(mode_id) = mode.payload["modeId"]
+            .as_str()
+            .or_else(|| mode.payload["mode_id"].as_str())
+        {
+            if let Some(options) = event.payload["config_options"].as_array_mut() {
+                for option in options {
+                    if option["category"] == "mode" || option["id"] == "mode" {
+                        option["currentValue"] = json!(mode_id);
+                    }
+                }
+            }
+            if event.payload["modes"].is_object() {
+                event.payload["modes"]["currentModeId"] = json!(mode_id);
+            }
+            event.id = mode.id;
+        }
+    }
+    Ok(Json(json!({
+        "config_options": event.payload["config_options"],
+        "modes": event.payload["modes"],
+        "event_id": event.id,
+        "live": false,
+        "notice": "Showing last advertised controls; changes will apply on the next message.",
+    })))
 }
 
 async fn register_pull_request(
@@ -1861,7 +1916,20 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert_eq!(
+                response.status(),
+                if method == "GET" {
+                    StatusCode::OK
+                } else {
+                    StatusCode::CONFLICT
+                }
+            );
+            let body = body_json(response.into_body()).await;
+            if method == "GET" {
+                assert_eq!(body["config_options"], json!([]));
+                assert_eq!(body["live"], false);
+                assert!(body["notice"].as_str().unwrap().contains("not advertised"));
+            }
         }
         db.with_conn(|conn| {
             for table in ["task_messages", "task_queue", "work_attempts"] {
@@ -1887,6 +1955,140 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn disconnected_picker_reads_task_controls_beyond_shared_history() {
+        use xpressclaw_core::sessions::NewEvent;
+
+        let (app, db) = test_app_with_db();
+        let board = TaskBoard::new(db.clone());
+        let task = board
+            .create(&CreateTask {
+                title: "Completed picker".into(),
+                agent_id: Some("atlas".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let sibling = board
+            .create(&CreateTask {
+                title: "Other task".into(),
+                agent_id: Some("atlas".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let sessions = SessionManager::new(db.clone());
+        sessions.ensure("atlas", None).unwrap();
+        sessions.ensure("beta", None).unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO work_attempts(id,session_id,task_id,runner,status,native_session_id)
+             VALUES('picker-attempt','atlas',?1,'pi','completed','picker-native')",
+                [&task.id],
+            )
+        })
+        .unwrap();
+        board.update_status(&task.id, "completed", None).unwrap();
+        let advertise = |task_id: &str, agent_id: &str, model: &str| {
+            sessions
+                .append_event(
+                    agent_id,
+                    NewEvent {
+                        task_id: Some(task_id),
+                        attempt_id: None,
+                        source_type: "acp",
+                        source_id: None,
+                        event_type: "session_config_options",
+                        summary: "Advertised controls",
+                        payload: json!({
+                            "config_options": [
+                                {"id":"model","category":"model","type":"select","currentValue":model,
+                                 "options":[{"value":model,"name":model}]},
+                                {"id":"mode","category":"mode","type":"select","currentValue":"old",
+                                 "options":[{"value":"old","name":"Old"},{"value":"new","name":"New"}]}
+                            ],
+                            "modes":{"currentModeId":"old","availableModes":[]}
+                        }),
+                    },
+                )
+                .unwrap()
+        };
+        advertise(&task.id, "atlas", "superseded");
+        advertise(&task.id, "atlas", "task-model");
+        let mode = sessions
+            .append_event(
+                "atlas",
+                NewEvent {
+                    task_id: Some(&task.id),
+                    attempt_id: None,
+                    source_type: "acp",
+                    source_id: None,
+                    event_type: "session_mode",
+                    summary: "Mode changed",
+                    payload: json!({"modeId":"new"}),
+                },
+            )
+            .unwrap();
+        // Both wrong-task and previous-assignee controls must be excluded.
+        advertise(&sibling.id, "atlas", "sibling-model");
+        advertise(&task.id, "beta", "other-agent-model");
+        for _ in 0..125 {
+            sessions
+                .append_event(
+                    "atlas",
+                    NewEvent {
+                        task_id: Some(&sibling.id),
+                        attempt_id: None,
+                        source_type: "acp",
+                        source_id: None,
+                        event_type: "runner_progress",
+                        summary: "Long build",
+                        payload: json!({}),
+                    },
+                )
+                .unwrap();
+        }
+        assert!(sessions
+            .list_events("atlas", None, 100)
+            .unwrap()
+            .iter()
+            .all(|event| event.event_type != "session_config_options"));
+        let event_count = sessions.list_events("atlas", None, 500).unwrap().len();
+        let read = || {
+            Request::builder()
+                .uri(format!("/tasks/{}/config", task.id))
+                .body(Body::empty())
+                .unwrap()
+        };
+        let response = app.clone().oneshot(read()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response.into_body()).await;
+        assert_eq!(body["live"], false);
+        assert_eq!(body["event_id"], mode.id);
+        assert_eq!(body["config_options"][0]["currentValue"], "task-model");
+        assert_eq!(body["config_options"][1]["currentValue"], "new");
+        assert_eq!(body["modes"]["currentModeId"], "new");
+        assert_eq!(
+            sessions.list_events("atlas", None, 500).unwrap().len(),
+            event_count
+        );
+        // A new assignment must not recover Atlas's task snapshot.
+        board
+            .update(
+                &task.id,
+                &UpdateTask {
+                    agent_id: Some("developer".into()),
+                    title: None,
+                    description: None,
+                    priority: None,
+                },
+            )
+            .unwrap();
+        let response = app.oneshot(read()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response.into_body()).await;
+        assert_eq!(body["config_options"], json!([]));
+        assert_eq!(body["live"], false);
     }
 
     #[tokio::test]

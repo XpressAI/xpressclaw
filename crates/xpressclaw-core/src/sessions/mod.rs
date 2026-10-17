@@ -230,6 +230,30 @@ impl SessionManager {
         })
     }
 
+    /// Read a task's latest advertised state without relying on a capped,
+    /// agent-wide activity window. The assigned Agent is part of the scope so
+    /// reassignment cannot restore another Agent's controls.
+    pub fn latest_task_event(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        event_type: &str,
+    ) -> Result<Option<SessionEvent>> {
+        self.db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT id, session_id, attempt_id, task_id, source_type, source_id,
+                        event_type, summary, payload, created_at
+                 FROM session_events
+                 WHERE task_id = ?1 AND session_id = ?2 AND event_type = ?3
+                 ORDER BY id DESC LIMIT 1",
+                rusqlite::params![task_id, session_id, event_type],
+                row_to_event,
+            )
+            .optional()
+            .map_err(|error| Error::Database(error.to_string()))
+        })
+    }
+
     pub fn list_events(
         &self,
         session_id: &str,

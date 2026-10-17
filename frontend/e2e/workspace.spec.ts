@@ -1320,6 +1320,19 @@ async function mockApi(
 		} else if (path === `/api/sessions/${agentId}/attempts/attempt-browser-test/interrupt`) {
 			options.interruptedAttempts?.push('attempt-browser-test');
 			response = { ...attempt('interrupted'), status: 'interrupted', completed_at: timestamp(62) };
+		} else if (path === `/api/tasks/${taskId}/config`) {
+			if (request.method() === 'POST') {
+				await route.fulfill({ status: 409, json: { error: 'Live controls are unavailable; choices will apply on the next message' } });
+				return;
+			}
+			response = task.agent_id === agentId ? {
+				config_options: [
+					{ id: 'model', name: 'Model', category: 'model', type: 'select', currentValue: 'codex-test', options: [{ value: 'codex-test', name: 'Codex Test' }] },
+					{ id: 'reasoning_effort', name: 'Reasoning', category: 'thought_level', type: 'select', currentValue: 'high', options: [{ value: 'high', name: 'High' }] },
+				],
+				event_id: 70,
+				live: false,
+			} : { config_options: [], live: false, notice: 'This task has not advertised model controls yet.' };
 		} else if (path === `/api/sessions/${agentId}/events`) {
 			response = [
 				{
@@ -1404,6 +1417,59 @@ function pickerControls(model = 'gpt-6.1-sol', effort?: string) {
 		modes: { currentModeId: effort ?? levels[0], availableModes: levels.map((id) => ({ id, name: `Thinking: ${id}` })) },
 	};
 }
+
+for (const history of ['evicted', 'sibling-task', 'previous-agent']) {
+	test(`task controls load without a message when history contains ${history} controls`, async ({ page }) => {
+		const postedMessages: Record<string, unknown>[] = [];
+		await mockApi(page, { taskStatus: 'completed', postedMessages });
+		const events: Record<string, unknown>[] = Array.from({ length: 100 }, (_, index) => activityEvent(100 + index));
+		if (history !== 'evicted') events.push({
+			...activityEvent(300),
+			task_id: history === 'sibling-task' ? 'another-task' : taskId,
+			session_id: history === 'previous-agent' ? 'previous-agent' : agentId,
+			event_type: 'session_config_options',
+			payload: { config_options: [{ id: 'model', name: 'Model', type: 'select', category: 'model',
+				currentValue: 'wrong-model', options: [{ value: 'wrong-model', name: 'Wrong task model' }] }] },
+		});
+		await page.route(`**/api/sessions/${agentId}/events`, (route) => route.fulfill({ json: events }));
+		let reads = 0;
+		await page.route(`**/api/tasks/${taskId}/config`, async (route) => {
+			if (route.request().method() === 'POST') {
+				await route.fulfill({ status: 409, json: { error: 'Agent disconnected; selection staged' } });
+			} else {
+				++reads;
+				await route.fulfill({ json: { ...pickerControls(), event_id: 5, live: false,
+					notice: 'Showing last advertised controls; changes will apply on the next message.' } });
+			}
+		});
+		await page.goto(`/tasks/${taskId}`);
+		const picker = page.getByTitle('Model and reasoning effort');
+		await expect(picker).toContainText('GPT-6.1 Sol');
+		expect(reads).toBeGreaterThan(0); // Loaded before opening the picker.
+		await picker.click();
+		await expect(page.locator('[data-model-picker]')).toContainText('last advertised controls');
+		await expect(page.getByRole('button', { name: 'Wrong task model', exact: true })).toHaveCount(0);
+		await page.getByRole('button', { name: 'Local Qwen', exact: true }).click();
+		await expect(picker).toContainText('Local Qwen');
+		await expect(page.getByRole('button', { name: 'MAX', exact: true })).toHaveCount(0);
+		expect(postedMessages).toEqual([]);
+	});
+}
+
+test('a task without advertised controls has a reachable picker and explicit empty state', async ({ page }) => {
+	const postedMessages: Record<string, unknown>[] = [];
+	await mockApi(page, { postedMessages, taskAttempts: [] });
+	await page.route(`**/api/sessions/${agentId}/events`, (route) => route.fulfill({ json: [] }));
+	await page.route(`**/api/tasks/${taskId}/config`, (route) => route.fulfill({ json: {
+		config_options: [], live: false, notice: 'This task has not advertised model controls yet.',
+	} }));
+	await page.goto(`/tasks/${taskId}`);
+	const picker = page.getByTitle('Model and reasoning effort');
+	await expect(picker).toContainText('Model settings');
+	await picker.click();
+	await expect(page.locator('[data-model-picker]')).toContainText('has not advertised model controls yet');
+	expect(postedMessages).toEqual([]);
+});
 
 test('model picker refreshes dependent reasoning choices without sending a message', async ({ page }) => {
 	const postedMessages: Record<string, unknown>[] = [];
@@ -1647,6 +1713,37 @@ test('a delayed picker refresh cannot overwrite a newer model change', async ({ 
 	await expect(page.getByRole('button', { name: 'MAX', exact: true })).toHaveCount(0);
 });
 
+for (const source of ['cached', 'live']) {
+	test(`a delayed ${source} page-load lookup cannot overwrite newer task controls`, async ({ page }) => {
+		await mockApi(page, { taskStatus: 'pending' });
+		let advertisedModel = 'gpt-6.1-sol';
+		let revision = 100;
+		await page.route(`**/api/sessions/${agentId}/events`, (route) => route.fulfill({ json: [{
+			...activityEvent(revision), event_type: 'session_config_options', payload: pickerControls(advertisedModel),
+		}] }));
+		let releaseRead!: () => void;
+		const gate = new Promise<void>((resolve) => (releaseRead = resolve));
+		let readStarted = false;
+		await page.route(`**/api/tasks/${taskId}/config`, async (route) => {
+			readStarted = true;
+			await gate;
+			await route.fulfill({ json: { ...pickerControls(), ...(source === 'cached' ? { event_id: 100 } : {}) } });
+		});
+		await page.goto(`/tasks/${taskId}`);
+		const picker = page.getByTitle('Model and reasoning effort');
+		await expect(picker).toContainText('GPT-6.1 Sol');
+		await expect.poll(() => readStarted).toBe(true);
+		advertisedModel = 'local/qwen';
+		++revision;
+		await expect(picker).toContainText('Local Qwen');
+		const response = page.waitForResponse((response) => response.url().endsWith(`/api/tasks/${taskId}/config`));
+		releaseRead();
+		await (await response).finished();
+		await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+		await expect(picker).toContainText('Local Qwen');
+	});
+}
+
 for (const pendingRequest of ['none', 'GET', 'POST']) {
 	test(`agent reassignment clears controls with ${pendingRequest} picker request pending`, async ({ page }) => {
 		const postedMessages: Record<string, unknown>[] = [];
@@ -1655,12 +1752,20 @@ for (const pendingRequest of ['none', 'GET', 'POST']) {
 		let releaseRequest!: () => void;
 		const requestGate = new Promise<void>((resolve) => (releaseRequest = resolve));
 		let requestStarted = false;
+		let reassigned = false;
+		await page.route(`**/api/tasks/${taskId}`, async (route) => {
+			if (route.request().method() === 'PATCH') reassigned = true;
+			await route.fallback();
+		});
 		await page.route(`**/api/tasks/${taskId}/config`, async (route) => {
-			if (route.request().method() === pendingRequest) {
+			const response = reassigned
+				? { config_options: [], live: false, notice: 'This task has not advertised model controls yet.' }
+				: { ...pickerControls(route.request().method() === 'POST' ? 'local/qwen' : undefined), event_id: 200 };
+			if (!reassigned && route.request().method() === pendingRequest) {
 				requestStarted = true;
 				await requestGate;
 			}
-			await route.fulfill({ json: { ...pickerControls(route.request().method() === 'POST' ? 'local/qwen' : undefined), event_id: 200 } });
+			await route.fulfill({ json: response });
 		});
 		await page.goto(`/tasks/${taskId}`);
 		const picker = page.getByTitle('Model and reasoning effort');
@@ -1677,7 +1782,8 @@ for (const pendingRequest of ['none', 'GET', 'POST']) {
 		await editor.getByLabel('Agent', { exact: true }).selectOption('project-secondary-test');
 		await editor.getByRole('button', { name: 'Save', exact: true }).click();
 		await expect(editor).toBeHidden();
-		await expect(picker).toHaveCount(0);
+		await expect(picker).toBeVisible();
+		await expect(picker).toContainText('Model settings');
 
 		if (pendingRequest !== 'none') {
 			const oldResponse = page.waitForResponse((response) => response.url().endsWith(`/api/tasks/${taskId}/config`)
@@ -1685,7 +1791,8 @@ for (const pendingRequest of ['none', 'GET', 'POST']) {
 			releaseRequest();
 			await (await oldResponse).finished();
 			await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
-			await expect(picker).toHaveCount(0);
+			await expect(picker).toBeVisible();
+			await expect(picker).toContainText('Model settings');
 		}
 		await page.locator(`#task-message-input-${taskId}`).fill('Continue with the new agent');
 		await page.getByRole('button', { name: 'Send message', exact: true }).click();

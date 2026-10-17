@@ -633,6 +633,8 @@ export interface AcpSessionControls {
 	config_options: AcpConfigOption[];
 	modes?: AcpModeState | null;
 	event_id?: number;
+	live?: boolean;
+	notice?: string;
 }
 
 export const sessions = {

@@ -54,6 +54,16 @@ The searchable picker discards removed/invalid settings and avoids displaying
 a duplicate legacy reasoning-mode selector. Failed requests do not by themselves
 retire a healthy connection, allowing users to switch away from a broken backend.
 
+The task page loads controls independently of its capped activity history. A
+read-only task configuration lookup prefers the retained live connection and
+falls back to the latest durable controls event scoped to both the task and its
+assigned Agent, including subsequent legacy mode changes. Other tasks' controls
+are never used. Completed/disconnected tasks therefore retain their advertised
+choices even after long histories or a control-plane restart. The picker remains
+reachable whenever an Agent is assigned; a task that has never advertised any
+controls shows an explicit empty state rather than borrowing another task's
+catalog. This does not initialize a brand-new ACP session.
+
 If the process is disconnected or busy, choices are staged for the next message;
 reasoning controls from the previous model are hidden and omitted from that
 message. Opening a picker does not start containers, queue work, or contact an
