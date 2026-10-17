@@ -1431,12 +1431,24 @@ async fn serve_process(
     }
 }
 
+fn is_reasoning_option(option: &SessionConfigOption) -> bool {
+    // Keep canonical ID fallbacks aligned with the task composer's detection;
+    // category is optional in ACP, including for custom agents.
+    matches!(
+        option.category,
+        Some(SessionConfigOptionCategory::ThoughtLevel)
+    ) || matches!(
+        option.id.to_string().as_str(),
+        "reasoning_effort" | "thought_level" | "thinking_level"
+    )
+}
+
 fn update_session_options(session: &mut ConnectedSession, options: Vec<SessionConfigOption>) {
     // Pi exposes the same reasoning selector through legacy modes as well.
     // Keep that alias aligned, while preserving independent mode selectors.
     let duplicate_modes = session.modes.as_ref().is_some_and(|modes| {
         session.config_options.iter().any(|option| {
-            matches!(option.category, Some(SessionConfigOptionCategory::ThoughtLevel))
+            is_reasoning_option(option)
                 && matches!(&option.kind, SessionConfigKind::Select(select) if {
                     let values = match &select.options {
                         SessionConfigSelectOptions::Ungrouped(choices) => choices.iter().map(|choice| choice.value.to_string()).collect::<Vec<_>>(),
@@ -1449,10 +1461,7 @@ fn update_session_options(session: &mut ConnectedSession, options: Vec<SessionCo
     });
     if duplicate_modes {
         session.modes = options.iter().find_map(|option| {
-            if !matches!(
-                option.category,
-                Some(SessionConfigOptionCategory::ThoughtLevel)
-            ) {
+            if !is_reasoning_option(option) {
                 return None;
             }
             let SessionConfigKind::Select(select) = &option.kind else {
@@ -1890,13 +1899,11 @@ async fn run_connected_turn(
                     Err(_)
                         if model_changed
                             && optional_session_config_ids.contains(&config_id)
-                            && matches!(
-                                option.category,
-                                Some(
-                                    SessionConfigOptionCategory::ThoughtLevel
-                                        | SessionConfigOptionCategory::ModelConfig
-                                )
-                            ) =>
+                            && (is_reasoning_option(option)
+                                || matches!(
+                                    option.category,
+                                    Some(SessionConfigOptionCategory::ModelConfig)
+                                )) =>
                     {
                         continue
                     }
@@ -3375,6 +3382,128 @@ mod tests {
             )
             .category(SessionConfigOptionCategory::ThoughtLevel),
         ]
+    }
+
+    #[tokio::test]
+    async fn categoryless_reasoning_preferences_follow_model_capabilities() {
+        fn controls(model: &str, reasoning_id: &str) -> Vec<SessionConfigOption> {
+            let mut options = dynamic_controls(model);
+            options[1].id = reasoning_id.to_string().into();
+            options[1].category = None;
+            options
+        }
+        for reasoning_id in ["reasoning_effort", "thought_level", "thinking_level"] {
+            for optional in [true, false] {
+                let db = Arc::new(Database::open_memory().unwrap());
+                let (recorder, _) = test_recorder(db.clone());
+                let (client_input, agent_input) = tokio::io::duplex(64 * 1024);
+                let (output_tx, output_rx) = tokio::sync::mpsc::channel(8);
+                let mock_agent = tokio::spawn(async move {
+                    let mut requests = BufReader::new(agent_input).lines();
+                    let mut model_requests = 0;
+                    let mut prompts = 0;
+                    while let Some(line) = requests.next_line().await.unwrap() {
+                        let request: Value = serde_json::from_str(&line).unwrap();
+                        let method = request["method"].as_str().unwrap();
+                        let result = match method {
+                            "initialize" => json!(InitializeResponse::new(ProtocolVersion::V1)),
+                            "session/new" => json!(NewSessionResponse::new("categoryless-session")
+                                .config_options(controls("reasoner", reasoning_id))
+                                .modes(SessionModeState::new(
+                                    "high",
+                                    vec![
+                                        SessionMode::new("high", "High"),
+                                        SessionMode::new("max", "Max")
+                                    ]
+                                ))),
+                            "session/set_config_option" => {
+                                model_requests += 1;
+                                assert_eq!(request["params"]["configId"], "z_model");
+                                assert_eq!(request["params"]["value"], "plain");
+                                json!(SetSessionConfigOptionResponse::new(controls(
+                                    "plain",
+                                    reasoning_id
+                                )))
+                            }
+                            "session/prompt" => {
+                                prompts += 1;
+                                json!(PromptResponse::new(StopReason::EndTurn))
+                            }
+                            other => panic!("unexpected ACP method: {other}"),
+                        };
+                        send_json(
+                            &output_tx,
+                            json!({ "jsonrpc": "2.0", "id": request["id"], "result": result }),
+                        )
+                        .await;
+                        if method == "session/prompt" {
+                            break;
+                        }
+                    }
+                    assert_eq!(model_requests, 1);
+                    assert_eq!(prompts, usize::from(optional));
+                });
+                let result = run_turn(
+                    AttachedContainer {
+                        info: ContainerInfo {
+                            container_id: "categoryless-container".into(),
+                            agent_id: "session-1".into(),
+                            status: "running".into(),
+                            host_port: None,
+                        },
+                        input: Box::pin(client_input),
+                        output: Box::pin(ReceiverStream::new(output_rx)),
+                    },
+                    AcpTurnRuntime::new(
+                        recorder,
+                        Arc::new(AcpElicitationBroker::new()),
+                        Arc::new(AcpTurnControlBroker::new()),
+                    ),
+                    AcpSessionStart::New,
+                    Path::new("/workspace"),
+                    "Switch to plain model",
+                    AcpTurnOptions {
+                        session_config: [
+                            ("z_model".into(), json!("plain")),
+                            (reasoning_id.into(), json!("high")),
+                        ]
+                        .into(),
+                        optional_session_config_ids: if optional {
+                            HashSet::from([reasoning_id.into()])
+                        } else {
+                            HashSet::new()
+                        },
+                        ..AcpTurnOptions::default()
+                    },
+                )
+                .await;
+                if optional {
+                    result.unwrap();
+                    let events = SessionManager::new(db)
+                        .list_events("session-1", None, 20)
+                        .unwrap();
+                    let snapshot = events
+                        .iter()
+                        .rev()
+                        .find(|event| event.event_type == "session_config_options")
+                        .unwrap();
+                    assert_eq!(snapshot.payload["modes"]["currentModeId"], "off");
+                    assert_eq!(
+                        snapshot.payload["modes"]["availableModes"]
+                            .as_array()
+                            .unwrap()
+                            .len(),
+                        1
+                    );
+                } else {
+                    assert!(result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("does not offer value 'high'"));
+                }
+                mock_agent.await.unwrap();
+            }
+        }
     }
 
     #[tokio::test]
