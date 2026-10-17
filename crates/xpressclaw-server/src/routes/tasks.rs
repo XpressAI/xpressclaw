@@ -202,6 +202,14 @@ async fn task_session_config(
             cached_task_session_config(&sessions, id, agent_id)
         }
     };
+    // Active/queued work is not an idle editing target, even in the brief gap
+    // between releasing the process lock and persisting the attempt outcome.
+    if sessions
+        .has_active_attempts(agent_id)
+        .map_err(internal_error)?
+    {
+        return cached();
+    }
     // A task may have moved A -> B -> A. Resolve within the assigned Agent,
     // ignoring newer attempts without a native session, rather than letting
     // another Agent's attempt hide this Agent's retained conversation.

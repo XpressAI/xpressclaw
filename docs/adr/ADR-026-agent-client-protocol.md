@@ -62,7 +62,11 @@ are never used. Completed/disconnected tasks therefore retain their advertised
 choices even after long histories or a control-plane restart. The picker remains
 reachable whenever an Agent is assigned; a task that has never advertised any
 controls shows an explicit empty state rather than borrowing another task's
-catalog. This does not initialize a brand-new ACP session.
+catalog. Live edits resolve only the assigned Agent's completed or interrupted
+task session, matching the dispatcher's resumable statuses. Sessions belonging
+only to failed/cancelled attempts can remain connected but are not live editing
+targets; active or queued work uses the cached/staged path. This does not
+initialize a brand-new ACP session.
 
 If the process is disconnected or busy, choices are staged for the next message;
 reasoning controls from the previous model are hidden and omitted from that

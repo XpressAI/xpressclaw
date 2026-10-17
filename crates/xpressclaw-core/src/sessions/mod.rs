@@ -380,9 +380,10 @@ impl SessionManager {
         })
     }
 
-    /// Resolve this task's initialized conversation within its current Agent.
-    /// Newer attempts for another Agent, or attempts that never obtained a
-    /// native session, must not hide a retained connection after reassignment.
+    /// Resolve this task's resumable conversation within its current Agent.
+    /// Match the dispatcher's terminal-session statuses: a failed new/forked
+    /// session may still be connected but will not be resumed on the next turn.
+    /// Other Agents and uninitialized attempts must not hide this conversation.
     pub fn latest_task_native_attempt(
         &self,
         task_id: &str,
@@ -397,6 +398,7 @@ impl SessionManager {
                  FROM work_attempts
                  WHERE task_id = ?1 AND session_id = ?2
                    AND native_session_id IS NOT NULL AND TRIM(native_session_id) != ''
+                   AND status IN ('completed', 'interrupted')
                  ORDER BY COALESCE(completed_at, created_at) DESC, rowid DESC LIMIT 1",
                 rusqlite::params![task_id, session_id],
                 row_to_attempt,
@@ -1317,6 +1319,64 @@ mod tests {
             .is_none());
         assert!(manager
             .latest_task_native_attempt("sibling", "agent-b")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn task_native_attempt_excludes_abandoned_and_active_sessions() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        insert_agent(&db, "agent");
+        let manager = SessionManager::new(db.clone());
+        manager.ensure("agent", None).unwrap();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO tasks(id,title,status,agent_id)
+                 VALUES('task','Failed fork recovery','completed','agent');
+                 INSERT INTO work_attempts
+                    (id,session_id,task_id,runner,status,native_session_id,created_at,completed_at) VALUES
+                    ('completed','agent','task','pi','completed','native-parent','2026-01-01','2026-01-02'),
+                    ('interrupted','agent','task','pi','interrupted','native-resumable','2026-01-02','2026-01-03'),
+                    ('failed','agent','task','pi','failed','native-failed-fork','2026-01-03','2026-01-09'),
+                    ('cancelled','agent','task','pi','cancelled','native-cancelled','2026-01-04','2026-01-10'),
+                    ('active','agent','task','pi','running','native-active','2026-01-11',NULL);",
+            )
+        }).unwrap();
+        assert!(manager.has_active_attempts("agent").unwrap());
+        assert_eq!(
+            manager
+                .latest_task_native_attempt("task", "agent")
+                .unwrap()
+                .unwrap()
+                .id,
+            "interrupted"
+        );
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE work_attempts SET status='failed' WHERE id='interrupted'",
+                [],
+            )
+        })
+        .unwrap();
+        assert_eq!(
+            manager
+                .latest_task_native_attempt("task", "agent")
+                .unwrap()
+                .unwrap()
+                .id,
+            "completed"
+        );
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE work_attempts SET status='failed' WHERE id='completed'",
+                [],
+            )
+        })
+        .unwrap();
+        // With only failed/cancelled/active sessions, mutation must be staged
+        // rather than successfully changing a session the next turn abandons.
+        assert!(manager
+            .latest_task_native_attempt("task", "agent")
             .unwrap()
             .is_none());
     }
