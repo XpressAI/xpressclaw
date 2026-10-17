@@ -183,6 +183,7 @@
 	let stagedConfig: Record<string, string | boolean> = {};
 	let lastControlsEventId = 0;
 	let configRequestVersion = 0;
+	let configRefreshVersion: number | null = null;
 	let messageInputFocused = $state(false);
 	let slashMenuDismissed = $state(false);
 	let selectedCommandIndex = $state(0);
@@ -550,7 +551,14 @@
 		if (!modelMenuOpen || !task || configUpdating) return;
 		modelSearch = '';
 		configNotice = '';
-		const version = ++configRequestVersion;
+		++configRequestVersion;
+		await refreshModelMenu(true);
+	}
+
+	async function refreshModelMenu(showErrors = false) {
+		if (!modelMenuOpen || !task || configUpdating || configRefreshVersion === configRequestVersion) return;
+		const version = configRequestVersion;
+		configRefreshVersion = version;
 		const id = task.id;
 		try {
 			const controls = await tasks.config(id);
@@ -558,9 +566,11 @@
 				applySessionControls(validConfigOptions(controls.config_options), controls.modes);
 			}
 		} catch (e) {
-			if (version === configRequestVersion && task?.id === id) {
+			if (showErrors && version === configRequestVersion && task?.id === id) {
 				configNotice = e instanceof Error ? e.message : String(e);
 			}
+		} finally {
+			if (configRefreshVersion === version) configRefreshVersion = null;
 		}
 	}
 
@@ -943,6 +953,9 @@
 				|| delegatedWork.some(item => !['completed', 'cancelled'].includes(item.status)))) {
 				await poll();
 			}
+			// Idle adapters can publish dependent controls after a configuration
+			// response. Keep an open picker live even on a completed task.
+			await refreshModelMenu();
 		}, 3000);
 	});
 

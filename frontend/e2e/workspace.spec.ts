@@ -1533,6 +1533,43 @@ for (const selector of [{ id: 'backend_choice', name: 'MoDeL' }, { id: 'MODEL', 
 	});
 }
 
+test('an open idle picker receives a response-late reasoning schema without another message', async ({ page }) => {
+	const postedMessages: Record<string, unknown>[] = [];
+	await mockApi(page, { postedMessages });
+	let controls: Record<string, unknown> = pickerControls();
+	let reads = 0;
+	let changes = 0;
+	await page.route(`**/api/tasks/${taskId}/config`, async (route) => {
+		if (route.request().method() === 'POST') {
+			++changes;
+			const selected = pickerControls('local/qwen');
+			controls = { ...selected, config_options: selected.config_options.filter((option) => option.id === 'model'), modes: null };
+		} else {
+			++reads;
+		}
+		await route.fulfill({ json: { ...controls, event_id: 200 } });
+	});
+	await page.goto(`/tasks/${taskId}`);
+	const picker = page.getByTitle('Model and reasoning effort');
+	await picker.click();
+	await page.getByRole('button', { name: 'Local Qwen', exact: true }).click();
+	await expect(picker).toContainText('Local Qwen');
+	await expect(page.getByRole('button', { name: 'MAX', exact: true })).toHaveCount(0);
+	await expect(page.getByRole('button', { name: 'OFF', exact: true })).toHaveCount(0);
+	// No turn or durable event follows: the completed task's open picker must
+	// read the live cache again after the adapter's delayed notification.
+	controls = pickerControls('local/qwen');
+	await expect(page.getByRole('button', { name: 'OFF', exact: true })).toBeVisible({ timeout: 7_000 });
+	expect(reads).toBeGreaterThan(1);
+	expect(changes).toBe(1);
+	expect(postedMessages).toEqual([]);
+	await picker.click();
+	await page.locator(`#task-message-input-${taskId}`).fill('Continue after the late schema');
+	await page.getByRole('button', { name: 'Send message', exact: true }).click();
+	await expect.poll(() => postedMessages.length).toBe(1);
+	expect(postedMessages[0].config_options).toEqual({ model: 'local/qwen', thought_level: 'off' });
+});
+
 test('queued model choices survive old snapshots until the agent confirms them', async ({ page }) => {
 	const postedMessages: Record<string, unknown>[] = [];
 	await mockApi(page, { taskStatus: 'pending', postedMessages });

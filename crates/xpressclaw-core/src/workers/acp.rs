@@ -42,6 +42,7 @@ use crate::tasks::conversation::PromptImageAttachment;
 
 const MAX_TRANSCRIPT_UPDATES: usize = 500;
 const MAX_DIAGNOSTIC_BYTES: usize = 200_000;
+const CONFIG_UPDATE_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
 const CLAUDE_OAUTH_REFRESH_RETRIES: usize = 3;
 const CLAUDE_OAUTH_REFRESH_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
 const CLAUDE_OAUTH_REFRESH_CONFLICT: &str = "failed to refresh oauth token: another claude code process is refreshing it or exited mid-refresh";
@@ -391,6 +392,7 @@ struct ActiveTurn {
 
 #[derive(Clone)]
 struct ConnectedSession {
+    config_updates: watch::Sender<u64>,
     config_options: Vec<SessionConfigOption>,
     modes: Option<SessionModeState>,
     mcp_signature: String,
@@ -1431,6 +1433,12 @@ async fn serve_process(
     }
 }
 
+fn is_model_option(option: &SessionConfigOption) -> bool {
+    matches!(option.category, Some(SessionConfigOptionCategory::Model))
+        || option.id.to_string().eq_ignore_ascii_case("model")
+        || option.name.eq_ignore_ascii_case("model")
+}
+
 fn is_reasoning_option(option: &SessionConfigOption) -> bool {
     // Keep canonical ID fallbacks aligned with the task composer's detection;
     // category is optional in ACP, including for custom agents.
@@ -1441,6 +1449,15 @@ fn is_reasoning_option(option: &SessionConfigOption) -> bool {
         option.id.to_string().as_str(),
         "reasoning_effort" | "thought_level" | "thinking_level"
     )
+}
+
+fn is_model_dependent_option(option: &SessionConfigOption) -> bool {
+    !is_model_option(option)
+        && (is_reasoning_option(option)
+            || matches!(
+                option.category,
+                Some(SessionConfigOptionCategory::ModelConfig)
+            ))
 }
 
 fn update_session_options(session: &mut ConnectedSession, options: Vec<SessionConfigOption>) {
@@ -1486,17 +1503,37 @@ fn update_session_options(session: &mut ConnectedSession, options: Vec<SessionCo
         });
     }
     session.config_options = options;
+    session
+        .config_updates
+        .send_modify(|revision| *revision += 1);
 }
 
-fn cache_config_response(
+async fn cache_config_response(
     sessions: &ConnectedSessions,
     session_id: &str,
     options: Vec<SessionConfigOption>,
     config_id: &str,
     value: &SessionConfigOptionValue,
+    mut updates: watch::Receiver<u64>,
 ) -> Vec<SessionConfigOption> {
+    // Subscribe before the RPC: adapters can notify before OR after an empty
+    // response. Give response-late schemas a bounded chance to settle.
+    let notified = options.is_empty()
+        && (updates.has_changed().unwrap_or(false)
+            || tokio::time::timeout(CONFIG_UPDATE_GRACE, updates.changed())
+                .await
+                .is_ok_and(|result| result.is_ok()));
     let mut sessions = sessions.lock().unwrap();
     let session = sessions.get_mut(session_id).expect("connected ACP session");
+    if options.is_empty() && (notified || updates.has_changed().unwrap_or(false)) {
+        // The notification is authoritative, including any clamped value.
+        return session.config_options.clone();
+    }
+    let options_were_empty = options.is_empty();
+    let changing_model = advertised_model_choices(&session.config_options)
+        .is_some_and(|(id, _)| id == config_id)
+        && session.config_options.iter().any(|option| option.id.to_string() == config_id
+            && matches!((&option.kind, value), (SessionConfigKind::Select(select), SessionConfigOptionValue::ValueId { value }) if select.current_value != *value));
     if !options.is_empty() {
         update_session_options(session, options);
     } else if let Some(option) = session
@@ -1513,6 +1550,18 @@ fn cache_config_response(
             }
             _ => {}
         }
+    }
+    if options_were_empty && changing_model {
+        // No replacement schema arrived yet. Never advertise reasoning/model
+        // settings from the old model as though they belong to the new one.
+        // A later notification restores the complete schema in this cache.
+        let options = session
+            .config_options
+            .iter()
+            .filter(|option| !is_model_dependent_option(option))
+            .cloned()
+            .collect();
+        update_session_options(session, options);
     }
     session.config_options.clone()
 }
@@ -1541,6 +1590,7 @@ async fn configure_connected_session(
         {
             let value =
                 resolve_config_value(option, &requested).map_err(Error::ConfigValidation)?;
+            let updates = session.config_updates.subscribe();
             let response = connection
                 .send_request(SetSessionConfigOptionRequest::new(
                     session_id.to_string(),
@@ -1556,7 +1606,9 @@ async fn configure_connected_session(
                 response.config_options,
                 &config_id,
                 &value,
-            );
+                updates,
+            )
+            .await;
         } else if config_id == "mode" && session.modes.is_some() {
             let mode = requested
                 .as_str()
@@ -1830,6 +1882,7 @@ async fn run_connected_turn(
     sessions.lock().unwrap().insert(
         native_session_id.clone(),
         ConnectedSession {
+            config_updates: watch::channel(0).0,
             config_options: config_options.clone(),
             modes: modes.clone(),
             mcp_signature,
@@ -1854,6 +1907,13 @@ async fn run_connected_turn(
             .map_err(agent_client_protocol::util::internal_error)?;
         model_changed |= config_options.iter().find(|option| option.id.to_string() == config_id)
             .is_some_and(|option| matches!(&option.kind, SessionConfigKind::Select(select) if select.current_value.to_string() != model_id));
+        let updates = sessions
+            .lock()
+            .unwrap()
+            .get(&native_session_id)
+            .unwrap()
+            .config_updates
+            .subscribe();
         let response = connection
             .send_request(SetSessionConfigOptionRequest::new(
                 session_id.clone(),
@@ -1868,7 +1928,9 @@ async fn run_connected_turn(
             response.config_options,
             &config_id,
             &SessionConfigOptionValue::value_id(model_id.clone()),
-        );
+            updates,
+        )
+        .await;
         modes = sessions
             .lock()
             .unwrap()
@@ -1899,11 +1961,7 @@ async fn run_connected_turn(
                     Err(_)
                         if model_changed
                             && optional_session_config_ids.contains(&config_id)
-                            && (is_reasoning_option(option)
-                                || matches!(
-                                    option.category,
-                                    Some(SessionConfigOptionCategory::ModelConfig)
-                                )) =>
+                            && is_model_dependent_option(option) =>
                     {
                         continue
                     }
@@ -1918,6 +1976,13 @@ async fn run_connected_turn(
                     SessionConfigOptionValue::ValueId { value } => value.to_string(),
                     _ => "updated".to_string(),
                 };
+                let updates = sessions
+                    .lock()
+                    .unwrap()
+                    .get(&native_session_id)
+                    .unwrap()
+                    .config_updates
+                    .subscribe();
                 let response = connection
                     .send_request(SetSessionConfigOptionRequest::new(
                         session_id.clone(),
@@ -1932,7 +1997,9 @@ async fn run_connected_turn(
                     response.config_options,
                     &config_id,
                     &value,
-                );
+                    updates,
+                )
+                .await;
                 modes = sessions
                     .lock()
                     .unwrap()
@@ -1949,6 +2016,13 @@ async fn run_connected_turn(
                 continue;
             }
 
+            if config_id == "mode"
+                && modes.is_none()
+                && optional_session_config_ids.contains(&config_id)
+            {
+                deferred_config.push((config_id, value));
+                continue;
+            }
             if config_id == "mode" {
                 let requested_mode = value.as_str().ok_or_else(|| {
                     agent_client_protocol::util::internal_error(
@@ -2022,9 +2096,10 @@ async fn run_connected_turn(
         )));
     }
 
-    if let Some(session) = sessions.lock().unwrap().get_mut(&native_session_id) {
-        update_session_options(session, config_options.clone());
-        // Model changes may also refresh legacy reasoning-mode choices.
+    if let Some(session) = sessions.lock().unwrap().get(&native_session_id) {
+        // Notifications may have advanced the cache while configuration RPCs
+        // were in flight. Read that snapshot; never replace it with a local copy.
+        config_options = session.config_options.clone();
         modes = session.modes.clone();
     }
     recorder
@@ -2255,11 +2330,9 @@ fn resolve_config_value(
 fn advertised_model_choices(
     config_options: &[SessionConfigOption],
 ) -> Option<(String, Vec<(String, String)>)> {
-    let model = config_options.iter().find(|option| {
-        matches!(option.category, Some(SessionConfigOptionCategory::Model))
-            || option.id.to_string().eq_ignore_ascii_case("model")
-            || option.name.eq_ignore_ascii_case("model")
-    })?;
+    let model = config_options
+        .iter()
+        .find(|option| is_model_option(option))?;
     let SessionConfigKind::Select(select) = &model.kind else {
         return None;
     };
@@ -3382,6 +3455,239 @@ mod tests {
             )
             .category(SessionConfigOptionCategory::ThoughtLevel),
         ]
+    }
+
+    #[tokio::test]
+    async fn empty_config_responses_accept_response_late_schemas() {
+        for after_grace in [false, true] {
+            let db = Arc::new(Database::open_memory().unwrap());
+            let (recorder, _) = test_recorder(db);
+            let (client_input, agent_input) = tokio::io::duplex(64 * 1024);
+            let (output_tx, output_rx) = tokio::sync::mpsc::channel(8);
+            let (response_sent, received_response) = oneshot::channel();
+            let (release_update, update_released) = oneshot::channel();
+            let mock_agent = tokio::spawn(async move {
+                let mut requests = BufReader::new(agent_input).lines();
+                let mut response_sent = Some(response_sent);
+                let mut update_released = Some(update_released);
+                while let Some(line) = requests.next_line().await.unwrap() {
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    let result = match request["method"].as_str().unwrap() {
+                        "initialize" => json!(InitializeResponse::new(ProtocolVersion::V1)),
+                        "session/new" => {
+                            let mut options = dynamic_controls("reasoner");
+                            options[0].category = Some(SessionConfigOptionCategory::ModelConfig);
+                            options.push(
+                                SessionConfigOption::boolean("fast", "Fast", true)
+                                    .category(SessionConfigOptionCategory::ModelConfig),
+                            );
+                            options.push(SessionConfigOption::boolean("safe", "Safe", true));
+                            json!(NewSessionResponse::new("late-session")
+                                .config_options(options)
+                                .modes(SessionModeState::new(
+                                    "high",
+                                    vec![
+                                        SessionMode::new("high", "High"),
+                                        SessionMode::new("max", "Max")
+                                    ]
+                                )))
+                        }
+                        "session/prompt" => json!(PromptResponse::new(StopReason::EndTurn)),
+                        "session/set_config_option" => {
+                            assert_eq!(request["params"]["configId"], "z_model");
+                            assert_eq!(request["params"]["value"], "plain");
+                            send_json(&output_tx, json!({ "jsonrpc":"2.0", "id":request["id"], "result":SetSessionConfigOptionResponse::new(vec![]) })).await;
+                            response_sent.take().unwrap().send(()).unwrap();
+                            update_released.take().unwrap().await.unwrap();
+                            send_json(&output_tx, json!({ "jsonrpc":"2.0", "method":"session/update", "params": {
+                                "sessionId":"late-session", "update": { "sessionUpdate":"config_option_update", "configOptions":dynamic_controls("plain") }
+                            }})).await;
+                            continue;
+                        }
+                        other => panic!("unexpected ACP method: {other}"),
+                    };
+                    send_json(
+                        &output_tx,
+                        json!({ "jsonrpc":"2.0", "id":request["id"], "result":result }),
+                    )
+                    .await;
+                }
+            });
+            let process = AcpProcess::start(AttachedContainer {
+                info: ContainerInfo {
+                    container_id: "late-container".into(),
+                    agent_id: "session-1".into(),
+                    status: "running".into(),
+                    host_port: None,
+                },
+                input: Box::pin(client_input),
+                output: Box::pin(ReceiverStream::new(output_rx)),
+            })
+            .await
+            .unwrap();
+            process
+                .run_turn(
+                    AcpTurnRuntime::new(
+                        recorder,
+                        Arc::new(AcpElicitationBroker::new()),
+                        Arc::new(AcpTurnControlBroker::new()),
+                    ),
+                    AcpSessionStart::New,
+                    Path::new("/workspace"),
+                    "Initialize",
+                    AcpTurnOptions::default(),
+                )
+                .await
+                .unwrap();
+            let mut change = tokio::spawn({
+                let process = process.clone();
+                async move {
+                    process
+                        .configure("late-session", Some(("z_model".into(), json!("plain"))))
+                        .await
+                }
+            });
+            received_response.await.unwrap();
+            if after_grace {
+                let controls = (&mut change).await.unwrap().unwrap();
+                assert!(!controls
+                    .config_options
+                    .iter()
+                    .any(is_model_dependent_option));
+                assert!(
+                    controls.config_options.iter().any(is_model_option),
+                    "the model selector itself must remain available"
+                );
+                assert!(controls
+                    .config_options
+                    .iter()
+                    .any(|option| option.id.to_string() == "safe"));
+                assert!(
+                    controls.modes.is_none(),
+                    "old mirrored reasoning modes must also disappear"
+                );
+                release_update.send(()).unwrap();
+                // The late notification is cached while idle; a subsequent
+                // picker read must expose it, not the conservative fallback.
+                tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                    loop {
+                        let controls = process.configure("late-session", None).await.unwrap();
+                        if controls.config_options.iter().any(is_reasoning_option) {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+            } else {
+                assert!(
+                    tokio::time::timeout(CONFIG_UPDATE_GRACE / 4, &mut change)
+                        .await
+                        .is_err(),
+                    "an empty response alone must not return stale reasoning controls"
+                );
+                release_update.send(()).unwrap();
+                let controls = change.await.unwrap().unwrap();
+                let effort = controls
+                    .config_options
+                    .iter()
+                    .find(|option| is_reasoning_option(option))
+                    .unwrap();
+                assert!(resolve_config_value(effort, &json!("off")).is_ok());
+                assert!(resolve_config_value(effort, &json!("high")).is_err());
+            }
+            let controls = process.configure("late-session", None).await.unwrap();
+            let effort = controls
+                .config_options
+                .iter()
+                .find(|option| is_reasoning_option(option))
+                .unwrap();
+            assert!(resolve_config_value(effort, &json!("off")).is_ok());
+            process.shutdown();
+            tokio::time::timeout(std::time::Duration::from_secs(1), mock_agent)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_model_schemas_do_not_send_stale_optional_controls() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let (recorder, _) = test_recorder(db);
+        let (client_input, agent_input) = tokio::io::duplex(64 * 1024);
+        let (output_tx, output_rx) = tokio::sync::mpsc::channel(8);
+        let mock_agent = tokio::spawn(async move {
+            let mut requests = BufReader::new(agent_input).lines();
+            while let Some(line) = requests.next_line().await.unwrap() {
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let method = request["method"].as_str().unwrap();
+                let result = match method {
+                    "initialize" => json!(InitializeResponse::new(ProtocolVersion::V1)),
+                    "session/new" => json!(NewSessionResponse::new("unconfirmed-session")
+                        .config_options(dynamic_controls("reasoner"))
+                        .modes(SessionModeState::new(
+                            "high",
+                            vec![
+                                SessionMode::new("high", "High"),
+                                SessionMode::new("max", "Max")
+                            ]
+                        ))),
+                    "session/set_config_option" => {
+                        assert_eq!(
+                            request["params"]["configId"], "z_model",
+                            "stale reasoning must not be sent without a new schema"
+                        );
+                        assert_eq!(request["params"]["value"], "plain");
+                        json!(SetSessionConfigOptionResponse::new(vec![]))
+                    }
+                    "session/prompt" => json!(PromptResponse::new(StopReason::EndTurn)),
+                    other => panic!("unexpected ACP method: {other}"),
+                };
+                send_json(
+                    &output_tx,
+                    json!({ "jsonrpc":"2.0", "id":request["id"], "result":result }),
+                )
+                .await;
+                if method == "session/prompt" {
+                    break;
+                }
+            }
+        });
+        run_turn(
+            AttachedContainer {
+                info: ContainerInfo {
+                    container_id: "unconfirmed-container".into(),
+                    agent_id: "session-1".into(),
+                    status: "running".into(),
+                    host_port: None,
+                },
+                input: Box::pin(client_input),
+                output: Box::pin(ReceiverStream::new(output_rx)),
+            },
+            AcpTurnRuntime::new(
+                recorder,
+                Arc::new(AcpElicitationBroker::new()),
+                Arc::new(AcpTurnControlBroker::new()),
+            ),
+            AcpSessionStart::New,
+            Path::new("/workspace"),
+            "Use the new model defaults",
+            AcpTurnOptions {
+                model: Some("plain".into()),
+                session_config: [
+                    ("a_effort".into(), json!("high")),
+                    ("mode".into(), json!("high")),
+                ]
+                .into(),
+                optional_session_config_ids: HashSet::from(["a_effort".into(), "mode".into()]),
+                ..AcpTurnOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        mock_agent.await.unwrap();
     }
 
     #[tokio::test]

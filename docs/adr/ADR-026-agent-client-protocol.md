@@ -46,6 +46,10 @@ The task composer can inspect and change controls on an existing idle ACP
 session without sending a prompt. Model changes use `session/set_config_option`
 and immediately replace the picker schema with the agent's response or
 `config_option_update` notification, including model-specific reasoning levels.
+An empty response briefly waits for a replacement notification, regardless of
+whether it arrives before or after the response. If none arrives in that grace
+period, old model-dependent controls are withheld rather than guessed; an open
+picker refreshes the live cache so later idle notifications become visible too.
 The searchable picker discards removed/invalid settings and avoids displaying
 a duplicate legacy reasoning-mode selector. Failed requests do not by themselves
 retire a healthy connection, allowing users to switch away from a broken backend.
