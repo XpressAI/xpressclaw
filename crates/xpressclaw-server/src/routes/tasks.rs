@@ -153,6 +153,12 @@ pub fn routes() -> Router<AppState> {
         .route("/{id}/dependencies", axum::routing::post(add_dependency))
 }
 
+fn configured_task_runner(state: &AppState, agent_id: &str) -> Option<String> {
+    let config = state.config();
+    let agent = config.agents.iter().find(|agent| agent.name == agent_id)?;
+    native::resolve_runner_kind(agent).ok()
+}
+
 async fn get_session_config(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -194,13 +200,17 @@ async fn task_session_config(
     };
     let agent_id = task.agent_id.as_deref().ok_or_else(unavailable)?;
     let sessions = SessionManager::new(state.db.clone());
+    let runner_kind = configured_task_runner(state, agent_id);
     let changed = change.is_some();
     let cached = || {
         if changed {
             Err(unavailable())
         } else {
-            cached_task_session_config(&sessions, id, agent_id)
+            cached_task_session_config(&sessions, id, agent_id, runner_kind.as_deref())
         }
+    };
+    let Some(runner_kind) = runner_kind.as_deref() else {
+        return cached();
     };
     // Active/queued work is not an idle editing target, even in the brief gap
     // between releasing the process lock and persisting the attempt outcome.
@@ -214,7 +224,7 @@ async fn task_session_config(
     // ignoring newer attempts without a native session, rather than letting
     // another Agent's attempt hide this Agent's retained conversation.
     let Some(attempt) = sessions
-        .latest_task_native_attempt(id, agent_id)
+        .latest_task_native_attempt(id, agent_id, runner_kind)
         .map_err(internal_error)?
     else {
         return cached();
@@ -223,7 +233,11 @@ async fn task_session_config(
     let Some(native_session_id) = attempt.native_session_id.as_deref() else {
         return cached();
     };
-    let Some(process) = state.project_processes.connected_process(agent_id).await else {
+    let Some(process) = state
+        .project_processes
+        .connected_process(agent_id, runner_kind)
+        .await
+    else {
         return cached();
     };
     let controls = match process.configure(native_session_id, change).await {
@@ -268,11 +282,16 @@ fn cached_task_session_config(
     sessions: &SessionManager,
     task_id: &str,
     agent_id: &str,
+    runner_kind: Option<&str>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let Some(mut event) = sessions
-        .latest_task_event(task_id, agent_id, "session_config_options")
+    let event = runner_kind
+        .map(|runner| {
+            sessions.latest_task_event(task_id, agent_id, "session_config_options", runner)
+        })
+        .transpose()
         .map_err(internal_error)?
-    else {
+        .flatten();
+    let (Some(runner_kind), Some(mut event)) = (runner_kind, event) else {
         return Ok(Json(json!({
             "config_options": [], "modes": null, "live": false,
             "notice": "This task has not advertised model controls yet.",
@@ -281,7 +300,7 @@ fn cached_task_session_config(
     // Legacy adapters can change modes without republishing the full schema.
     // Keep those changes task-scoped and independent of the history window too.
     if let Some(mode) = sessions
-        .latest_task_event(task_id, agent_id, "session_mode")
+        .latest_task_event(task_id, agent_id, "session_mode", runner_kind)
         .map_err(internal_error)?
         .filter(|mode| mode.id > event.id)
     {
@@ -652,6 +671,10 @@ async fn get_task(
     let blocked_by = board.get_blockers(&id).unwrap_or_default();
     let ready = board.is_ready(&id).unwrap_or(true);
     let mut result = json!(task);
+    result["runner_kind"] = json!(task
+        .agent_id
+        .as_deref()
+        .and_then(|agent| configured_task_runner(&state, agent)));
     result["error_message"] = json!(board.current_error(&task).map_err(internal_error)?);
     result["parent_title"] = json!(task
         .parent_task_id
@@ -1357,6 +1380,10 @@ mod tests {
     use super::*;
 
     fn test_app_with_db() -> (Router, Arc<Database>) {
+        test_app_with_db_config(Config::load_default().unwrap())
+    }
+
+    fn test_app_with_db_config(config: Config) -> (Router, Arc<Database>) {
         let db = Arc::new(Database::open_memory().unwrap());
         db.with_conn(|conn| {
             conn.execute_batch(
@@ -1370,9 +1397,8 @@ mod tests {
             )
         })
         .unwrap();
-        let config = Arc::new(Config::load_default().unwrap());
         let state = AppState::new(
-            config,
+            Arc::new(config),
             db.clone(),
             None,
             std::path::PathBuf::from("test.yaml"),
@@ -1968,7 +1994,13 @@ mod tests {
     async fn disconnected_picker_reads_task_controls_beyond_shared_history() {
         use xpressclaw_core::sessions::NewEvent;
 
-        let (app, db) = test_app_with_db();
+        let mut config = Config::load_default().unwrap();
+        config.agents.push(xpressclaw_core::config::AgentConfig {
+            name: "atlas".into(),
+            backend: "pi".into(),
+            ..Default::default()
+        });
+        let (app, db) = test_app_with_db_config(config);
         let board = TaskBoard::new(db.clone());
         let task = board
             .create(&CreateTask {
@@ -2004,7 +2036,7 @@ mod tests {
                         task_id: Some(task_id),
                         attempt_id: None,
                         source_type: "acp",
-                        source_id: None,
+                        source_id: Some("pi"),
                         event_type: "session_config_options",
                         summary: "Advertised controls",
                         payload: json!({
@@ -2029,7 +2061,7 @@ mod tests {
                     task_id: Some(&task.id),
                     attempt_id: None,
                     source_type: "acp",
-                    source_id: None,
+                    source_id: Some("pi"),
                     event_type: "session_mode",
                     summary: "Mode changed",
                     payload: json!({"modeId":"new"}),
@@ -2096,6 +2128,89 @@ mod tests {
         let body = body_json(response.into_body()).await;
         assert_eq!(body["config_options"], json!([]));
         assert_eq!(body["live"], false);
+    }
+
+    #[tokio::test]
+    async fn task_controls_and_metadata_follow_runner_changes() {
+        use xpressclaw_core::config::AgentConfig;
+        use xpressclaw_core::sessions::NewEvent;
+
+        let db = Arc::new(Database::open_memory().unwrap());
+        xpressclaw_core::agents::registry::AgentRegistry::new(db.clone())
+            .ensure("agent", "pi")
+            .unwrap();
+        let task = TaskBoard::new(db.clone())
+            .create(&CreateTask {
+                title: "Runner-scoped controls".into(),
+                agent_id: Some("agent".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let sessions = SessionManager::new(db.clone());
+        sessions.ensure("agent", None).unwrap();
+        for runner in ["pi", "codex"] {
+            sessions
+                .append_event(
+                    "agent",
+                    NewEvent {
+                        task_id: Some(&task.id),
+                        attempt_id: None,
+                        source_type: "acp",
+                        source_id: Some(runner),
+                        event_type: "session_config_options",
+                        summary: "Runner controls",
+                        payload: json!({"config_options":[{"id":"model","currentValue":runner}]}),
+                    },
+                )
+                .unwrap();
+        }
+        let config = Config {
+            agents: vec![AgentConfig {
+                name: "agent".into(),
+                backend: "pi".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let state = AppState::new(Arc::new(config), db, None, "test.yaml".into(), true);
+        let app = Router::new()
+            .nest("/tasks", routes())
+            .with_state(state.clone());
+        for runner in ["pi", "codex", "claude", "pi"] {
+            let mut config = (*state.config()).clone();
+            config.agents[0].runner.kind = runner.into();
+            state.apply_config(Arc::new(config), None);
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/tasks/{}", task.id))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(body_json(response.into_body()).await["runner_kind"], runner);
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/tasks/{}/config", task.id))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let controls = body_json(response.into_body()).await;
+            assert_eq!(controls["live"], false);
+            if runner == "claude" {
+                assert_eq!(controls["config_options"], json!([]));
+            } else {
+                assert_eq!(controls["config_options"][0]["currentValue"], runner);
+            }
+        }
     }
 
     #[tokio::test]

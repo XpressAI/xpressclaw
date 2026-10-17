@@ -238,6 +238,7 @@ impl SessionManager {
         task_id: &str,
         session_id: &str,
         event_type: &str,
+        runner: &str,
     ) -> Result<Option<SessionEvent>> {
         self.db.with_conn(|conn| {
             conn.query_row(
@@ -245,8 +246,12 @@ impl SessionManager {
                         event_type, summary, payload, created_at
                  FROM session_events
                  WHERE task_id = ?1 AND session_id = ?2 AND event_type = ?3
+                   AND ((source_type = 'acp' AND source_id = ?4)
+                        OR (source_type != 'acp' AND EXISTS(
+                            SELECT 1 FROM work_attempts a
+                            WHERE a.id = session_events.attempt_id AND a.runner = ?4)))
                  ORDER BY id DESC LIMIT 1",
-                rusqlite::params![task_id, session_id, event_type],
+                rusqlite::params![task_id, session_id, event_type, runner],
                 row_to_event,
             )
             .optional()
@@ -388,6 +393,7 @@ impl SessionManager {
         &self,
         task_id: &str,
         session_id: &str,
+        runner: &str,
     ) -> Result<Option<WorkAttempt>> {
         self.db.with_conn(|conn| {
             conn.query_row(
@@ -396,11 +402,11 @@ impl SessionManager {
                         created_at, started_at, completed_at, context_used, context_size,
                         trigger_message_id, response_queued_at, response_started_at
                  FROM work_attempts
-                 WHERE task_id = ?1 AND session_id = ?2
+                 WHERE task_id = ?1 AND session_id = ?2 AND runner = ?3
                    AND native_session_id IS NOT NULL AND TRIM(native_session_id) != ''
                    AND status IN ('completed', 'interrupted')
                  ORDER BY COALESCE(completed_at, created_at) DESC, rowid DESC LIMIT 1",
-                rusqlite::params![task_id, session_id],
+                rusqlite::params![task_id, session_id, runner],
                 row_to_attempt,
             )
             .optional()
@@ -1300,27 +1306,122 @@ mod tests {
         // Task-wide lookup would select B (or an uninitialized A attempt).
         // Equal timestamps also need a deterministic newest-row tie breaker.
         let attempt = manager
-            .latest_task_native_attempt("task", "agent-a")
+            .latest_task_native_attempt("task", "agent-a", "pi")
             .unwrap()
             .unwrap();
         assert_eq!(attempt.id, "a-current");
         assert_eq!(attempt.native_session_id.as_deref(), Some("native-a"));
         assert_eq!(
             manager
-                .latest_task_native_attempt("task", "agent-b")
+                .latest_task_native_attempt("task", "agent-b", "pi")
                 .unwrap()
                 .unwrap()
                 .id,
             "b-newer"
         );
         assert!(manager
-            .latest_task_native_attempt("missing", "agent-a")
+            .latest_task_native_attempt("missing", "agent-a", "pi")
             .unwrap()
             .is_none());
         assert!(manager
-            .latest_task_native_attempt("sibling", "agent-b")
+            .latest_task_native_attempt("sibling", "agent-b", "pi")
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn task_native_attempt_and_controls_follow_the_selected_runner() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        insert_agent(&db, "agent");
+        let manager = SessionManager::new(db.clone());
+        manager.ensure("agent", None).unwrap();
+        db.with_conn(|conn| conn.execute_batch(
+            "INSERT INTO tasks(id,title,status,agent_id) VALUES('task','Runner changes','completed','agent');
+             INSERT INTO work_attempts(id,session_id,task_id,runner,status,native_session_id,created_at) VALUES
+                ('pi','agent','task','pi','completed','pi-session','2026-01-01'),
+                ('codex','agent','task','codex','completed','codex-session','2026-01-02');"
+        )).unwrap();
+        for runner in ["pi", "codex"] {
+            manager
+                .append_event(
+                    "agent",
+                    NewEvent {
+                        task_id: Some("task"),
+                        attempt_id: Some(runner),
+                        source_type: "user",
+                        source_id: Some("local-user"),
+                        event_type: "session_config_options",
+                        summary: "Edited controls",
+                        payload: json!({"runner":runner}),
+                    },
+                )
+                .unwrap();
+        }
+        // ACP provenance describes the runtime, even if the scheduling
+        // metadata of an already-queued attempt belonged to another runner.
+        manager
+            .append_event(
+                "agent",
+                NewEvent {
+                    task_id: Some("task"),
+                    attempt_id: Some("codex"),
+                    source_type: "acp",
+                    source_id: Some("pi"),
+                    event_type: "session_config_options",
+                    summary: "Runtime controls",
+                    payload: json!({"runner":"pi"}),
+                },
+            )
+            .unwrap();
+        // An unlinked ACP mode/config event retains its runner provenance too.
+        manager
+            .append_event(
+                "agent",
+                NewEvent {
+                    task_id: Some("task"),
+                    attempt_id: None,
+                    source_type: "acp",
+                    source_id: Some("codex"),
+                    event_type: "session_mode",
+                    summary: "Mode changed",
+                    payload: json!({"modeId":"plan"}),
+                },
+            )
+            .unwrap();
+        for runner in ["pi", "codex", "pi"] {
+            assert_eq!(
+                manager
+                    .latest_task_native_attempt("task", "agent", runner)
+                    .unwrap()
+                    .unwrap()
+                    .runner,
+                runner
+            );
+            assert_eq!(
+                manager
+                    .latest_task_event("task", "agent", "session_config_options", runner)
+                    .unwrap()
+                    .unwrap()
+                    .payload["runner"],
+                runner
+            );
+        }
+        assert!(manager
+            .latest_task_native_attempt("task", "agent", "claude")
+            .unwrap()
+            .is_none());
+        assert!(manager
+            .latest_task_event("task", "agent", "session_config_options", "claude")
+            .unwrap()
+            .is_none());
+        assert!(manager
+            .latest_task_event("task", "agent", "session_mode", "pi")
+            .unwrap()
+            .is_none());
+        assert!(manager
+            .latest_task_event("task", "agent", "session_mode", "codex")
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -1345,7 +1446,7 @@ mod tests {
         assert!(manager.has_active_attempts("agent").unwrap());
         assert_eq!(
             manager
-                .latest_task_native_attempt("task", "agent")
+                .latest_task_native_attempt("task", "agent", "pi")
                 .unwrap()
                 .unwrap()
                 .id,
@@ -1360,7 +1461,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             manager
-                .latest_task_native_attempt("task", "agent")
+                .latest_task_native_attempt("task", "agent", "pi")
                 .unwrap()
                 .unwrap()
                 .id,
@@ -1376,7 +1477,7 @@ mod tests {
         // With only failed/cancelled/active sessions, mutation must be staged
         // rather than successfully changing a session the next turn abandons.
         assert!(manager
-            .latest_task_native_attempt("task", "agent")
+            .latest_task_native_attempt("task", "agent", "pi")
             .unwrap()
             .is_none());
     }

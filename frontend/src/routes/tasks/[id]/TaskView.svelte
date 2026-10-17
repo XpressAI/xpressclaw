@@ -830,10 +830,10 @@
 	}
 
 	function resetHarnessControls(agentId: string | null) {
-		const controlsScope = `${taskId}:${agentId ?? ''}`;
+		const controlsScope = `${taskId}:${agentId ?? ''}:${task?.runner_kind ?? ''}`;
 		if (controlsInitializedFor === controlsScope) return false;
-		// Invalidate in-flight reads/writes even when only the assignment, not
-		// the task ID, changed. An unadvertised agent starts with no controls.
+		// Invalidate in-flight reads/writes when the assignment or configured
+		// runner changes. An unadvertised context starts with no controls.
 		++configRequestVersion;
 		stagedConfig = {};
 		lastControlsEventId = 0;
@@ -853,8 +853,12 @@
 	function refreshHarnessControls(events: SessionEvent[], agentId: string) {
 		resetHarnessControls(agentId);
 		// Session history is shared across this Agent's tasks. Never use a
-		// sibling task's model, reasoning modes, or commands in this composer.
-		events = events.filter((event) => event.task_id === taskId && event.session_id === agentId);
+		// sibling task's or obsolete runner's controls in this composer.
+		const runnerKind = task?.runner_kind;
+		events = events.filter((event) => event.task_id === taskId && event.session_id === agentId
+			&& (runnerKind === undefined // Compatibility with older task APIs.
+				|| Boolean(runnerKind && (event.source_type === 'acp' ? event.source_id === runnerKind
+					: attempts.some((attempt) => attempt.id === event.attempt_id && attempt.runner === runnerKind)))));
 		const advertised = [...events].reverse().find((event) => event.event_type === 'session_config_options');
 		const options = validConfigOptions(advertised?.payload.config_options);
 		const latestMode = [...events].reverse().find((event) => event.event_type === 'session_mode');

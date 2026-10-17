@@ -108,6 +108,7 @@ struct NativeAttemptRuntime {
 
 #[derive(Clone)]
 struct ProjectAcpProcess {
+    runner_kind: String,
     fingerprint: String,
     container_id: String,
     process: AcpProcess,
@@ -417,12 +418,12 @@ impl ConversationAcpProcesses {
 impl ProjectAcpProcesses {
     /// Resolve only an existing connection; opening a picker must not launch
     /// containers, create work attempts, or make a model request.
-    pub async fn connected_process(&self, agent_id: &str) -> Option<AcpProcess> {
+    pub async fn connected_process(&self, agent_id: &str, runner_kind: &str) -> Option<AcpProcess> {
         let slot = self.slots.lock().unwrap().get(agent_id).cloned()?;
         let entry = slot.lock().await;
         entry
             .as_ref()
-            .filter(|entry| entry.process.is_alive())
+            .filter(|entry| entry.runner_kind == runner_kind && entry.process.is_alive())
             .map(|entry| entry.process.clone())
     }
 
@@ -439,6 +440,7 @@ impl ProjectAcpProcesses {
         &self,
         docker: &DockerManager,
         agent_id: &str,
+        runner_kind: &str,
         spec: &ContainerSpec,
     ) -> Result<ProjectAcpProcess> {
         let fingerprint = retained_process_fingerprint(spec)?;
@@ -456,7 +458,12 @@ impl ProjectAcpProcesses {
             false
         };
         if reusable {
-            return Ok(entry.as_ref().unwrap().clone());
+            // A logical runner alias can change without changing the actual
+            // image/argv/environment. Preserve that transport and refresh its
+            // identity only when a dispatcher really prepares the new runner.
+            let current = entry.as_mut().unwrap();
+            current.runner_kind = runner_kind.to_string();
+            return Ok(current.clone());
         }
 
         let previous = entry.take();
@@ -475,6 +482,7 @@ impl ProjectAcpProcesses {
             }
         };
         let started = ProjectAcpProcess {
+            runner_kind: runner_kind.to_string(),
             fingerprint,
             container_id,
             process,
@@ -993,6 +1001,7 @@ async fn execute_conversation_turn_once(
         &db,
         &docker,
         &agent.name,
+        &kind,
         &spec,
         &project_processes,
         &conversation_processes,
@@ -1309,6 +1318,7 @@ async fn start_project_with_recovery(
     db: &Arc<Database>,
     docker: &DockerManager,
     agent: &str,
+    runner_kind: &str,
     spec: &ContainerSpec,
     processes: &ProjectAcpProcesses,
     conversations: &ConversationAcpProcesses,
@@ -1323,7 +1333,9 @@ async fn start_project_with_recovery(
     {
         return Ok(Some((
             guard,
-            processes.get_or_start(docker, agent, spec).await?,
+            processes
+                .get_or_start(docker, agent, runner_kind, spec)
+                .await?,
         )));
     }
     drop(guard);
@@ -1344,7 +1356,10 @@ async fn start_project_with_recovery(
         conversations.retire_agent_everywhere(agent).await;
         processes.retire_agent(agent).await;
     }
-    let process = match processes.get_or_start(docker, agent, spec).await {
+    let process = match processes
+        .get_or_start(docker, agent, runner_kind, spec)
+        .await
+    {
         Ok(process) => process,
         Err(error) => {
             if let Err(rollback) = docker.rollback_project_recovery(agent).await {
@@ -1706,6 +1721,7 @@ async fn execute_item_once(runtime: NativeAttemptRuntime, item: QueueItem) -> Re
         &db,
         &docker,
         workload_id,
+        &kind,
         &spec,
         &processes,
         &conversation_processes,
@@ -4515,6 +4531,78 @@ fn truncate(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     #[tokio::test]
+    async fn live_picker_rejects_a_retained_process_from_another_runner() {
+        use crate::docker::manager::{AttachedContainer, ContainerInfo};
+        use bollard::container::LogOutput;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio_stream::wrappers::ReceiverStream;
+
+        let (input, agent_input) = tokio::io::duplex(8192);
+        let (output_tx, output_rx) = tokio::sync::mpsc::channel(4);
+        let mock_agent = tokio::spawn(async move {
+            let mut lines = BufReader::new(agent_input).lines();
+            while let Some(line) = lines.next_line().await.unwrap() {
+                let request: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(
+                    request["method"], "initialize",
+                    "picker lookup must not create sessions or prompt"
+                );
+                let response = json!({"jsonrpc":"2.0","id":request["id"],"result":{
+                    "protocolVersion":1,"agentCapabilities":{},"authMethods":[]
+                }});
+                output_tx
+                    .send(Ok(LogOutput::StdOut {
+                        message: format!("{response}\n").into_bytes().into(),
+                    }))
+                    .await
+                    .unwrap();
+            }
+        });
+        let process = AcpProcess::start(AttachedContainer {
+            info: ContainerInfo {
+                container_id: "mock".into(),
+                agent_id: "agent".into(),
+                status: "running".into(),
+                host_port: None,
+            },
+            input: Box::pin(input),
+            output: Box::pin(ReceiverStream::new(output_rx)),
+        })
+        .await
+        .unwrap();
+        let processes = ProjectAcpProcesses::default();
+        *processes.slot("agent").lock().await = Some(ProjectAcpProcess {
+            runner_kind: "pi".into(),
+            fingerprint: "mock".into(),
+            container_id: "mock".into(),
+            process: process.clone(),
+        });
+        assert!(processes
+            .connected_process("agent", "pi")
+            .await
+            .unwrap()
+            .same_process(&process));
+        assert!(processes
+            .connected_process("agent", "codex")
+            .await
+            .is_none());
+        // Inspecting a different runner neither launches it nor retires the
+        // retained process; switching back can still inspect the original.
+        assert!(processes
+            .connected_process("agent", "pi")
+            .await
+            .unwrap()
+            .same_process(&process));
+        assert!(processes.connected_process("missing", "pi").await.is_none());
+        process.shutdown();
+        tokio::time::timeout(Duration::from_secs(2), process.wait_for_exit())
+            .await
+            .unwrap();
+        mock_agent.await.unwrap();
+        assert!(processes.connected_process("agent", "pi").await.is_none());
+    }
+
+    #[tokio::test]
     async fn retained_images_require_the_selected_harness_before_recovery() {
         for (identity, built_in, allowed) in [
             (Some("codex"), true, false),
@@ -4588,7 +4676,7 @@ mod tests {
             ..Default::default()
         };
         let parent = processes
-            .get_or_start(&docker, "agent", &spec)
+            .get_or_start(&docker, "agent", "custom", &spec)
             .await
             .unwrap();
         let mut settings = Config::default();
@@ -4612,7 +4700,7 @@ mod tests {
             let busy_turn = lifecycle.enter("agent").await;
             let requested_turn = lifecycle.enter("agent").await;
             let changed = ContainerSpec { environment: prepared_config.agents[0].runner.environment.iter().map(|(key,value)| format!("{key}={value}")).collect(), ..spec.clone() };
-            let mut recovery = Box::pin(start_project_with_recovery(&db, &docker, "agent", &changed, &processes, &conversations, &lifecycle, requested_turn, &config, &prepared_config));
+            let mut recovery = Box::pin(start_project_with_recovery(&db, &docker, "agent", "custom", &changed, &processes, &conversations, &lifecycle, requested_turn, &config, &prepared_config));
             assert!(tokio::time::timeout(Duration::from_millis(100), &mut recovery).await.is_err());
             assert!(docker.is_container_running(&parent.container_id).await);
             // Settings change while the recovery is waiting. It must not
@@ -4626,7 +4714,7 @@ mod tests {
             assert!(docker.is_container_running(&parent.container_id).await);
             let (requested_turn, refreshed) = enter_agent_runtime_config(&config, &lifecycle, "agent").await;
             let changed = ContainerSpec { environment: refreshed.agents[0].runner.environment.iter().map(|(key,value)| format!("{key}={value}")).collect(), ..changed };
-            let (guard, updated) = start_project_with_recovery(&db, &docker, "agent", &changed, &processes, &conversations, &lifecycle, requested_turn, &config, &refreshed).await.unwrap().unwrap();
+            let (guard, updated) = start_project_with_recovery(&db, &docker, "agent", "custom", &changed, &processes, &conversations, &lifecycle, requested_turn, &config, &refreshed).await.unwrap().unwrap();
             docker.validate_project_configuration("agent", &changed).await.unwrap();
             assert_ne!(updated.container_id, parent.container_id);
             let environment = engine.inspect_container(&updated.container_id, None).await.unwrap().config.unwrap().env.unwrap();
@@ -4636,7 +4724,7 @@ mod tests {
             drop(guard);
             let fail_initialize = r#"require('readline').createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);console.log(JSON.stringify({jsonrpc:'2.0',id:m.id,error:{code:-32603,message:'fixture initialization failed'}}));});"#;
             let broken = ContainerSpec { cmd: Some(vec!["node".into(), "-e".into(), fail_initialize.into()]), ..changed.clone() };
-            let failed = start_project_with_recovery(&db, &docker, "agent", &broken, &processes, &conversations, &lifecycle, lifecycle.enter("agent").await, &config, &refreshed).await;
+            let failed = start_project_with_recovery(&db, &docker, "agent", "custom", &broken, &processes, &conversations, &lifecycle, lifecycle.enter("agent").await, &config, &refreshed).await;
             assert!(failed.is_err());
             assert_eq!(docker.validate_project_configuration("agent", &changed).await.unwrap().as_deref(), Some(updated.container_id.as_str()));
             assert!(docker.is_container_running(&updated.container_id).await);
@@ -4677,7 +4765,7 @@ mod tests {
         let spec = ContainerSpec { image: image.clone(), expose_port: None, cmd: Some(vec!["node".into(), "-e".into(), r#"require('readline').createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);if(m.method==='initialize')console.log(JSON.stringify({jsonrpc:'2.0',id:m.id,result:{protocolVersion:1,agentCapabilities:{},authMethods:[]}}));});"#.into()]), ..Default::default() };
         let processes = ProjectAcpProcesses::default();
         let parent = processes
-            .get_or_start(&docker, "agent", &spec)
+            .get_or_start(&docker, "agent", "custom", &spec)
             .await
             .unwrap();
         let parent_id = parent.container_id.clone();
@@ -4697,7 +4785,7 @@ mod tests {
             assert_eq!(exec_text(&docker, network_probe).await, "experiment");
             exec_text(&docker, "require('fs').writeFileSync('/tmp/package-installed-later','installed')").await;
             let updated = ContainerSpec { image: "not-pulled:future-update".into(), ..spec };
-            let resumed = processes.get_or_start(&docker, "agent", &updated).await.unwrap();
+            let resumed = processes.get_or_start(&docker, "agent", "custom", &updated).await.unwrap();
             assert_eq!(resumed.container_id, parent_id);
             assert!(resumed.process.same_process(&parent.process), "an image update must not restart ACP or its container");
             assert_eq!(exec_text(&docker, "console.log(require('fs').readFileSync('/tmp/package-installed-later','utf8'))").await.trim(), "installed");
@@ -4709,7 +4797,7 @@ mod tests {
             // A separate, explicit process recovery still preserves the
             // writable layer, even when the selected image has since changed.
             docker.stop_preserving("agent").await.unwrap();
-            let recovered = processes.get_or_start(&docker, "agent", &updated).await.unwrap();
+            let recovered = processes.get_or_start(&docker, "agent", "custom", &updated).await.unwrap();
             assert_eq!(recovered.container_id, parent_id);
             assert_eq!(exec_text(&docker, "console.log(require('fs').readFileSync('/tmp/package-installed-later','utf8'))").await.trim(), "installed");
         }).catch_unwind().await;

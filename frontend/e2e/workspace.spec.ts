@@ -299,6 +299,7 @@ async function mockApi(
 		taskDescription?: string;
 		taskStatus?: string;
 		taskAgentId?: string | null;
+		runnerKind?: { value: string };
 		taskActivityStatus?: string;
 		taskSubtasks?: Record<string, unknown>[];
 		taskMessages?: Record<string, unknown>[];
@@ -1194,7 +1195,7 @@ async function mockApi(
 				await route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: 'Temporary task load failure' }) });
 				return;
 			}
-			response = task;
+			response = { ...task, ...(options.runnerKind ? { runner_kind: options.runnerKind.value } : {}) };
 		} else if (path === `/api/tasks/${taskId}/messages`) {
 			if (request.method() === 'POST') {
 				const payload = request.postDataJSON() as Record<string, unknown>;
@@ -1798,6 +1799,55 @@ for (const pendingRequest of ['none', 'GET', 'POST']) {
 		await page.getByRole('button', { name: 'Send message', exact: true }).click();
 		await expect.poll(() => postedMessages.length).toBe(1);
 		expect(postedMessages[0].config_options).toEqual({});
+	});
+}
+
+for (const pendingRequest of ['none', 'GET', 'POST']) {
+	test(`runner changes discard old controls and ${pendingRequest} responses`, async ({ page }) => {
+		const runnerKind = { value: 'codex' };
+		const postedMessages: Record<string, unknown>[] = [];
+		await mockApi(page, { taskStatus: 'pending', runnerKind, postedMessages });
+		const piControls = { config_options: [{
+			id: 'model', name: 'Model', category: 'model', type: 'select', currentValue: 'pi-model',
+			options: [{ value: 'pi-model', name: 'Pi Model' }],
+		}] };
+		await page.route(`**/api/sessions/${agentId}/events`, (route) => route.fulfill({ json: [
+			{ ...activityEvent(5), event_type: 'session_config_options', payload: pickerControls() },
+			{ ...activityEvent(300), source_id: 'pi', event_type: 'session_config_options', payload: piControls },
+		] }));
+		let releaseRequest!: () => void;
+		const gate = new Promise<void>((resolve) => (releaseRequest = resolve));
+		let requestStarted = false;
+		await page.route(`**/api/tasks/${taskId}/config`, async (route) => {
+			const runner = runnerKind.value;
+			const response = runner === 'pi' ? { ...piControls, event_id: 300 }
+				: { ...pickerControls(route.request().method() === 'POST' ? 'local/qwen' : undefined), event_id: 5 };
+			if (runner === 'codex' && route.request().method() === pendingRequest) {
+				requestStarted = true;
+				await gate;
+			}
+			await route.fulfill({ json: response });
+		});
+		await page.goto(`/tasks/${taskId}`);
+		const picker = page.getByTitle('Model and reasoning effort');
+		await expect(picker).toContainText('GPT-6.1 Sol'); // Ignore newer Pi history while Codex is selected.
+		await picker.click();
+		if (pendingRequest === 'POST') await page.getByRole('button', { name: 'Local Qwen', exact: true }).click();
+		if (pendingRequest !== 'none') await expect.poll(() => requestStarted).toBe(true);
+		runnerKind.value = 'pi';
+		await expect(picker).toContainText('Pi Model');
+		if (pendingRequest !== 'none') {
+			const response = page.waitForResponse((response) => response.url().endsWith(`/api/tasks/${taskId}/config`)
+				&& response.request().method() === pendingRequest);
+			releaseRequest();
+			await (await response).finished();
+			await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+			await expect(picker).toContainText('Pi Model');
+		}
+		await page.locator(`#task-message-input-${taskId}`).fill('Continue with the new runner');
+		await page.getByRole('button', { name: 'Send message', exact: true }).click();
+		await expect.poll(() => postedMessages.length).toBe(1);
+		expect(postedMessages[0].config_options).toEqual({ model: 'pi-model' });
 	});
 }
 

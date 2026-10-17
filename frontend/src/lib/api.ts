@@ -793,6 +793,8 @@ export const workspaces = {
 // -- Tasks --
 
 export interface Task {
+	/** Configured ACP runner, supplied by task inspection (not durable task history). */
+	runner_kind?: string | null;
 	parent_title?: string | null;
 	error_message?: string | null;
 	start_after?: string | null;

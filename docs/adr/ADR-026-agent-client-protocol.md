@@ -56,8 +56,9 @@ retire a healthy connection, allowing users to switch away from a broken backend
 
 The task page loads controls independently of its capped activity history. A
 read-only task configuration lookup prefers the retained live connection and
-falls back to the latest durable controls event scoped to both the task and its
-assigned Agent, including subsequent legacy mode changes. Other tasks' controls
+falls back to the latest durable controls event scoped to the task, its assigned
+Agent, and the currently configured runner, including subsequent legacy mode
+changes. A retained process from another runner is not a live editing target. Other tasks' controls
 are never used. Completed/disconnected tasks therefore retain their advertised
 choices even after long histories or a control-plane restart. The picker remains
 reachable whenever an Agent is assigned; a task that has never advertised any
@@ -65,8 +66,10 @@ controls shows an explicit empty state rather than borrowing another task's
 catalog. Live edits resolve only the assigned Agent's completed or interrupted
 task session, matching the dispatcher's resumable statuses. Sessions belonging
 only to failed/cancelled attempts can remain connected but are not live editing
-targets; active or queued work uses the cached/staged path. This does not
-initialize a brand-new ACP session.
+targets; active or queued work uses the cached/staged path. Task inspection also
+reports the configured runner so changing it invalidates old controls and
+in-flight responses even without reassignment. This does not initialize a
+brand-new ACP session.
 
 If the process is disconnected or busy, choices are staged for the next message;
 reasoning controls from the previous model are hidden and omitted from that
