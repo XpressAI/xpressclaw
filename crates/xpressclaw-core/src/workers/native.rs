@@ -1518,7 +1518,7 @@ async fn execute_item_once(runtime: NativeAttemptRuntime, item: QueueItem) -> Re
     let connected = connected_command.is_some();
     let kind = resolve_runner_kind(agent)?;
     let session_start = session_start(&db, &item, &kind)?;
-    let requested_session_config = requested_session_config(&db, agent, &item.task_id)?;
+    let requested_session_config = requested_session_config(&db, agent, &item.task_id, &kind)?;
     let mut prompt = build_prompt(&db, &item, attempt_id)?;
     if session_start == AcpSessionStart::New {
         prepend_unresumed_interrupted_prompt(&db, &item, attempt_id, &mut prompt)?;
@@ -3243,13 +3243,23 @@ fn requested_session_config(
     db: &Arc<Database>,
     agent: &AgentConfig,
     task_id: &str,
+    runner_kind: &str,
 ) -> Result<RequestedSessionConfig> {
     let mut requested = agent.runner.session_config.clone();
     let mut optional_ids = requested.keys().cloned().collect::<HashSet<_>>();
     let task = TaskBoard::new(db.clone()).get(task_id)?;
+    let matches_scope = |scope: Option<&Value>| {
+        scope.is_some_and(|scope| {
+            scope["agent_id"] == agent.name && scope["runner_kind"] == runner_kind
+        })
+    };
     if let Some(overrides) = task
         .context
         .as_ref()
+        .filter(|context| {
+            context["origin"] != "session_message"
+                || matches_scope(context.get("session_config_scope"))
+        })
         .and_then(|context| context.get("session_config"))
         .and_then(Value::as_object)
     {
@@ -3262,9 +3272,9 @@ fn requested_session_config(
     let latest_message_payload: Option<String> = db.with_conn(|conn| {
         conn.query_row(
             "SELECT payload FROM session_events
-             WHERE task_id = ?1 AND event_type = 'task_message_received'
+             WHERE task_id = ?1 AND session_id = ?2 AND event_type = 'task_message_received'
              ORDER BY id DESC LIMIT 1",
-            [task_id],
+            rusqlite::params![task_id, agent.name],
             |row| row.get(0),
         )
         .optional()
@@ -3274,6 +3284,7 @@ fn requested_session_config(
         .as_deref()
         .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
         .as_ref()
+        .filter(|payload| matches_scope(payload.get("config_scope")))
         .and_then(|payload| payload.get("config_options"))
         .and_then(Value::as_object)
     {
@@ -7131,6 +7142,7 @@ flows:
                     event_type: "task_message_received",
                     summary: "Change controls",
                     payload: json!({
+                        "config_scope": {"agent_id":"atlas","runner_kind":"pi"},
                         "config_options": {
                             "mode": "build",
                             "model": "fast",
@@ -7143,6 +7155,7 @@ flows:
             .unwrap();
 
         let agent = AgentConfig {
+            name: "atlas".into(),
             runner: NativeRunnerConfig {
                 session_config: [
                     ("mode".into(), json!("default")),
@@ -7156,7 +7169,7 @@ flows:
             },
             ..Default::default()
         };
-        let requested = requested_session_config(&db, &agent, &task.id).unwrap();
+        let requested = requested_session_config(&db, &agent, &task.id, "pi").unwrap();
         assert_eq!(requested.values.get("model"), Some(&json!("fast")));
         assert_eq!(requested.values.get("effort"), Some(&json!("low")));
         assert_eq!(
@@ -7171,6 +7184,138 @@ flows:
             requested.optional_ids,
             HashSet::from(["effort".into(), "model".into()])
         );
+    }
+
+    #[test]
+    fn message_controls_do_not_cross_runner_or_agent_boundaries() {
+        use crate::sessions::NewEvent;
+        use crate::tasks::board::CreateTask;
+        let db = Arc::new(Database::open_memory().unwrap());
+        add_test_agent(&db, "atlas");
+        add_test_agent(&db, "beta");
+        let sessions = SessionManager::new(db.clone());
+        sessions.ensure("atlas", None).unwrap();
+        sessions.ensure("beta", None).unwrap();
+        let task = TaskBoard::new(db.clone())
+            .create(&CreateTask {
+                title: "Queued runner change".into(),
+                agent_id: Some("atlas".into()),
+                context: Some(json!({"session_config":{"workflow_required":true}})),
+                ..Default::default()
+            })
+            .unwrap();
+        let mut agent = AgentConfig {
+            name: "atlas".into(),
+            ..Default::default()
+        };
+        agent
+            .runner
+            .session_config
+            .insert("model".into(), json!("default"));
+        let post = |scope: Value, model: &str| {
+            sessions.append_event("atlas", NewEvent {
+            task_id: Some(&task.id), attempt_id: None, source_type: "user", source_id: None,
+            event_type: "task_message_received", summary: "Message controls",
+            payload: json!({"config_scope":scope,"config_options":{"model":model,"runner_only":true}}),
+        }).unwrap()
+        };
+        post(
+            json!({"agent_id":"atlas","runner_kind":"pi"}),
+            "pi-selected",
+        );
+        assert_eq!(
+            requested_session_config(&db, &agent, &task.id, "pi")
+                .unwrap()
+                .values["model"],
+            "pi-selected"
+        );
+        // The same queued message or automatic continuation must not submit
+        // Pi's opaque values to a newly configured Codex adapter.
+        let changed = requested_session_config(&db, &agent, &task.id, "codex").unwrap();
+        assert_eq!(changed.values["model"], "default");
+        assert!(!changed.values.contains_key("runner_only"));
+        assert_eq!(changed.values["workflow_required"], true);
+        assert!(changed.optional_ids.contains("model"));
+        agent.name = "beta".into();
+        assert_eq!(
+            requested_session_config(&db, &agent, &task.id, "pi")
+                .unwrap()
+                .values["model"],
+            "default"
+        );
+        agent.name = "atlas".into();
+        post(
+            json!({"agent_id":"atlas","runner_kind":"codex"}),
+            "codex-selected",
+        );
+        assert_eq!(
+            requested_session_config(&db, &agent, &task.id, "codex")
+                .unwrap()
+                .values["model"],
+            "codex-selected"
+        );
+        assert_eq!(
+            requested_session_config(&db, &agent, &task.id, "pi")
+                .unwrap()
+                .values["model"],
+            "default"
+        );
+        post(Value::Null, "legacy-unscoped");
+        assert_eq!(
+            requested_session_config(&db, &agent, &task.id, "pi")
+                .unwrap()
+                .values["model"],
+            "default"
+        );
+    }
+
+    #[test]
+    fn session_message_task_controls_are_scoped_without_weakening_workflow_requirements() {
+        use crate::tasks::board::CreateTask;
+        let db = Arc::new(Database::open_memory().unwrap());
+        add_test_agent(&db, "atlas");
+        let mut agent = AgentConfig {
+            name: "atlas".into(),
+            ..Default::default()
+        };
+        agent
+            .runner
+            .session_config
+            .insert("model".into(), json!("default"));
+        for (origin, scope, runner, expected) in [
+            (
+                "session_message",
+                json!({"agent_id":"atlas","runner_kind":"pi"}),
+                "pi",
+                "selected",
+            ),
+            (
+                "session_message",
+                json!({"agent_id":"atlas","runner_kind":"pi"}),
+                "codex",
+                "default",
+            ),
+            (
+                "session_message",
+                json!({"agent_id":"beta","runner_kind":"pi"}),
+                "pi",
+                "default",
+            ),
+            ("session_message", Value::Null, "pi", "default"),
+            ("workflow", Value::Null, "codex", "selected"),
+        ] {
+            let task = TaskBoard::new(db.clone()).create(&CreateTask {
+                title: "Scoped interactive controls".into(), agent_id: Some("atlas".into()),
+                context: Some(json!({"origin":origin,"session_config_scope":scope,"session_config":{"model":"selected"}})),
+                ..Default::default()
+            }).unwrap();
+            let requested = requested_session_config(&db, &agent, &task.id, runner).unwrap();
+            assert_eq!(requested.values["model"], expected);
+            assert_eq!(
+                requested.optional_ids.contains("model"),
+                expected == "default"
+            );
+        }
     }
 
     #[test]

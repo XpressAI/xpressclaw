@@ -71,6 +71,17 @@ reports the configured runner so changing it invalidates old controls and
 in-flight responses even without reassignment. This does not initialize a
 brand-new ACP session.
 
+Message controls carry an Agent/runner scope, captured before queue publication
+in the same transaction as the message and its response attempt. The dispatcher
+replays only choices for the currently resolved scope, including on automatic
+continuations. Interactive session-created task controls carry the same
+provenance; legacy unscoped interactive preferences are not guessed. Explicit
+workflow/task configuration requirements remain strict. Clients can submit the
+advertised scope with edits/messages; a stale scope is rejected without queuing
+work. Scope-bearing picker responses also refresh completed-task composers after
+a runner change, even if the new runner's cached event is older. A rejected
+message refreshes the controls while retaining its draft for retry.
+
 If the process is disconnected or busy, choices are staged for the next message;
 reasoning controls from the previous model are hidden and omitted from that
 message. Opening a picker does not start containers, queue work, or contact an

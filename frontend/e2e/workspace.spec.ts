@@ -1848,8 +1848,73 @@ for (const pendingRequest of ['none', 'GET', 'POST']) {
 		await page.getByRole('button', { name: 'Send message', exact: true }).click();
 		await expect.poll(() => postedMessages.length).toBe(1);
 		expect(postedMessages[0].config_options).toEqual({ model: 'pi-model' });
+		expect(postedMessages[0].config_scope).toEqual({ agent_id: agentId, runner_kind: 'pi' });
 	});
 }
+
+test('a completed picker accepts an older snapshot after its advertised runner scope changes', async ({ page }) => {
+	const postedMessages: Record<string, unknown>[] = [];
+	await mockApi(page, { taskStatus: 'completed', runnerKind: { value: 'codex' }, postedMessages });
+	await page.route(`**/api/sessions/${agentId}/events`, (route) => route.fulfill({ json: [{
+		...activityEvent(300), event_type: 'session_config_options', payload: pickerControls(),
+	}] }));
+	let configuredRunner = 'codex';
+	const piControls = { config_options: [{ id: 'model', name: 'Model', category: 'model', type: 'select',
+		currentValue: 'pi-model', options: [{ value: 'pi-model', name: 'Pi Model' }] }] };
+	await page.route(`**/api/tasks/${taskId}/config`, (route) => route.fulfill({ json: {
+		...(configuredRunner === 'pi' ? piControls : pickerControls()),
+		event_id: configuredRunner === 'pi' ? 5 : 300,
+		config_scope: { agent_id: agentId, runner_kind: configuredRunner },
+	} }));
+	await page.goto(`/tasks/${taskId}`);
+	const picker = page.getByTitle('Model and reasoning effort');
+	await expect(picker).toContainText('GPT-6.1 Sol');
+	configuredRunner = 'pi'; // No task polling or new message on this completed task.
+	await picker.click();
+	await expect(picker).toContainText('Pi Model');
+	await picker.click();
+	await expect(page.locator('[data-model-picker]').getByRole('button', { name: 'Pi Model', exact: true })).toBeVisible();
+	expect(postedMessages).toEqual([]);
+});
+
+test('a stale message scope refreshes a completed composer without losing its draft', async ({ page }) => {
+	const runnerKind = { value: 'codex' };
+	const postedMessages: Record<string, unknown>[] = [];
+	const rejected: Record<string, unknown>[] = [];
+	await mockApi(page, { taskStatus: 'completed', runnerKind, postedMessages });
+	const piControls = { config_options: [{ id: 'model', name: 'Model', category: 'model', type: 'select',
+		currentValue: 'pi-model', options: [{ value: 'pi-model', name: 'Pi Model' }] }] };
+	await page.route(`**/api/tasks/${taskId}/config`, (route) => route.fulfill({ json: {
+		...(runnerKind.value === 'pi' ? piControls : pickerControls()),
+		config_scope: { agent_id: agentId, runner_kind: runnerKind.value },
+	} }));
+	await page.route(`**/api/tasks/${taskId}/messages`, async (route) => {
+		if (route.request().method() === 'POST') {
+			const body = route.request().postDataJSON();
+			if (body.config_scope?.runner_kind !== runnerKind.value) {
+				rejected.push(body);
+				await route.fulfill({ status: 409, json: { error: 'Agent or runner changed; refresh the model controls and try again' } });
+				return;
+			}
+		}
+		await route.fallback();
+	});
+	await page.goto(`/tasks/${taskId}`);
+	await expect(page.getByTitle('Model and reasoning effort')).toContainText('GPT-6.1 Sol');
+	runnerKind.value = 'pi';
+	const composer = page.locator(`#task-message-input-${taskId}`);
+	await composer.fill('Keep this draft');
+	await page.getByRole('button', { name: 'Send message', exact: true }).click();
+	await expect.poll(() => rejected.length).toBe(1);
+	expect(rejected[0].config_scope).toEqual({ agent_id: agentId, runner_kind: 'codex' });
+	await expect(page.getByTitle('Model and reasoning effort')).toContainText('Pi Model');
+	await expect(composer).toHaveValue('Keep this draft');
+	await expect(page.getByRole('button', { name: 'Send message', exact: true })).toBeEnabled();
+	await page.getByRole('button', { name: 'Send message', exact: true }).click();
+	await expect.poll(() => postedMessages.length).toBe(1);
+	expect(postedMessages[0].config_scope).toEqual({ agent_id: agentId, runner_kind: 'pi' });
+	expect(postedMessages[0].config_options).toEqual({ model: 'pi-model' });
+});
 
 test('attempt errors can be dismissed', async ({ page }) => {
 	const rawError = '<img src=x onerror="window.__rawHtmlExecuted = true"> ACP process stopped during the turn';

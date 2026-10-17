@@ -9,6 +9,7 @@ use crate::db::Database;
 use crate::error::{Error, Result};
 use crate::message_artifacts::PublishedFileAttachment;
 use crate::projects::ensure_project_accepts_work;
+use crate::sessions::{NewEvent, SessionControlScope, SessionManager};
 use crate::tasks::attachments::DecodedImageAttachment;
 use crate::tasks::queue::{QueueItem, TaskQueue};
 use crate::visualizations::{
@@ -62,6 +63,11 @@ pub struct TaskMessageAttachmentData {
 /// Manages conversation threads for tasks.
 pub struct TaskConversation {
     db: Arc<Database>,
+}
+
+struct MessageControls<'a> {
+    scope: Option<&'a SessionControlScope>,
+    values: &'a std::collections::HashMap<String, serde_json::Value>,
 }
 
 struct MessageExtras<'a> {
@@ -121,6 +127,39 @@ impl TaskConversation {
         content: &str,
         attachments: &[DecodedImageAttachment],
     ) -> Result<(TaskMessage, Option<QueueItem>)> {
+        self.add_user_message_and_enqueue(task_id, agent_id, content, attachments, None)
+    }
+
+    /// Publish message controls before their queued turn becomes claimable.
+    pub fn add_user_message_with_controls_and_enqueue(
+        &self,
+        task_id: &str,
+        agent_id: Option<&str>,
+        content: &str,
+        attachments: &[DecodedImageAttachment],
+        config_options: &std::collections::HashMap<String, serde_json::Value>,
+        config_scope: Option<&SessionControlScope>,
+    ) -> Result<(TaskMessage, Option<QueueItem>)> {
+        self.add_user_message_and_enqueue(
+            task_id,
+            agent_id,
+            content,
+            attachments,
+            Some(MessageControls {
+                scope: config_scope,
+                values: config_options,
+            }),
+        )
+    }
+
+    fn add_user_message_and_enqueue(
+        &self,
+        task_id: &str,
+        agent_id: Option<&str>,
+        content: &str,
+        attachments: &[DecodedImageAttachment],
+        controls: Option<MessageControls<'_>>,
+    ) -> Result<(TaskMessage, Option<QueueItem>)> {
         let conn = self.db.conn();
         let tx =
             rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
@@ -137,6 +176,35 @@ impl TaskConversation {
                 visualizations: &[],
             },
         )?;
+        if let (Some(agent_id), Some(MessageControls { scope, values })) = (agent_id, controls) {
+            tx.execute(
+                "INSERT OR IGNORE INTO logical_sessions(id,agent_id) VALUES(?1,?1)",
+                [agent_id],
+            )?;
+            let summary = if content.is_empty() {
+                if attachments.len() == 1 {
+                    "Sent a file".to_string()
+                } else {
+                    format!("Sent {} files", attachments.len())
+                }
+            } else {
+                content.to_string()
+            };
+            SessionManager::append_event_on(
+                &tx,
+                agent_id,
+                NewEvent {
+                    attempt_id: None,
+                    task_id: Some(task_id),
+                    source_type: "user",
+                    source_id: Some("local-user"),
+                    event_type: "task_message_received",
+                    summary: &summary,
+                    payload: json!({"role":"user","content":content,"attachments":message.attachments,
+                    "message_id":message.id,"config_options":values,"config_scope":scope}),
+                },
+            )?;
+        }
         let continuation = agent_id
             .map(|agent_id| {
                 TaskQueue::enqueue_continuation_for_message_in_transaction(
@@ -619,6 +687,90 @@ mod tests {
     use crate::sessions::SessionManager;
     use crate::tasks::board::{CreateTask, TaskBoard};
     use crate::tasks::queue::TaskQueue;
+
+    #[test]
+    fn message_controls_commit_before_queue_publication_and_roll_back_together() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        AgentRegistry::new(db.clone())
+            .ensure("atlas", "pi")
+            .unwrap();
+        let board = TaskBoard::new(db.clone());
+        let task = board
+            .create(&CreateTask {
+                title: "Atomic controls".into(),
+                agent_id: Some("atlas".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "CREATE TRIGGER require_controls BEFORE INSERT ON task_queue
+             WHEN NOT EXISTS(SELECT 1 FROM session_events WHERE task_id=NEW.task_id
+                AND event_type='task_message_received'
+                AND json_extract(payload,'$.config_scope.runner_kind')='pi')
+             BEGIN SELECT RAISE(ABORT,'controls must precede queue publication'); END;",
+            )
+        })
+        .unwrap();
+        let scope = SessionControlScope {
+            agent_id: "atlas".into(),
+            runner_kind: "pi".into(),
+        };
+        let values = std::collections::HashMap::from([("model".into(), json!("pi-model"))]);
+        let conversation = TaskConversation::new(db.clone());
+        let (message, queued) = conversation
+            .add_user_message_with_controls_and_enqueue(
+                &task.id,
+                Some("atlas"),
+                "Run this",
+                &[],
+                &values,
+                Some(&scope),
+            )
+            .unwrap();
+        assert!(queued.is_some());
+        let event = SessionManager::new(db.clone())
+            .list_events("atlas", None, 100)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.event_type == "task_message_received")
+            .unwrap();
+        assert_eq!(event.payload["message_id"], message.id);
+        assert_eq!(event.payload["config_scope"], json!(scope));
+        assert_eq!(event.payload["config_options"]["model"], "pi-model");
+
+        let failed = board
+            .create(&CreateTask {
+                title: "Rollback controls".into(),
+                agent_id: Some("atlas".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "CREATE TRIGGER fail_queue BEFORE INSERT ON task_queue
+             BEGIN SELECT RAISE(ABORT,'fixture queue failure'); END;",
+            )
+        })
+        .unwrap();
+        assert!(conversation
+            .add_user_message_with_controls_and_enqueue(
+                &failed.id,
+                Some("atlas"),
+                "Must roll back",
+                &[],
+                &values,
+                Some(&scope),
+            )
+            .is_err());
+        assert!(conversation.get_messages(&failed.id).unwrap().is_empty());
+        assert!(!SessionManager::new(db)
+            .list_events("atlas", None, 100)
+            .unwrap()
+            .iter()
+            .any(|event| event.task_id.as_deref() == Some(&failed.id)
+                && event.event_type == "task_message_received"));
+    }
 
     #[test]
     fn stores_attachment_metadata_and_loads_prompt_bytes() {

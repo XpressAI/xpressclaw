@@ -7,7 +7,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use xpressclaw_core::sessions::SessionManager;
+use xpressclaw_core::sessions::{SessionControlScope, SessionManager};
 use xpressclaw_core::tasks::attachments::{
     decode_attachments, is_prompt_image, ImageAttachmentInput,
 };
@@ -66,6 +66,7 @@ pub struct MessageInput {
     pub attachments: Vec<ImageAttachmentInput>,
     #[serde(default)]
     pub config_options: std::collections::HashMap<String, Value>,
+    pub config_scope: Option<SessionControlScope>,
     #[serde(default)]
     pub delivery: MessageDelivery,
 }
@@ -82,6 +83,7 @@ pub enum MessageDelivery {
 pub struct SessionConfigInput {
     pub config_id: String,
     pub value: Value,
+    pub config_scope: Option<SessionControlScope>,
 }
 
 #[derive(Deserialize)]
@@ -159,6 +161,16 @@ fn configured_task_runner(state: &AppState, agent_id: &str) -> Option<String> {
     native::resolve_runner_kind(agent).ok()
 }
 
+pub(super) fn configured_control_scope(
+    state: &AppState,
+    agent_id: &str,
+) -> Option<SessionControlScope> {
+    Some(SessionControlScope {
+        agent_id: agent_id.to_string(),
+        runner_kind: configured_task_runner(state, agent_id)?,
+    })
+}
+
 async fn get_session_config(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -171,13 +183,18 @@ async fn set_session_config(
     Path(id): Path<String>,
     Json(input): Json<SessionConfigInput>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    task_session_config(&state, &id, Some((input.config_id, input.value))).await
+    task_session_config(
+        &state,
+        &id,
+        Some((input.config_id, input.value, input.config_scope)),
+    )
+    .await
 }
 
 async fn task_session_config(
     state: &AppState,
     id: &str,
-    change: Option<(String, Value)>,
+    change: Option<(String, Value, Option<SessionControlScope>)>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let task = TaskBoard::new(state.db.clone()).get(id).map_err(|error| {
         (
@@ -201,6 +218,23 @@ async fn task_session_config(
     let agent_id = task.agent_id.as_deref().ok_or_else(unavailable)?;
     let sessions = SessionManager::new(state.db.clone());
     let runner_kind = configured_task_runner(state, agent_id);
+    let control_scope = runner_kind.as_ref().map(|runner| SessionControlScope {
+        agent_id: agent_id.to_string(),
+        runner_kind: runner.clone(),
+    });
+    if change
+        .as_ref()
+        .and_then(|(_, _, scope)| scope.as_ref())
+        .is_some_and(|scope| Some(scope) != control_scope.as_ref())
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error":"Agent or runner changed; refresh the model controls and try again"
+            })),
+        ));
+    }
+    let change = change.map(|(id, value, _)| (id, value));
     let changed = change.is_some();
     let cached = || {
         if changed {
@@ -254,6 +288,7 @@ async fn task_session_config(
     };
     let mut payload = json!(controls);
     payload["live"] = json!(true);
+    payload["config_scope"] = json!(control_scope);
     if changed {
         let event = sessions
             .append_event(
@@ -269,6 +304,7 @@ async fn task_session_config(
                         "config_options": controls.config_options,
                         "modes": controls.modes,
                         "native_session_id": native_session_id,
+                        "config_scope": control_scope,
                     }),
                 },
             )
@@ -294,6 +330,9 @@ fn cached_task_session_config(
     let (Some(runner_kind), Some(mut event)) = (runner_kind, event) else {
         return Ok(Json(json!({
             "config_options": [], "modes": null, "live": false,
+            "config_scope": runner_kind.map(|runner| SessionControlScope {
+                agent_id: agent_id.to_string(), runner_kind: runner.to_string(),
+            }),
             "notice": "This task has not advertised model controls yet.",
         })));
     };
@@ -325,6 +364,7 @@ fn cached_task_session_config(
         "config_options": event.payload["config_options"],
         "modes": event.payload["modes"],
         "event_id": event.id,
+        "config_scope": SessionControlScope { agent_id: agent_id.to_string(), runner_kind: runner_kind.to_string() },
         "live": false,
         "notice": "Showing last advertised controls; changes will apply on the next message.",
     })))
@@ -1176,15 +1216,22 @@ async fn add_message(
         ),
         _ => internal_error(error),
     })?;
-    let summary = if content.is_empty() {
-        if attachments.len() == 1 {
-            "Sent a file".to_string()
-        } else {
-            format!("Sent {} files", attachments.len())
-        }
-    } else {
-        content.clone()
-    };
+    let control_scope = task
+        .agent_id
+        .as_deref()
+        .and_then(|agent| configured_control_scope(&state, agent));
+    if req
+        .config_scope
+        .as_ref()
+        .is_some_and(|scope| Some(scope) != control_scope.as_ref())
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error":"Agent or runner changed; refresh the model controls and try again"
+            })),
+        ));
+    }
 
     let sessions = SessionManager::new(state.db.clone());
     let active_attempt = if let Some(agent_id) = task.agent_id.as_ref().filter(|_| !task.backlog) {
@@ -1210,36 +1257,18 @@ async fn add_message(
         .is_some_and(|attempt| attempt.status == "waiting_for_input");
     let conv = TaskConversation::new(state.db.clone());
     let (msg, continuation) = conv
-        .add_user_message_with_attachments_and_enqueue(
+        .add_user_message_with_controls_and_enqueue(
             &id,
             task.agent_id.as_deref(),
             &content,
             &attachments,
+            &req.config_options,
+            control_scope.as_ref(),
         )
         .map_err(internal_error)?;
 
     let mut delivery = "stored";
     if let Some(agent_id) = task.agent_id.as_ref().filter(|_| !task.backlog) {
-        sessions
-            .append_event(
-                agent_id,
-                xpressclaw_core::sessions::NewEvent {
-                    attempt_id: None,
-                    task_id: Some(&id),
-                    source_type: "user",
-                    source_id: Some("local-user"),
-                    event_type: "task_message_received",
-                    summary: &summary,
-                    payload: json!({
-                        "role": req.role,
-                        "content": content,
-                        "attachments": msg.attachments,
-                        "config_options": req.config_options,
-                    }),
-                },
-            )
-            .map_err(internal_error)?;
-
         delivery = if let Some(active_attempt) = active_attempt {
             // A deferred interruption cannot reach a turn parked on an elicitation.
             // Cancel that request and hand off to the queued guidance immediately.
@@ -2211,6 +2240,76 @@ mod tests {
                 assert_eq!(controls["config_options"][0]["currentValue"], runner);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn message_controls_have_scope_and_stale_submissions_do_not_enqueue() {
+        let mut config = Config::default();
+        config.agents.push(xpressclaw_core::config::AgentConfig {
+            name: "atlas".into(),
+            backend: "pi".into(),
+            ..Default::default()
+        });
+        let (app, db) = test_app_with_db_config(config);
+        let task = TaskBoard::new(db.clone())
+            .create(&CreateTask {
+                title: "Scoped message".into(),
+                agent_id: Some("atlas".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        for scope in [
+            json!({"agent_id":"atlas","runner_kind":"codex"}),
+            json!({"agent_id":"beta","runner_kind":"pi"}),
+        ] {
+            for endpoint in ["messages", "config"] {
+                let body = if endpoint == "messages" {
+                    json!({"role":"user","content":"Stale controls","config_options":{"model":"old"},"config_scope":scope})
+                } else {
+                    json!({"config_id":"model","value":"old","config_scope":scope})
+                };
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::post(format!("/tasks/{}/{endpoint}", task.id))
+                            .header("content-type", "application/json")
+                            .body(Body::from(body.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::CONFLICT);
+                assert!(body_json(response.into_body()).await["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("changed"));
+            }
+        }
+        db.with_conn(|conn| {
+            for table in ["task_messages", "task_queue", "work_attempts"] {
+                assert_eq!(
+                    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row
+                        .get::<_, i64>(0))?,
+                    0
+                );
+            }
+            Ok::<_, xpressclaw_core::error::Error>(())
+        })
+        .unwrap();
+        let scope = json!({"agent_id":"atlas","runner_kind":"pi"});
+        let response = app.oneshot(Request::post(format!("/tasks/{}/messages", task.id))
+            .header("content-type","application/json").body(Body::from(json!({
+                "role":"user","content":"Use Pi","config_options":{"model":"selected"},"config_scope":scope
+            }).to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let event = SessionManager::new(db)
+            .list_events("atlas", None, 100)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.event_type == "task_message_received")
+            .unwrap();
+        assert_eq!(event.payload["config_scope"], scope);
+        assert_eq!(event.payload["config_options"]["model"], "selected");
     }
 
     #[tokio::test]

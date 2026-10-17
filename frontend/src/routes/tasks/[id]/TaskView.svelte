@@ -9,7 +9,7 @@
 	import { goto } from '$app/navigation';
 	import { tasks, agents, sessions, workspaces, ApiError } from '$lib/api';
 	import { selectChoices, isModelOption, isReasoningOption, isAdditionalModelOption, reconcileConfig, unconfirmedConfig, duplicatesReasoningMode } from '$lib/acpConfig';
-	import type { AcpCommand, AcpConfigOption, AcpModeState, DelegatedWork, Task, TaskMessage, Agent, WorkAttempt, SessionEvent, ImageAttachmentUpload, GitChange, WorkspaceGitStatus, MessageVisualization } from '$lib/api';
+	import type { AcpCommand, AcpConfigOption, AcpModeState, SessionControlScope, DelegatedWork, Task, TaskMessage, Agent, WorkAttempt, SessionEvent, ImageAttachmentUpload, GitChange, WorkspaceGitStatus, MessageVisualization } from '$lib/api';
 	import { timeAgo } from '$lib/utils';
 	import { serverTimestampMs } from '$lib/serverTime';
 	import { renderContent } from '$lib/formatMessage';
@@ -397,6 +397,8 @@
 		`${choice.name} ${choice.value} ${choice.description ?? ''}`.toLowerCase().includes(modelSearch.toLowerCase())
 	) : []);
 	let hasModelMenu = $derived(Boolean(modelOption || reasoningOption || modelConfigOptions.length > 0));
+	let submissionScope = $derived(task?.agent_id && task.runner_kind
+		? { agent_id: task.agent_id, runner_kind: task.runner_kind } : undefined);
 	let submissionConfig = $derived(Object.fromEntries(Object.entries(selectedConfig).filter(([id]) => {
 		const option = configOptions.find((option) => option.id === id);
 		return !modelControlsPending || !option || (!isReasoningOption(option) && !isAdditionalModelOption(option));
@@ -546,6 +548,18 @@
 		selectedConfig = reconcileConfig(options, stagedConfig);
 	}
 
+	function acceptControlScope(scope: SessionControlScope | null | undefined): boolean {
+		if (!task) return false;
+		if (scope === undefined) return true; // Older APIs did not advertise scope.
+		if (scope && scope.agent_id !== task.agent_id) return false;
+		const runnerKind = scope?.runner_kind ?? null;
+		if (task.runner_kind !== runnerKind) {
+			task = { ...task, runner_kind: runnerKind };
+			resetHarnessControls(task.agent_id);
+		}
+		return true;
+	}
+
 	async function toggleModelMenu() {
 		modelMenuOpen = !modelMenuOpen;
 		if (!modelMenuOpen || !task || configUpdating) return;
@@ -563,8 +577,11 @@
 		const id = task.id;
 		try {
 			const controls = await tasks.config(id);
-			if (version === configRequestVersion && task?.id === id
-				&& (controls.event_id ?? eventRevision) >= lastControlsEventId) {
+			if (version === configRequestVersion && task?.id === id) {
+				if (!acceptControlScope(controls.config_scope)) { void poll(); return; }
+				// A new runner can legitimately have an older cached event ID.
+				if (controls.event_id !== undefined && controls.event_id < lastControlsEventId) return;
+				if (controls.event_id === undefined && eventRevision < lastControlsEventId) return;
 				lastControlsEventId = Math.max(lastControlsEventId, controls.event_id ?? 0);
 				applySessionControls(validConfigOptions(controls.config_options), controls.modes);
 				configNotice = controls.notice ?? '';
@@ -585,8 +602,9 @@
 		configNotice = '';
 		configUpdating = true;
 		try {
-			const controls = await tasks.setConfig(id, option.id, value);
+			const controls = await tasks.setConfig(id, option.id, value, submissionScope);
 			if (version !== configRequestVersion || task?.id !== id) return;
+			if (!acceptControlScope(controls.config_scope)) { void poll(); return; }
 			delete stagedConfig[option.id];
 			if (isModelOption(option)) {
 				for (const dependent of configOptions.filter((item) => isReasoningOption(item) || isAdditionalModelOption(item))) {
@@ -597,7 +615,11 @@
 			applySessionControls(validConfigOptions(controls.config_options), controls.modes);
 		} catch (e) {
 			if (version !== configRequestVersion || task?.id !== id) return;
-			if (e instanceof ApiError && e.status === 409) stageConfigOption(option, value);
+			if (e instanceof ApiError && e.status === 409) {
+				await poll();
+				if (version !== configRequestVersion || task?.id !== id) return;
+				stageConfigOption(option, value);
+			}
 			// Other failures leave the last confirmed selection intact.
 			configNotice = e instanceof Error ? e.message : String(e);
 		} finally {
@@ -1178,6 +1200,7 @@
 		try {
 			await tasks.addMessage(task.id, 'user', content, {
 				configOptions: submissionConfig,
+				configScope: submissionScope,
 				attachments,
 				delivery: immediate ? 'immediate' : 'after_tool',
 			});
@@ -1189,6 +1212,7 @@
 			await poll();
 			scrollToBottom(true);
 		} catch (e) {
+			if (e instanceof ApiError && e.status === 409) await poll();
 			messageAttachmentError = e instanceof Error ? e.message : String(e);
 		} finally {
 			messageSending = false;
@@ -1203,7 +1227,11 @@
 		showJumpToLatest = false;
 		await tasks.addMessage(task.id, 'user', prompt, {
 			configOptions: submissionConfig,
+			configScope: submissionScope,
 			delivery: 'after_tool',
+		}).catch(async (e) => {
+			if (e instanceof ApiError && e.status === 409) await poll();
+			throw e;
 		});
 		await poll();
 		scrollToBottom(true);

@@ -9,7 +9,7 @@ use xpressclaw_core::acp::{is_builtin_runner_image, is_host_runner_image};
 use xpressclaw_core::agents::registry::AgentRegistry;
 use xpressclaw_core::config::{default_native_runner_image, AgentConfig, ContainerEngineAccess};
 use xpressclaw_core::docker::manager::DockerManager;
-use xpressclaw_core::sessions::{NewEvent, SessionManager};
+use xpressclaw_core::sessions::{NewEvent, SessionControlScope, SessionManager};
 use xpressclaw_core::tasks::attachments::{decode_image_attachments, ImageAttachmentInput};
 use xpressclaw_core::tasks::board::{CreateTask, TaskBoard};
 use xpressclaw_core::tasks::conversation::TaskConversation;
@@ -44,6 +44,7 @@ struct MessageInput {
     new_session: bool,
     #[serde(default)]
     config_options: std::collections::HashMap<String, Value>,
+    config_scope: Option<SessionControlScope>,
 }
 
 pub fn routes() -> Router<AppState> {
@@ -334,6 +335,19 @@ async fn post_message(
     } else {
         content.clone()
     };
+    let control_scope = super::tasks::configured_control_scope(&state, &id);
+    if input
+        .config_scope
+        .as_ref()
+        .is_some_and(|scope| Some(scope) != control_scope.as_ref())
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error":"Agent or runner changed; refresh the model controls and try again"
+            })),
+        ));
+    }
     ensure_session(&state, &id)?;
     let sessions = SessionManager::new(state.db.clone());
     let event = sessions
@@ -354,6 +368,7 @@ async fn post_message(
                         "size": attachment.data.len(),
                     })).collect::<Vec<_>>(),
                     "config_options": input.config_options.clone(),
+                    "config_scope": control_scope,
                 }),
             },
         )
@@ -386,6 +401,7 @@ async fn post_message(
                 "source_event_id": event.id,
                 "session_mode": if input.new_session { "new" } else { "continue" },
                 "session_config": input.config_options,
+                "session_config_scope": control_scope,
             })),
         })
         .map_err(internal_error)?;
@@ -595,7 +611,7 @@ mod tests {
                     .uri("/sessions/builder/messages")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        json!({ "content": "Implement the feature" }).to_string(),
+                        json!({ "content": "Implement the feature", "config_options":{"model":"selected"} }).to_string(),
                     ))
                     .unwrap(),
             )
@@ -607,6 +623,45 @@ mod tests {
         assert_eq!(value["queued"], true);
         assert!(value["attempt_id"].is_string());
         assert_eq!(value["task"]["context"]["session_mode"], "continue");
+        let scope = json!({"agent_id":"builder","runner_kind":"codex"});
+        assert_eq!(value["task"]["context"]["session_config_scope"], scope);
+        assert_eq!(value["event"]["payload"]["config_scope"], scope);
+        assert_eq!(
+            value["task"]["context"]["session_config"]["model"],
+            "selected"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_message_control_scope_is_rejected_before_task_creation() {
+        let (app, db) = test_app_with_db();
+        let response = app
+            .oneshot(
+                Request::post("/sessions/builder/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "content":"Old controls", "config_options":{"model":"old"},
+                            "config_scope":{"agent_id":"builder","runner_kind":"pi"}
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        db.with_conn(|conn| {
+            for table in ["tasks", "task_messages", "task_queue", "work_attempts"] {
+                assert_eq!(
+                    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row
+                        .get::<_, i64>(0))?,
+                    0
+                );
+            }
+            Ok::<_, xpressclaw_core::error::Error>(())
+        })
+        .unwrap();
     }
 
     #[tokio::test]

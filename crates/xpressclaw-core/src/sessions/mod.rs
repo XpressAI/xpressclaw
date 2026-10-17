@@ -15,6 +15,14 @@ use crate::db::Database;
 use crate::error::{Error, Result};
 use crate::projects::ensure_project_accepts_work;
 
+/// Provenance for opaque ACP choices saved with a user message. Values from
+/// another Agent/runner cannot be interpreted as requirements for this adapter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionControlScope {
+    pub agent_id: String,
+    pub runner_kind: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogicalSession {
     pub id: String,
@@ -190,9 +198,20 @@ impl SessionManager {
     }
 
     pub fn append_event(&self, session_id: &str, event: NewEvent<'_>) -> Result<SessionEvent> {
+        let id = self
+            .db
+            .with_conn(|conn| Self::append_event_on(conn, session_id, event))?;
+        self.get_event(id)
+    }
+
+    /// The caller can include event provenance in its message/queue transaction.
+    pub(crate) fn append_event_on(
+        conn: &rusqlite::Connection,
+        session_id: &str,
+        event: NewEvent<'_>,
+    ) -> Result<i64> {
         let payload = serde_json::to_string(&event.payload)?;
-        let id = self.db.with_conn(|conn| {
-            conn.execute(
+        conn.execute(
                 "INSERT INTO session_events
                  (session_id, attempt_id, task_id, source_type, source_id, event_type, summary, payload)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -207,14 +226,12 @@ impl SessionManager {
                     payload,
                 ],
             )?;
-            conn.execute(
-                "UPDATE logical_sessions
+        conn.execute(
+            "UPDATE logical_sessions
                  SET latest_summary = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
-                rusqlite::params![event.summary, session_id],
-            )?;
-            Ok::<_, Error>(conn.last_insert_rowid())
-        })?;
-        self.get_event(id)
+            rusqlite::params![event.summary, session_id],
+        )?;
+        Ok(conn.last_insert_rowid())
     }
 
     pub fn get_event(&self, id: i64) -> Result<SessionEvent> {

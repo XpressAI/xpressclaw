@@ -629,7 +629,13 @@ export interface ImageAttachmentUpload {
 	data: string;
 }
 
+export interface SessionControlScope {
+	agent_id: string;
+	runner_kind: string;
+}
+
 export interface AcpSessionControls {
+	config_scope?: SessionControlScope | null;
 	config_options: AcpConfigOption[];
 	modes?: AcpModeState | null;
 	event_id?: number;
@@ -652,7 +658,7 @@ export const sessions = {
 		const query = status ? `?status=${encodeURIComponent(status)}` : '';
 		return request<WorkAttempt[]>(`/api/sessions/${id}/attempts${query}`);
 	},
-	sendMessage: (id: string, content: string, options?: { priority?: number; newSession?: boolean; configOptions?: Record<string, string | boolean>; attachments?: ImageAttachmentUpload[] }) =>
+	sendMessage: (id: string, content: string, options?: { priority?: number; newSession?: boolean; configOptions?: Record<string, string | boolean>; configScope?: SessionControlScope; attachments?: ImageAttachmentUpload[] }) =>
 		request<{ event: SessionEvent; task: Task; attempt_id: string; queued: boolean }>(
 			`/api/sessions/${id}/messages`,
 			{ method: 'POST', body: JSON.stringify({
@@ -660,6 +666,7 @@ export const sessions = {
 				priority: options?.priority,
 				new_session: options?.newSession ?? false,
 				config_options: options?.configOptions ?? {},
+				config_scope: options?.configScope,
 				attachments: options?.attachments ?? []
 			}) }
 		),
@@ -918,17 +925,18 @@ export const tasks = {
 		return request<TaskActivity>(`/api/tasks/${id}/activity${query}`);
 	},
 	config: (id: string) => request<AcpSessionControls>(`/api/tasks/${id}/config`),
-	setConfig: (id: string, configId: string, value: string | boolean) =>
+	setConfig: (id: string, configId: string, value: string | boolean, configScope?: SessionControlScope) =>
 		request<AcpSessionControls>(`/api/tasks/${id}/config`, {
-			method: 'POST', body: JSON.stringify({ config_id: configId, value }),
+			method: 'POST', body: JSON.stringify({ config_id: configId, value, config_scope: configScope }),
 		}),
-	addMessage: (id: string, role: string, content: string, options?: { configOptions?: Record<string, string | boolean>; attachments?: ImageAttachmentUpload[]; delivery?: 'after_tool' | 'immediate' }) =>
+	addMessage: (id: string, role: string, content: string, options?: { configOptions?: Record<string, string | boolean>; configScope?: SessionControlScope; attachments?: ImageAttachmentUpload[]; delivery?: 'after_tool' | 'immediate' }) =>
 		request<TaskMessageResponse>(`/api/tasks/${id}/messages`, {
 			method: 'POST',
 			body: JSON.stringify({
 				role,
 				content,
 				config_options: options?.configOptions ?? {},
+				config_scope: options?.configScope,
 				attachments: options?.attachments ?? [],
 				delivery: options?.delivery ?? 'after_tool'
 			})
