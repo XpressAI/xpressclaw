@@ -1320,6 +1320,15 @@ async function mockApi(
 		} else if (path === `/api/sessions/${agentId}/attempts/attempt-browser-test/interrupt`) {
 			options.interruptedAttempts?.push('attempt-browser-test');
 			response = { ...attempt('interrupted'), status: 'interrupted', completed_at: timestamp(62) };
+		} else if (path === `/api/tasks/${taskId}/config`) {
+			response = {
+				context: { agent_id: task.agent_id, runner_kind: 'codex', native_session_id: 'native-browser-test' },
+				availability: 'cached', revision: null, event_id: 70, pending: {}, model_pending: false,
+				config_options: [
+					{ id: 'model', name: 'Model', category: 'model', type: 'select', currentValue: 'codex-test', options: [{ value: 'codex-test', name: 'Codex Test' }] },
+					{ id: 'reasoning_effort', name: 'Reasoning', category: 'thought_level', type: 'select', currentValue: 'high', options: [{ value: 'high', name: 'High' }] },
+				], modes: null, notice: 'Last observed controls; changes will apply on the next turn.',
+			};
 		} else if (path === `/api/sessions/${agentId}/events`) {
 			response = [
 				{
@@ -1349,6 +1358,184 @@ async function mockApi(
 		await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(response) });
 	});
 }
+
+function pickerSnapshot(model = 'sol', thought = model === 'qwen' ? 'off' : 'high') {
+	const levels = model === 'qwen' ? ['off'] : ['high', 'max'];
+	return {
+		context: { agent_id: agentId, runner_kind: 'codex', native_session_id: 'native-picker' },
+		availability: 'live', revision: null as string | null, event_id: 100, pending: {} as Record<string, string | boolean>, model_pending: false, has_preferences: false,
+		config_options: [
+			{ id: 'model', name: 'Model', category: 'model', type: 'select', currentValue: model, options: [{ value: 'sol', name: 'Sol Reasoning' }, { value: 'qwen', name: 'Local Qwen' }] },
+			{ id: 'thought_level', name: 'Thinking', category: 'thought_level', type: 'select', currentValue: thought, options: levels.map(value => ({ value, name: value.toUpperCase() })) },
+		], modes: { currentModeId: thought, availableModes: levels.map(id => ({ id, name: `Thinking: ${id}` })) },
+		notice: 'Applied to the connected session.',
+	};
+}
+
+for (const history of ['evicted', 'sibling', 'abandoned']) {
+	test(`canonical picker ignores ${history} history and does not submit observed defaults`, async ({ page }) => {
+		const postedMessages: Record<string, unknown>[] = [];
+		await mockApi(page, { taskStatus: 'completed', postedMessages });
+		await page.route(`**/api/sessions/${agentId}/events`, route => route.fulfill({ json: history === 'evicted' ? [] : [{
+			...activityEvent(500), task_id: history === 'sibling' ? 'another-task' : taskId,
+			event_type: 'session_config_options', payload: pickerSnapshot('qwen'),
+		}] }));
+		await page.route(`**/api/tasks/${taskId}/config`, route => route.fulfill({ json: pickerSnapshot() }));
+		await page.goto(`/tasks/${taskId}`);
+		const picker = page.getByTitle('Model and reasoning effort');
+		await expect(picker).toContainText('Sol Reasoning');
+		await picker.click();
+		await expect(page.getByRole('button', { name: 'MAX', exact: true })).toBeVisible();
+		await expect(page.getByRole('button', { name: 'Thinking: max', exact: true })).toHaveCount(0);
+		expect(postedMessages).toEqual([]);
+		await page.locator(`#task-message-input-${taskId}`).fill('Continue unchanged');
+		await page.getByRole('button', { name: 'Send message', exact: true }).click();
+		await expect.poll(() => postedMessages.length).toBe(1);
+		expect(postedMessages[0].config_options).toEqual({});
+	});
+}
+
+test('explicit picker edits refresh dependent reasoning without a message', async ({ page }) => {
+	const postedMessages: Record<string, unknown>[] = [];
+	await mockApi(page, { taskStatus: 'completed', postedMessages });
+	let snapshot = pickerSnapshot();
+	const edits: Record<string, unknown>[] = [];
+	await page.route(`**/api/tasks/${taskId}/config`, async route => {
+		if (route.request().method() === 'POST') {
+			const edit = route.request().postDataJSON(); edits.push(edit);
+			snapshot = { ...(edit.config_id === 'model' ? pickerSnapshot(edit.value) : pickerSnapshot('sol', edit.value)), revision: String(edits.length) };
+		}
+		await route.fulfill({ json: snapshot });
+	});
+	await page.goto(`/tasks/${taskId}`);
+	const picker = page.getByTitle('Model and reasoning effort');
+	await expect(picker).toContainText('Sol Reasoning');
+	await picker.click();
+	await page.getByLabel('Search models').fill('qwen');
+	await expect(page.locator('[data-model-picker]').getByRole('button', { name: 'Sol Reasoning', exact: true })).toHaveCount(0);
+	await page.getByRole('button', { name: 'Local Qwen', exact: true }).click();
+	await expect(page.getByRole('button', { name: 'OFF', exact: true })).toBeVisible();
+	await expect(page.getByRole('button', { name: 'MAX', exact: true })).toHaveCount(0);
+	await page.getByLabel('Search models').fill('');
+	await page.getByRole('button', { name: 'Sol Reasoning', exact: true }).click();
+	await page.getByRole('button', { name: 'MAX', exact: true }).click();
+	await expect.poll(() => edits.length).toBe(3);
+	expect(edits.map(({ config_id, value }) => ({ config_id, value }))).toEqual([
+		{ config_id: 'model', value: 'qwen' }, { config_id: 'model', value: 'sol' }, { config_id: 'thought_level', value: 'max' },
+	]);
+	expect(edits[2].revision).toBe('2');
+	expect(edits[0].context).toEqual(pickerSnapshot().context);
+	expect(postedMessages).toEqual([]);
+});
+
+for (const availability of ['busy', 'cached']) {
+	test(`${availability} edits are durable pending preferences, not message payloads`, async ({ page }) => {
+		const postedMessages: Record<string, unknown>[] = [];
+		await mockApi(page, { taskStatus: 'completed', postedMessages });
+		let snapshot = { ...pickerSnapshot(), availability };
+		await page.route(`**/api/tasks/${taskId}/config`, async route => {
+			if (route.request().method() === 'POST') snapshot = { ...snapshot, revision: 'saved', pending: { model: 'qwen' }, model_pending: true, notice: 'Saved for the next turn; not yet applied.' };
+			await route.fulfill({ json: snapshot });
+		});
+		await page.goto(`/tasks/${taskId}`);
+		const picker = page.getByTitle('Model and reasoning effort');
+		await expect(picker).toContainText('Sol Reasoning'); await picker.click();
+		await page.getByRole('button', { name: 'Local Qwen', exact: true }).click();
+		await expect(picker).toContainText('Local Qwen (pending)');
+		await expect(page.getByRole('button', { name: 'MAX', exact: true })).toHaveCount(0);
+		await page.reload();
+		await expect(picker).toContainText('Local Qwen (pending)');
+		await picker.click();
+		await expect(page.locator('[data-model-picker]')).toContainText('not yet applied');
+		expect(postedMessages).toEqual([]);
+		snapshot = { ...pickerSnapshot('qwen'), revision: 'saved' };
+		await expect(picker).toContainText('Local Qwen');
+		await expect(picker).not.toContainText('(pending)');
+		await expect(page.getByRole('button', { name: 'OFF', exact: true })).toBeVisible();
+	});
+}
+
+test('stale picker context refreshes without saving the rejected edit or losing a draft', async ({ page }) => {
+	await mockApi(page, { taskStatus: 'completed' });
+	let snapshot = pickerSnapshot();
+	let posts = 0;
+	await page.route(`**/api/tasks/${taskId}/config`, async route => {
+		if (route.request().method() === 'POST') {
+			++posts;
+			snapshot = { ...pickerSnapshot('qwen'), context: { ...snapshot.context, runner_kind: 'pi', native_session_id: 'new-session' } };
+			await route.fulfill({ status: 409, json: { error: 'Control context changed; refresh and try again' } });
+		} else await route.fulfill({ json: snapshot });
+	});
+	await page.goto(`/tasks/${taskId}`);
+	const input = page.locator(`#task-message-input-${taskId}`);
+	await input.fill('Keep this draft');
+	const picker = page.getByTitle('Model and reasoning effort');
+	await expect(picker).toContainText('Sol Reasoning'); await picker.click();
+	await page.getByRole('button', { name: 'MAX', exact: true }).click();
+	await expect(picker).toContainText('Local Qwen');
+	await expect(page.locator('[data-model-picker]')).toContainText('refresh and try again');
+	await expect(input).toHaveValue('Keep this draft');
+	await expect(picker).not.toContainText('(pending)');
+	expect(posts).toBe(1);
+});
+
+test('explicit preferences can be cleared even when their old catalog is unavailable', async ({ page }) => {
+	await mockApi(page, { taskStatus: 'completed' });
+	let snapshot = { ...pickerSnapshot(), availability: 'unavailable', config_options: [] as ReturnType<typeof pickerSnapshot>['config_options'],
+		pending: { model: 'gone' } as Record<string, string | boolean>, has_preferences: true, revision: 'old', notice: 'Saved for the next turn; not yet applied.' };
+	let reset: Record<string, unknown> | undefined;
+	await page.route(`**/api/tasks/${taskId}/config`, async route => {
+		if (route.request().method() === 'POST') {
+			reset = route.request().postDataJSON();
+			snapshot = { ...snapshot, pending: {}, has_preferences: false, revision: 'cleared', notice: 'Task preferences cleared; agent defaults apply on the next turn.' };
+		}
+		await route.fulfill({ json: snapshot });
+	});
+	await page.goto(`/tasks/${taskId}`);
+	const picker = page.getByTitle('Model and reasoning effort');
+	await expect(picker).toContainText('(pending)'); await picker.click();
+	await page.getByRole('button', { name: 'Clear task preferences', exact: true }).click();
+	await expect(picker).not.toContainText('(pending)');
+	await expect(page.locator('[data-model-picker]')).toContainText('preferences cleared');
+	expect(reset?.reset).toBe(true);
+	expect(reset?.revision).toBe('old');
+});
+
+test('a late snapshot cannot undo a successful explicit edit', async ({ page }) => {
+	await mockApi(page, { taskStatus: 'completed' });
+	let reads = 0;
+	let held = false;
+	let release!: () => void;
+	const gate = new Promise<void>(resolve => release = resolve);
+	let snapshot = pickerSnapshot();
+	await page.route(`**/api/tasks/${taskId}/config`, async route => {
+		if (route.request().method() === 'POST') { snapshot = pickerSnapshot('qwen'); await route.fulfill({ json: snapshot }); }
+		else if (++reads === 2) { held = true; await gate; await route.fulfill({ headers: { 'x-old': 'yes' }, json: pickerSnapshot() }); }
+		else await route.fulfill({ json: snapshot });
+	});
+	await page.goto(`/tasks/${taskId}`);
+	const picker = page.getByTitle('Model and reasoning effort');
+	await expect(picker).toContainText('Sol Reasoning'); await picker.click();
+	await expect.poll(() => held).toBe(true);
+	await page.getByRole('button', { name: 'Local Qwen', exact: true }).click();
+	await expect(picker).toContainText('Local Qwen');
+	const old = page.waitForResponse(response => response.headers()['x-old'] === 'yes');
+	release(); await (await old).finished();
+	await expect(picker).toContainText('Local Qwen');
+});
+
+test('uninitialized picker stays reachable without borrowing history', async ({ page }) => {
+	await mockApi(page, { taskStatus: 'completed' });
+	await page.route(`**/api/tasks/${taskId}/config`, route => route.fulfill({ json: {
+		...pickerSnapshot(), availability: 'unavailable', config_options: [], modes: null,
+		context: { ...pickerSnapshot().context, native_session_id: null }, notice: 'This context has not advertised usable controls yet.',
+	} }));
+	await page.goto(`/tasks/${taskId}`);
+	const picker = page.getByTitle('Model and reasoning effort');
+	await expect(picker).toContainText('Model settings'); await picker.click();
+	await expect(page.locator('[data-model-picker]')).toContainText('has not advertised');
+	await expect(page.locator('[data-model-picker]').getByRole('button')).toHaveCount(0);
+});
 
 test('activity stays chronological, compact, expandable, and pageable', async ({ page }) => {
 	await mockApi(page);

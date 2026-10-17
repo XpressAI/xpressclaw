@@ -559,6 +559,25 @@ export interface AcpMode {
 	description?: string | null;
 }
 
+export interface TaskControlContext {
+	agent_id: string;
+	runner_kind: string;
+	native_session_id: string | null;
+}
+
+export interface TaskControlSnapshot {
+	context: TaskControlContext | null;
+	availability: 'live' | 'cached' | 'busy' | 'unavailable';
+	config_options: AcpConfigOption[];
+	modes: AcpModeState | null;
+	event_id: number | null;
+	revision: string | null;
+	pending: Record<string, string | boolean>;
+	model_pending: boolean;
+	has_preferences: boolean;
+	notice: string;
+}
+
 export interface AcpModeState {
 	currentModeId: string;
 	availableModes: AcpMode[];
@@ -907,6 +926,9 @@ export const tasks = {
 		const query = params.size ? `?${params}` : '';
 		return request<TaskActivity>(`/api/tasks/${id}/activity${query}`);
 	},
+	config: (id: string) => request<TaskControlSnapshot>(`/api/tasks/${id}/config`),
+	setConfig: (id: string, configId: string | null, value: string | boolean, context: TaskControlContext, revision: string | null) =>
+		request<TaskControlSnapshot>(`/api/tasks/${id}/config`, { method: 'POST', body: JSON.stringify({ config_id: configId ?? undefined, value, context, revision, reset: configId === null }) }),
 	addMessage: (id: string, role: string, content: string, options?: { configOptions?: Record<string, string | boolean>; attachments?: ImageAttachmentUpload[]; delivery?: 'after_tool' | 'immediate' }) =>
 		request<TaskMessageResponse>(`/api/tasks/${id}/messages`, {
 			method: 'POST',
