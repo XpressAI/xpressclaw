@@ -3787,13 +3787,20 @@ mod tests {
                             "initialize" => json!(InitializeResponse::new(ProtocolVersion::V1)),
                             "session/new" => json!(NewSessionResponse::new("categoryless-session")
                                 .config_options(controls(initial_model, reasoning_id))
-                                .modes(SessionModeState::new(
-                                    "high",
-                                    vec![
-                                        SessionMode::new("high", "High"),
-                                        SessionMode::new("max", "Max")
-                                    ]
-                                ))),
+                                .modes(if initial_model == "plain" {
+                                    SessionModeState::new(
+                                        "off",
+                                        vec![SessionMode::new("off", "Off")],
+                                    )
+                                } else {
+                                    SessionModeState::new(
+                                        "high",
+                                        vec![
+                                            SessionMode::new("high", "High"),
+                                            SessionMode::new("max", "Max"),
+                                        ],
+                                    )
+                                })),
                             "session/set_config_option" => {
                                 model_requests += 1;
                                 assert_eq!(request["params"]["configId"], "z_model");
