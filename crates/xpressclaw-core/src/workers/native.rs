@@ -1496,6 +1496,9 @@ async fn execute_item_once(runtime: NativeAttemptRuntime, item: QueueItem) -> Re
         .attempt_id
         .as_deref()
         .ok_or_else(|| Error::Task(format!("queue item {} has no work attempt", item.id)))?;
+    // Queue input ownership is immutable once claimed. Capture it before
+    // repository preparation can yield to a later message/response attempt.
+    let control_boundary = message_control_boundary(&db, &item.task_id, attempt_id)?;
     let (_runtime_lifecycle_guard, config, repository) = prepare_repository_for_turn(
         &db,
         &config_source,
@@ -1518,8 +1521,9 @@ async fn execute_item_once(runtime: NativeAttemptRuntime, item: QueueItem) -> Re
     let connected = connected_command.is_some();
     let kind = resolve_runner_kind(agent)?;
     let session_start = session_start(&db, &item, &kind)?;
-    let requested_session_config = requested_session_config(&db, agent, &item.task_id, &kind)?;
-    let mut prompt = build_prompt(&db, &item, attempt_id)?;
+    let requested_session_config =
+        requested_session_config(&db, agent, &item.task_id, &kind, control_boundary)?;
+    let mut prompt = build_prompt_at_boundary(&db, &item, attempt_id, control_boundary)?;
     if session_start == AcpSessionStart::New {
         prepend_unresumed_interrupted_prompt(&db, &item, attempt_id, &mut prompt)?;
     }
@@ -2268,7 +2272,22 @@ fn prepend_unresumed_interrupted_prompt(
     Ok(())
 }
 
+#[cfg(test)]
 fn build_prompt(db: &Arc<Database>, item: &QueueItem, attempt_id: &str) -> Result<AgentPrompt> {
+    build_prompt_at_boundary(
+        db,
+        item,
+        attempt_id,
+        message_control_boundary(db, &item.task_id, attempt_id)?,
+    )
+}
+
+fn build_prompt_at_boundary(
+    db: &Arc<Database>,
+    item: &QueueItem,
+    attempt_id: &str,
+    boundary: MessageControlBoundary,
+) -> Result<AgentPrompt> {
     // Connect v1 admits one text message, including authorized platform history,
     // per command. Reusing the Task must not replay any earlier command, even
     // when it was cancelled/failed before recording a started_at boundary.
@@ -2297,23 +2316,28 @@ fn build_prompt(db: &Arc<Database>, item: &QueueItem, attempt_id: &str) -> Resul
     let task = TaskBoard::new(db.clone()).get(&item.task_id)?;
     let (previous_trigger_message_id, previous_started, trigger_message_id) =
         db.with_conn(|conn| {
-            let trigger_message_id = conn.query_row(
-                "SELECT trigger_message_id FROM work_attempts WHERE id = ?1 AND task_id = ?2",
-                rusqlite::params![attempt_id, item.task_id],
-                |row| row.get::<_, Option<i64>>(0),
-            )?;
+            let trigger_message_id = match boundary {
+                MessageControlBoundary::Message(id) => Some(id),
+                MessageControlBoundary::QueuedEvent(id) => conn.query_row(
+                    "SELECT json_extract(payload, '$.message_boundary') FROM session_events WHERE id = ?1 AND task_id = ?2",
+                    rusqlite::params![id, item.task_id], |row| row.get::<_, Option<i64>>(0),
+                )?,
+                MessageControlBoundary::Unavailable => None,
+            };
             let previous = conn
                 .query_row(
                     "SELECT trigger_message_id, started_at FROM work_attempts
                      WHERE task_id = ?1 AND id != ?2 AND started_at IS NOT NULL
                        AND (?4 OR NOT (status = 'interrupted' AND native_session_id IS NULL))
-                       AND (?3 IS NULL OR trigger_message_id IS NULL OR trigger_message_id < ?3)
+                       AND (?3 IS NULL OR trigger_message_id IS NULL OR trigger_message_id < ?3
+                            OR (?5 AND trigger_message_id = ?3))
                      ORDER BY trigger_message_id DESC, created_at DESC, rowid DESC LIMIT 1",
                     rusqlite::params![
                         item.task_id,
                         attempt_id,
                         trigger_message_id,
-                        recovery.is_some()
+                        recovery.is_some(),
+                        matches!(boundary, MessageControlBoundary::QueuedEvent(_))
                     ],
                     |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, String>(1)?)),
                 )
@@ -3231,6 +3255,36 @@ fn mcp_server_from_config(name: &str, config: &McpServerConfig) -> Result<McpSer
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MessageControlBoundary {
+    Message(i64),
+    QueuedEvent(i64),
+    Unavailable,
+}
+
+fn message_control_boundary(
+    db: &Arc<Database>,
+    task_id: &str,
+    attempt_id: &str,
+) -> Result<MessageControlBoundary> {
+    db.with_conn(|conn| {
+        let (message_id, queued_event): (Option<i64>, Option<i64>) = conn.query_row(
+            "SELECT a.trigger_message_id,
+                    (SELECT MIN(e.id) FROM session_events e
+                     WHERE e.attempt_id = a.id AND e.task_id = a.task_id AND e.event_type = 'attempt_queued')
+             FROM work_attempts a WHERE a.id = ?1 AND a.task_id = ?2",
+            rusqlite::params![attempt_id, task_id], |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(match (message_id, queued_event) {
+            (Some(id), _) => MessageControlBoundary::Message(id),
+            // Automatic continuations may have no triggering message. Only
+            // inherit controls that existed when that response was queued.
+            (None, Some(id)) => MessageControlBoundary::QueuedEvent(id),
+            (None, None) => MessageControlBoundary::Unavailable,
+        })
+    })
+}
+
 struct RequestedSessionConfig {
     values: HashMap<String, Value>,
     optional_ids: HashSet<String>,
@@ -3244,6 +3298,7 @@ fn requested_session_config(
     agent: &AgentConfig,
     task_id: &str,
     runner_kind: &str,
+    boundary: MessageControlBoundary,
 ) -> Result<RequestedSessionConfig> {
     let mut requested = agent.runner.session_config.clone();
     let mut optional_ids = requested.keys().cloned().collect::<HashSet<_>>();
@@ -3269,12 +3324,21 @@ fn requested_session_config(
         }
     }
 
+    let (message_id, queued_event) = match boundary {
+        MessageControlBoundary::Message(id) => (Some(id), None),
+        MessageControlBoundary::QueuedEvent(id) => (None, Some(id)),
+        MessageControlBoundary::Unavailable => (None, None),
+    };
     let latest_message_payload: Option<String> = db.with_conn(|conn| {
         conn.query_row(
             "SELECT payload FROM session_events
              WHERE task_id = ?1 AND session_id = ?2 AND event_type = 'task_message_received'
+               AND source_type = 'user'
+               AND ((?3 IS NOT NULL AND json_type(payload, '$.message_id') = 'integer'
+                     AND json_extract(payload, '$.message_id') <= ?3)
+                    OR (?4 IS NOT NULL AND id <= ?4))
              ORDER BY id DESC LIMIT 1",
-            rusqlite::params![task_id, agent.name],
+            rusqlite::params![task_id, agent.name, message_id, queued_event],
             |row| row.get(0),
         )
         .optional()
@@ -7107,6 +7171,181 @@ flows:
         assert!(!visible_idle.hidden);
         assert_eq!(visible_idle.task_type, "IDLE");
         assert!(!dashboard_task_metrics_enabled(&visible_idle));
+    }
+
+    #[test]
+    fn preparing_attempt_keeps_its_triggering_messages_controls() {
+        use crate::sessions::SessionControlScope;
+        use crate::tasks::board::CreateTask;
+        let db = Arc::new(Database::open_memory().unwrap());
+        add_test_agent(&db, "atlas");
+        let task = TaskBoard::new(db.clone())
+            .create(&CreateTask {
+                title: "Response boundaries".into(),
+                agent_id: Some("atlas".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let conversation = TaskConversation::new(db.clone());
+        let scope = SessionControlScope {
+            agent_id: "atlas".into(),
+            runner_kind: "pi".into(),
+        };
+        let first_values = HashMap::from([
+            ("model".into(), json!("first-model")),
+            ("thought_level".into(), json!("low")),
+        ]);
+        let (first_message, _) = conversation
+            .add_user_message_with_controls_and_enqueue(
+                &task.id,
+                Some("atlas"),
+                "Earlier prompt",
+                &[],
+                &first_values,
+                Some(&scope),
+            )
+            .unwrap();
+        let first = TaskQueue::new(db.clone()).claim("atlas").unwrap().unwrap();
+        let first_id = first.attempt_id.as_deref().unwrap();
+        let boundary = message_control_boundary(&db, &task.id, first_id).unwrap();
+        assert_eq!(boundary, MessageControlBoundary::Message(first_message.id));
+        // Repository preparation yields here; another message owns a new turn.
+        let second_values = HashMap::from([
+            ("model".into(), json!("second-model")),
+            ("thought_level".into(), json!("max")),
+        ]);
+        let (second_message, second) = conversation
+            .add_user_message_with_controls_and_enqueue(
+                &task.id,
+                Some("atlas"),
+                "Later prompt",
+                &[],
+                &second_values,
+                Some(&scope),
+            )
+            .unwrap();
+        let second = second.unwrap();
+        let agent = AgentConfig {
+            name: "atlas".into(),
+            ..Default::default()
+        };
+        let requested =
+            super::requested_session_config(&db, &agent, &task.id, "pi", boundary).unwrap();
+        assert_eq!(requested.values["model"], "first-model");
+        assert_eq!(requested.values["thought_level"], "low");
+        let prompt = build_prompt_at_boundary(&db, &first, first_id, boundary)
+            .unwrap()
+            .content;
+        assert!(prompt.contains("Earlier prompt"));
+        assert!(!prompt.contains("Later prompt"));
+        let second_boundary =
+            message_control_boundary(&db, &task.id, second.attempt_id.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            second_boundary,
+            MessageControlBoundary::Message(second_message.id)
+        );
+        let requested =
+            super::requested_session_config(&db, &agent, &task.id, "pi", second_boundary).unwrap();
+        assert_eq!(requested.values["model"], "second-model");
+        assert_eq!(requested.values["thought_level"], "max");
+    }
+
+    #[test]
+    fn automatic_attempt_inherits_only_inputs_visible_when_queued() {
+        use crate::sessions::SessionControlScope;
+        use crate::tasks::board::CreateTask;
+        for history in [false, true] {
+            let db = Arc::new(Database::open_memory().unwrap());
+            add_test_agent(&db, "atlas");
+            let task = TaskBoard::new(db.clone())
+                .create(&CreateTask {
+                    title: "Automatic response".into(),
+                    agent_id: Some("atlas".into()),
+                    ..Default::default()
+                })
+                .unwrap();
+            let conversation = TaskConversation::new(db.clone());
+            let scope = SessionControlScope {
+                agent_id: "atlas".into(),
+                runner_kind: "pi".into(),
+            };
+            if history {
+                conversation
+                    .add_user_message_with_controls_and_enqueue(
+                        &task.id,
+                        Some("atlas"),
+                        "Previous guidance",
+                        &[],
+                        &HashMap::from([("model".into(), json!("previous-model"))]),
+                        Some(&scope),
+                    )
+                    .unwrap();
+                db.with_conn(|conn| conn.execute_batch(
+                    "UPDATE task_queue SET status='completed';
+                     UPDATE work_attempts SET status='completed',started_at='2026-01-01',completed_at='2026-01-01';"
+                )).unwrap();
+            }
+            let queue = TaskQueue::new(db.clone());
+            let automatic = queue
+                .enqueue_continuation(&task.id, "atlas")
+                .unwrap()
+                .unwrap();
+            let claimed = queue.claim("atlas").unwrap().unwrap();
+            assert_eq!(claimed.id, automatic.id);
+            let attempt_id = claimed.attempt_id.as_deref().unwrap();
+            let boundary = message_control_boundary(&db, &task.id, attempt_id).unwrap();
+            assert!(matches!(boundary, MessageControlBoundary::QueuedEvent(_)));
+            conversation
+                .add_user_message_with_controls_and_enqueue(
+                    &task.id,
+                    Some("atlas"),
+                    "Future guidance",
+                    &[],
+                    &HashMap::from([("model".into(), json!("future-model"))]),
+                    Some(&scope),
+                )
+                .unwrap();
+            let mut agent = AgentConfig {
+                name: "atlas".into(),
+                ..Default::default()
+            };
+            agent
+                .runner
+                .session_config
+                .insert("model".into(), json!("default-model"));
+            let requested =
+                super::requested_session_config(&db, &agent, &task.id, "pi", boundary).unwrap();
+            assert_eq!(
+                requested.values["model"],
+                if history {
+                    "previous-model"
+                } else {
+                    "default-model"
+                }
+            );
+            let prompt = build_prompt_at_boundary(&db, &claimed, attempt_id, boundary)
+                .unwrap()
+                .content;
+            assert!(!prompt.contains("Future guidance"));
+            assert!(!prompt.contains("Previous guidance"));
+        }
+    }
+
+    // Scope/precedence fixtures below intentionally see their whole synthetic
+    // event history. Dispatch-boundary tests use a real claimed queue item.
+    fn requested_session_config(
+        db: &Arc<Database>,
+        agent: &AgentConfig,
+        task_id: &str,
+        runner: &str,
+    ) -> Result<RequestedSessionConfig> {
+        super::requested_session_config(
+            db,
+            agent,
+            task_id,
+            runner,
+            MessageControlBoundary::QueuedEvent(i64::MAX),
+        )
     }
 
     #[test]

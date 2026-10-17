@@ -146,6 +146,13 @@ impl TaskQueue {
             }
             _ => title,
         };
+        // Freeze automatic responses too, including the absence of any input.
+        // A later message may own a separate response while this one prepares.
+        let message_boundary: i64 = transaction.query_row(
+            "SELECT COALESCE(MAX(id), 0) FROM task_messages WHERE task_id = ?1 AND role = 'user'",
+            [task_id],
+            |row| row.get(0),
+        )?;
 
         transaction.execute(
             "INSERT INTO task_queue (task_id, agent_id, status) VALUES (?1, ?2, 'queued')",
@@ -189,8 +196,9 @@ impl TaskQueue {
                 task_id,
                 source_type,
                 source_id,
-                serde_json::json!({ "runner": "auto", "kind": kind, "queue_id": queue_id })
-                    .to_string(),
+                serde_json::json!({ "runner": "auto", "kind": kind, "queue_id": queue_id,
+                    "message_boundary": message_boundary })
+                .to_string(),
             ],
         )?;
         transaction.execute(
@@ -213,7 +221,7 @@ impl TaskQueue {
     /// recovery uses this after persisting task ownership but before (or after
     /// an interrupted) initial dispatch.
     pub fn ensure_enqueued(&self, task_id: &str, agent_id: &str) -> Result<Option<QueueItem>> {
-        let id = self.db.with_conn(|conn| {
+        let (created, repair) = self.db.with_conn(|conn| {
             let transaction = rusqlite::Transaction::new_unchecked(
                 conn,
                 rusqlite::TransactionBehavior::Immediate,
@@ -232,48 +240,50 @@ impl TaskQueue {
             if let Some((id, attempt_id)) = active {
                 Self::preserve_queued_response(&transaction, task_id)?;
                 transaction.commit()?;
-                return Ok::<_, Error>(attempt_id.is_none().then_some(id));
+                return Ok::<_, Error>((None, attempt_id.is_none().then_some(id)));
             }
-            transaction.execute(
-                "INSERT INTO task_queue (task_id, agent_id, status) VALUES (?1, ?2, 'queued')",
-                rusqlite::params![task_id, agent_id],
-            )?;
-            let id = transaction.last_insert_rowid();
+            let item = Self::enqueue_new_in_transaction(&transaction, task_id, agent_id)?;
             transaction.commit()?;
-            Ok(Some(id))
+            Ok((Some(item), None))
         })?;
 
-        id.map(|id| self.create_attempt_for_item(id, task_id, agent_id))
-            .transpose()
+        if let Some(id) = repair {
+            self.create_attempt_for_item(id, task_id, agent_id)
+                .map(Some)
+        } else {
+            Ok(created)
+        }
     }
 
     /// Enqueue one continuation turn unless the task already has a queued
     /// turn. A running turn is intentionally not considered a duplicate: the
     /// continuation waits behind it and receives any messages sent meanwhile.
     pub fn enqueue_continuation(&self, task_id: &str, agent_id: &str) -> Result<Option<QueueItem>> {
-        let id = self.db.with_conn(|conn| {
+        self.db.with_conn(|conn| {
             let transaction = rusqlite::Transaction::new_unchecked(
                 conn,
                 rusqlite::TransactionBehavior::Immediate,
             )?;
             Self::ensure_locally_scheduled(&transaction, task_id)?;
             ensure_task_project_accepts_work(&transaction, task_id)?;
-            let changed = transaction.execute(
-                "INSERT INTO task_queue (task_id, agent_id, status)
-                 SELECT ?1, ?2, 'queued'
-                 WHERE NOT EXISTS (
-                    SELECT 1 FROM task_queue WHERE task_id = ?1 AND status = 'queued'
-                 )",
-                rusqlite::params![task_id, agent_id],
+            let queued: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM task_queue WHERE task_id = ?1 AND status = 'queued')",
+                [task_id],
+                |row| row.get(0),
             )?;
-            let id = (changed == 1).then(|| transaction.last_insert_rowid());
+            let item = if queued {
+                None
+            } else {
+                Some(Self::enqueue_new_in_transaction(
+                    &transaction,
+                    task_id,
+                    agent_id,
+                )?)
+            };
             Self::preserve_queued_response(&transaction, task_id)?;
             transaction.commit()?;
-            Ok::<_, Error>(id)
-        })?;
-
-        id.map(|id| self.create_attempt_for_item(id, task_id, agent_id))
-            .transpose()
+            Ok(item)
+        })
     }
 
     /// Enqueue (or coalesce into) the response cycle triggered by a user

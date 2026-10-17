@@ -73,9 +73,13 @@ brand-new ACP session.
 
 Message controls carry an Agent/runner scope, captured before queue publication
 in the same transaction as the message and its response attempt. The dispatcher
-replays only choices for the currently resolved scope, including on automatic
-continuations. Interactive session-created task controls carry the same
-provenance; legacy unscoped interactive preferences are not guessed. Explicit
+replays only choices for the currently resolved scope and the claimed attempt's
+trigger-message boundary. Automatic responses snapshot their input boundary when
+queued, including an empty history. The boundary is captured before asynchronous
+repository preparation and shared by prompt construction and control lookup;
+later messages cannot replace either input. Interactive session-created task
+controls carry the same provenance; legacy unscoped interactive preferences are
+not guessed. Explicit
 workflow/task configuration requirements remain strict. Clients can submit the
 advertised scope with edits/messages; a stale scope is rejected without queuing
 work. Scope-bearing picker responses also refresh completed-task composers after
