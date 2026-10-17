@@ -1499,6 +1499,10 @@ async fn execute_item_once(runtime: NativeAttemptRuntime, item: QueueItem) -> Re
         .attempt_id
         .as_deref()
         .ok_or_else(|| Error::Task(format!("queue item {} has no work attempt", item.id)))?;
+    // Picker choices are task preferences, not message payload. Freeze them
+    // before asynchronous preparation; edits during this turn belong to the
+    // next dispatch. No queue or automatic-continuation fencing is needed.
+    let picker_preferences = crate::tasks::controls::preferences(&db, &item.task_id)?;
     let (_runtime_lifecycle_guard, config, repository) = prepare_repository_for_turn(
         &db,
         &config_source,
@@ -1521,7 +1525,13 @@ async fn execute_item_once(runtime: NativeAttemptRuntime, item: QueueItem) -> Re
     let connected = connected_command.is_some();
     let kind = resolve_runner_kind(agent)?;
     let session_start = session_start(&db, &item, &kind)?;
-    let requested_session_config = requested_session_config(&db, agent, &item.task_id)?;
+    let requested_session_config = requested_session_config(
+        &db,
+        agent,
+        &item.task_id,
+        &kind,
+        picker_preferences.as_ref(),
+    )?;
     let mut prompt = build_prompt(&db, &item, attempt_id)?;
     if session_start == AcpSessionStart::New {
         prepend_unresumed_interrupted_prompt(&db, &item, attempt_id, &mut prompt)?;
@@ -3228,13 +3238,15 @@ struct RequestedSessionConfig {
     optional_ids: HashSet<String>,
 }
 
-/// Merge harness defaults, workflow/task overrides, and the controls chosen
-/// alongside the latest user message. Values stay keyed by opaque ACP option
+/// Merge defaults, task requirements, frozen explicit picker preferences, and
+/// legacy explicit message options newer than those preferences. Values stay keyed by opaque ACP option
 /// IDs; the adapter remains the source of truth for what each option means.
 fn requested_session_config(
     db: &Arc<Database>,
     agent: &AgentConfig,
     task_id: &str,
+    runner_kind: &str,
+    picker: Option<&crate::tasks::controls::ControlPreferences>,
 ) -> Result<RequestedSessionConfig> {
     let mut requested = agent.runner.session_config.clone();
     let mut optional_ids = requested.keys().cloned().collect::<HashSet<_>>();
@@ -3251,12 +3263,21 @@ fn requested_session_config(
         }
     }
 
+    if let Some(picker) =
+        picker.filter(|p| p.scope.agent_id == agent.name && p.scope.runner_kind == runner_kind)
+    {
+        for (id, value) in &picker.values {
+            requested.insert(id.clone(), value.clone());
+            optional_ids.remove(id);
+        }
+    }
     let latest_message_payload: Option<String> = db.with_conn(|conn| {
         conn.query_row(
             "SELECT payload FROM session_events
              WHERE task_id = ?1 AND event_type = 'task_message_received'
+               AND id > ?2
              ORDER BY id DESC LIMIT 1",
-            [task_id],
+            rusqlite::params![task_id, picker.map_or(0, |p| p.after_event_id)],
             |row| row.get(0),
         )
         .optional()
@@ -3270,7 +3291,7 @@ fn requested_session_config(
         .and_then(Value::as_object)
     {
         for (key, value) in overrides {
-            // TaskView sends its full selected control map on every message.
+            // Legacy callers can still submit explicit message configuration.
             // Preserve preference provenance when that merely echoes the
             // untouched runner value; changed values remain requirements.
             let unchanged_preference =
@@ -7019,6 +7040,81 @@ flows:
     }
 
     #[test]
+    fn picker_preferences_are_frozen_scoped_and_not_observed_defaults() {
+        use crate::{
+            sessions::NewEvent,
+            tasks::{
+                board::CreateTask,
+                controls::{self, ControlScope},
+            },
+        };
+        let db = Arc::new(Database::open_memory().unwrap());
+        add_test_agent(&db, "atlas");
+        let sessions = SessionManager::new(db.clone());
+        sessions.ensure("atlas", None).unwrap();
+        let task = TaskBoard::new(db.clone())
+            .create(&CreateTask {
+                title: "Preferences".into(),
+                agent_id: Some("atlas".into()),
+                context: Some(json!({"session_config":{"required":true}})),
+                ..Default::default()
+            })
+            .unwrap();
+        sessions.append_event("atlas",NewEvent{attempt_id:None,task_id:Some(&task.id),source_type:"user",source_id:None,event_type:"task_message_received",summary:"Legacy selection",payload:json!({"config_options":{"model":"old","unselected":"must-not-replay"}})}).unwrap();
+        let scope = ControlScope {
+            agent_id: "atlas".into(),
+            runner_kind: "pi".into(),
+        };
+        let first = controls::save_preferences(
+            &db,
+            &task.id,
+            scope.clone(),
+            None,
+            HashMap::from([("model".into(), json!("sol"))]),
+            HashSet::new(),
+        )
+        .unwrap();
+        let frozen = controls::preferences(&db, &task.id).unwrap().unwrap();
+        let second = controls::save_preferences(
+            &db,
+            &task.id,
+            scope,
+            Some(&first.revision),
+            HashMap::from([("model".into(), json!("qwen"))]),
+            HashSet::new(),
+        )
+        .unwrap();
+        let agent = AgentConfig {
+            name: "atlas".into(),
+            runner: NativeRunnerConfig {
+                session_config: HashMap::from([("default_only".into(), json!(true))]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let earlier = requested_session_config(&db, &agent, &task.id, "pi", Some(&frozen)).unwrap();
+        assert_eq!(earlier.values["model"], "sol");
+        assert_eq!(earlier.values["required"], true);
+        assert!(!earlier.values.contains_key("unselected"));
+        assert_eq!(earlier.optional_ids, HashSet::from(["default_only".into()]));
+        let later = requested_session_config(&db, &agent, &task.id, "pi", Some(&second)).unwrap();
+        assert_eq!(later.values["model"], "qwen");
+        let changed_runner =
+            requested_session_config(&db, &agent, &task.id, "codex", Some(&second)).unwrap();
+        assert!(!changed_runner.values.contains_key("model"));
+        let other = AgentConfig {
+            name: "other".into(),
+            ..agent
+        };
+        assert!(
+            !requested_session_config(&db, &other, &task.id, "pi", Some(&second))
+                .unwrap()
+                .values
+                .contains_key("model")
+        );
+    }
+
+    #[test]
     fn message_controls_override_workflow_and_harness_session_defaults() {
         use crate::sessions::NewEvent;
         use crate::tasks::board::CreateTask;
@@ -7076,7 +7172,7 @@ flows:
             },
             ..Default::default()
         };
-        let requested = requested_session_config(&db, &agent, &task.id).unwrap();
+        let requested = requested_session_config(&db, &agent, &task.id, "pi", None).unwrap();
         assert_eq!(requested.values.get("model"), Some(&json!("fast")));
         assert_eq!(requested.values.get("effort"), Some(&json!("low")));
         assert_eq!(

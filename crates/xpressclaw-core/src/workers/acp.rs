@@ -365,10 +365,68 @@ enum AcpProcessCommand {
 }
 
 /// Agent-owned choices, including dependent controls refreshed after a change.
-#[derive(Clone, Serialize)]
+#[derive(Clone, serde::Deserialize, Serialize)]
 pub struct AcpSessionControls {
     pub config_options: Vec<SessionConfigOption>,
     pub modes: Option<SessionModeState>,
+}
+
+impl AcpSessionControls {
+    /// Validate a picker edit using exactly the adapter rules used for live
+    /// configuration. Return its model classification and canonical value so
+    /// accepted case/name aliases cannot remain perpetually pending.
+    pub fn validate_edit(&self, id: &str, value: &Value) -> Result<(bool, Value)> {
+        if let Some(option) = self
+            .config_options
+            .iter()
+            .find(|option| option.id.to_string() == id)
+        {
+            let value =
+                match resolve_config_value(option, value).map_err(Error::ConfigValidation)? {
+                    SessionConfigOptionValue::Boolean { value } => json!(value),
+                    SessionConfigOptionValue::ValueId { value } => json!(value.to_string()),
+                    _ => {
+                        return Err(Error::ConfigValidation(
+                            "Unsupported session control value".into(),
+                        ))
+                    }
+                };
+            return Ok((is_model_option(option), value));
+        }
+        if id == "mode"
+            && self.modes.as_ref().is_some_and(|modes| {
+                value
+                    .as_str()
+                    .is_some_and(|v| modes.available_modes.iter().any(|m| m.id.to_string() == v))
+            })
+        {
+            return Ok((false, value.clone()));
+        }
+        Err(Error::ConfigValidation(format!(
+            "Unknown or invalid session option '{id}'"
+        )))
+    }
+
+    pub fn dependent_ids(&self) -> HashSet<String> {
+        let mut ids = self
+            .config_options
+            .iter()
+            .filter(|option| is_model_dependent_option(option))
+            .map(|option| option.id.to_string())
+            .collect::<HashSet<_>>();
+        if self
+            .modes
+            .as_ref()
+            .is_some_and(|modes| modes_duplicate_reasoning(modes, &self.config_options))
+        {
+            ids.insert("mode".into());
+        }
+        ids
+    }
+
+    pub fn model_id(&self) -> Option<String> {
+        advertised_model_choices(&self.config_options).map(|(id, _)| id)
+    }
 }
 
 type ConnectedSessions = Arc<Mutex<HashMap<String, ConnectedSession>>>;
@@ -1460,11 +1518,8 @@ fn is_model_dependent_option(option: &SessionConfigOption) -> bool {
             ))
 }
 
-fn update_session_options(session: &mut ConnectedSession, options: Vec<SessionConfigOption>) {
-    // Pi exposes the same reasoning selector through legacy modes as well.
-    // Keep that alias aligned, while preserving independent mode selectors.
-    let duplicate_modes = session.modes.as_ref().is_some_and(|modes| {
-        session.config_options.iter().any(|option| {
+fn modes_duplicate_reasoning(modes: &SessionModeState, options: &[SessionConfigOption]) -> bool {
+    options.iter().any(|option| {
             is_reasoning_option(option)
                 && matches!(&option.kind, SessionConfigKind::Select(select) if {
                     let values = match &select.options {
@@ -1475,7 +1530,15 @@ fn update_session_options(session: &mut ConnectedSession, options: Vec<SessionCo
                     values.len() == modes.available_modes.len() && modes.available_modes.iter().all(|mode| values.contains(&mode.id.to_string()))
                 })
         })
-    });
+}
+
+fn update_session_options(session: &mut ConnectedSession, options: Vec<SessionConfigOption>) {
+    // Pi exposes the same reasoning selector through legacy modes as well.
+    // Keep that alias aligned, while preserving independent mode selectors.
+    let duplicate_modes = session
+        .modes
+        .as_ref()
+        .is_some_and(|modes| modes_duplicate_reasoning(modes, &session.config_options));
     if duplicate_modes {
         session.modes = options.iter().find_map(|option| {
             if !is_reasoning_option(option) {
@@ -1959,7 +2022,7 @@ async fn run_connected_turn(
                 let value = match resolve_config_value(option, &value) {
                     Ok(value) => value,
                     Err(_)
-                        if model_changed
+                        if (model_changed || has_model_override)
                             && optional_session_config_ids.contains(&config_id)
                             && is_model_dependent_option(option) =>
                     {
@@ -2039,7 +2102,9 @@ async fn run_connected_turn(
                     .iter()
                     .any(|mode| mode.id.to_string() == requested_mode)
                 {
-                    if model_changed && optional_session_config_ids.contains(&config_id) {
+                    if (model_changed || has_model_override)
+                        && optional_session_config_ids.contains(&config_id)
+                    {
                         continue;
                     }
                     return Err(agent_client_protocol::util::internal_error(format!(
@@ -3699,7 +3764,14 @@ mod tests {
             options
         }
         for reasoning_id in ["reasoning_effort", "thought_level", "thinking_level"] {
-            for optional in [true, false] {
+            // A prompt-free picker edit may already have selected the model.
+            // Old optional defaults must still yield on the following turn.
+            for (optional, initial_model) in [
+                (true, "reasoner"),
+                (false, "reasoner"),
+                (true, "plain"),
+                (false, "plain"),
+            ] {
                 let db = Arc::new(Database::open_memory().unwrap());
                 let (recorder, _) = test_recorder(db.clone());
                 let (client_input, agent_input) = tokio::io::duplex(64 * 1024);
@@ -3714,7 +3786,7 @@ mod tests {
                         let result = match method {
                             "initialize" => json!(InitializeResponse::new(ProtocolVersion::V1)),
                             "session/new" => json!(NewSessionResponse::new("categoryless-session")
-                                .config_options(controls("reasoner", reasoning_id))
+                                .config_options(controls(initial_model, reasoning_id))
                                 .modes(SessionModeState::new(
                                     "high",
                                     vec![

@@ -42,6 +42,22 @@ agent advertises the model selector and its valid values; Xpressclaw does not
 maintain provider-specific model lists or translate the preference into a CLI
 flag. An invalid value fails with the choices reported by that agent.
 
+### Task model controls
+
+The task picker reads one backend-resolved ACP snapshot independent of recent
+activity history. Observed schemas are not preferences: the composer does not
+copy displayed defaults into messages. Explicit picker edits are task preferences
+scoped to Agent/runner, persisted separately from message delivery. Idle connected
+edits apply without a prompt; busy/disconnected edits remain visibly pending until
+acknowledged by the appropriate session. Dispatch freezes preferences before
+asynchronous preparation. A model change refreshes dependent controls and clears
+previously explicit model-dependent preferences. Users can clear task preferences
+without reconstructing an adapter's original defaults.
+
+See [the picker contract](../acp-picker-reset.md) for context/revision checks,
+application boundaries, compatibility, and bounded review scope. This does not
+initialize a brand-new ACP session or change queue/continuation/crash-repair rules.
+
 ### Session lifecycle
 
 > **Updated by ADR-033:** Each project now retains its initialized ACP process

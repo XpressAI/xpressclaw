@@ -1,76 +1,94 @@
 # ACP picker reset — bounded replacement for PR #263
 
-Status: **draft, backend foundation only**. This is not yet the end-to-end picker
-replacement. The existing frontend is deliberately unchanged in this first slice.
+This replacement separates **observed ACP state**, **explicit task preferences**,
+and **turn execution**. The old PR and its uncommitted work remain reference only.
 
 ## User-visible contract
 
-- Opening an initialized task's picker does not require a chat message.
-- Model/reasoning choices come from ACP, not a provider catalog maintained here.
-- Changing a model on an idle, connected session refreshes dependent controls.
-- Busy/disconnected selections must be labeled pending, not applied. This behavior
-  must not be silently removed to simplify the implementation.
-- A task with no initialized session has an explicit unavailable state. Opening
-  the picker does not launch containers, create sessions, or contact an LLM.
-- Reassignment, runner changes, and failed forks cannot contribute another
-  context's controls. Long activity histories cannot hide the picker.
+- Opening an initialized task's picker requires no chat message. Its catalog
+  comes from ACP, not a provider/model list maintained here.
+- An idle connected edit uses `session/set_config_option` without prompting.
+  Dependent reasoning choices follow the returned/notified schema. Late schema
+  notifications are refreshed without requiring a message.
+- Busy/disconnected edits are saved as explicit task preferences and visibly
+  marked **pending**, including after page reload. Saving never queues work.
+- An uninitialized context has an explicit unavailable state. Opening a picker
+  does not launch containers, create a native session, or contact an LLM.
+- Reassignment, runner changes, abandoned forks, and long activity histories
+  cannot supply the wrong catalog.
 
-## State ownership
+## Observations are not instructions
 
-There are three different things; they must not be conflated:
+`GET /api/tasks/{id}/config` is the frontend's only observed-state source. It
+returns `context` (Agent, runner, native session), `availability` (`live`,
+`cached`, `busy`, `unavailable`), `config_options`, `modes`, and the durable
+`event_id` when applicable. It also reports the explicit preference revision,
+`pending` edits, whether a different model is pending, and `has_preferences`.
 
-1. **Observed schema and values**: a backend snapshot of a specific native
-   conversation. Durable events are an observation cache, never user preferences.
-2. **Explicit user edits**: only the settings the user actually changed, with a
-   clear owner and pending/applied result. Do not serialize the entire displayed
-   schema into every chat message.
-3. **Turn execution**: consumes explicit intent at a defined boundary. Existing
-   workflow requirements and external callers remain distinct from UI defaults.
+The reusable-task-session selector is shared with dispatch. Idle reads use
+completed/interrupted sessions; busy inspection can use an active attempt. An
+active attempt without a native ID does not borrow a previous catalog. A failed
+fork is not a fallback; updates on the same reusable native session can remain
+valid after a failed turn. Activity history is not another schema source.
 
-`GET /api/tasks/{id}/config` is the sole intended frontend source for observed
-controls. It returns `context` (Agent, runner, native session), `availability`
-(`live`, `cached`, `busy`, `unavailable`), `config_options`, `modes`, and a durable
-`event_id` where available. Event IDs are comparable within a context, not across
-native-session or runner changes. Activity events should only trigger a refresh.
+Displayed selections are presentation only: neither normal messages nor
+visualization follow-ups send the displayed control map. Therefore loading a
+cache cannot promote all of its model-dependent defaults to strict requirements.
 
-The selector for reusable task sessions is shared with the dispatcher. Idle
-reads use completed/interrupted sessions; busy inspection can use an active
-attempt. An active attempt without a native ID does not borrow an old catalog.
-An abandoned fork is not a fallback; updates on the same reusable native session
-can remain valid after a failed turn. No new database table or queue mechanism is
-required for these read-only operations.
+## Explicit preference edits
 
-## This first slice
+`POST /api/tasks/{id}/config` accepts `context`, `revision`, `config_id`, and
+`value`. It validates against the currently resolved ACP schema. Assignment,
+context, or optimistic-revision conflicts return 409 without saving the edit;
+the composer refreshes without losing its draft. Invalid choices return 400.
 
-- Reuse the tested ACP configuration transport from #263: prompt-free inspection
-  and mutation, response/notification reconciliation, model-before-dependent
-  ordering, and keeping healthy connections available after request failures.
-- Add the canonical, read-only snapshot endpoint independent of recent history.
-- Share task-session selection with dispatch and reject an obsolete retained
-  runner. Add no new HTTP mutation yet.
-- Keep the old PR and its uncommitted changes untouched for reference.
+Only explicitly edited values are persisted under `tasks.context.acp_preferences`,
+scoped to the assigned Agent and canonical runner. Existing task context is
+preserved. A model edit clears previously explicit model-dependent preferences;
+reasoning edits are unavailable until the selected model advertises its schema.
+Independent task/workflow requirements and runner defaults remain separate.
 
-## Remaining before this draft can be ready
+The preference is saved before attempting live application. If a turn has become
+active or the connection is unavailable, it stays pending. If the adapter rejects
+a previously advertised live choice, the response explicitly says it was saved
+but not applied; the user can choose another model or clear the preference.
+Neither an RPC failure nor enqueueing a message counts as application. Matching
+live state or a matching observation newer than the saved preference acknowledges
+it. Preferences stay explicit/sticky for this task, not provider-wide defaults.
 
-- Implement the explicit-intent mutation contract and wire the picker to the
-  snapshot endpoint. Separate observed state, pending edits, and confirmed edits.
-- Specify persistence and the application boundary for pending edits. Preserve
-  busy/disconnected use without copying every observed option to messages.
-- Add browser regressions for the actual user workflow, including slow refreshes
-  and recovery. Do not claim this backend slice fixes the UI on its own.
-- Run focused integration checks and one bounded review pass on the complete
-  contract before requesting approval.
+`POST` with `reset: true` clears the explicit task preference map. The UI exposes
+**Clear task preferences**, including when a former catalog is unavailable.
+This restores normal agent/workflow configuration on future turns; it does not
+claim to reconstruct or reset an adapter's original remote-session defaults.
 
-## Review and scope boundaries
+## Application boundary, without queue redesign
 
-A reproducible violation of the contract above blocks this replacement. A
-pre-existing general message-delivery bug belongs in a separate follow-up unless
-it is a demonstrated dependency of the new picker path. In particular, do not
-copy #263's automatic-continuation fences or orphaned-queue repair changes merely
-because they were previously reviewed there. Do not silently drop correctness
-requirements to keep a diff small either.
+Dispatch reads one preference snapshot **before asynchronous repository
+preparation**. An edit after that boundary applies to a later dispatch, never by
+replacing the current turn's captured input. Automatic continuations naturally
+use the same task-preference rule; there is no message ownership to infer for
+these preferences and no need to modify queue creation or repair.
 
-After two non-converging review rounds, stop and report the remaining issues and
-scope tradeoffs. Automated review is evidence, not permission for an unbounded
-rewrite. No merge, deployment, package rebuild, or new-session discovery is
-included in this work.
+Preferences are applied after agent/task defaults, and only within their recorded
+Agent/runner scope. Legacy explicit message configuration newer than a preference
+can still override it. Older message snapshots cannot resurrect options the user
+cleared or replaced. Legacy message delivery is not redesigned in this PR.
+
+Model preferences override the runner's default model. Optional reasoning defaults
+that became incompatible with that model yield even if the picker already applied
+the model before the next turn. Explicit workflow/message requirements still
+validate strictly.
+
+## Validation and review scope
+
+Regressions cover read-only discovery beyond capped history, scope/resumability,
+explicit edit persistence/CAS, invalid/stale edits, pending-model dependency
+suppression, acknowledgement, reset, frozen dispatch preferences, model-default
+precedence, delayed schemas, and browser workflows without message submission.
+
+A reproducible violation of this contract blocks the PR. General automatic-turn
+prompt fencing, orphaned-queue repair, and legacy message-delivery hardening stay
+separate unless demonstrated to be dependencies of this picker path. After two
+non-converging review rounds, stop and report scope tradeoffs rather than expanding
+indefinitely. No merge, deployment, package rebuild, or new-session discovery is
+included.

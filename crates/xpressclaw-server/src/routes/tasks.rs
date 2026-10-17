@@ -135,7 +135,10 @@ pub fn routes() -> Router<AppState> {
             get(get_message_visualization),
         )
         .route("/{id}/activity", get(get_activity))
-        .route("/{id}/config", get(super::task_controls::get))
+        .route(
+            "/{id}/config",
+            get(super::task_controls::get).post(super::task_controls::set),
+        )
         .route("/{id}/pull-requests", post(register_pull_request))
         .route(
             "/{id}/elicitations/{elicitation_id}/response",

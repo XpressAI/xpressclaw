@@ -48,6 +48,8 @@ pub struct AppState {
     pub conversation_processes: Arc<ConversationAcpProcesses>,
     /// Retained task ACP connections, also used by prompt-free model controls.
     pub project_processes: Arc<ProjectAcpProcesses>,
+    /// Serialize explicit picker edits/CAS across browser clients, not turns.
+    pub task_controls_lock: Arc<tokio::sync::Mutex<()>>,
     /// Per-Agent barrier shared by native dispatchers and destructive Project
     /// lifecycle operations.
     pub native_runtime_lifecycle: Arc<NativeRuntimeLifecycle>,
@@ -147,6 +149,7 @@ impl AppState {
             turn_controls: Arc::new(AcpTurnControlBroker::new()),
             conversation_processes: Arc::new(ConversationAcpProcesses::default()),
             project_processes: Arc::new(ProjectAcpProcesses::default()),
+            task_controls_lock: Arc::new(tokio::sync::Mutex::new(())),
             native_runtime_lifecycle: Arc::new(NativeRuntimeLifecycle::default()),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             project_sync_lock: Arc::new(tokio::sync::Mutex::new(())),
