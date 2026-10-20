@@ -1,5 +1,6 @@
 <script lang="ts">
 	import type { WorkspacePaneState, WorkspaceTab } from '$lib/workspace';
+	import { revealActiveTab } from '$lib/tabStrip';
 	import SortableTab from './SortableTab.svelte';
 	import TabStripDropZone from './TabStripDropZone.svelte';
 	import WorkspaceContent from './WorkspaceContent.svelte';
@@ -30,14 +31,13 @@
 
 	let tabStrip = $state<HTMLDivElement>();
 	let activeTab = $derived(pane.tabs.find((tab) => tab.id === pane.activeTabId) ?? pane.tabs[0]);
+	let activeTabId = $derived(activeTab?.id);
 
 	$effect(() => {
-		pane.activeTabId;
+		activeTabId;
 		if (!tabStrip) return;
 		const frame = window.requestAnimationFrame(() => {
-			tabStrip
-				?.querySelector<HTMLElement>('[data-workspace-tab-active="true"]')
-				?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+			if (tabStrip) revealActiveTab(tabStrip);
 		});
 		return () => window.cancelAnimationFrame(frame);
 	});

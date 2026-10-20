@@ -3,6 +3,7 @@
 	import { CollisionPriority } from '@dnd-kit/abstract';
 	import { pointerIntersection } from '@dnd-kit/collision';
 	import type { Snippet } from 'svelte';
+	import { revealActiveTabOnResize } from '$lib/tabStrip';
 
 	// The strip itself accepts tabs so the empty run past the last tab appends,
 	// which matters once "Split active tab right" leaves a pane with a short tab
@@ -34,6 +35,6 @@
 	});
 </script>
 
-<div bind:this={element} {@attach dropZone.attach} data-workspace-tab-strip data-workspace-pane-id={paneId} {...rest}>
+<div bind:this={element} use:revealActiveTabOnResize {@attach dropZone.attach} data-workspace-tab-strip data-workspace-pane-id={paneId} {...rest}>
 	{@render children()}
 </div>

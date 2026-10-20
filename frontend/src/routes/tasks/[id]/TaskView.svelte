@@ -1482,7 +1482,7 @@
 					</div>
 				{/if}
 
-				<!-- Subtasks -->
+				<!-- Task plan and delegated work share the details sidebar/sheet. -->
 				{#if planSteps.length > 0}
 					<div class="space-y-2">
 						<h3 class="text-xs font-medium text-muted-foreground uppercase tracking-wide">
@@ -1518,6 +1518,15 @@
 								</div>
 							{/each}
 						</div>
+					</div>
+				{/if}
+
+				<DelegatedWorkPanel items={delegatedWork} agents={agentList} />
+
+				{#if current.parent_task_id}
+					<div class="space-y-2">
+						<h3 class="text-xs font-medium uppercase tracking-wide text-muted-foreground">Parent task</h3>
+						<a href="/tasks/{current.parent_task_id}" class="text-sm underline hover:text-foreground">{current.parent_title || 'Open parent task'}</a>
 					</div>
 				{/if}
 
@@ -2008,9 +2017,6 @@
 						</section>
 					{/if}
 
-					{#if task.parent_task_id}<p class="my-3 text-xs text-muted-foreground">Delegated from <a href="/tasks/{task.parent_task_id}" class="text-primary underline">{task.parent_title || 'parent task'}</a></p>{/if}
-                    <DelegatedWorkPanel items={delegatedWork} agents={agentList} />
-
 					<!-- Live indicator -->
 					{#if workingAttempt}
 						<div class="space-y-2 py-2 pl-10">
@@ -2037,7 +2043,7 @@
                             {:else if blockingDelegates.length === 1}
 								<p>Waiting for {delegatedAgentName(blockingDelegates[0])}: <a class="underline" href="/tasks/{blockingDelegates[0].task_id}">{blockingDelegates[0].title}</a>.</p>
 							{:else}
-								<p>Waiting for {blockingDelegates.length} required delegated tasks shown above.</p>
+								<p>Waiting for {blockingDelegates.length} required delegated tasks.</p>
 							{/if}
 							{#if queuedAttempt?.trigger_message_id}<p class="text-xs text-muted-foreground">Your message is saved and will be handled after the required work is resolved.</p>
 							{:else if queuedAttempt}<p class="text-xs text-muted-foreground">Queued work will continue after the required work is resolved.</p>{/if}
