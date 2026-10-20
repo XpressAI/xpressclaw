@@ -535,7 +535,7 @@
 		{:else}
 			<div class="flex min-h-0 flex-1">
 				<div class="flex min-w-0 flex-1 flex-col">
-					<div bind:this={messagePane} data-conversation-message-pane class="workspace-scroll-y flex-1 px-4 py-5 sm:px-6"><div class="mx-auto max-w-4xl space-y-5">
+					<div bind:this={messagePane} data-conversation-message-pane class="workspace-scroll-y flex-1 px-4 sm:px-6"><div class="mx-auto max-w-4xl space-y-5 py-5">
 						{#if hasOlderMessages}<div class="flex justify-center"><button type="button" onclick={() => void loadOlderMessages()} disabled={loadingOlderMessages} class="rounded-full border border-border bg-card px-4 py-2 text-xs text-muted-foreground hover:text-foreground disabled:opacity-50">{loadingOlderMessages ? 'Loading earlier messages…' : 'Load earlier messages'}</button></div>{/if}
 						{#if messages.length === 0}<div class="rounded-xl border border-dashed border-border p-10 text-center"><h2 class="font-medium">Start the conversation</h2><p class="mt-2 text-sm text-muted-foreground">Every participating Agent can answer, even while its task lane is busy.</p></div>{/if}
 						{#each messages as message (message.id)}
@@ -629,7 +629,7 @@
 									{/each}
 								</div>
 							{/if}
-							<textarea bind:this={composerInput} bind:value={content} onkeydown={handleKeydown} onpaste={handlePaste} oncompositionstart={() => (composing = true)} oncompositionend={() => (composing = false)} rows="3" placeholder="Message #{conversation.title || 'conversation'}…" class="block max-h-36 w-full resize-none bg-transparent px-3.5 py-2.5 text-sm outline-none"></textarea>
+							<textarea bind:this={composerInput} bind:value={content} onkeydown={handleKeydown} onpaste={handlePaste} oncompositionstart={() => (composing = true)} oncompositionend={() => (composing = false)} rows="3" placeholder="Message #{conversation.title || 'conversation'}…" class="block max-h-[min(9rem,calc(var(--workspace-viewport-height,100dvh)/4))] w-full resize-none bg-transparent px-3.5 py-2.5 text-sm outline-none"></textarea>
 							{#if attachmentError}<div class="px-3.5 pb-2 text-xs text-destructive" role="alert">{attachmentError}</div>{/if}
 							<div class="flex items-center justify-between px-2 pb-2">
 								<div class="flex items-center gap-1">

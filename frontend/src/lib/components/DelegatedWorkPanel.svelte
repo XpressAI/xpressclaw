@@ -75,16 +75,16 @@
 </script>
 
 {#snippet card(item: DelegatedWork)}
-	<li class="min-w-0 rounded-lg border border-border bg-background px-3 py-2.5" data-delegated-task={item.task_id}>
-		<div class="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
+	<li class="min-w-0 rounded-lg border border-border bg-background p-2.5" data-delegated-task={item.task_id}>
+		<a href="/tasks/{item.task_id}" class="flex items-start gap-1 text-sm font-medium text-foreground hover:text-primary hover:underline">
+			<span class="min-w-0 break-words">{item.title}</span>
+			<ArrowUpRight class="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+		</a>
+		<div class="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
 			<span class="font-medium text-foreground">{agentName(item.agent_id)}</span>
 			<span class="rounded-full px-2 py-0.5 {tone(item.activity_status)}">{label(item.activity_status)}</span>
 			{#if item.blocks_parent}<span class="text-muted-foreground">Required by this task</span>{/if}
 		</div>
-		<a href="/tasks/{item.task_id}" class="mt-1.5 flex items-start gap-1 text-sm font-medium text-foreground hover:text-primary hover:underline">
-			<span class="min-w-0 break-words">{item.title}</span>
-			<ArrowUpRight class="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-		</a>
 		{#if item.error_message}<p class="mt-2 whitespace-pre-wrap break-words text-xs text-destructive" data-delegated-error>{item.error_message}</p>{/if}
 		<div class="mt-1.5 flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
 			{#if duration(item)}<span data-delegated-duration>{duration(item)}</span>{/if}
@@ -95,11 +95,11 @@
 {/snippet}
 
 {#if items.length > 0}
-	<section aria-label="Delegated work" class="my-3 rounded-xl border border-border bg-muted/25 p-3 sm:p-4">
-		<div class="mb-3 flex items-center gap-2">
-			<GitBranch class="h-4 w-4 text-muted-foreground" aria-hidden="true" />
-			<h3 class="text-sm font-semibold">Delegated work</h3>
-			<span class="text-xs text-muted-foreground">{outstanding.length} open · {completed.length} completed</span>
+	<section aria-label="Delegated work" class="space-y-2">
+		<div class="flex flex-wrap items-center gap-x-2 gap-y-1">
+			<GitBranch class="h-3.5 w-3.5 text-muted-foreground" aria-hidden="true" />
+			<h3 class="text-xs font-medium uppercase tracking-wide text-muted-foreground">Delegated work</h3>
+			<span class="w-full text-xs text-muted-foreground">{outstanding.length} open · {completed.length} completed</span>
 		</div>
 		{#if outstanding.length > 0}
 			<ul class="space-y-2">{#each outstanding as item (item.task_id)}{@render card(item)}{/each}</ul>

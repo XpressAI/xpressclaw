@@ -10,6 +10,8 @@
 	import { PROJECT_MUTATION_EVENT, sortProjectsByRecency, type ProjectMutation } from '$lib/projectEvents';
 	import { serverTimestampMs } from '$lib/serverTime';
 	import { planningViewport } from '$lib/taskPlanning';
+	import { revealActiveTab } from '$lib/tabStrip';
+	import { workspaceViewport } from '$lib/workspaceViewport';
 	import { agentRuntimeSummary, agentRuntimeTitle, timeAgo } from '$lib/utils';
 	import {
 		createWorkspaceTab,
@@ -97,6 +99,7 @@
 
 	let focusedPane = $derived(panes.find((pane) => pane.id === focusedPaneId) ?? panes[0]);
 	let focusedTab = $derived(focusedPane?.tabs.find((tab) => tab.id === focusedPane.activeTabId) ?? focusedPane?.tabs[0] ?? null);
+	let focusedTabId = $derived(focusedTab?.id);
 	let openTabs = $derived(panes.flatMap((pane) => pane.tabs.map((tab, index) => ({
 		paneId: pane.id,
 		tab,
@@ -158,12 +161,10 @@
 
 	$effect(() => {
 		focusedPaneId;
-		focusedPane?.activeTabId;
+		focusedTabId;
 		if (!compactTabStrip) return;
 		const frame = window.requestAnimationFrame(() => {
-			compactTabStrip
-				?.querySelector<HTMLElement>('[data-workspace-tab-active="true"]')
-				?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+			if (compactTabStrip) revealActiveTab(compactTabStrip);
 		});
 		return () => window.cancelAnimationFrame(frame);
 	});
@@ -1053,7 +1054,7 @@
 	});
 </script>
 
-<div class="flex h-[100dvh] min-w-0 overflow-hidden pt-[env(safe-area-inset-top)] lg:pb-[env(safe-area-inset-bottom)] pl-[env(safe-area-inset-left)] pr-[env(safe-area-inset-right)]">
+<div use:workspaceViewport data-workspace-shell class="workspace-shell flex h-[100dvh] min-w-0 overflow-hidden pt-[env(safe-area-inset-top)] lg:pb-[env(safe-area-inset-bottom)] pl-[env(safe-area-inset-left)] pr-[env(safe-area-inset-right)]">
 	<aside data-workspace-sidebar class="hidden shrink-0 flex-col border-r border-border/60 transition-[width] duration-200 lg:flex {sidebarCollapsed ? 'w-14' : 'w-64'}" style="background: hsl(var(--sidebar))">
 		<div class="flex h-11 shrink-0 items-center {sidebarCollapsed ? 'justify-center' : 'gap-2 px-3'}">
 			<a href="/dashboard" class="flex min-w-0 items-center gap-2 rounded-md outline-none transition hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/50" aria-label="Open Control center" title="Control center">
@@ -1127,8 +1128,8 @@
 		</div>
 	</aside>
 
-	<main class="flex min-w-0 flex-1 flex-col overflow-hidden pb-[calc(4rem+env(safe-area-inset-bottom))] lg:pb-0">
-		<div class="flex h-12 shrink-0 items-center gap-3 border-b border-border bg-background/95 px-3 backdrop-blur lg:hidden">
+	<main class="flex min-w-0 flex-1 flex-col overflow-hidden">
+		<div class="workspace-mobile-header flex h-12 shrink-0 items-center gap-3 border-b border-border bg-background/95 px-3 backdrop-blur lg:hidden">
 			<button type="button" onclick={() => (mobileMenuOpen = true)} aria-label="Open agent switcher" title="Browse workspace" aria-haspopup="dialog" aria-expanded={mobileMenuOpen} aria-controls={navigationId} class="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg text-muted-foreground hover:bg-accent hover:text-foreground">
 				<svg class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><path stroke-linecap="round" d="M4 6h16M4 12h16M4 18h16" /></svg>
 			</button>
@@ -1153,7 +1154,7 @@
 					bind:element={compactTabStrip}
 					role="group"
 					aria-label="Open tabs"
-					class="flex h-9 shrink-0 items-stretch overflow-x-auto border-b border-border bg-[hsl(var(--field))] lg:hidden scrollbar-hide"
+					class="workspace-mobile-tabs flex h-9 shrink-0 items-stretch overflow-x-auto border-b border-border bg-[hsl(var(--field))] lg:hidden scrollbar-hide"
 				>
 					{#each openTabs as item (item.tab.id)}
 						<SortableTab
@@ -1202,6 +1203,15 @@
 		{:else}
 			<div class="min-h-0 flex-1 overflow-auto">{@render children()}</div>
 		{/if}
+
+		<nav aria-label="Workspace navigation" class="workspace-bottom-navigation grid shrink-0 h-[calc(4rem+env(safe-area-inset-bottom))] grid-cols-5 border-t border-border bg-background/95 pb-[env(safe-area-inset-bottom)] pl-[env(safe-area-inset-left)] pr-[env(safe-area-inset-right)] backdrop-blur lg:hidden">
+			<button type="button" onclick={() => mobileMenuOpen = true} aria-label="Browse workspace" aria-haspopup="dialog" aria-expanded={mobileMenuOpen} aria-controls={navigationId} class="flex flex-col items-center justify-center gap-1 text-[10px] text-muted-foreground hover:text-foreground">
+				<svg class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" d="M4 6h16M4 12h16M4 18h16" /></svg><span>Browse</span>
+			</button>
+			{#each utilityTabs as item}
+				<a href={item.href} class="flex flex-col items-center justify-center gap-1 text-[10px] {tabCategory(focusedTab?.kind) === tabCategory(item.kind) ? 'text-primary' : 'text-muted-foreground'}"><svg class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d={item.icon} /></svg><span>{item.label}</span></a>
+			{/each}
+		</nav>
 	</main>
 </div>
 
@@ -1237,15 +1247,6 @@
 	</dialog>
 {/if}
 
-<nav aria-label="Workspace navigation" class="fixed inset-x-0 bottom-0 z-40 grid h-[calc(4rem+env(safe-area-inset-bottom))] grid-cols-5 border-t border-border bg-background/95 pb-[env(safe-area-inset-bottom)] pl-[env(safe-area-inset-left)] pr-[env(safe-area-inset-right)] backdrop-blur lg:hidden">
-	<button type="button" onclick={() => mobileMenuOpen = true} aria-label="Browse workspace" aria-haspopup="dialog" aria-expanded={mobileMenuOpen} aria-controls={navigationId} class="flex flex-col items-center justify-center gap-1 text-[10px] text-muted-foreground hover:text-foreground">
-		<svg class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" d="M4 6h16M4 12h16M4 18h16" /></svg><span>Browse</span>
-	</button>
-	{#each utilityTabs as item}
-		<a href={item.href} class="flex flex-col items-center justify-center gap-1 text-[10px] {tabCategory(focusedTab?.kind) === tabCategory(item.kind) ? 'text-primary' : 'text-muted-foreground'}"><svg class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d={item.icon} /></svg><span>{item.label}</span></a>
-	{/each}
-</nav>
-
 {#if !mobileMenuOpen}{@render workspaceContextMenu()}{/if}
 
 {#snippet workspaceContextMenu()}
@@ -1279,6 +1280,17 @@
 {/if}
 
 <style>
+	@media (max-width: 1023px) {
+		.workspace-shell {
+			position: fixed;
+			inset-inline: 0;
+			top: var(--workspace-viewport-top, 0px);
+			height: var(--workspace-viewport-height, 100dvh);
+		}
+		.workspace-shell:global([data-keyboard-open]) .workspace-bottom-navigation,
+		.workspace-shell:global([data-keyboard-open]) .workspace-mobile-header,
+		.workspace-shell:global([data-keyboard-open]) :global(.workspace-mobile-tabs) { display: none; }
+	}
 	.workspace-navigation { position: fixed; inset: 0; width: 100%; max-width: none; height: 100dvh; max-height: none; margin: 0; padding: 0; border: 0; background: transparent; color: hsl(var(--foreground)); }
 	.workspace-navigation::backdrop { background: #0008; }
 	.navigation-sheet { position: absolute; top: calc(var(--planning-viewport-top, 0px) + var(--planning-viewport-height, 100dvh) - 12px); transform: translateY(-100%); left: max(12px, env(safe-area-inset-left)); width: min(calc(100% - 24px), 26rem); height: min(46rem, calc(var(--planning-viewport-height, 100dvh) - 24px)); padding-bottom: max(12px, env(safe-area-inset-bottom)); }

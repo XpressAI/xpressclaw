@@ -38,9 +38,8 @@ export default defineConfig({
 			name: 'webkit',
 			use: { ...devices['Desktop Safari'] },
 			testMatch: /workspace\.spec\.ts/,
-			// Only the tab-strip suite is written to run on WebKit; other tests carry
-			// Chromium-only assumptions and would need their own porting work.
-			grep: /dragging a tab|abandons the drag|marks where it will land|compact tab strip|compact strip|never starts a drag|freshly split pane|drag in flight|deleted mid-drag|touch swipe/,
+			// Tab gestures and mobile editing run on both browser engines.
+			grep: /dragging a tab|abandons the drag|marks where it will land|compact tab strip|compact strip|never starts a drag|freshly split pane|drag in flight|deleted mid-drag|touch swipe|mobile editing/,
 		},
 		// Chromium can inject real touch input through CDP, including native
 		// panning, which WebKit's driver cannot; this profile reproduces phone

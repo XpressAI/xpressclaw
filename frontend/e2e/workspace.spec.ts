@@ -6838,10 +6838,25 @@ async function delegatedApi(page: Page, options: { parentStatus?: string; parent
 }
 
 for (const width of [390, 1440]) {
-	test(`delegated work explains a queued reply at ${width}px`, async ({ page }) => {
+	test(`delegated work explains a queued reply at ${width}px`, async ({ page }, testInfo) => {
 		await page.setViewportSize({ width, height: 900 });
 		await delegatedApi(page);
 		await page.goto(`/tasks/${taskId}`);
+		const composer = page.locator(`#task-message-input-${taskId}`);
+		await composer.fill('Keep this draft while checking delegated work.');
+		await expect(page.locator('[data-task-transcript-scroll] [data-delegated-task]')).toHaveCount(0);
+		await expect(page.locator('[data-delegation-wait]')).toContainText('Waiting for senior-reviewer: Review authorized recovery and SDK retries');
+		await expect(page.locator('[data-delegation-wait]')).toContainText('Your message is saved');
+		await expect(page.getByText('The agent is queued to respond', { exact: true })).toHaveCount(0);
+		await expect(page.locator('[data-task-activity-status="waiting_for_subtasks"]').first()).toBeVisible();
+		if (width === 390) {
+			await expect(page.getByRole('region', { name: 'Delegated work', exact: true })).toHaveCount(0);
+			await page.getByRole('button', { name: 'Show task details' }).click();
+		}
+		const details = width === 390
+			? page.getByRole('dialog', { name: 'Task details', exact: true })
+			: page.locator('[data-task-details-sidebar]');
+		await expect(details.getByRole('region', { name: 'Delegated work', exact: true })).toBeVisible();
 		const panel = page.getByRole('region', { name: 'Delegated work', exact: true });
 		await expect(panel).toBeVisible();
 		await expect(panel.getByText('senior-reviewer', { exact: true })).toBeVisible();
@@ -6850,17 +6865,11 @@ for (const width of [390, 1440]) {
 		await expect(panel.locator('[data-delegated-duration]')).toContainText('Elapsed: 10m');
 		await expect(panel.getByText(/Tool activity ·/)).toBeVisible();
 		await expect(panel.getByRole('link')).toHaveAttribute('href', '/tasks/review-child');
-		await expect(page.locator('[data-delegation-wait]')).toContainText('Waiting for senior-reviewer: Review authorized recovery and SDK retries');
-		await expect(page.locator('[data-delegation-wait]')).toContainText('Your message is saved');
-		await expect(page.getByText('The agent is queued to respond', { exact: true })).toHaveCount(0);
-		await expect(page.locator('[data-task-activity-status="waiting_for_subtasks"]').first()).toBeVisible();
 		await expect(panel.getByText('Validate the implementation')).toHaveCount(0);
-		if (width === 1440) {
-			await expect(page.getByRole('heading', { name: 'Steps (1 complete)', exact: true })).toBeVisible();
-			await page.screenshot({ path: '/tmp/delegated-work-desktop.png' });
-		} else {
-			await page.screenshot({ path: '/tmp/delegated-work-mobile.png' });
-		}
+		await expect(details.getByRole('heading', { name: 'Steps (1 complete)', exact: true })).toBeVisible();
+		await page.screenshot({ path: testInfo.outputPath(`delegated-details-${width}.png`) });
+		if (width === 390) await page.getByRole('button', { name: 'Close task details' }).click();
+		await expect(composer).toHaveValue('Keep this draft while checking delegated work.');
 	});
 }
 
@@ -6871,6 +6880,9 @@ test('delegated work refreshes on quiet polls and freezes completed duration', a
 	Object.assign(state.children[0], { status: 'completed', activity_status: 'completed', blocks_parent: false, finished_at: recentSqliteTimestamp(60_000) });
 	await expect(page.locator('[data-delegation-wait]')).toHaveCount(0, { timeout: 10_000 });
 	await expect(page.getByText('The agent is queued to respond', { exact: true })).toBeVisible();
+	await expect(page.locator('[data-task-transcript-scroll] [data-delegated-task]')).toHaveCount(0);
+	const sidebar = page.locator('[data-task-details-sidebar]');
+	await expect(sidebar.locator('[data-delegated-task]')).toBeHidden();
 	await page.getByText('Completed delegated work (1)', { exact: true }).click();
 	const duration = page.locator('[data-delegated-duration]');
 	await expect(duration).toContainText('Last run:');
@@ -6976,13 +6988,17 @@ for (const width of [390, 1440]) {
   await page.goto(`/tasks/${taskId}`);
   await expect(page.locator('[data-delegation-wait]')).toContainText('Delegated work needs attention');
   await expect(page.locator('[data-delegation-wait]')).toContainText('Your message is saved');
-  await expect(page.locator('[data-delegated-error]')).toContainText('Installed files are preserved');
   await expect(page.getByText('The agent is queued to respond', { exact: true })).toHaveCount(0);
   await expect(page.locator('[data-delegation-wait] a')).toHaveAttribute('href', '/tasks/review-child');
+  if (width === 390) await page.getByRole('button', { name: 'Show task details' }).click();
+  const panel = page.getByRole('region', { name: 'Delegated work', exact: true });
+  await expect(panel.locator('[data-delegated-error]')).toBeVisible();
+  await expect(panel.locator('[data-delegated-error]')).toContainText('Installed files are preserved');
   if (width === 1440) await page.screenshot({ path: '/tmp/delegated-state-parent.png', fullPage: true });
   // A quiet poll must remove the current error when retry starts, keeping history elsewhere.
   Object.assign(state.children[0], { status: 'in_progress', activity_status: 'running', error_message: null });
-  await expect(page.locator('[data-delegated-error]')).toHaveCount(0, { timeout: 10_000 });
+  await expect(panel.locator('[data-delegated-error]')).toHaveCount(0, { timeout: 10_000 });
+  if (width === 390) await page.getByRole('button', { name: 'Close task details' }).click();
   await expect(page.locator('[data-delegation-wait]')).toContainText('Waiting for');
  });
 
@@ -7053,3 +7069,142 @@ for (const width of [390, 1440]) {
   await expect(projectLink).not.toContainText('Needs attention');
  });
 }
+
+test.describe('mobile editing', () => {
+	// Keep the PWA worker from bypassing the mocked API during later poll cycles.
+	test.use({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, serviceWorkers: 'block' });
+
+	async function setKeyboardViewport(page: Page, height: number, offsetTop = 0, scale = 1) {
+		await page.evaluate(({ height, offsetTop, scale }) => {
+			for (const [key, value] of Object.entries({ height, offsetTop, scale })) {
+				Object.defineProperty(window.visualViewport!, key, { configurable: true, value });
+			}
+			window.visualViewport!.dispatchEvent(new Event('resize'));
+			window.visualViewport!.dispatchEvent(new Event('scroll'));
+		}, { height, offsetTop, scale });
+	}
+
+	for (const surface of ['task', 'conversation', 'new work']) {
+		test(`${surface} keeps the composer above the keyboard while editing a long draft`, async ({ page }, testInfo) => {
+			const projectListRequests: string[] = [];
+			await mockApi(page, {
+				projectListRequests,
+				conversations: [{
+					id: conversationId, project_id: projectId, title: 'Mobile editing', icon: null,
+					created_at: timestamp(1), updated_at: timestamp(1), last_message_at: null,
+					participants: [{ participant_type: 'agent', participant_id: agentId, joined_at: timestamp(1) }],
+				}],
+			});
+			await page.goto(surface === 'task' ? `/tasks/${taskId}` : surface === 'conversation' ? `/conversations/${conversationId}` : '/');
+			const composer = surface === 'task' ? page.locator(`#task-message-input-${taskId}`)
+				: surface === 'conversation' ? page.getByPlaceholder('Message #Mobile editing…')
+				: page.getByPlaceholder('Describe the outcome you want…');
+			const sendButton = page.getByRole('button', { name: surface === 'task' ? 'Send message' : surface === 'conversation' ? 'Send' : 'Send work', exact: true });
+			const draft = Array.from({ length: 20 }, (_, i) => `Line ${i + 1}: Keep this draft editable.`).join('\n');
+			await composer.fill(draft);
+			const originalInput = await composer.elementHandle();
+			await composer.evaluate((input: HTMLTextAreaElement) => {
+				input.setSelectionRange(8, 12);
+				input.scrollTop = 0;
+			});
+
+			// Mobile keyboards resize the visual viewport without resizing the
+			// layout viewport. A short browser window alone cannot reproduce this.
+			await setKeyboardViewport(page, 440, 24);
+			const shell = page.getByRole('main').locator('..');
+			await expect.poll(async () => (await shell.boundingBox())!.height).toBe(440);
+			await expect.poll(async () => (await shell.boundingBox())!.y).toBe(24);
+			await expect(page.getByRole('navigation', { name: 'Workspace navigation' })).toBeHidden();
+			await expect.poll(async () => {
+				const bounds = (await composer.boundingBox())!;
+				return bounds.y >= 24 && bounds.y + bounds.height <= 464;
+			}).toBe(true);
+			await expect(composer).toBeFocused();
+			await expect(composer).toHaveCSS('font-size', '16px');
+			expect(await composer.evaluate((input) => input.scrollHeight > input.clientHeight)).toBe(true);
+
+			const polls = projectListRequests.length;
+			await expect.poll(() => projectListRequests.length, { timeout: 10_000 }).toBeGreaterThanOrEqual(polls + 2);
+			await expect(composer).toBeFocused();
+			expect(await originalInput!.evaluate((input) => input.isConnected)).toBe(true);
+			expect(await composer.evaluate((input: HTMLTextAreaElement) => [input.selectionStart, input.selectionEnd, input.scrollTop])).toEqual([8, 12, 0]);
+			await page.keyboard.insertText('Edit');
+			await expect(composer).toHaveValue(draft.slice(0, 8) + 'Edit' + draft.slice(12));
+			// Exercise the browser's actual clipboard insertion into a selection.
+			await composer.evaluate((input: HTMLTextAreaElement) => input.setSelectionRange(8, 12));
+			await page.keyboard.press('ControlOrMeta+c');
+			await composer.evaluate((input: HTMLTextAreaElement) => input.setSelectionRange(0, 4));
+			await page.keyboard.press('ControlOrMeta+v');
+			await expect(composer).toHaveValue('Edit' + draft.slice(4, 8) + 'Edit' + draft.slice(12));
+			await page.screenshot({ path: testInfo.outputPath(`${surface}-keyboard.png`) });
+
+			// Viewport panning must keep the composer visible without stealing its caret.
+			await setKeyboardViewport(page, 320, 42);
+			await expect.poll(async () => (await shell.boundingBox())!.y).toBe(42);
+			await expect.poll(async () => { const bounds = (await composer.boundingBox())!; return bounds.y + bounds.height; }).toBeLessThanOrEqual(362);
+			await expect.poll(async () => { const bounds = (await sendButton.boundingBox())!; return bounds.y + bounds.height; }).toBeLessThanOrEqual(362);
+			await page.screenshot({ path: testInfo.outputPath(`${surface}-small-keyboard.png`) });
+			await setKeyboardViewport(page, 844);
+			await expect.poll(async () => (await shell.boundingBox())!.height).toBe(844);
+			await expect(page.getByRole('navigation', { name: 'Workspace navigation' })).toBeVisible();
+			await expect(composer).toBeFocused();
+		});
+	}
+
+	for (const width of [390, 1024]) {
+		test(`background refresh preserves the tab strip and text selection at ${width}px`, async ({ page }) => {
+			await page.setViewportSize({ width, height: 844 });
+			const tabs = Array.from({ length: 8 }, (_, index) => ({
+				id: `editing-tab-${index}`, path: index === 0 ? `/tasks/${taskId}` : `/projects/p${index}`,
+				kind: index === 0 ? 'task' : 'project', title: `Long project title number ${index}`,
+				resourceId: index === 0 ? taskId : `p${index}`, status: null, lastActiveAt: index + 1,
+			}));
+			await page.addInitScript((tabs) => localStorage.setItem('xpressclaw.workspace.v1', JSON.stringify({
+				focusedPaneId: 'editing-pane', panes: [{ id: 'editing-pane', activeTabId: tabs[0].id, width: 1, tabs }],
+			})), tabs);
+			const projectListRequests: string[] = [];
+			await mockApi(page, { preserveWorkspace: true, projectListRequests });
+			await page.goto(`/tasks/${taskId}`);
+			const composer = page.locator(`#task-message-input-${taskId}`);
+			await composer.fill('Keep my selection during background updates.');
+			await composer.evaluate((input: HTMLTextAreaElement) => input.setSelectionRange(8, 17));
+			const strip = page.locator('[data-workspace-tab-strip]:visible');
+			await expect.poll(() => strip.evaluate((element) => element.scrollWidth > element.clientWidth)).toBe(true);
+			await strip.evaluate((element) => element.scrollLeft = element.scrollWidth);
+			const scrollLeft = await strip.evaluate((element) => element.scrollLeft);
+			expect(scrollLeft).toBeGreaterThan(0);
+			const polls = projectListRequests.length;
+			await expect.poll(() => projectListRequests.length, { timeout: 10_000 }).toBeGreaterThanOrEqual(polls + 2);
+			await expect(composer).toBeFocused();
+			expect(await composer.evaluate((input: HTMLTextAreaElement) => [input.selectionStart, input.selectionEnd])).toEqual([8, 17]);
+			expect(await strip.evaluate((element) => element.scrollLeft)).toBe(scrollLeft);
+			if (width === 1024) {
+				await strip.locator('[data-workspace-tab]').last().locator('button').first().click();
+				await page.setViewportSize({ width: 390, height: 844 });
+				const activeTab = page.locator('[data-workspace-tab-strip]:visible [data-workspace-tab-active="true"]');
+				await expect.poll(async () => {
+					const bounds = (await activeTab.boundingBox())!;
+					return bounds.x >= -1 && bounds.x + bounds.width <= 391;
+				}).toBe(true);
+			}
+		});
+	}
+
+	test('pinch zoom preserves the layout and orientation changes update the available height', async ({ page }) => {
+		await mockApi(page);
+		await page.goto(`/tasks/${taskId}`);
+		const composer = page.locator(`#task-message-input-${taskId}`);
+		await composer.fill('Keep the zoom accessible.');
+		const shell = page.getByRole('main').locator('..');
+		await expect.poll(async () => (await shell.boundingBox())!.height).toBe(844);
+		await setKeyboardViewport(page, 422, 0, 2);
+		// Wait for the animation frame that handles a viewport update.
+		await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => resolve())));
+		expect((await shell.boundingBox())!.height).toBe(844);
+		await expect(page.getByRole('navigation', { name: 'Workspace navigation' })).toBeVisible();
+		await page.setViewportSize({ width: 844, height: 390 });
+		await setKeyboardViewport(page, 390);
+		await expect.poll(async () => (await shell.boundingBox())!.height).toBe(390);
+		await expect(composer).toHaveValue('Keep the zoom accessible.');
+	});
+});
