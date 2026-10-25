@@ -639,8 +639,20 @@
 		return unchanged ? null : next;
 	}
 
-	function dragPoint(event: DragMoveEvent | DragEndEvent): { x: number; y: number } | undefined {
-		return (event.operation as { position?: { current?: { x: number; y: number } } }).position?.current;
+	function dragPoint(event: DragMoveEvent | DragEndEvent): { x: number; y: number } {
+		// dragmove is dispatched before dnd-kit commits its new position. A whole
+		// burst of pointer moves can be coalesced into this one event in WebKit.
+		if ('to' in event && event.to) return event.to;
+		const current = event.operation.position.current;
+		if ('by' in event && event.by) {
+			return { x: current.x + event.by.x, y: current.y + event.by.y };
+		}
+		// A pointer can be released before its last scheduled dragmove runs.
+		// Keyboard drops have no pointer coordinates and use the committed position.
+		if (event.nativeEvent instanceof MouseEvent) {
+			return { x: event.nativeEvent.clientX, y: event.nativeEvent.clientY };
+		}
+		return current;
 	}
 
 	function handleTabDragMove(event: DragMoveEvent) {
@@ -651,11 +663,10 @@
 
 	function handleTabDragEnd(event: DragEndEvent) {
 		const { source } = event.operation;
-		const landing = dropPreview;
 		dropPreview = null;
 		if (!isSortable(source)) return;
 		const tabId = String(source.id);
-		const release = releaseTarget(dragPoint(event), tabId) ?? landing;
+		const release = releaseTarget(dragPoint(event), tabId);
 		// Nothing moved while the drag was in flight, so abandoning it is simply
 		// declining to move anything now.
 		if (event.canceled || !release) return;

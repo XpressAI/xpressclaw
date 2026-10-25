@@ -6602,38 +6602,72 @@ test('a tab can be dropped into the empty strip of a freshly split pane', async 
 
 
 
-test('releasing a tab outside every strip abandons the drag', async ({ page }) => {
+test('keyboard tab dragging moves by its requested delta and can be cancelled', async ({ page }) => {
 	await seedWorkspace(page, {
 		focusedPaneId: 'seed-pane',
 		panes: [{ id: 'seed-pane', activeTabId: TAB_PROJECTS.id, width: 1, tabs: [TAB_NEW_WORK, TAB_PROJECTS, TAB_SETTINGS] }],
 	});
 	await page.goto('/projects');
-
 	const pane = page.locator('[data-workspace-pane]').first();
-	const tabs = pane.locator('[data-workspace-tab]');
-	await expect(tabs).toHaveCount(3);
-
-	const origin = await tabs.nth(0).boundingBox();
-	const over = await tabs.nth(2).boundingBox();
-	if (!origin || !over) throw new Error('tab has no bounding box');
-
-	await page.mouse.move(origin.x + origin.width / 2, origin.y + origin.height / 2);
-	await page.mouse.down();
-	await page.mouse.move(origin.x + origin.width / 2 + 12, origin.y + origin.height / 2, { steps: 5 });
-	await page.mouse.move(over.x + over.width / 2, over.y + over.height / 2, { steps: 10 });
+	const firstTab = pane.locator('[data-workspace-tab]').first();
+	await firstTab.focus();
+	await page.keyboard.press('Space');
 	await settleFrames(page);
-	// The landing slot is marked, so the release is what decides the outcome.
-	await expect(pane.locator('[data-tab-drop-indicator]')).toHaveCount(1);
-
-	// Let go over the content area, which is not a drop target.
-	await page.mouse.move(640, 500, { steps: 15 });
+	await page.keyboard.press('Shift+ArrowDown');
 	await settleFrames(page);
 	await expect(pane.locator('[data-tab-drop-indicator]')).toHaveCount(0);
-	await page.mouse.up();
-
+	await page.keyboard.press('Escape');
+	await expect(page.locator('[data-dnd-dragging], [data-dnd-placeholder]')).toHaveCount(0);
 	await expect.poll(() => tabTitles(pane)).toEqual(['New work', 'Projects', 'Settings']);
+	await firstTab.focus();
+	await page.keyboard.press('Space');
+	await settleFrames(page);
+	await page.keyboard.press('Shift+ArrowRight');
+	await settleFrames(page);
+	await page.keyboard.press('Space');
+	await expect(page.locator('[data-dnd-dragging], [data-dnd-placeholder]')).toHaveCount(0);
+	await expect.poll(() => tabTitles(pane)).toEqual(['Projects', 'New work', 'Settings']);
 	await expect(page).toHaveURL('/projects');
 });
+
+for (const settleBeforeRelease of [true, false]) {
+	test(`releasing a tab outside every strip abandons the drag (${settleBeforeRelease ? 'settled' : 'immediate'} release)`, async ({ page }) => {
+		await seedWorkspace(page, {
+			focusedPaneId: 'seed-pane',
+			panes: [{ id: 'seed-pane', activeTabId: TAB_PROJECTS.id, width: 1, tabs: [TAB_NEW_WORK, TAB_PROJECTS, TAB_SETTINGS] }],
+		});
+		await page.goto('/projects');
+
+		const pane = page.locator('[data-workspace-pane]').first();
+		const tabs = pane.locator('[data-workspace-tab]');
+		await expect(tabs).toHaveCount(3);
+
+		const origin = await tabs.nth(0).boundingBox();
+		const over = await tabs.nth(2).boundingBox();
+		if (!origin || !over) throw new Error('tab has no bounding box');
+
+		await page.mouse.move(origin.x + origin.width / 2, origin.y + origin.height / 2);
+		await page.mouse.down();
+		await page.mouse.move(origin.x + origin.width / 2 + 12, origin.y + origin.height / 2, { steps: 5 });
+		await page.mouse.move(over.x + over.width / 2, over.y + over.height / 2, { steps: 10 });
+		await settleFrames(page);
+		// The landing slot is marked, so the release is what decides the outcome.
+		await expect(pane.locator('[data-tab-drop-indicator]')).toHaveCount(1);
+
+		// One movement models pointer events coalesced into a single frame. The
+		// destination must clear the previous target even without another move.
+		await page.mouse.move(640, 500);
+		if (settleBeforeRelease) {
+			await settleFrames(page);
+			await expect(pane.locator('[data-tab-drop-indicator]')).toHaveCount(0);
+		}
+		await page.mouse.up();
+		await expect(page.locator('[data-dnd-dragging], [data-dnd-placeholder]')).toHaveCount(0);
+
+		await expect.poll(() => tabTitles(pane)).toEqual(['New work', 'Projects', 'Settings']);
+		await expect(page).toHaveURL('/projects');
+	});
+}
 
 test('the compact strip drops a tab into the pane that owns the tab under it', async ({ page }) => {
 	await page.setViewportSize({ width: 900, height: 700 });
