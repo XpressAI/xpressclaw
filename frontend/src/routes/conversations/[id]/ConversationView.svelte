@@ -518,9 +518,9 @@
 	{#if loading}
 		<div class="flex flex-1 items-center justify-center"><AgentLoading label="Loading conversation" phase="loading" /></div>
 	{:else if conversation}
-		<header class="shrink-0 border-b border-border bg-card/30 px-4 pt-3 sm:px-6">
+		<header class="conversation-header shrink-0 border-b border-border bg-card/30 px-4 pt-3 sm:px-6">
 			<div class="flex flex-wrap items-center justify-between gap-3">
-				<div class="min-w-0"><p class="truncate text-xs text-muted-foreground"><a href="/projects/{encodeURIComponent(project?.id || '')}" class="hover:text-foreground">{project?.name || 'Project'}</a> / Conversation</p><h1 class="mt-1 truncate text-lg font-semibold"><span class="mr-2 text-muted-foreground">#</span>{conversation.title || 'Untitled conversation'}</h1></div>
+				<div class="min-w-0"><p class="conversation-breadcrumbs truncate text-xs text-muted-foreground"><a href="/projects/{encodeURIComponent(project?.id || '')}" class="hover:text-foreground">{project?.name || 'Project'}</a> / Conversation</p><h1 class="mt-1 truncate text-lg font-semibold"><span class="mr-2 text-muted-foreground">#</span>{conversation.title || 'Untitled conversation'}</h1></div>
 				<div class="relative flex items-center gap-2"><div class="hidden -space-x-2 sm:flex">{#each participantAgents.slice(0, 5) as agent}<span title={agent.title || agent.name} class="flex h-8 w-8 items-center justify-center rounded-full border-2 border-background bg-muted text-[10px] font-semibold">{harnessMark(agent.backend)}</span>{/each}</div><button type="button" onclick={() => (showPeople = !showPeople)} class="rounded-lg border border-border px-3 py-1.5 text-xs">{participantAgents.length} Agent{participantAgents.length === 1 ? '' : 's'}</button><button type="button" onclick={() => (showTaskComposer = true)} class="rounded-lg bg-primary px-3 py-1.5 text-xs text-primary-foreground">Continue with task</button>
 					{#if showPeople}<div class="absolute right-0 top-10 z-30 w-72 rounded-xl border border-border bg-card p-3 shadow-xl"><p class="mb-2 text-xs font-semibold">Conversation Agents</p><div class="space-y-1">{#each projectAgents as agent}<button type="button" onclick={() => void toggleParticipant(agent)} class="flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-xs hover:bg-accent"><span class="flex h-7 w-7 items-center justify-center rounded-full bg-muted text-[9px]">{harnessMark(agent.backend)}</span><span class="min-w-0 flex-1 truncate">{agent.title || agent.name}</span><span class="text-primary">{participantAgentIds.includes(agent.id) ? '✓' : '+'}</span></button>{/each}</div>{#if availableAgents.length === 0}<a href="/projects/{encodeURIComponent(project?.id || '')}" class="mt-2 block text-xs text-primary">Manage project Agents</a>{/if}</div>{/if}
 				</div>
@@ -629,7 +629,7 @@
 									{/each}
 								</div>
 							{/if}
-							<textarea bind:this={composerInput} bind:value={content} onkeydown={handleKeydown} onpaste={handlePaste} oncompositionstart={() => (composing = true)} oncompositionend={() => (composing = false)} rows="3" placeholder="Message #{conversation.title || 'conversation'}…" class="block max-h-[min(9rem,calc(var(--workspace-viewport-height,100dvh)/4))] w-full resize-none bg-transparent px-3.5 py-2.5 text-sm outline-none"></textarea>
+							<textarea bind:this={composerInput} bind:value={content} onkeydown={handleKeydown} onpaste={handlePaste} oncompositionstart={() => (composing = true)} oncompositionend={() => (composing = false)} rows="3" placeholder="Message #{conversation.title || 'conversation'}…" class="block max-h-[min(9rem,calc(var(--workspace-pane-height,var(--workspace-viewport-height,100dvh))/4))] w-full resize-none bg-transparent px-3.5 py-2.5 text-sm outline-none"></textarea>
 							{#if attachmentError}<div class="px-3.5 pb-2 text-xs text-destructive" role="alert">{attachmentError}</div>{/if}
 							<div class="flex items-center justify-between px-2 pb-2">
 								<div class="flex items-center gap-1">
@@ -643,7 +643,7 @@
 					</div>
 				</div>
 
-				<aside class="hidden w-72 shrink-0 overflow-y-auto border-l border-border bg-card/20 p-4 xl:block"><div class="mb-3 flex items-center justify-between"><h2 class="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Tasks</h2><button type="button" onclick={() => (showTaskComposer = true)} class="text-xs text-primary">+ Add</button></div><div class="space-y-2">{#each taskList.slice(0, 10) as task}<a href="/tasks/{task.id}" class="block rounded-lg border border-border bg-card p-3 hover:border-primary/40"><div class="flex items-start gap-2"><span class="mt-1 h-2 w-2 shrink-0 rounded-full {statusDot(task.status)}"></span><span class="min-w-0 flex-1"><span class="line-clamp-2 text-xs font-medium">{task.title}</span><span class="mt-1 block text-[10px] text-muted-foreground">{task.status.replaceAll('_', ' ')} · {timeAgo(task.updated_at)}</span></span></div></a>{/each}{#if taskList.length === 0}<p class="rounded-lg border border-dashed border-border p-4 text-center text-xs text-muted-foreground">No tasks yet.</p>{/if}</div></aside>
+				<aside data-conversation-tasks aria-label="Conversation tasks" class="conversation-tasks hidden w-72 shrink-0 overflow-y-auto border-l border-border bg-card/20 p-4"><div class="mb-3 flex items-center justify-between"><h2 class="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Tasks</h2><button type="button" onclick={() => (showTaskComposer = true)} class="text-xs text-primary">+ Add</button></div><div class="space-y-2">{#each taskList.slice(0, 10) as task}<a href="/tasks/{task.id}" class="block rounded-lg border border-border bg-card p-3 hover:border-primary/40"><div class="flex items-start gap-2"><span class="mt-1 h-2 w-2 shrink-0 rounded-full {statusDot(task.status)}"></span><span class="min-w-0 flex-1"><span class="line-clamp-2 text-xs font-medium">{task.title}</span><span class="mt-1 block text-[10px] text-muted-foreground">{task.status.replaceAll('_', ' ')} · {timeAgo(task.updated_at)}</span></span></div></a>{/each}{#if taskList.length === 0}<p class="rounded-lg border border-dashed border-border p-4 text-center text-xs text-muted-foreground">No tasks yet.</p>{/if}</div></aside>
 			</div>
 		{/if}
 	{:else}
@@ -663,3 +663,16 @@
 		</form>
 	</div>
 {/if}
+
+<style>
+	/* History paging and follow-to-latest manage this scroller explicitly. */
+	[data-conversation-message-pane] { overflow-anchor: none; }
+	:global([data-pane-wide-details]) .conversation-tasks { display: block; }
+	:global([data-short-pane]) .conversation-header { padding-top: 6px; }
+	:global([data-short-pane]) .conversation-breadcrumbs { display: none; }
+	:global([data-short-pane]) .conversation-header > div { flex-wrap: nowrap; gap: 4px; }
+	:global([data-short-pane]) .conversation-header > div > div:last-child { flex-shrink: 0; }
+	:global([data-short-pane]) .conversation-header h1 { font-size: 16px; line-height: 24px; margin-top: 0; }
+	:global([data-short-pane]) .conversation-header nav { margin-top: 4px; }
+	:global([data-short-pane]) .conversation-header > div button { padding: 6px 8px; }
+</style>

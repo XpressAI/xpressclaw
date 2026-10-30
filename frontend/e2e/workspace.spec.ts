@@ -4117,7 +4117,11 @@ test('task changed files open beside the task with the file tree collapsed', asy
 	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&path=src%2Fmain.ts&tree=collapsed`);
 	await expect(page.locator('[data-workspace-pane]')).toHaveCount(2);
 	await expect(page.locator(`#task-message-input-${taskId}`)).toBeVisible();
-	await expect(page.locator('[data-task-details-sidebar]')).toBeVisible();
+	await expect(page.locator('[data-task-details-sidebar]')).toBeHidden();
+	await page.getByRole('button', { name: 'Show task details' }).click();
+	const details = page.getByRole('dialog', { name: 'Task details', exact: true });
+	await expect(details.getByRole('heading', { name: 'Changed files' })).toBeVisible();
+	await details.getByRole('button', { name: 'Close task details' }).click();
 	await expect(page.locator('[data-workspace-tree]')).toHaveCount(0);
 	await expect(page.locator('[data-monaco-editor]')).toBeVisible({ timeout: 20_000 });
 	await expect(page.getByText('Loading editor…')).toBeHidden({ timeout: 20_000 });
@@ -4205,7 +4209,8 @@ test('task changed files use normal navigation at the workspace pane limit', asy
 	await expect(page.getByRole('button', { name: 'Split active tab right' }).last()).toBeDisabled();
 
 	const focusedPane = page.locator('[data-workspace-pane]').first();
-	const changedFile = focusedPane.locator('[data-task-changed-files]').getByRole('link', { name: 'src/main.ts' });
+	await focusedPane.getByRole('button', { name: 'Show task details' }).click();
+	const changedFile = page.getByRole('dialog', { name: 'Task details', exact: true }).getByRole('link', { name: 'src/main.ts' });
 	await changedFile.focus();
 	await page.keyboard.press('Enter');
 
@@ -5009,7 +5014,7 @@ test('tab move menu items stay disabled when there is nowhere to move', async ({
 });
 
 test('the compact tab strip reorders tabs by drag on narrow screens', async ({ page }) => {
-	await page.setViewportSize({ width: 900, height: 700 });
+	await page.setViewportSize({ width: 700, height: 700 });
 	await seedWorkspace(page, {
 		focusedPaneId: 'seed-pane',
 		panes: [{ id: 'seed-pane', activeTabId: TAB_PROJECTS.id, width: 1, tabs: [TAB_NEW_WORK, TAB_PROJECTS, TAB_SETTINGS] }],
@@ -5028,7 +5033,7 @@ test('the compact tab strip reorders tabs by drag on narrow screens', async ({ p
 });
 
 test('the compact strip appends into the last pane on empty space', async ({ page }) => {
-	await page.setViewportSize({ width: 900, height: 700 });
+	await page.setViewportSize({ width: 700, height: 700 });
 	await seedWorkspace(page, {
 		focusedPaneId: 'pane-left',
 		panes: [
@@ -6459,15 +6464,16 @@ test('start and stop task icons call the existing lifecycle actions', async ({ p
 });
 
 for (const viewport of [{ width: 390, height: 844 }, { width: 820, height: 900 }]) {
-	test(`compact navigation is modal and leaves task content full width at ${viewport.width}px`, async ({ page }, testInfo) => {
+	test(`compact navigation is modal and keeps the workspace in place at ${viewport.width}px`, async ({ page }, testInfo) => {
 		await page.setViewportSize(viewport);
 		await mockApi(page, { live: true, projectCount: 15, completedTaskCount: 45 });
 		await page.goto(`/tasks/${taskId}`);
 		await expect(page.locator('[data-workspace-sidebar]')).toBeHidden();
-		await expect(page.locator('[data-task-details-sidebar]')).toBeHidden();
+		await expect(page.locator('[data-task-details-sidebar]')).toBeVisible({ visible: viewport.width >= 668 });
 		const transcript = page.locator('[data-task-transcript-scroll]');
 		await expect(transcript).toBeVisible();
-		expect((await transcript.boundingBox())!.width).toBeGreaterThan(viewport.width - 5);
+		const transcriptWidth = (await transcript.boundingBox())!.width;
+		expect(transcriptWidth).toBeGreaterThan(viewport.width - (viewport.width >= 668 ? 293 : 5));
 		const composer = page.locator(`#task-message-input-${taskId}`);
 		await composer.fill('Do not lose this draft when browsing tasks.');
 		const browse = page.getByRole('button', { name: 'Browse workspace', exact: true });
@@ -6487,6 +6493,7 @@ for (const viewport of [{ width: 390, height: 844 }, { width: 820, height: 900 }
 		await expect(dialog).toBeHidden();
 		await expect(browse).toBeFocused();
 		await expect(composer).toHaveValue('Do not lose this draft when browsing tasks.');
+		expect((await transcript.boundingBox())!.width).toBe(transcriptWidth);
 		await browse.click();
 		await page.mouse.click(viewport.width - 4, 4);
 		await expect(dialog).toBeHidden();
@@ -6495,11 +6502,18 @@ for (const viewport of [{ width: 390, height: 844 }, { width: 820, height: 900 }
 		await expect(dialog).toBeHidden();
 		await expect(page).toHaveURL('/tasks?view=board');
 		await page.goto(`/tasks/${taskId}`);
-		await page.getByRole('button', { name: 'Show task details' }).click();
-		const details = page.getByRole('dialog', { name: 'Task details', exact: true });
-		await expect(details).toBeVisible();
-		await page.screenshot({ path: testInfo.outputPath(`task-details-sheet-${viewport.width}.png`) });
-		await details.getByRole('button', { name: 'Close task details' }).click();
+		if (viewport.width >= 668) {
+			await page.getByRole('button', { name: 'Hide task details' }).click();
+			await expect(page.locator('[data-task-details-sidebar]')).toBeHidden();
+			await page.getByRole('button', { name: 'Show task details' }).click();
+			await expect(page.locator('[data-task-details-sidebar]')).toBeVisible();
+		} else {
+			await page.getByRole('button', { name: 'Show task details' }).click();
+			const details = page.getByRole('dialog', { name: 'Task details', exact: true });
+			await expect(details).toBeVisible();
+			await page.screenshot({ path: testInfo.outputPath(`task-details-sheet-${viewport.width}.png`) });
+			await details.getByRole('button', { name: 'Close task details' }).click();
+		}
 		await browse.click();
 		await page.setViewportSize({ width: 1280, height: 900 });
 		await expect(dialog).toBeHidden();
@@ -6670,7 +6684,7 @@ for (const settleBeforeRelease of [true, false]) {
 }
 
 test('the compact strip drops a tab into the pane that owns the tab under it', async ({ page }) => {
-	await page.setViewportSize({ width: 900, height: 700 });
+	await page.setViewportSize({ width: 700, height: 700 });
 	await seedWorkspace(page, {
 		focusedPaneId: 'pane-left',
 		panes: [
@@ -7217,8 +7231,8 @@ test.describe('mobile editing', () => {
 				await page.setViewportSize({ width: 390, height: 844 });
 				const activeTab = page.locator('[data-workspace-tab-strip]:visible [data-workspace-tab-active="true"]');
 				await expect.poll(async () => {
-					const bounds = (await activeTab.boundingBox())!;
-					return bounds.x >= -1 && bounds.x + bounds.width <= 391;
+					const bounds = await activeTab.boundingBox();
+					return !!bounds && bounds.x >= -1 && bounds.x + bounds.width <= 391;
 				}).toBe(true);
 			}
 		});
@@ -7240,5 +7254,242 @@ test.describe('mobile editing', () => {
 		await setKeyboardViewport(page, 390);
 		await expect.poll(async () => (await shell.boundingBox())!.height).toBe(390);
 		await expect(composer).toHaveValue('Keep the zoom accessible.');
+	});
+});
+
+test.describe('adaptive workspace', () => {
+	test.use({ viewport: { width: 951, height: 620 }, isMobile: true, hasTouch: true, serviceWorkers: 'block' });
+	type Segment = { x: number; y: number; width: number; height: number };
+
+	async function prepare(page: Page, count = 2, focused = count - 1, foldAPI = false) {
+		await page.addInitScript(({ count, focused, foldAPI, taskId, conversationId }) => {
+			const resources = [
+				{ path: `/tasks/${taskId}`, kind: 'task', resourceId: taskId, title: 'Task' },
+				{ path: `/conversations/${conversationId}`, kind: 'conversation', resourceId: conversationId, title: 'Duo notes' },
+				{ path: '/', kind: 'home', resourceId: null, title: 'New work' },
+			];
+			localStorage.setItem('xpressclaw.workspace.v1', JSON.stringify({
+				focusedPaneId: `duo-pane-${focused}`,
+				panes: resources.slice(0, count).map((tab, index) => ({
+					id: `duo-pane-${index}`, activeTabId: `duo-tab-${index}`, width: 1,
+					tabs: [{ ...tab, id: `duo-tab-${index}`, status: null, lastActiveAt: index + 1 }],
+				})),
+			}));
+			const posture = Object.assign(new EventTarget(), { type: 'continuous' });
+			const viewport = { segments: null as DOMRect[] | null };
+			Object.defineProperty(window, 'viewport', { configurable: true, value: foldAPI ? viewport : undefined });
+			Object.defineProperty(navigator, 'devicePosture', { configurable: true, value: foldAPI ? posture : undefined });
+		}, { count, focused, foldAPI, taskId, conversationId });
+		await mockApi(page, {
+			preserveWorkspace: true,
+			conversations: [{
+				id: conversationId, project_id: projectId, title: 'Duo notes', icon: null,
+				created_at: timestamp(1), updated_at: timestamp(1), last_message_at: timestamp(30),
+				participants: [{ participant_type: 'agent', participant_id: agentId, joined_at: timestamp(1) }],
+			}],
+			conversationMessages: Array.from({ length: 30 }, (_, i) => ({
+				id: i + 1, conversation_id: conversationId, sender_type: 'agent', sender_id: agentId,
+				sender_name: 'Agent', content: `Conversation entry ${i + 1}`, message_type: 'message',
+				linked_task_id: null, metadata: {}, attachments: [], created_at: timestamp(i + 1),
+			})),
+		});
+		await page.goto(focused === 0 ? `/tasks/${taskId}` : focused === 1 ? `/conversations/${conversationId}` : '/');
+		await expect(page.locator('[data-workspace-pane]')).toHaveCount(count);
+	}
+
+	async function fold(page: Page, segments: Segment[] | null, event = 'change') {
+		await page.evaluate(({ segments, event }) => {
+			const viewport = (window as typeof window & { viewport: { segments: DOMRect[] | null } }).viewport;
+			const posture = (navigator as typeof navigator & { devicePosture: EventTarget & { type: string } }).devicePosture;
+			viewport.segments = segments?.map(segment => DOMRect.fromRect(segment)) ?? null;
+			posture.type = segments ? 'folded' : 'continuous';
+			if (event === 'resize') window.dispatchEvent(new Event('resize'));
+			else posture.dispatchEvent(new Event('change'));
+		}, { segments, event });
+	}
+
+	async function expectInside(locator: Locator, region: Segment) {
+		await expect.poll(async () => {
+			const rect = await locator.boundingBox();
+			return !!rect && rect.x >= region.x - 1 && rect.y >= region.y - 1
+				&& rect.x + rect.width <= region.x + region.width + 1 && rect.y + rect.height <= region.y + region.height + 1;
+		}).toBe(true);
+	}
+
+	test('Duo viewport changes preserve both drafts, focus, selection, and scroll without fold APIs', async ({ page }, testInfo) => {
+		await prepare(page);
+		const panes = page.locator('[data-workspace-pane]');
+		await expect(page.locator('[data-workspace-pane]:visible')).toHaveCount(2);
+		const task = panes.nth(0).locator('textarea').first();
+		const conversation = page.getByPlaceholder('Message #Duo notes…');
+		await task.fill('Keep the task draft.');
+		await conversation.fill('Keep the conversation draft and selection.');
+		const input = await conversation.elementHandle();
+		const transcript = page.locator('[data-conversation-message-pane]');
+		await transcript.dispatchEvent('pointerdown');
+		await transcript.evaluate(element => element.scrollTop = 200);
+		await conversation.focus();
+		await conversation.evaluate((element: HTMLTextAreaElement) => element.setSelectionRange(9, 21));
+		for (const size of [
+			{ width: 669, height: 902 }, { width: 382, height: 618 }, { width: 385, height: 609 },
+			{ width: 594, height: 406 }, { width: 951, height: 620 },
+		]) {
+			await page.setViewportSize(size);
+			await expect(page.locator('[data-workspace-pane]:visible')).toHaveCount(size.width === 951 ? 2 : 1);
+			await expect(conversation).toBeFocused();
+			expect(await input!.evaluate(element => element.isConnected)).toBe(true);
+			expect(await conversation.evaluate((element: HTMLTextAreaElement) => [element.selectionStart, element.selectionEnd])).toEqual([9, 21]);
+			await expect(task).toHaveValue('Keep the task draft.');
+			await expect(conversation).toHaveValue('Keep the conversation draft and selection.');
+			await expect.poll(() => transcript.evaluate(element => element.scrollTop)).toBe(200);
+			expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+		}
+		await page.screenshot({ path: testInfo.outputPath('duo-unfolded.png') });
+	});
+
+	for (const kind of ['task', 'conversation']) {
+		test(`${kind} details use the pane width on the 669px inner display`, async ({ page }, testInfo) => {
+			await page.setViewportSize({ width: 669, height: 902 });
+			await prepare(page, kind === 'task' ? 1 : 2, kind === 'task' ? 0 : 1);
+			const details = page.locator(kind === 'task' ? '[data-task-details-sidebar]' : '[data-conversation-tasks]');
+			await expect(details).toBeVisible();
+			await page.screenshot({ path: testInfo.outputPath(`duo-${kind}-details.png`) });
+			await page.setViewportSize({ width: 385, height: 609 });
+			await expect(details).toBeHidden();
+			if (kind === 'task') {
+				await page.getByRole('button', { name: 'Show task details' }).click();
+				await expect(page.getByRole('dialog', { name: 'Task details', exact: true })).toBeVisible();
+				await page.getByRole('button', { name: 'Close task details' }).click();
+			}
+			await page.setViewportSize({ width: 669, height: 902 });
+			await expect(details).toBeVisible();
+		});
+	}
+
+	test('posture events align panes to book and laptop segments, including keyboard occlusion', async ({ page }, testInfo) => {
+		await page.setViewportSize({ width: 669, height: 902 });
+		await prepare(page, 2, 1, true);
+		const composer = page.getByPlaceholder('Message #Duo notes…');
+		await composer.fill('Preserve this through every posture.');
+		await composer.evaluate((element: HTMLTextAreaElement) => element.setSelectionRange(9, 13));
+		const original = await composer.elementHandle();
+		const book = [{ x: 0, y: 0, width: 328, height: 902 }, { x: 340, y: 0, width: 329, height: 902 }];
+		await fold(page, book);
+		const panes = page.locator('[data-workspace-pane]');
+		await expect(page.locator('[data-workspace-layout]')).toHaveAttribute('data-workspace-layout', 'horizontal');
+		await expect(page.locator('[data-workspace-pane]:visible')).toHaveCount(2);
+		await expectInside(panes.nth(0), book[0]);
+		await expectInside(panes.nth(1), book[1]);
+		await expect(composer).toBeFocused();
+		await page.screenshot({ path: testInfo.outputPath('duo-book.png') });
+
+		await page.setViewportSize({ width: 951, height: 620 });
+		const laptop = [{ x: 0, y: 0, width: 951, height: 304 }, { x: 0, y: 316, width: 951, height: 304 }];
+		await fold(page, laptop, 'resize');
+		await expect(page.locator('[data-workspace-layout]')).toHaveAttribute('data-workspace-layout', 'vertical');
+		for (let i = 0; i < 2; i++) {
+			await expectInside(panes.nth(i), laptop[i]);
+			await expectInside(panes.nth(i).locator('textarea').first(), laptop[i]);
+			await expectInside(panes.nth(i).getByRole('button', { name: i ? 'Send' : 'Send message', exact: true }), laptop[i]);
+		}
+		await expect(composer).toBeFocused();
+		await page.screenshot({ path: testInfo.outputPath('duo-laptop.png') });
+
+		await page.evaluate(() => {
+			Object.defineProperty(visualViewport, 'height', { configurable: true, value: 280 });
+			Object.defineProperty(visualViewport, 'offsetTop', { configurable: true, value: 12 });
+			visualViewport!.dispatchEvent(new Event('resize'));
+		});
+		await expect(page.locator('[data-workspace-pane]:visible')).toHaveCount(1);
+		await expectInside(composer, { x: 0, y: 12, width: 951, height: 280 });
+		await expectInside(panes.nth(1).getByRole('button', { name: 'Send', exact: true }), { x: 0, y: 12, width: 951, height: 280 });
+		await expect(composer).toBeFocused();
+		expect(await original!.evaluate(element => element.isConnected)).toBe(true);
+		expect(await composer.evaluate((element: HTMLTextAreaElement) => [element.selectionStart, element.selectionEnd])).toEqual([9, 13]);
+		await page.evaluate(() => {
+			Reflect.deleteProperty(visualViewport!, 'height');
+			Reflect.deleteProperty(visualViewport!, 'offsetTop');
+			visualViewport!.dispatchEvent(new Event('resize'));
+		});
+		await fold(page, null);
+		await expect(page.locator('[data-workspace-layout]')).toHaveAttribute('data-workspace-layout', 'flow');
+		await expect(page.locator('[data-workspace-pane]:visible')).toHaveCount(2);
+		await expect(composer).toHaveValue('Preserve this through every posture.');
+		await expect(composer).toBeFocused();
+		expect(await page.evaluate(() => JSON.parse(localStorage.getItem('xpressclaw.workspace.v1')!).panes.map((pane: { id: string }) => pane.id))).toEqual(['duo-pane-0', 'duo-pane-1']);
+	});
+
+	test('a spare fold segment can open a pane without replacing the current task', async ({ page }) => {
+		await page.setViewportSize({ width: 669, height: 902 });
+		await prepare(page, 1, 0, true);
+		const task = page.locator(`#task-message-input-${taskId}`);
+		await task.fill('Retain the original task draft.');
+		const input = await task.elementHandle();
+		await fold(page, [{ x: 0, y: 0, width: 328, height: 902 }, { x: 340, y: 0, width: 329, height: 902 }]);
+		await page.getByRole('button', { name: 'Open another pane' }).click();
+		await expect(page.locator('[data-workspace-pane]:visible')).toHaveCount(2);
+		await expect(page.getByPlaceholder('Describe the outcome you want…')).toBeVisible();
+		await expectInside(page.getByRole('button', { name: 'Send work', exact: true }), { x: 340, y: 0, width: 329, height: 902 });
+		await expect(task).toHaveValue('Retain the original task draft.');
+		expect(await input!.evaluate(element => element.isConnected)).toBe(true);
+		await page.getByRole('button', { name: 'Browse workspace', exact: true }).first().click();
+		const navigation = page.getByRole('dialog', { name: 'Browse workspace', exact: true });
+		await expect(navigation).toBeVisible();
+		await expectInside(navigation.locator('aside'), { x: 0, y: 0, width: 328, height: 902 });
+	});
+
+	test('task details sheets stay in their segment and recover normal positioning when unfolded', async ({ page }, testInfo) => {
+		await page.setViewportSize({ width: 669, height: 902 });
+		await prepare(page, 2, 0, true);
+		const book = [{ x: 0, y: 0, width: 328, height: 902 }, { x: 340, y: 0, width: 329, height: 902 }];
+		await fold(page, book);
+		await page.getByRole('button', { name: 'Show task details' }).click();
+		const details = page.getByRole('dialog', { name: 'Task details', exact: true });
+		await expectInside(details, book[0]);
+		await page.screenshot({ path: testInfo.outputPath('duo-book-details-sheet.png') });
+		await page.setViewportSize({ width: 951, height: 620 });
+		const laptop = [{ x: 0, y: 0, width: 951, height: 304 }, { x: 0, y: 316, width: 951, height: 304 }];
+		await fold(page, laptop);
+		await expectInside(details, laptop[0]);
+		await fold(page, null);
+		await expect.poll(() => details.evaluate(element => element.style.left)).toBe('');
+		await expectInside(details, { x: 0, y: 0, width: 951, height: 620 });
+		await page.getByRole('button', { name: 'Close task details' }).click();
+		await expect(details).toBeHidden();
+	});
+
+	test('hidden panes stay accessible and focusing a visible neighbour does not rearrange them', async ({ page }) => {
+		await prepare(page, 3, 2);
+		const visibleIds = () => page.locator('[data-workspace-pane]:visible').evaluateAll(elements => elements.map(element => element.getAttribute('data-pane-id')));
+		await expect.poll(visibleIds).toEqual(['duo-pane-1', 'duo-pane-2']);
+		const home = page.getByPlaceholder('Describe the outcome you want…');
+		await home.fill('Keep the third pane draft.');
+		await page.getByPlaceholder('Message #Duo notes…').fill('Focus the visible neighbour.');
+		await expect.poll(visibleIds).toEqual(['duo-pane-1', 'duo-pane-2']);
+		await page.getByRole('group', { name: 'Open tabs', exact: true }).getByRole('button', { name: 'Browser-tested workspace', exact: true }).click();
+		await expect.poll(visibleIds).toEqual(['duo-pane-0', 'duo-pane-1']);
+		await page.setViewportSize({ width: 1700, height: 900 });
+		await expect(page.locator('[data-workspace-pane]:visible')).toHaveCount(3);
+		await expect(home).toHaveValue('Keep the third pane draft.');
+	});
+
+	test('unsaved file edits remain mounted when folding down to one pane', async ({ page }) => {
+		await page.setViewportSize({ width: 1440, height: 900 });
+		await mockApi(page);
+		await page.goto(`/tasks/${taskId}`);
+		await page.locator('[data-task-changed-files]').getByRole('link', { name: 'src/main.ts' }).click();
+		const editor = page.locator('[data-monaco-editor]');
+		await expect(editor).toBeVisible({ timeout: 20_000 });
+		await editor.locator('.view-lines').click({ position: { x: 20, y: 20 } });
+		await page.keyboard.press('Control+A');
+		await page.keyboard.insertText('export const preserved = "Duo draft";');
+		const original = await editor.elementHandle();
+		for (const size of [{ width: 951, height: 620 }, { width: 669, height: 902 }, { width: 382, height: 618 }, { width: 951, height: 620 }]) {
+			await page.setViewportSize(size);
+			await expect(editor).toBeVisible();
+			await expect(editor).toContainText('Duo draft');
+			await expect(page.getByRole('button', { name: 'Save', exact: true })).toBeEnabled();
+			expect(await original!.evaluate(element => element.isConnected)).toBe(true);
+		}
 	});
 });

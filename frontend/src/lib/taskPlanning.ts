@@ -65,15 +65,56 @@ export function timezone(): string {
   return Intl.DateTimeFormat().resolvedOptions().timeZone;
 }
 
-// Keep modal controls above the software keyboard, including from task details.
+// Keep modal controls above the keyboard and inside their pane's fold segment.
 export function planningViewport(node: HTMLDialogElement) {
   const viewport = window.visualViewport;
+  const pane = node.closest<HTMLElement>('[data-workspace-pane]');
+  const properties = ['position', 'inset', 'left', 'right', 'top', 'bottom', 'width', 'max-height', 'margin', 'transform'];
+  const original = properties.map(property => node.style.getPropertyValue(property));
+  let constrained = false;
+  let frame = 0;
+  const restore = () => {
+    properties.forEach((property, i) => {
+      if (original[i]) node.style.setProperty(property, original[i]);
+      else node.style.removeProperty(property);
+    });
+    constrained = false;
+  };
   const update = () => {
+    frame = 0;
     node.style.setProperty('--planning-viewport-height', String(viewport?.height ?? innerHeight) + 'px');
     node.style.setProperty('--planning-viewport-top', String(viewport?.offsetTop ?? 0) + 'px');
+    const bounds = pane?.getBoundingClientRect();
+    if (bounds?.width && pane?.closest('[data-foldable]')) {
+      constrained = true;
+      node.style.position = 'fixed';
+      node.style.inset = 'auto';
+      node.style.left = (bounds.x + 8) + 'px';
+      node.style.top = (bounds.y + 8) + 'px';
+      node.style.width = Math.max(0, bounds.width - 16) + 'px';
+      node.style.maxHeight = Math.max(0, bounds.height - 16) + 'px';
+      node.style.margin = '0';
+      node.style.transform = 'none';
+    } else if (constrained) restore();
   };
+  const scheduleUpdate = () => { if (!frame) frame = requestAnimationFrame(update); };
+  const resize = new ResizeObserver(scheduleUpdate);
+  const position = new MutationObserver(scheduleUpdate);
+  if (pane) {
+    resize.observe(pane);
+    position.observe(pane, { attributes: true, attributeFilter: ['style'] });
+  }
   update();
-  viewport?.addEventListener('resize', update);
-  viewport?.addEventListener('scroll', update);
-  return { destroy() { viewport?.removeEventListener('resize', update); viewport?.removeEventListener('scroll', update); } };
+  viewport?.addEventListener('resize', scheduleUpdate);
+  viewport?.addEventListener('scroll', scheduleUpdate);
+  window.addEventListener('resize', scheduleUpdate);
+  return { destroy() {
+    cancelAnimationFrame(frame);
+    resize.disconnect();
+    position.disconnect();
+    viewport?.removeEventListener('resize', scheduleUpdate);
+    viewport?.removeEventListener('scroll', scheduleUpdate);
+    window.removeEventListener('resize', scheduleUpdate);
+    if (constrained) restore();
+  } };
 }
