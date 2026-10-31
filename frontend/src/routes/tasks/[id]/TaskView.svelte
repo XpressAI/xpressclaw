@@ -6,6 +6,7 @@
 	import ContextMenu from '$lib/components/ContextMenu.svelte';
 	import TaskPlanningActions from '$lib/components/planning/TaskActions.svelte';
 	import { dateLabel, planningViewport } from '$lib/taskPlanning';
+	import { MIN_DETAILS_WIDTH } from '$lib/workspaceLayout';
 	import { goto } from '$app/navigation';
 	import { tasks, agents, sessions, workspaces, ApiError } from '$lib/api';
 	import { selectChoices, isModelOption, isReasoningOption, isAdditionalModelOption, reconcileConfig, duplicatesReasoningMode } from '$lib/acpConfig';
@@ -21,7 +22,7 @@
 	import { clearComposerDraft, loadComposerDraft, saveComposerDraft } from '$lib/composerDrafts';
 	import { appendImageFiles, imageDataUrl, MAX_IMAGE_ATTACHMENTS, pastedImageFiles, shouldHandleImagePaste } from '$lib/imageAttachments';
 	import { coalesceAgentMessageFragments } from '$lib/agentMessageFragments';
-	import { TASK_FILE_SPLIT_MIN_PANE_WIDTH, WORKSPACE_OPEN_SPLIT_EVENT, type WorkspaceOpenSplitDetail } from '$lib/workspace';
+	import { WORKSPACE_OPEN_SPLIT_EVENT, type WorkspaceOpenSplitDetail } from '$lib/workspace';
 
 	let { taskId, compact = false }: { taskId: string; compact?: boolean } = $props();
 	let planningTask = $state<Task | null>(null);
@@ -864,9 +865,7 @@
 	}
 
 	function updateDetailsSidebarVisibility() {
-		detailsSidebarFits = typeof window !== 'undefined'
-			&& window.innerWidth >= 1024
-			&& (!compact || (taskViewEl?.clientWidth ?? 0) >= TASK_FILE_SPLIT_MIN_PANE_WIDTH);
+		detailsSidebarFits = (taskViewEl?.clientWidth ?? 0) >= MIN_DETAILS_WIDTH;
 	}
 
 	function toggleDetailsSidebar() {
@@ -1569,8 +1568,8 @@
 
 <div bind:this={taskViewEl} class="flex min-h-0 h-full flex-col">
 	<!-- Header -->
-	<div class="shrink-0 border-b border-border px-3 py-3 sm:px-6 sm:py-4">
-		<div class="flex items-center gap-2 text-sm text-muted-foreground mb-2">
+	<div class="task-header shrink-0 border-b border-border px-3 py-3 sm:px-6 sm:py-4">
+		<div class="task-breadcrumbs flex items-center gap-2 text-sm text-muted-foreground mb-2">
 			<a href="/tasks" class="hover:text-foreground">Tasks</a>
 			<span>/</span>
 			<span class="text-foreground truncate">{task?.title ?? '...'}</span>
@@ -1595,7 +1594,7 @@
 				>&times;</button>
 			</div>
 		{:else if task}
-			<div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+			<div class="task-title-row flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
 				<div class="min-w-0">
 					<h1 class="text-lg font-bold sm:text-xl">{task.title}</h1>
 					{#if task.start_after || task.backlog}
@@ -1604,7 +1603,7 @@
 							{#if task.backlog}<span>Backlog</span>{/if}
 						</div>
 					{/if}
-					<div class="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs sm:text-sm">
+					<div class="task-header-metadata mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs sm:text-sm">
 						<span class="flex items-center gap-1.5">
 							<span data-task-activity-status={taskActivityStatus} class="h-2 w-2 rounded-full {taskActivityStatus === 'in_progress' ? 'animate-pulse' : ''}
 								{taskActivityStatus === 'completed' ? 'bg-emerald-400' :
@@ -2270,6 +2269,12 @@
 </div>
 
 <style>
+	[data-task-transcript-scroll] { overflow-anchor: none; }
+	:global([data-short-pane]) .task-header { padding: 6px 12px; }
+	:global([data-short-pane]) .task-breadcrumbs,
+	:global([data-short-pane]) .task-header-metadata { display: none; }
+	:global([data-short-pane]) .task-title-row { flex-direction: row; align-items: center; gap: 8px; }
+	:global([data-short-pane]) .task-title-row h1 { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 16px; }
 	.task-action {
 		display: inline-flex;
 		align-items: center;

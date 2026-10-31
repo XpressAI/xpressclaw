@@ -11,7 +11,8 @@
 	import { serverTimestampMs } from '$lib/serverTime';
 	import { planningViewport } from '$lib/taskPlanning';
 	import { revealActiveTab } from '$lib/tabStrip';
-	import { workspaceViewport } from '$lib/workspaceViewport';
+	import { workspaceViewport, type WorkspaceViewport } from '$lib/workspaceViewport';
+	import { measureWorkspaceLayout, MIN_PANE_WIDTH, PANE_DIVIDER_WIDTH, regionStyle, visiblePaneStart, type WorkspaceLayout } from '$lib/workspaceLayout';
 	import { agentRuntimeSummary, agentRuntimeTitle, timeAgo } from '$lib/utils';
 	import {
 		createWorkspaceTab,
@@ -56,7 +57,6 @@
 		: 'xpressclaw.workspace.v1';
 	const MAX_PANES = 4;
 	const MAX_TABS = 10;
-	const MIN_PANE_WIDTH = 380;
 	let recencyClock = Date.now();
 	const initialRoute = currentRoute();
 	const initialDescription = describeWorkspacePath(initialRoute);
@@ -69,6 +69,16 @@
 	let workspaceReady = $state(false);
 	let lastSyncedPath = '';
 	let workspaceEl = $state<HTMLDivElement>();
+	let viewport = $state<WorkspaceViewport>({ width: 0, segments: [] });
+	let layout = $state<WorkspaceLayout>({ x: 0, y: 0, width: 0, capacity: 1, regions: [], axis: 'horizontal' });
+	let paneWindowAnchor = $state(0);
+	let layoutFrame = 0;
+	let foldable = $derived(viewport.segments.length > 1);
+	let paneStart = $derived(visiblePaneStart(paneWindowAnchor, Math.max(0, panes.findIndex(pane => pane.id === focusedPaneId)), panes.length, layout.capacity));
+	let paneEnd = $derived(Math.min(panes.length, paneStart + layout.capacity));
+	let showPaneTabs = $derived(layout.capacity > 1 || foldable || viewport.width >= 1024);
+	let showGlobalTabs = $derived(!showPaneTabs || paneEnd - paneStart < panes.length);
+	let focusedRegion = $derived(layout.regions[Math.max(0, panes.findIndex(pane => pane.id === focusedPaneId) - paneStart)]);
 	let compactTabStrip = $state<HTMLDivElement>();
 	let sidebarCollapsed = $state(false);
 	let mobileMenuOpen = $state(false);
@@ -157,6 +167,32 @@
 		if (!workspaceReady || !workspacePath(route) || route === lastSyncedPath) return;
 		lastSyncedPath = route;
 		openPath(route, false);
+	});
+
+	$effect(() => { paneWindowAnchor = paneStart; });
+
+	function measureLayout() {
+		layoutFrame = 0;
+		if (!workspaceEl) return;
+		const next = measureWorkspaceLayout(workspaceEl.getBoundingClientRect(), viewport.segments);
+		if (JSON.stringify(next) !== JSON.stringify(layout)) layout = next;
+	}
+
+	function scheduleLayout() {
+		if (!layoutFrame) layoutFrame = requestAnimationFrame(measureLayout);
+	}
+
+	function updateViewport(next: WorkspaceViewport) {
+		viewport = next;
+		scheduleLayout();
+	}
+
+	$effect(() => {
+		if (!workspaceEl) return;
+		const observer = new ResizeObserver(scheduleLayout);
+		observer.observe(workspaceEl);
+		scheduleLayout();
+		return () => { observer.disconnect(); cancelAnimationFrame(layoutFrame); layoutFrame = 0; };
 	});
 
 	$effect(() => {
@@ -793,13 +829,17 @@
 	}
 
 	function canCreatePane(minimumPaneWidth = MIN_PANE_WIDTH): boolean {
-		return panes.length < MAX_PANES
-			&& (!workspaceEl || workspaceEl.clientWidth / (panes.length + 1) >= minimumPaneWidth);
+		if (panes.length >= MAX_PANES) return false;
+		if (layout.regions.length) {
+			return panes.length < layout.regions.length && (minimumPaneWidth === MIN_PANE_WIDTH
+				|| layout.regions.every(region => region.width >= minimumPaneWidth));
+		}
+		return (layout.width - panes.length * PANE_DIVIDER_WIDTH) / (panes.length + 1) >= minimumPaneWidth;
 	}
 
-	function openPathInSplit(route: string) {
+	function openPathInSplit(route: string, minimumPaneWidth = TASK_FILE_SPLIT_MIN_PANE_WIDTH) {
 		if (!workspacePath(route)) return;
-		if (!canCreatePane(TASK_FILE_SPLIT_MIN_PANE_WIDTH)) {
+		if (!canCreatePane(minimumPaneWidth)) {
 			openPath(route);
 			return;
 		}
@@ -1044,7 +1084,7 @@
 		loadWorkspaceSummary();
 		checkDocker();
 		const desktopViewport = window.matchMedia('(min-width: 1024px)');
-		const closeMobileOnDesktop = () => { if (desktopViewport.matches) closeMobileMenu(); };
+		const closeMobileOnDesktop = () => { if (desktopViewport.matches && !foldable) closeMobileMenu(); };
 		desktopViewport.addEventListener('change', closeMobileOnDesktop);
 		const handleOnline = () => void checkConnection();
 		window.addEventListener('online', handleOnline);
@@ -1065,7 +1105,7 @@
 	});
 </script>
 
-<div use:workspaceViewport data-workspace-shell class="workspace-shell flex h-[100dvh] min-w-0 overflow-hidden pt-[env(safe-area-inset-top)] lg:pb-[env(safe-area-inset-bottom)] pl-[env(safe-area-inset-left)] pr-[env(safe-area-inset-right)]">
+<div use:workspaceViewport={updateViewport} data-workspace-shell data-foldable={foldable || undefined} class="workspace-shell flex h-[100dvh] min-w-0 overflow-hidden pt-[env(safe-area-inset-top)] lg:pb-[env(safe-area-inset-bottom)] pl-[env(safe-area-inset-left)] pr-[env(safe-area-inset-right)]">
 	<aside data-workspace-sidebar class="hidden shrink-0 flex-col border-r border-border/60 transition-[width] duration-200 lg:flex {sidebarCollapsed ? 'w-14' : 'w-64'}" style="background: hsl(var(--sidebar))">
 		<div class="flex h-11 shrink-0 items-center {sidebarCollapsed ? 'justify-center' : 'gap-2 px-3'}">
 			<a href="/dashboard" class="flex min-w-0 items-center gap-2 rounded-md outline-none transition hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/50" aria-label="Open Control center" title="Control center">
@@ -1165,7 +1205,8 @@
 					bind:element={compactTabStrip}
 					role="group"
 					aria-label="Open tabs"
-					class="workspace-mobile-tabs flex h-9 shrink-0 items-stretch overflow-x-auto border-b border-border bg-[hsl(var(--field))] lg:hidden scrollbar-hide"
+					style={`display:${showGlobalTabs ? 'flex' : 'none'};${layout.regions[0] ? `max-width:${layout.regions[0].width}px;margin-left:${layout.regions[0].x}px` : ''}`}
+					class="workspace-mobile-tabs h-9 shrink-0 items-stretch overflow-x-auto border-b border-border bg-[hsl(var(--field))] scrollbar-hide"
 				>
 					{#each openTabs as item (item.tab.id)}
 						<SortableTab
@@ -1187,15 +1228,20 @@
 				</TabStripDropZone>
 			</DragDropProvider>
 
-			<div bind:this={workspaceEl} class="flex min-h-0 flex-1 overflow-hidden">
+			<div bind:this={workspaceEl} data-workspace-layout={layout.regions.length ? layout.axis : 'flow'} class="relative flex min-h-0 flex-1 overflow-hidden">
 				<!-- One provider spans every pane so a tab can be dragged across them. -->
 				<DragDropProvider sensors={tabDragSensors} onDragMove={handleTabDragMove} onDragEnd={handleTabDragEnd}>
 				{#each panes as pane, index (pane.id)}
-					<div data-workspace-pane class="min-w-0 flex-col overflow-hidden {pane.id === focusedPaneId ? 'flex' : 'hidden'} lg:flex" style:flex={`${pane.width} 1 0%`}>
+					{@const region = layout.regions[index - paneStart]}
+					<div data-workspace-pane data-pane-id={pane.id} class="min-w-0 flex-col overflow-hidden"
+						style={`display:${index >= paneStart && index < paneEnd ? 'flex' : 'none'};${region ? regionStyle(region) : `flex:${pane.width} 1 0%;min-width:${paneEnd - paneStart > 1 ? 280 : 0}px`}`}>
 						<WorkspacePane
 							{pane}
 							focused={pane.id === focusedPaneId}
-							compact={panes.length > 1}
+							compact={paneEnd - paneStart > 1}
+							showTabs={showPaneTabs}
+							splitDirection={layout.axis === 'vertical' ? 'below' : 'right'}
+							onbrowse={foldable ? () => mobileMenuOpen = true : undefined}
 							canSplit={canCreatePane()}
 							dropIndex={dropPreview?.paneId === pane.id ? dropPreview.index : null}
 							onfocus={() => focusPane(pane.id)}
@@ -1205,11 +1251,16 @@
 							onsplit={() => splitPane(pane.id)}
 						/>
 					</div>
-					{#if index < panes.length - 1}
-						<button type="button" onpointerdown={(event) => startResize(index, event)} class="relative z-20 hidden w-1 shrink-0 cursor-col-resize border-x border-border/60 bg-card/50 hover:bg-primary/30 lg:block" aria-label="Resize panes"></button>
+					{#if !layout.regions.length && index >= paneStart && index < paneEnd - 1}
+						<button type="button" onpointerdown={(event) => startResize(index, event)} class="relative z-20 w-1 shrink-0 cursor-col-resize touch-none border-x border-border/60 bg-card/50 hover:bg-primary/30" aria-label="Resize panes"></button>
 					{/if}
 				{/each}
 				</DragDropProvider>
+				{#each layout.regions.slice(paneEnd - paneStart) as region}
+					<div data-empty-workspace-segment style={regionStyle(region)} class="grid place-items-center rounded-lg border border-dashed border-border p-4">
+						<button type="button" disabled={!canCreatePane()} onclick={() => openPathInSplit('/', MIN_PANE_WIDTH)} class="rounded-lg border border-border bg-card px-4 py-3 text-sm hover:bg-accent disabled:opacity-40">Open another pane</button>
+					</div>
+				{/each}
 			</div>
 		{:else}
 			<div class="min-h-0 flex-1 overflow-auto">{@render children()}</div>
@@ -1229,7 +1280,7 @@
 {#if mobileMenuOpen}
 	<dialog bind:this={mobileMenuDialog} id={navigationId} use:planningViewport class="workspace-navigation" aria-label="Browse workspace" onkeydown={keepNavigationFocus} onclose={() => { mobileMenuOpen = false; contextMenu = null; }}>
 		<button type="button" class="absolute inset-0" tabindex="-1" aria-label="Close agent switcher" onclick={closeMobileMenu}></button>
-		<aside class="navigation-sheet flex min-h-0 flex-col overflow-hidden rounded-2xl border border-border p-3 shadow-2xl" style="background: hsl(var(--sidebar))">
+		<aside class="navigation-sheet flex min-h-0 flex-col overflow-hidden rounded-2xl border border-border p-3 shadow-2xl" style={`background:hsl(var(--sidebar));${focusedRegion ? `left:${layout.x + focusedRegion.x + 12}px;top:${layout.y + focusedRegion.y + focusedRegion.height - 12}px;width:${focusedRegion.width - 24}px;height:min(46rem,${focusedRegion.height - 24}px)` : ''}`}>
 			<div class="mb-3 flex h-9 shrink-0 items-center gap-2"><a href="/dashboard" onclick={closeMobileMenu} class="flex min-w-0 items-center gap-2 rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50" aria-label="Open Control center"><img src="/icon-32.png" alt="" class="h-6 w-6 rounded" /><span class="text-sm font-semibold">xpressclaw</span></a><span class="min-w-0 flex-1 truncate text-right text-xs text-muted-foreground">{sidebarTitle}</span><button type="button" onclick={closeMobileMenu} aria-label="Close" class="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg text-xl text-muted-foreground hover:bg-accent">×</button></div>
 			<a href="/" onclick={closeMobileMenu} class="mb-3 flex shrink-0 items-center justify-center gap-2 rounded-lg bg-primary px-3 py-2 text-sm font-medium text-primary-foreground">+ New work</a>
 			{#if sidebarCategory === 'tasks'}
@@ -1291,6 +1342,15 @@
 {/if}
 
 <style>
+	.workspace-shell[data-foldable] {
+		position: fixed;
+		inset-inline: 0;
+		top: var(--workspace-viewport-top, 0px);
+		height: var(--workspace-viewport-height, 100dvh);
+	}
+	.workspace-shell[data-foldable] .workspace-mobile-header,
+	.workspace-shell[data-foldable] .workspace-bottom-navigation,
+	.workspace-shell[data-foldable] :global([data-workspace-sidebar]) { display: none; }
 	@media (max-width: 1023px) {
 		.workspace-shell {
 			position: fixed;
@@ -1300,7 +1360,7 @@
 		}
 		.workspace-shell:global([data-keyboard-open]) .workspace-bottom-navigation,
 		.workspace-shell:global([data-keyboard-open]) .workspace-mobile-header,
-		.workspace-shell:global([data-keyboard-open]) :global(.workspace-mobile-tabs) { display: none; }
+		.workspace-shell:global([data-keyboard-open]) :global(.workspace-mobile-tabs) { display: none !important; }
 	}
 	.workspace-navigation { position: fixed; inset: 0; width: 100%; max-width: none; height: 100dvh; max-height: none; margin: 0; padding: 0; border: 0; background: transparent; color: hsl(var(--foreground)); }
 	.workspace-navigation::backdrop { background: #0008; }

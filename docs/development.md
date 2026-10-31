@@ -150,6 +150,26 @@ Work timing is phase-specific. `response_queued_at` anchors queue wait and
 and `started_at` fields remain available for compatibility but must not be used
 as current-turn response-latency anchors when the explicit fields are present.
 
+## Responsive workspace layout
+
+Workspace panes use the measured workspace width to decide how many panes fit.
+Task details and Conversation task lists use their own pane width. Narrowing the
+window keeps the focused pane visible; the other panes remain mounted so their
+drafts, editor models, and scroll positions survive reopening the larger layout.
+
+When the browser exposes `window.viewport.segments`, the workspace intersects
+those rectangles with the area available above the keyboard. It places panes
+inside the resulting regions, with navigation and task sheets constrained to
+the selected region. Resize, visual-viewport, and device-posture events update
+the layout without changing the saved pane arrangement.
+
+The browser tests simulate segment rectangles and keyboard geometry in Chromium
+and WebKit, covering the [Duo viewport sizes documented by WebKit](https://webkit.org/blog/18486/webkit-features-for-safari-27-1/#viewport-sizes):
+
+```bash
+npm --prefix frontend run test:e2e -- --grep 'adaptive workspace|mobile editing'
+```
+
 ## Native runner images
 
 Build all standard and host-engine runner variants:
