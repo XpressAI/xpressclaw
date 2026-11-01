@@ -243,8 +243,12 @@ impl WorkflowEngine {
                     &output,
                     None,
                 )?;
-            } else if let Some(agent_id) = task.agent_id.as_deref() {
-                TaskQueue::new(self.db.clone()).ensure_enqueued(task_id, agent_id)?;
+            } else if task.status.as_str() == "pending" {
+                // Recover an unpublished initial dispatch. Other nonterminal
+                // tasks keep their existing work or wait for a user response.
+                if let Some(agent_id) = task.agent_id.as_deref() {
+                    TaskQueue::new(self.db.clone()).ensure_enqueued(task_id, agent_id)?;
+                }
             }
         }
         // Includes the crash boundary after all child results were committed,
@@ -479,6 +483,98 @@ flows:
             engine.instances.list_step_executions(&id).unwrap().len(),
             branches.len() + 1
         );
+    }
+
+    #[test]
+    fn recovery_preserves_parallel_questions_until_the_user_answers() {
+        for status_after_question in ["waiting_for_input", "in_progress"] {
+            let (db, engine, id) = start(PARALLEL);
+            let branches = branches(&engine, &id);
+            let task_id = branches[0].task_id.as_deref().unwrap();
+            let queue = TaskQueue::new(db.clone());
+            let board = TaskBoard::new(db.clone());
+            let conversation = TaskConversation::new(db.clone());
+            let complete_response = |item: &crate::tasks::queue::QueueItem, output: &str| {
+                conversation
+                    .complete_final_assistant_attempt(
+                        crate::tasks::conversation::FinalAssistantAttempt {
+                            task_id,
+                            queue_id: item.id,
+                            attempt_id: item.attempt_id.as_deref().unwrap(),
+                            completion_summary: output,
+                            content: output,
+                            visualizations: &[],
+                            published_files: &[],
+                        },
+                    )
+                    .unwrap()
+                    .unwrap();
+            };
+            let question = queue.claim("atlas").unwrap().unwrap();
+            complete_response(
+                &question,
+                "NEEDS_USER_INPUT: Which constraint should I use?",
+            );
+            // Also cover a restart between persisting the question and marking
+            // the task as waiting: recovery must park it without dispatching.
+            board
+                .update_status(task_id, status_after_question, Some("atlas"))
+                .unwrap();
+            engine
+                .on_task_completed(
+                    branches[1].task_id.as_deref().unwrap(),
+                    "completed",
+                    r#"{"proposal":"B"}"#,
+                )
+                .unwrap();
+
+            let recovered = WorkflowEngine::new(db.clone());
+            recovered.recover().unwrap();
+            recovered.recover().unwrap();
+            assert_eq!(
+                board.get(task_id).unwrap().status.as_str(),
+                "waiting_for_input"
+            );
+            assert!(!queue.has_active_response_for_task(task_id).unwrap());
+            assert!(queue.claim("atlas").unwrap().is_none());
+            assert_eq!(
+                recovered.instances.list_step_executions(&id).unwrap().len(),
+                3
+            );
+            assert_eq!(
+                recovered
+                    .instances
+                    .get_step_execution(&branches[0].id)
+                    .unwrap()
+                    .status,
+                "running"
+            );
+
+            let (_, answer) = conversation
+                .add_user_message_with_attachments_and_enqueue(
+                    task_id,
+                    Some("atlas"),
+                    "Use the tighter constraint.",
+                    &[],
+                )
+                .unwrap();
+            recovered.recover().unwrap();
+            let response = queue.claim("atlas").unwrap().unwrap();
+            assert_eq!(response.id, answer.unwrap().id);
+            complete_response(&response, r#"{"proposal":"A"}"#);
+            board
+                .update_status(task_id, "completed", Some("atlas"))
+                .unwrap();
+            recovered
+                .on_task_completed(task_id, "completed", r#"{"proposal":"A"}"#)
+                .unwrap();
+            let executions = recovered.instances.list_step_executions(&id).unwrap();
+            assert_eq!(executions.len(), 4);
+            let solve = board
+                .get(executions[3].task_id.as_deref().unwrap())
+                .unwrap();
+            assert_eq!(solve.description.as_deref(), Some("Compare A and B"));
+        }
     }
 
     #[test]
