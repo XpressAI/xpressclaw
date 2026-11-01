@@ -4093,6 +4093,73 @@ test('runner readiness does not offer a download for an incompatible retained en
 	await expect(page.getByRole('button', { name: 'Prepare runner', exact: true })).toHaveCount(0);
 });
 
+test('a downloaded harness upgrade is a quiet link to settings while the Agent stays ready', async ({ page }, testInfo) => {
+	const writes: string[] = [];
+	page.on('request', (request) => {
+		if (request.method() !== 'GET' && new URL(request.url()).pathname.startsWith('/api/agents/')) writes.push(request.url());
+	});
+	await mockApi(page, { runnerReadiness: {
+		ready: true, kind: 'codex', using_retained: true,
+		runner_update: { current_version: '2.1.1', available_version: '2.2.2' },
+	} });
+	await page.goto(`/agents/${agentId}`);
+	const notice = page.locator('[data-runner-upgrade]');
+	await expect(notice).toContainText('Harness update available');
+	await expect(notice).toContainText('2.1.1 → 2.2.2 downloaded');
+	await expect(page.getByText('This agent is not ready to run')).toHaveCount(0);
+	await expect(page.getByRole('button', { name: 'Prepare runner', exact: true })).toHaveCount(0);
+	await expect(page.getByRole('alert')).toHaveCount(0);
+	await page.getByPlaceholder('Send work or ask a question…').fill('Keep working on this draft');
+	await page.setViewportSize({ width: 390, height: 844 });
+	await expect(notice.getByRole('link', { name: 'Review update' })).toBeVisible();
+	await page.screenshot({ path: testInfo.outputPath('runner-upgrade-mobile.png') });
+	await notice.getByRole('link', { name: 'Review update' }).click();
+	await expect(page).toHaveURL(`/agents/${agentId}?tab=runner`);
+	await expect(page.locator('[data-runner-upgrade-details]')).toContainText('current environment 2.1.1; downloaded 2.2.2');
+	await expect(page.locator('[data-runner-upgrade-details]')).toContainText('after an environment rebuild');
+	await expect(page.getByRole('button', { name: 'Discard environment and rebuild' })).toHaveCount(0);
+	expect(writes).toEqual([]);
+});
+
+test('a ready Agent refreshes its upgrade notice without replacing the composer draft', async ({ page }) => {
+	await page.clock.install();
+	const readiness: Record<string, unknown> = { ready: true, kind: 'codex', runner_update: null };
+	await mockApi(page, { runnerReadiness: readiness });
+	await page.goto(`/agents/${agentId}`);
+	const composer = page.getByPlaceholder('Send work or ask a question…');
+	await composer.fill('Unsent work');
+	await expect(page.locator('[data-runner-upgrade]')).toHaveCount(0);
+	readiness.runner_update = { current_version: '2.1.1', available_version: '2.2.2' };
+	await page.clock.fastForward(61_000);
+	await expect(page.locator('[data-runner-upgrade]')).toBeVisible();
+	await expect(composer).toHaveValue('Unsent work');
+	await expect(composer).toBeFocused();
+	readiness.runner_update = null;
+	await page.clock.fastForward(61_000);
+	await expect(page.locator('[data-runner-upgrade]')).toHaveCount(0);
+	await expect(composer).toHaveValue('Unsent work');
+});
+
+test('Harness settings refresh the version notice after downloading an update', async ({ page }) => {
+	const runnerImageUpdateRequests: string[] = [];
+	await mockApi(page, { runnerImageUpdateRequests });
+	let initialReadiness: Route | undefined;
+	await page.route(`**/api/sessions/${agentId}/readiness`, (route) => {
+		if (!runnerImageUpdateRequests.length) { initialReadiness = route; return; }
+		return route.fulfill({ json: { ready: true, kind: 'codex', runner_update: { current_version: '2.1.1', available_version: '9.9.9' } } });
+	});
+	await page.goto(`/agents/${agentId}?tab=runner`);
+	await expect(page.getByRole('button', { name: 'Download harness update' })).toBeVisible();
+	await expect(page.locator('[data-runner-upgrade-details]')).toHaveCount(0);
+	await expect.poll(() => Boolean(initialReadiness)).toBe(true);
+	await page.getByRole('button', { name: 'Download harness update' }).click();
+	await expect(page.locator('[data-runner-upgrade-details]')).toContainText('current environment 2.1.1; downloaded 9.9.9');
+	const oldResponse = page.waitForResponse((response) => response.url().endsWith('/readiness'));
+	await initialReadiness!.fulfill({ json: { ready: true, runner_update: null } });
+	await oldResponse;
+	await expect(page.locator('[data-runner-upgrade-details]')).toContainText('current environment 2.1.1; downloaded 9.9.9');
+});
+
 test('agent Work keeps internal presentation capability out of the user interface', async ({ page }) => {
 	await mockApi(page, {
 		runnerReadiness: {

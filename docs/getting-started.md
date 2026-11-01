@@ -80,6 +80,11 @@ runner image has not been downloaded. **Prepare runner** preserves that
 environment. Downloads show elapsed time and keep any failure visible for retry;
 the readiness panel also refreshes when another Agent downloads the shared image.
 
+When a newer harness version is already downloaded for the Agent, Work shows a
+small **Harness update available** note with the current and downloaded versions.
+**Review update** opens Harness settings. The Agent stays ready to work; applying
+the downloaded image still uses the explicit environment rebuild there.
+
 Runtime selection is automatic. An explicit `DOCKER_HOST` wins; otherwise
 Xpressclaw prefers a live user-level Docker Desktop or rootless Podman socket
 before falling back to the platform Docker endpoint. Readiness and server

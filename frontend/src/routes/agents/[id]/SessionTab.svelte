@@ -8,6 +8,7 @@
 	import { clearComposerDraft, loadComposerDraft, saveComposerDraft } from '$lib/composerDrafts';
 	import { appendImageFiles, imageDataUrl, IMAGE_FILE_ACCEPT, MAX_IMAGE_ATTACHMENTS, pastedImageFiles, shouldHandleImagePaste } from '$lib/imageAttachments';
 	import { timeAgo } from '$lib/utils';
+	import { projectPath } from '$lib/workspace';
 
 	let { agentId }: { agentId: string } = $props();
 	const messageDraftScope = () => `session.${agentId}`;
@@ -36,6 +37,7 @@
 	let preparationTimer: ReturnType<typeof setInterval> | null = null;
 	let readinessRequest = 0;
 	let loadingReadiness = false;
+	let lastReadinessCheck = 0;
 
 	const RECENT_WORK_LIMIT = 5;
 	const ATTENTION_STATUSES = ['waiting_for_input', 'blocked'];
@@ -54,7 +56,7 @@
 		loadReadiness();
 		pollTimer = setInterval(load, 2500);
 		readinessTimer = setInterval(() => {
-			if (!readiness?.ready) void loadReadiness();
+			if (!readiness?.ready || Date.now() - lastReadinessCheck >= 60_000) void loadReadiness();
 		}, 10_000);
 	});
 
@@ -90,6 +92,7 @@
 	async function loadReadiness() {
 		if (preparing || loadingReadiness) return;
 		loadingReadiness = true;
+		lastReadinessCheck = Date.now();
 		const request = ++readinessRequest;
 		try {
 			const next = await sessions.readiness(agentId);
@@ -233,6 +236,14 @@
 		<div role="alert" class="rounded-xl border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive">Could not prepare runner: {prepareError}</div>
 	{:else if prepareNotice}
 		<p role="status" class="text-sm text-emerald-600">{prepareNotice}</p>
+	{/if}
+
+	{#if readiness?.runner_update}
+		<p data-runner-upgrade class="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
+			<span class="inline-flex items-center gap-1.5"><span class="h-1.5 w-1.5 rounded-full bg-primary/60" aria-hidden="true"></span>Harness update available</span>
+			<span>{readiness.runner_update.current_version} → {readiness.runner_update.available_version} downloaded</span>
+			<a href={projectPath(agentId, 'runner')} class="underline underline-offset-2 hover:text-foreground">Review update</a>
+		</p>
 	{/if}
 
 	{#if overview}
