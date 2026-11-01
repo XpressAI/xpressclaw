@@ -15,10 +15,14 @@
 	let readiness = $state<RunnerReadiness | null>(null);
 	let taskList = $state<Task[]>([]);
 	let error = $state<string | null>(null);
+	let readinessError = $state<string | null>(null);
+	let prepareError = $state<string | null>(null);
+	let prepareNotice = $state<string | null>(null);
 	let message = $state('');
 	let messageDraftReady = $state(false);
 	let sending = $state(false);
 	let preparing = $state(false);
+	let preparationSeconds = $state(0);
 	let startFresh = $state(false);
 	let imageAttachments = $state<ImageAttachmentUpload[]>([]);
 	let imageInput = $state<HTMLInputElement>();
@@ -28,6 +32,10 @@
 		src: imageDataUrl(attachment),
 	})));
 	let pollTimer: ReturnType<typeof setInterval> | null = null;
+	let readinessTimer: ReturnType<typeof setInterval> | null = null;
+	let preparationTimer: ReturnType<typeof setInterval> | null = null;
+	let readinessRequest = 0;
+	let loadingReadiness = false;
 
 	const RECENT_WORK_LIMIT = 5;
 	const ATTENTION_STATUSES = ['waiting_for_input', 'blocked'];
@@ -45,10 +53,16 @@
 		load();
 		loadReadiness();
 		pollTimer = setInterval(load, 2500);
+		readinessTimer = setInterval(() => {
+			if (!readiness?.ready) void loadReadiness();
+		}, 10_000);
 	});
 
 	onDestroy(() => {
 		if (pollTimer) clearInterval(pollTimer);
+		if (readinessTimer) clearInterval(readinessTimer);
+		if (preparationTimer) clearInterval(preparationTimer);
+		readinessRequest++;
 	});
 
 	async function load() {
@@ -74,23 +88,45 @@
 	}
 
 	async function loadReadiness() {
+		if (preparing || loadingReadiness) return;
+		loadingReadiness = true;
+		const request = ++readinessRequest;
 		try {
-			readiness = await sessions.readiness(agentId);
+			const next = await sessions.readiness(agentId);
+			if (request !== readinessRequest) return;
+			readiness = next;
+			readinessError = null;
+			if (next.ready) prepareError = null;
 		} catch (e) {
-			error = e instanceof Error ? e.message : String(e);
+			if (request === readinessRequest) readinessError = e instanceof Error ? e.message : String(e);
+		} finally {
+			loadingReadiness = false;
 		}
 	}
 
 	async function prepareRunner() {
 		if (preparing) return;
+		const request = ++readinessRequest;
 		preparing = true;
+		prepareError = null;
+		prepareNotice = null;
+		preparationSeconds = 0;
+		const started = Date.now();
+		preparationTimer = setInterval(() => {
+			preparationSeconds = Math.floor((Date.now() - started) / 1000);
+		}, 1000);
 		try {
-			readiness = await sessions.prepare(agentId);
-			error = null;
+			const next = await sessions.prepare(agentId);
+			if (request !== readinessRequest) return;
+			readiness = next;
+			readinessError = null;
+			prepareNotice = next.ready ? 'Runner is ready.' : next.image_present ? 'Runner image is ready. Resolve the remaining issues above.' : null;
 		} catch (e) {
-			error = e instanceof Error ? e.message : String(e);
+			if (request === readinessRequest) prepareError = e instanceof Error ? e.message : String(e);
 		} finally {
 			preparing = false;
+			if (preparationTimer) clearInterval(preparationTimer);
+			preparationTimer = null;
 		}
 	}
 
@@ -167,6 +203,9 @@
 	{#if error}
 		<div class="rounded-xl border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive">{error}</div>
 	{/if}
+	{#if readinessError}
+		<div role="alert" class="rounded-xl border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive">Could not check runner readiness: {readinessError}</div>
+	{/if}
 
 	{#if readiness && !readiness.ready}
 		<div class="rounded-xl border border-amber-500/30 bg-amber-500/5 p-4">
@@ -180,13 +219,20 @@
 						<p class="mt-2 text-xs text-foreground">Run <code>{readiness.kind} login</code> on this computer, then refresh.</p>
 					{/if}
 				</div>
-				{#if readiness.docker_available && !readiness.image_present}
+				{#if readiness.docker_available && !readiness.image_present && readiness.can_prepare !== false}
 					<button onclick={prepareRunner} disabled={preparing} class="shrink-0 rounded-lg bg-primary px-3 py-2 text-xs font-medium text-primary-foreground disabled:opacity-50">
-						{preparing ? 'Preparing…' : 'Prepare runner'}
+						{preparing ? 'Downloading…' : 'Prepare runner'}
 					</button>
 				{/if}
 			</div>
 		</div>
+	{/if}
+	{#if preparing}
+		<p role="status" class="text-sm text-muted-foreground">Downloading runner image… {preparationSeconds}s elapsed. Agents using this runner will share the download.</p>
+	{:else if prepareError}
+		<div role="alert" class="rounded-xl border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive">Could not prepare runner: {prepareError}</div>
+	{:else if prepareNotice}
+		<p role="status" class="text-sm text-emerald-600">{prepareNotice}</p>
 	{/if}
 
 	{#if overview}

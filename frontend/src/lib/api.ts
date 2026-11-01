@@ -620,6 +620,8 @@ export interface RunnerReadiness {
 	image: string;
 	runtime_image: string | null;
 	image_present: boolean;
+	using_retained?: boolean;
+	can_prepare?: boolean;
 	workspace: string;
 	workspace_present: boolean;
 	model: string | null;

@@ -75,6 +75,11 @@ image, project folder, server command, and subscription credentials. Use
 `xpressclaw-runner-<product>:latest` image is accepted as a development
 fallback.
 
+Readiness accepts a compatible retained Agent environment even when a newer
+runner image has not been downloaded. **Prepare runner** preserves that
+environment. Downloads show elapsed time and keep any failure visible for retry;
+the readiness panel also refreshes when another Agent downloads the shared image.
+
 Runtime selection is automatic. An explicit `DOCKER_HOST` wins; otherwise
 Xpressclaw prefers a live user-level Docker Desktop or rootless Podman socket
 before falling back to the platform Docker endpoint. Readiness and server

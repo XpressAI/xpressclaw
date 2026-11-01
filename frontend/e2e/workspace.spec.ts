@@ -1,4 +1,4 @@
-import { expect, test, type Locator, type Page } from '@playwright/test';
+import { expect, test, type Locator, type Page, type Route } from '@playwright/test';
 
 const taskId = 'task-browser-test';
 const agentId = 'project-browser-test';
@@ -3997,6 +3997,100 @@ test('agent Work shows only the five most recently updated tasks', async ({ page
 		'/tasks/project-task-2',
 	]);
 	await expect(page.getByRole('link', { name: 'All tasks' })).toHaveAttribute('href', '/tasks');
+});
+
+test('runner preparation errors survive session polling and clear on successful retry', async ({ page }) => {
+	await page.clock.install();
+	await mockApi(page);
+	const missing = { ready: false, docker_available: true, image_present: false, auth_present: true, issues: ['Runner image has not been pulled'] };
+	let preparations = 0;
+	let sessionLoads = 0;
+	await page.route(`**/api/sessions/${agentId}`, async (route) => {
+		await route.fulfill({ json: {
+			session: { id: agentId, status: ++sessionLoads === 1 ? 'idle' : 'queued' },
+			active_attempts: [], queued_attempts: [], recent_attempts: [], recent_events: [], artifacts: [],
+		} });
+	});
+	await page.route(`**/api/sessions/${agentId}/readiness`, async (route) => {
+		if (route.request().method() === 'POST') {
+			preparations++;
+			if (preparations === 1) {
+				await route.fulfill({ status: 503, json: { error: 'Registry is unavailable' } });
+			} else {
+				await route.fulfill({ json: { ...missing, ready: true, image_present: true, issues: [] } });
+			}
+		} else await route.fulfill({ json: missing });
+	});
+	await page.goto(`/agents/${agentId}`);
+	await page.getByRole('button', { name: 'Prepare runner', exact: true }).click();
+	const failure = page.getByText('Registry is unavailable', { exact: false });
+	await expect(failure).toBeVisible();
+	await page.clock.fastForward(3500);
+	const composer = page.locator('section').filter({ has: page.getByPlaceholder('Send work or ask a question…') });
+	await expect(composer.getByText('Queued', { exact: true })).toBeVisible();
+	await expect(failure).toBeVisible();
+	await page.getByRole('button', { name: 'Prepare runner', exact: true }).click();
+	await expect(page.getByText('Runner is ready.', { exact: true })).toBeVisible();
+	await expect(failure).toHaveCount(0);
+	await expect(page.getByText('This agent is not ready to run')).toHaveCount(0);
+	expect(preparations).toBe(2);
+});
+
+test('runner preparation shows download progress and ignores a stale readiness response', async ({ page }) => {
+	await page.clock.install();
+	await mockApi(page);
+	const missing = { ready: false, docker_available: true, image_present: false, can_prepare: true, auth_present: true, issues: ['Runner image has not been pulled'] };
+	let gets = 0;
+	let preparations = 0;
+	let delayedReadiness: Route | undefined;
+	let delayedPreparation: Route | undefined;
+	await page.route(`**/api/sessions/${agentId}/readiness`, async (route) => {
+		if (route.request().method() === 'POST') {
+			preparations++;
+			delayedPreparation = route;
+		} else if (++gets === 1) await route.fulfill({ json: missing });
+		else delayedReadiness = route;
+	});
+	await page.goto(`/agents/${agentId}`);
+	const prepare = page.getByRole('button', { name: 'Prepare runner', exact: true });
+	await expect(prepare).toBeVisible();
+	await page.clock.fastForward(10_100);
+	await expect.poll(() => Boolean(delayedReadiness)).toBe(true);
+	await prepare.click();
+	await expect.poll(() => Boolean(delayedPreparation)).toBe(true);
+	await page.clock.fastForward(15_000);
+	await expect(page.getByRole('button', { name: 'Downloading…', exact: true })).toBeDisabled();
+	await expect(page.getByText(/Downloading runner image… 1[5-9]s elapsed/)).toBeVisible();
+	expect(preparations).toBe(1);
+	expect(gets).toBe(2);
+	await delayedPreparation!.fulfill({ json: { ...missing, ready: true, image_present: true, can_prepare: false, issues: [] } });
+	await expect(page.getByText('Runner is ready.', { exact: true })).toBeVisible();
+	const stale = page.waitForResponse((response) => response.request().method() === 'GET' && response.url().endsWith('/readiness'));
+	await delayedReadiness!.fulfill({ json: missing });
+	await stale;
+	await expect(page.getByText('This agent is not ready to run')).toHaveCount(0);
+	await expect(page.getByText('Runner is ready.', { exact: true })).toBeVisible();
+});
+
+test('runner readiness notices a shared image prepared by another Agent', async ({ page }) => {
+	await page.clock.install();
+	const readiness = { ready: false, docker_available: true, image_present: false, can_prepare: true, auth_present: true, issues: ['Runner image has not been pulled'] };
+	await mockApi(page, { runnerReadiness: readiness });
+	await page.goto(`/agents/${agentId}`);
+	await expect(page.getByRole('button', { name: 'Prepare runner', exact: true })).toBeVisible();
+	Object.assign(readiness, { ready: true, image_present: true, can_prepare: false, issues: [] });
+	await page.clock.fastForward(10_100);
+	await expect(page.getByText('This agent is not ready to run')).toHaveCount(0);
+});
+
+test('runner readiness does not offer a download for an incompatible retained environment', async ({ page }) => {
+	await mockApi(page, { runnerReadiness: {
+		ready: false, docker_available: true, image_present: false, can_prepare: false, auth_present: true,
+		issues: ['The retained environment uses a different harness. Restore its settings or rebuild it.'],
+	} });
+	await page.goto(`/agents/${agentId}`);
+	await expect(page.getByText('The retained environment uses a different harness.', { exact: false })).toBeVisible();
+	await expect(page.getByRole('button', { name: 'Prepare runner', exact: true })).toHaveCount(0);
 });
 
 test('agent Work keeps internal presentation capability out of the user interface', async ({ page }) => {

@@ -135,6 +135,8 @@ jobs:
           done
           test_name=routes::agents::tests::rebuild_and_delete_preserve_session_and_container_boundaries
           XPRESSCLAW_RETENTION_TEST_IMAGE=xpressclaw-environment-test:local cargo test -p xpressclaw-server --lib "$test_name" -- --ignored --exact --nocapture
+          test_name=routes::sessions::tests::readiness_and_prepare_reuse_retained_environment_without_pulling
+          XPRESSCLAW_RETENTION_TEST_IMAGE=xpressclaw-environment-test:local cargo test -p xpressclaw-server --lib "$test_name" -- --ignored --exact --nocapture
 
       - name: Clippy
         run: cargo clippy -p xpressclaw-core -p xpressclaw-server -p xpressclaw-cli -p xpressclaw-tauri --all-targets -- -D warnings
