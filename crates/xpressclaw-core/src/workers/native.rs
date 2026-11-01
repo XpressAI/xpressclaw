@@ -1795,7 +1795,12 @@ async fn execute_item_once(runtime: NativeAttemptRuntime, item: QueueItem) -> Re
             Some(result) => result,
             None => {
                 let result = docker
-                    .workflow_command(workload_id, &container_workspace, &command)
+                    .workflow_command(
+                        workload_id,
+                        &container_workspace,
+                        &repository.container_bootstrap,
+                        &command,
+                    )
                     .await;
                 sessions.clear_container(attempt_id)?;
                 if finish_terminal_dispatch_after_worker_exit(
@@ -1811,8 +1816,7 @@ async fn execute_item_once(runtime: NativeAttemptRuntime, item: QueueItem) -> Re
             }
         };
         sessions.clear_container(attempt_id)?;
-        let output =
-            serde_json::to_string(&result).map_err(|error| Error::Workflow(error.to_string()))?;
+        let output = result.json_output()?;
         sessions.add_artifact(
             attempt_id,
             "result",

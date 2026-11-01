@@ -28,9 +28,12 @@ Open **Automations → New workflow** to choose one of six working templates:
    high-level design, gives an independent role a clean-session challenge, and
    produces acceptance criteria plus independently useful delivery slices. It
    works for product, policy, operations, research, and software work.
-6. **Team solve** plans a problem, runs two independent proposal tasks, implements
-   a solution, captures test output, reviews it in a fresh session, applies at most
-   one repair pass, and requires a final verification command to succeed.
+6. **Implement alternatives → choose best** defines a rubric, builds two independent
+   implementations, runs common checks, and selects the strongest eligible result.
+   It can refine a copy using ideas from the other implementation, keeping it only
+   when the original rubric scores it higher and its checks pass. The worker adopts
+   and re-verifies the chosen version, then publishes a comparison report.
+   Saving a reusable decision to project memory is optional.
 
 The compact **Start blank** action retains the original one-step starter for
 people who want an executable empty canvas instead of a primary gallery card.
@@ -210,8 +213,9 @@ timeout fails the workflow; otherwise it follows the named step or flow.
 - **Independent specification challenge:** give the challenger a reusable Agent
   role and `new_session: true`, then pass its structured gaps and recommendations
   to the final drafting step.
-- **Team solve:** compare independent proposals, hand the selected approach to
-  a worker, review recorded test results, and verify after one optional repair.
+- **Implement alternatives → choose best:** define the rubric before building,
+  evaluate independent implementations with shared checks, then adopt and verify
+  the selected result.
 - **Failure handling:** an `on_error` flow catches failed agent tasks; explicit
   timeout flows handle external systems that never respond.
 
@@ -223,15 +227,54 @@ Each run snapshots its workflow definition when it starts. Editing the reusable
 definition affects future runs without changing a run that is already waiting,
 looping, or executing a task.
 
-## Parallel proposals and executable verification
+## Parallel alternatives and executable verification
 
-The built-in **Team solve** template uses XpressClaw tasks and persisted outputs
-for its handoffs. Each Agent role
-starts a fresh session. The coordinator plans and reviews, two ideators propose
-approaches independently, and the worker owns the solution and test environment.
-The reviewer receives the implementation record and captured test results, so the
-roles can use separate workspaces. Supply a problem and a verification command
-that returns zero when its acceptance checks pass.
+The built-in **Implement alternatives → choose best** workflow completes a task
+through a common baseline, a predefined rubric, two independent implementations,
+shared verification, selection, adoption, and a final check.
+
+The worker inspects the destination and relevant project memory, then prepares a
+reproducible starting point. The coordinator defines mandatory requirements,
+weighted quality criteria, expected evidence, and a tie-break rule before either
+candidate starts. It creates the shared verification script, incorporating any
+existing command the user supplies. Both candidates receive the same baseline,
+brief, rubric, and checks. Each builds a complete alternative in its own uniquely
+named directory or Git worktree. Different Agents can run concurrently and use
+different configured models; two roles bound to one Agent run serially.
+
+After both implementations are ready, command steps run the saved verification
+script in each candidate's exact directory. The evaluator compares actual outputs
+and source changes against the original rubric, producing a scorecard and rationale.
+The engine checks the selected candidate's machine-derived `passed` flag before
+allowing adoption. A higher quality score cannot override failed required checks.
+A failed or timed-out candidate remains ineligible while the other can still win.
+If no eligible result is selected, the workflow publishes the comparison and fails
+without applying a candidate to the destination.
+
+`refine_winner` is enabled by default. An independent review looks for specific
+ideas from the other implementation that could improve the winner. When there is
+a concrete opportunity, the worker creates an unchanged copy of the winner and a
+separate experimental refinement. Both are checked in the worker's environment
+with the same saved script and rescored against the original rubric. The engine
+requires passing checks, confirmation that mandatory requirements still hold,
+and a strictly higher numeric score before choosing the refinement. Failed checks,
+ties, and lower scores retain the original winner. If the unchanged copy cannot
+pass its recheck, the run stops before applying either version. The original
+candidate workspaces and change sets remain available throughout.
+
+The worker applies the selected change set, preserving unrelated user changes,
+then runs the same verification script against the adopted result. A successful
+run ends with a human-readable answer and a downloadable report published through
+`publish_task_files`, including the rubric, scorecard, selection rationale,
+delivered files, test evidence, and any before/after refinement comparison. Results
+also reach a linked Project Conversation.
+The optional `remember_decision` input is off by default; when enabled, a separate
+step preserves reusable project knowledge only after final verification succeeds.
+
+Agent roles exchange source state and change sets through persisted step outputs,
+so candidates can use separate workspaces. Git worktrees belong under `.worktrees/`.
+Absolute command directories keep verification tied to the intended candidate even
+when an Agent adopts a different active repository between turns.
 
 A `parallel` block contains 1–16 Agent or command steps:
 
@@ -283,20 +326,40 @@ Linux container:
         timeout: 5m
 ```
 
-The working directory is relative to the Agent's active workspace. The runner
-checks the resolved directory stays within it. Timeouts default to five minutes
+Relative working directories start at the Agent's active repository. Absolute
+container paths are also accepted, and the runner resolves symlinks to check that
+the directory stays inside the Agent's configured workspace. Timeouts default to five minutes
 and support the same duration syntax as waits, up to 24 hours. A command exposes
-`exit_code`, `stdout`, `stderr`, `signal`, `timed_out`, `stdout_truncated`, and
+`passed`, `exit_code`, `stdout`, `stderr`, `signal`, `timed_out`, `stdout_truncated`, and
 `stderr_truncated`; each output stream is capped at 1 MiB. These results also appear
-in the command task and its attempt artifacts. `allow_failure: true` captures a
-nonzero exit so a later step can review it. Timeouts, signals, and execution errors
-fail the step. The default requires exit code zero.
+in the command task and its attempt artifacts. `allow_failure: true` captures
+nonzero exits, signals, and timeouts so later steps can compare outcomes. Launch
+and transport errors fail the step. The derived `passed` flag is true only for
+exit code zero with no signal or timeout; strict command steps require it to be
+true. Use this flag for eligibility gates.
 
 Commands use the run's saved definition and execution result. Updating task text
 or reporting success cannot override the test gate. A saved command result is
 reused after restart. If execution was interrupted before its result was saved,
 the command fails with an interruption message; a new workflow run executes it
 again. A command's process group is terminated on timeout, disconnect, or exit.
+
+Numeric `when` switches can compare step outputs or a numeric literal with
+`>`, `>=`, `<`, or `<=`. For example:
+
+```yaml
+      - id: improvement_gate
+        type: when
+        switch: "@assessment.after_score > @assessment.before_score"
+        arms:
+          - match: "true"
+            goto: flow adopt_refined
+          - match: default
+            goto: flow adopt_original
+```
+
+The comparison runs in the engine using finite numbers. Missing or nonnumeric
+operands fail the step instead of accepting a claimed improvement.
 
 The `command` field on a normal Agent `step` still invokes a harness slash command.
 Use `type: command` for direct shell execution. Both the visual editor and YAML

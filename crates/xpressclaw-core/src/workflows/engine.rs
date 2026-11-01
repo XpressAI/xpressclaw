@@ -1138,7 +1138,7 @@ impl WorkflowEngine {
         ctx: &Value,
     ) -> Result<()> {
         let switch_expr = step.switch_var.as_deref().unwrap_or("");
-        let resolved_value = context::resolve_variable(switch_expr, ctx)
+        let resolved_value = condition::switch_value(switch_expr, ctx)?
             .map(|v| match v {
                 Value::String(s) => s,
                 other => serde_json::to_string(&other).unwrap_or_default(),
@@ -1663,7 +1663,7 @@ impl WorkflowEngine {
                                     "failed"
                                 }
                                 .into(),
-                                output,
+                                result.json_output()?,
                             ))
                         }
                         None => Ok((

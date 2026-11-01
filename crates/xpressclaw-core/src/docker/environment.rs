@@ -212,6 +212,7 @@ impl DockerManager {
         &self,
         agent_id: &str,
         workspace: &str,
+        workspace_root: &str,
         command: &crate::workflows::commands::WorkflowCommand,
     ) -> Result<crate::workflows::commands::CommandResult> {
         let mut attached = self
@@ -226,7 +227,7 @@ impl DockerManager {
                 &[],
             )
             .await?;
-        let request = json!({"script": command.script, "cwd": command.cwd, "timeout_secs": command.timeout_secs});
+        let request = json!({"script": command.script, "cwd": command.cwd, "workspace_root": workspace_root, "timeout_secs": command.timeout_secs});
         let operation = async {
             attached
                 .input
@@ -867,7 +868,7 @@ mod tests {
                 execution_id: "test-command".into(), script: "printf captured; printf failure >&2; exit 7".into(),
                 cwd: ".".into(), timeout_secs: 5, allow_failure: true,
             };
-            let captured = docker.workflow_command("loopback", "/tmp", &command).await.unwrap();
+            let captured = docker.workflow_command("loopback", "/tmp", "/tmp", &command).await.unwrap();
             assert_eq!(captured.exit_code, Some(7));
             assert_eq!(captured.stdout, "captured");
             assert_eq!(captured.stderr, "failure");
@@ -875,12 +876,19 @@ mod tests {
             assert!(!captured.succeeds(false));
             command.script = "sleep 30 & wait".into();
             command.timeout_secs = 1;
-            let timed = docker.workflow_command("loopback", "/tmp", &command).await.unwrap();
+            let timed = docker.workflow_command("loopback", "/tmp", "/tmp", &command).await.unwrap();
             assert!(timed.timed_out);
-            assert!(!timed.succeeds(true));
+            assert!(timed.succeeds(true));
+            assert!(!timed.passed());
+            assert!(!timed.succeeds(false));
             command.script = "pwd".into();
             command.cwd = "..".into();
-            assert!(docker.workflow_command("loopback", "/tmp", &command).await.is_err());
+            assert!(docker.workflow_command("loopback", "/tmp", "/tmp", &command).await.is_err());
+            command.cwd = "/tmp".into();
+            let absolute = docker.workflow_command("loopback", "/tmp/artifacts", "/tmp", &command).await.unwrap();
+            assert_eq!(absolute.stdout.trim(), "/tmp");
+            command.cwd = "/".into();
+            assert!(docker.workflow_command("loopback", "/tmp/artifacts", "/tmp", &command).await.is_err());
             eprintln!("workflow command verification passed");
             let echo = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
             let inbound = PortForward { id: "llm".into(), direction: ForwardDirection::HostToContainer, host_port: echo.local_addr().unwrap().port(), container_port: 18081 };

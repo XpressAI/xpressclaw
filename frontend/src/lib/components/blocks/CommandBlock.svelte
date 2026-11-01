@@ -36,8 +36,8 @@
 				<label>Working directory<input aria-label="Command working directory" value={cwd} oninput={(event) => onupdate({ cwd: event.currentTarget.value })} class="mt-1 w-full rounded border border-input bg-background p-2 font-mono" /></label>
 				<label>Timeout<input aria-label="Command timeout" value={timeout} oninput={(event) => onupdate({ timeout: event.currentTarget.value })} class="mt-1 w-full rounded border border-input bg-background p-2 font-mono" /></label>
 			</div>
-			<label class="flex items-center gap-2"><input type="checkbox" checked={allowFailure} onchange={(event) => onupdate({ allowFailure: event.currentTarget.checked })} />Continue after a nonzero exit for review</label>
-			<p class="text-muted-foreground">Runs in the Agent’s workspace. Later steps receive exit_code, stdout, stderr, signal, timed_out, and output truncation flags.</p>
+			<label class="flex items-center gap-2"><input type="checkbox" checked={allowFailure} onchange={(event) => onupdate({ allowFailure: event.currentTarget.checked })} />Capture failed or timed-out checks for review</label>
+			<p class="text-muted-foreground">Relative directories start at the active repository; absolute paths must stay inside the Agent’s configured workspace. Later steps receive passed, exit_code, stdout, stderr, signal, timed_out, and output truncation flags.</p>
 		</div>
 	{/if}
 </div>

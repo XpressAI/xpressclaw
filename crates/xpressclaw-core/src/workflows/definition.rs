@@ -104,10 +104,12 @@ pub struct Step {
     /// the same command in the native product UI.
     #[serde(default)]
     pub command: Option<String>,
-    /// Command steps run in the selected Agent container, relative to its workspace.
+    /// Working directory in the Agent container: relative to its active repository,
+    /// or absolute inside its configured workspace.
     #[serde(default)]
     pub cwd: Option<String>,
-    /// Capture a nonzero exit for a later step. Timeouts and launch errors fail.
+    /// Capture an unsuccessful process outcome for a later step. Launch and
+    /// transport errors still fail; callers can branch on the derived passed flag.
     #[serde(default)]
     pub allow_failure: bool,
     /// ACP configuration values to apply before this step's prompt. Keys are
@@ -650,7 +652,7 @@ impl WorkflowDefinition {
                         ));
                     }
                     if step.outputs.is_some() {
-                        return Err(Error::Workflow("command outputs are fixed: exit_code, stdout, stderr, signal, timed_out, stdout_truncated, stderr_truncated".into()));
+                        return Err(Error::Workflow("command outputs are fixed: passed, exit_code, stdout, stderr, signal, timed_out, stdout_truncated, stderr_truncated".into()));
                     }
                 }
                 "step" => self.validate_agent_reference(step, flow_name, false)?,
@@ -935,13 +937,14 @@ fn find_step_in_list<'a>(steps: &'a [Step], step_id: &str) -> Option<&'a Step> {
 
 /// The runner additionally resolves symlinks before entering this directory.
 pub(super) fn validate_command_cwd(cwd: &str) -> Result<()> {
-    if cwd.starts_with('/')
+    if cwd.trim().is_empty()
         || cwd.contains('\\')
         || cwd.contains(':')
         || cwd.split('/').any(|part| part == "..")
     {
         return Err(Error::Workflow(
-            "command cwd must be relative to the Agent workspace and cannot contain '..'".into(),
+            "command cwd must be a nonempty container path without '..', backslashes, or a drive prefix"
+                .into(),
         ));
     }
     Ok(())

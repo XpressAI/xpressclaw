@@ -19,7 +19,7 @@ function run(script, options = {}) {
       try { resolve(JSON.parse(output)); } catch { reject(new Error(`No result: ${code}: ${error}`)); }
     });
   });
-  child.stdin.write(JSON.stringify({ script, cwd: options.cwd || '.', timeout_secs: options.timeout || 5 }) + '\n');
+  child.stdin.write(JSON.stringify({ script, cwd: options.cwd || '.', workspace_root: options.workspaceRoot, timeout_secs: options.timeout || 5 }) + '\n');
   if (options.disconnect) setTimeout(() => child.stdin.end(), 150);
   return done;
 }
@@ -68,6 +68,22 @@ test('working directories stay inside the real workspace boundary', { skip: !lin
     assert.equal(inside.stdout.trim(), join(root, 'tests'));
     assert.match((await run('pwd', { root, cwd: '../' })).error, /outside/);
     assert.match((await run('pwd', { root, cwd: 'escape' })).error, /outside/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+test('absolute candidate paths remain usable when the active repository changes', { skip: !linux }, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'workflow-candidates-'));
+  try {
+    const first = join(root, 'candidate-a');
+    const second = join(root, 'candidate-b');
+    mkdirSync(first); mkdirSync(second);
+    const selected = await run('pwd', { root: second, workspaceRoot: root, cwd: first });
+    assert.equal(selected.exit_code, 0);
+    assert.equal(selected.stdout.trim(), first);
+    const relative = await run('pwd', { root: second, workspaceRoot: root });
+    assert.equal(relative.stdout.trim(), second);
+    assert.match((await run('pwd', { root: second, workspaceRoot: root, cwd: tmpdir() })).error, /outside/);
+    symlinkSync(tmpdir(), join(root, 'escape'));
+    assert.match((await run('pwd', { root: second, workspaceRoot: root, cwd: join(root, 'escape') })).error, /outside/);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 test('disconnect terminates the process group before it can write later', { skip: !linux }, async () => {

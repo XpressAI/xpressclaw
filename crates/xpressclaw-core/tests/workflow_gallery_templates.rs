@@ -29,8 +29,8 @@ const PRIMARY_TEMPLATES: [(&str, &str, bool); 6] = [
         false,
     ),
     (
-        "team-solve",
-        include_str!("../../../frontend/src/lib/workflows/templates/team-solve.yaml"),
+        "choose-best",
+        include_str!("../../../frontend/src/lib/workflows/templates/choose-best.yaml"),
         false,
     ),
 ];

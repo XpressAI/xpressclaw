@@ -38,8 +38,9 @@ process.stdin.on('data', (chunk) => {
     const request = JSON.parse(input.slice(0, newline));
     if (typeof request.script !== 'string' || !request.script.trim()) throw new Error('Command is empty');
     if (!Number.isInteger(request.timeout_secs) || request.timeout_secs < 1 || request.timeout_secs > 86400) throw new Error('Command timeout must be between 1s and 24h');
-    const root = realpathSync(process.cwd());
-    const cwd = realpathSync(resolve(root, request.cwd || '.'));
+    const active = realpathSync(process.cwd());
+    const root = realpathSync(request.workspace_root || active);
+    const cwd = realpathSync(resolve(active, request.cwd || '.'));
     const rel = relative(root, cwd);
     if (rel === '..' || rel.startsWith('../') || isAbsolute(rel)) throw new Error('Command directory is outside the Agent workspace');
     const buffers = { stdout: [], stderr: [] };

@@ -1,0 +1,643 @@
+name: __WORKFLOW_NAME__
+description: Define a rubric, implement two independent alternatives, run common checks, and deliver the strongest eligible result.
+version: 1
+
+inputs:
+  goal:
+    type: string
+    description: Task to complete, including constraints and acceptance criteria.
+    required: true
+  context:
+    type: string
+    description: Relevant source files, background, or examples.
+    default: Use the worker's workspace, project memory, and supplied context.
+  priorities:
+    type: string
+    description: Priorities for the selection rubric, in order of importance.
+    default: Correctness, fit with project conventions, simplicity, maintainability, and execution cost.
+  verification_command:
+    type: string
+    description: Existing checks to include unchanged in the shared verification script. Leave empty for the rubric step to design the checks.
+    default: ""
+  refine_winner:
+    type: boolean
+    description: Try improvements from the other implementation and keep them only if the winner's rubric score increases and its checks still pass.
+    default: true
+  remember_decision:
+    type: boolean
+    description: Save a reusable decision to project memory after the selected result passes final verification.
+    default: false
+  coordinator:
+    type: agent
+    description: Defines the rubric and evaluates both implementations from fresh sessions.
+    required: true
+  candidate_a:
+    type: agent
+    description: Implements the first alternative in an isolated workspace.
+    required: true
+  candidate_b:
+    type: agent
+    description: Implements an independent alternative. Choose a different Agent for concurrent execution.
+    required: true
+  worker:
+    type: agent
+    description: Owns the starting workspace, adopts the selected result, verifies it, and publishes the report.
+    required: true
+    primary: true
+
+variables:
+  refinement_review: {}
+  refinement: {}
+  refinement_before: {}
+  refinement_after: {}
+  refinement_assessment: {}
+  remember:
+    note_id: ""
+
+flows:
+  main:
+    color: "#06b6d4"
+    steps:
+      - id: prepare
+        type: step
+        label: Establish a common starting point
+        agent: "@worker"
+        new_session: true
+        prompt: |
+          Establish the starting point for this task:
+          Goal: @goal
+          Context: @context
+
+          Inspect the requested destination and relevant source material without
+          changing it. Read relevant project conventions and prior decisions with
+          get_project_memory_index and search_project_memory, and check them
+          against current evidence. Keep project memory unchanged.
+
+          Return a self-contained baseline that both implementers can reproduce
+          in separate Agent environments. For a repository, include its identity,
+          exact starting commit, relevant paths, and any task-relevant uncommitted
+          changes as a portable patch or file contents. For other work, include
+          the source material needed to produce the deliverable. Preserve existing
+          user changes. Give the absolute path to the intended destination within
+          your configured workspace. If essential material cannot be handed off,
+          ask for it before continuing. Do not implement or delegate tasks here.
+        outputs:
+          baseline: { type: string, description: Common source state and reproducible handoff for both candidates, including relevant local changes. }
+          destination: { type: string, description: Absolute destination directory inside the worker's configured workspace. }
+          project_context: { type: string, description: Relevant project conventions and decisions with file or memory note references. }
+
+      - id: rubric
+        type: step
+        label: Define the rubric and executable checks
+        agent: "@coordinator"
+        new_session: true
+        prompt: |
+          Define how to choose the best completed implementation before either
+          candidate is built.
+          Goal: @goal
+          Baseline: @prepare.baseline
+          Project context: @prepare.project_context
+          User priorities: @priorities
+          Existing verification command: @verification_command
+
+          Separate mandatory acceptance requirements from ranked quality criteria.
+          Give each quality criterion an ID, scoring guidance, weight, and expected
+          evidence; weights must sum to 100. Use scores from 0 to 5 and define
+          meaningful scoring thresholds for noisy measurements. Include a tie-break
+          rule. Criteria may
+          cover correctness, maintainability, performance, usability, or other
+          properties relevant to this task. Use tests and measurable checks where
+          they provide evidence.
+
+          Produce one portable shell verification script to run from each candidate
+          directory and later from the adopted result. Include the user's existing
+          command unchanged when supplied, and propagate its failure. Evaluate the
+          current candidate using relative paths; do not read deliverables from the
+          original workspace. Design any
+          additional checks from the task's requirements. The script must exit
+          nonzero when a mandatory check fails and print useful results or metrics
+          for ranking. Keep deliverables unchanged by checks and use temporary
+          files for generated fixtures. Test the validity of fixture data and
+          expected answers. Keep checks independent of the candidate's implementation and
+          do not change the source baseline. If a meaningful acceptance check needs
+          missing user information, ask before completing this step.
+
+          Return the rubric, shared implementation brief, and script. These outputs
+          are fixed for the rest of this run. Keep memory unchanged and do not
+          delegate tasks.
+        outputs:
+          requirements: { type: array, description: Mandatory acceptance requirements and the evidence needed to establish each one. }
+          criteria: { type: array, description: Quality criteria with IDs, scoring guidance, weights totaling 100, and evidence sources. }
+          tie_break: { type: string, description: Rule for resolving equal scores. }
+          brief: { type: string, description: Shared task brief and boundaries for both implementations. }
+          verification_script: { type: string, description: Shared shell checks; nonzero exit means a mandatory check failed. }
+
+      - id: implementations
+        type: parallel
+        label: Implement independent alternatives
+        steps:
+          - id: alternative_a
+            type: step
+            label: Implement alternative A
+            agent: "@candidate_a"
+            new_session: true
+            prompt: |
+              Implement a complete solution using the most direct justified approach.
+              Goal: @goal
+              Common baseline: @prepare.baseline
+              Project context: @prepare.project_context
+              Shared brief: @rubric.brief
+              Mandatory requirements: @rubric.requirements
+              Quality rubric: @rubric.criteria
+              Verification script: @rubric.verification_script
+
+              Work in a new, uniquely named directory within your configured Agent
+              workspace. For Git work, create a worktree under .worktrees/ from the
+              supplied baseline; otherwise use a separate candidate directory.
+              Reproduce the supplied source state before editing. Keep existing
+              work and the other candidate's files untouched. Use a different
+              directory even when both candidate roles are bound to the same Agent.
+
+              Implement the result and run the prescribed checks, fixing routine
+              failures before finishing. Preserve the required behavior and test
+              expectations. Return the exact absolute candidate directory and a
+              complete, portable change set: a patch including new files, or the
+              deliverable file contents and their relative paths. Include rationale
+              and any deviations from the brief. The worker must be able to adopt
+              this result without access to your filesystem. Keep work local and
+              project memory unchanged. Do not delegate additional tasks.
+            outputs:
+              workspace: { type: string, description: Absolute directory containing this implementation, inside the Agent's configured workspace. }
+              change_set: { type: string, description: Complete portable patch or deliverable file contents and paths relative to the common baseline. }
+              rationale: { type: string, description: Approach, tradeoffs, and any deviations relevant to the rubric. }
+          - id: alternative_b
+            type: step
+            label: Implement alternative B
+            agent: "@candidate_b"
+            new_session: true
+            prompt: |
+              Independently implement a complete solution using a different approach
+              from the most obvious technique, and explain the tradeoffs.
+              Goal: @goal
+              Common baseline: @prepare.baseline
+              Project context: @prepare.project_context
+              Shared brief: @rubric.brief
+              Mandatory requirements: @rubric.requirements
+              Quality rubric: @rubric.criteria
+              Verification script: @rubric.verification_script
+
+              Work in a new, uniquely named directory within your configured Agent
+              workspace. For Git work, create a worktree under .worktrees/ from the
+              supplied baseline; otherwise use a separate candidate directory.
+              Reproduce the supplied source state before editing. Keep existing
+              work and the other candidate's files untouched. Use a different
+              directory even when both candidate roles are bound to the same Agent.
+
+              Implement the result and run the prescribed checks, fixing routine
+              failures before finishing. Preserve the required behavior and test
+              expectations. Return the exact absolute candidate directory and a
+              complete, portable change set: a patch including new files, or the
+              deliverable file contents and their relative paths. Include rationale
+              and any deviations from the brief. The worker must be able to adopt
+              this result without access to your filesystem. Keep work local and
+              project memory unchanged. Do not delegate additional tasks.
+            outputs:
+              workspace: { type: string, description: Absolute directory containing this implementation, inside the Agent's configured workspace. }
+              change_set: { type: string, description: Complete portable patch or deliverable file contents and paths relative to the common baseline. }
+              rationale: { type: string, description: Approach, tradeoffs, and any deviations relevant to the rubric. }
+
+      - id: checks
+        type: parallel
+        label: Run the same checks on both candidates
+        steps:
+          - id: check_a
+            type: command
+            label: Verify alternative A
+            agent: "@candidate_a"
+            cwd: "@alternative_a.workspace"
+            command: "@rubric.verification_script"
+            timeout: 5m
+            allow_failure: true
+          - id: check_b
+            type: command
+            label: Verify alternative B
+            agent: "@candidate_b"
+            cwd: "@alternative_b.workspace"
+            command: "@rubric.verification_script"
+            timeout: 5m
+            allow_failure: true
+
+      - id: evaluate
+        type: step
+        label: Evaluate the candidates against the rubric
+        agent: "@coordinator"
+        new_session: true
+        prompt: |
+          Evaluate the completed implementations using the rubric defined before
+          they were built.
+          Goal: @goal
+          Common baseline: @prepare.baseline
+          Mandatory requirements: @rubric.requirements
+          Quality criteria: @rubric.criteria
+          Tie-break rule: @rubric.tie_break
+          Candidate A: @alternative_a
+          Actual check result A: @check_a
+          Candidate B: @alternative_b
+          Actual check result B: @check_b
+
+          Inspect the change sets and recorded test evidence. A candidate whose
+          check result has passed=false is ineligible, including timed-out or
+          interrupted checks. Confirm the mandatory requirements
+          for each eligible candidate, score every quality criterion using its
+          predefined guidance, and calculate the weighted totals. Cite concrete
+          evidence for scores, including measured test results where relevant.
+          Do not change weights, expected answers, or acceptance rules after seeing
+          the implementations. Apply the declared tie-break rule when needed.
+
+          Return winner as exactly "a", "b", or "none". Choose none when neither
+          candidate meets the mandatory requirements. Preserve both implementations;
+          this step selects a completed candidate without editing or combining them.
+          Keep project memory unchanged and do not delegate tasks.
+        outputs:
+          winner: { type: string, description: Exactly a, b, or none. }
+          scorecard: { type: array, description: Per-candidate eligibility, criterion scores, weighted totals, and supporting evidence. }
+          rationale: { type: string, description: Why the selected candidate wins, or why neither is eligible. }
+
+      - id: selection
+        type: when
+        label: Route the selection
+        switch: "@evaluate.winner"
+        arms:
+          - match: a
+            goto: step require_a_pass
+          - match: b
+            goto: step require_b_pass
+          - match: default
+            goto: flow no_winner
+
+      - id: require_a_pass
+        type: when
+        label: Require passing checks for A
+        switch: "@check_a.passed"
+        arms:
+          - match: "true"
+            goto: step refinement_gate
+          - match: default
+            goto: flow no_winner
+
+      - id: require_b_pass
+        type: when
+        label: Require passing checks for B
+        switch: "@check_b.passed"
+        arms:
+          - match: "true"
+            goto: step refinement_gate
+          - match: default
+            goto: flow no_winner
+
+      - id: refinement_gate
+        type: when
+        label: Review the winner for improvements when enabled
+        switch: "@refine_winner"
+        arms:
+          - match: "true"
+            continue: true
+          - match: default
+            goto: flow adopt_original
+
+      - id: refinement_review
+        type: step
+        label: Look for useful ideas in the other implementation
+        agent: "@coordinator"
+        new_session: true
+        prompt: |
+          Review the selected implementation for a useful refinement before it is
+          applied to the destination.
+          Goal: @goal
+          Rubric: @rubric
+          Candidate A: @alternative_a
+          Check result A: @check_a
+          Candidate B: @alternative_b
+          Check result B: @check_b
+          Selection and scorecard: @evaluate
+
+          Identify specific ideas from the other implementation that could improve
+          the winner under the existing rubric without losing its strengths.
+          Recommend a bounded refinement only when you can explain the expected
+          benefit and how the existing criteria will measure it. Otherwise return
+          worth_refining=false and keep the original winner. Do not change files,
+          acceptance rules, or project memory, and do not delegate tasks.
+        outputs:
+          worth_refining: { type: boolean, description: Whether a concrete improvement is worth trying. }
+          improvements: { type: array, description: Proposed changes, their source in the other implementation, and the rubric criteria they should improve. }
+          rationale: { type: string, description: Expected gain or reason to preserve the original winner. }
+
+      - id: refinement_opportunity
+        type: when
+        label: Try a concrete improvement
+        switch: "@refinement_review.worth_refining"
+        arms:
+          - match: "true"
+            continue: true
+          - match: default
+            goto: flow adopt_original
+
+      - id: refinement
+        type: step
+        label: Refine a copy while preserving the winner
+        agent: "@worker"
+        new_session: true
+        prompt: |
+          Try the proposed refinement in isolation before applying any result.
+          Goal: @goal
+          Common baseline: @prepare.baseline
+          Selected candidate: @evaluate.winner
+          Candidate A change set: @alternative_a.change_set
+          Candidate B change set: @alternative_b.change_set
+          Frozen rubric and checks: @rubric
+          Proposed improvements: @refinement_review
+
+          Create two new, separate directories inside your configured workspace:
+          an exact copy of the original winning implementation and an experimental
+          copy for refinement. Use uniquely named Git worktrees under .worktrees/
+          when applicable. Preserve both original candidate workspaces and the
+          intended destination. Apply the proposed ideas only to the experimental
+          copy, keeping the accepted requirements and shared checks unchanged.
+          Run routine checks while developing the change. Return the absolute
+          before and after directories, a complete portable refined change set
+          relative to the common baseline, and a concise change summary.
+          The workflow will recheck and rescore both copies before deciding which
+          to apply. Do not write project memory or delegate tasks.
+        outputs:
+          before_workspace: { type: string, description: Absolute directory with an unchanged copy of the original winner. }
+          after_workspace: { type: string, description: Separate absolute directory with the experimental refinement. }
+          change_set: { type: string, description: Complete refined patch or deliverable contents relative to the common baseline. }
+          summary: { type: string, description: Ideas adopted from the other implementation and the changes made. }
+
+      - id: refinement_checks
+        type: parallel
+        label: Recheck the original winner and refinement
+        steps:
+          - id: refinement_before
+            type: command
+            label: Verify the unchanged winner
+            agent: "@worker"
+            cwd: "@refinement.before_workspace"
+            command: "@rubric.verification_script"
+            timeout: 5m
+            allow_failure: true
+          - id: refinement_after
+            type: command
+            label: Verify the experimental refinement
+            agent: "@worker"
+            cwd: "@refinement.after_workspace"
+            command: "@rubric.verification_script"
+            timeout: 5m
+            allow_failure: true
+
+      - id: baseline_recheck
+        type: when
+        label: Require a verified baseline for the comparison
+        switch: "@refinement_before.passed"
+        arms:
+          - match: "true"
+            continue: true
+          - match: default
+            goto: flow no_winner
+
+      - id: refinement_recheck
+        type: when
+        label: Keep the original if the refinement fails
+        switch: "@refinement_after.passed"
+        arms:
+          - match: "true"
+            continue: true
+          - match: default
+            goto: flow adopt_original
+
+      - id: refinement_assessment
+        type: step
+        label: Score the improvement against the same rubric
+        agent: "@coordinator"
+        new_session: true
+        prompt: |
+          Compare the original winner and its experimental refinement using exactly
+          the rubric established before implementation.
+          Goal: @goal
+          Original rubric: @rubric
+          Original winner and source changes: @evaluate, @alternative_a, @alternative_b
+          Proposed improvements: @refinement_review
+          Refined changes: @refinement
+          Actual checks of the original winner: @refinement_before
+          Actual checks of the refinement: @refinement_after
+
+          Score both versions criterion by criterion with the same weights,
+          scoring guidance, and meaningful-change thresholds. Verify that the
+          original mandatory requirements remain satisfied and return
+          requirements_met=false if any are violated. Calculate weighted
+          totals on a 0–100 scale from the criterion scores. Cite the change or
+          measured evidence supporting each score difference. Return numeric
+          before_score and after_score, not an assertion that one is better.
+          A tie or lower score keeps the original; the workflow requires strict
+          improvement before applying the refinement. Keep files and memory
+          unchanged and do not delegate tasks.
+        outputs:
+          requirements_met: { type: boolean, description: Whether the refined version still satisfies every original mandatory requirement. }
+          before_score: { type: number, description: Original winner's weighted rubric score from 0 to 100. }
+          after_score: { type: number, description: Refined version's weighted rubric score from 0 to 100. }
+          scorecard: { type: array, description: Before/after criterion scores, weights, and concrete evidence. }
+          rationale: { type: string, description: What improved, stayed equivalent, or regressed under the unchanged rubric. }
+
+      - id: refinement_requirements
+        type: when
+        label: Keep the original if a requirement regresses
+        switch: "@refinement_assessment.requirements_met"
+        arms:
+          - match: "true"
+            continue: true
+          - match: default
+            goto: flow adopt_original
+
+      - id: improvement_gate
+        type: when
+        label: Adopt the refinement only for a higher score
+        switch: "@refinement_assessment.after_score > @refinement_assessment.before_score"
+        arms:
+          - match: "true"
+            goto: flow adopt_refined
+          - match: default
+            goto: flow adopt_original
+
+  adopt_original:
+    color: "#4A90D9"
+    steps:
+      - id: adopt
+        type: step
+        label: Adopt the selected implementation
+        agent: "@worker"
+        new_session: true
+        prompt: |
+          Adopt the selected implementation to complete the user's task.
+          Goal: @goal
+          Original baseline: @prepare.baseline
+          Intended destination: @prepare.destination
+          Selected candidate: @evaluate.winner
+          Selection rationale: @evaluate.rationale
+          Candidate A change set: @alternative_a.change_set
+          Candidate B change set: @alternative_b.change_set
+
+          Inspect the destination and preserve unrelated user changes. Apply the
+          selected candidate's complete change set from the common baseline.
+          Use the candidate's source or patch directly rather than reconstructing
+          it from the evaluator's summary. Resolve transfer or application issues
+          while preserving the chosen implementation and required behavior. Keep
+          work local. Return the exact absolute destination for final verification
+          and a summary of the delivered files. Do not modify the rubric or tests,
+          write project memory, or delegate tasks. This branch keeps the original
+          winner; do not apply the experimental refinement.
+        outputs:
+          workspace: { type: string, description: Absolute directory containing the adopted result, inside the worker's configured workspace. }
+          summary: { type: string, description: Applied original winner, resulting files, and any transfer issues resolved. }
+
+      - id: verify_original_delivery
+        type: jump
+        target: flow finish
+
+  adopt_refined:
+    color: "#22c55e"
+    steps:
+      - id: adopt
+        type: step
+        label: Adopt the verified improvement
+        agent: "@worker"
+        new_session: true
+        prompt: |
+          Adopt the improved winner to complete @goal.
+          Original baseline: @prepare.baseline
+          Intended destination: @prepare.destination
+          Original selection: @evaluate
+          Verified refined change set: @refinement.change_set
+          Refinement checks: @refinement_after
+          Before/after rubric assessment: @refinement_assessment
+
+          The workflow confirmed passing checks and a strictly higher rubric score.
+          Apply this exact refined change set while preserving unrelated user
+          changes. Keep the original winning candidate intact for comparison.
+          Return the exact absolute destination for final verification and a
+          summary of the delivered changes. Keep work local. Do not change the
+          rubric or tests, write memory, or delegate tasks.
+        outputs:
+          workspace: { type: string, description: Absolute directory containing the improved result, inside the worker's configured workspace. }
+          summary: { type: string, description: Applied refinement, improvements over the original winner, and resulting files. }
+
+      - id: verify_refined_delivery
+        type: jump
+        target: flow finish
+
+  finish:
+    color: "#22c55e"
+    steps:
+      - id: verify
+        type: command
+        label: Verify the adopted result
+        agent: "@worker"
+        cwd: "@adopt.workspace"
+        command: "@rubric.verification_script"
+        timeout: 5m
+
+      - id: memory_gate
+        type: when
+        label: Remember the verified decision when requested
+        switch: "@remember_decision"
+        arms:
+          - match: "true"
+            continue: true
+          - match: default
+            goto: step deliver
+
+      - id: remember
+        type: step
+        label: Preserve reusable project knowledge
+        agent: "@coordinator"
+        new_session: true
+        prompt: |
+          The user enabled saving a reusable decision after successful verification.
+          Goal: @goal
+          Project context: @prepare.project_context
+          Rubric: @rubric
+          Evaluation: @evaluate
+          Refinement assessment: @refinement_assessment
+          Adopted result: @adopt.summary
+          Final captured verification: @verify
+
+          Identify a decision, convention, or procedure that will help future work.
+          Search project memory first. Use create_project_memory or
+          update_project_memory to preserve one useful atomic note with its rationale
+          and evidence, avoiding duplicate or contradictory notes. Save only what
+          the implementation and checks establish. If there is no reusable knowledge,
+          leave memory unchanged and return an empty note_id. Keep run logs in this
+          workflow. Do not change solution files or delegate tasks.
+        outputs:
+          note_id: { type: string, description: Created or updated memory note ID, or an empty string when no note was needed. }
+
+      - id: deliver
+        type: step
+        label: Deliver the chosen result and comparison report
+        agent: "@worker"
+        new_session: true
+        prompt: |
+          Deliver the completed task and its evidence:
+          Goal: @goal
+          Rubric: @rubric
+          Candidate A: @alternative_a
+          Check result A: @check_a
+          Candidate B: @alternative_b
+          Check result B: @check_b
+          Evaluation and selection: @evaluate
+          Refinement review: @refinement_review
+          Refinement checks: @refinement_before, @refinement_after
+          Refinement assessment: @refinement_assessment
+          Adopted result: @adopt
+          Final captured verification: @verify
+          Memory note ID: @remember.note_id
+
+          Inspect the final files without changing the implementation or tests.
+          Write a concise Markdown report in a new temporary directory covering
+          the completed outcome, rubric, comparison scorecard, selection rationale,
+          delivered files, and actual verification results. When refinement was
+          attempted, include its before/after comparison and whether it was adopted
+          or the original winner was kept. Publish it and useful
+          supporting files with publish_task_files. Keep attachments within the
+          tool's size limit. Mention a saved memory note only when its ID is nonempty.
+          Keep memory unchanged here. Return a clear final answer describing what
+          was completed, why this alternative was selected, how it was verified,
+          and which files are attached. A linked Project Conversation receives
+          the final response automatically; do not send a duplicate or delegate.
+
+  no_winner:
+    color: "#ef4444"
+    steps:
+      - id: explain_no_winner
+        type: step
+        label: Report why no verified result can be adopted
+        agent: "@coordinator"
+        new_session: true
+        prompt: |
+          Report why no eligible result can be adopted for @goal.
+          Rubric: @rubric
+          Actual checks A: @check_a
+          Actual checks B: @check_b
+          Evaluation: @evaluate
+          Staged winner and refinement checks: @refinement_before, @refinement_after
+
+          Identify failed mandatory checks, unmet requirements, or a selection
+          inconsistent with the recorded evidence. Preserve both candidate workspaces
+          and explain what must change for a successful run. Publish a comparison
+          report with publish_task_files. Keep solution files and project memory
+          unchanged. Do not claim that the task is complete or delegate more work.
+      - id: reject_selection
+        type: command
+        label: End the run without an eligible result
+        agent: "@worker"
+        command: "exit 1"
+        timeout: 5s

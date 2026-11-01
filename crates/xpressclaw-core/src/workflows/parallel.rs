@@ -639,6 +639,18 @@ flows:
         let command = commands::for_task(&db, task_id).unwrap().unwrap();
         assert!(commands::begin(&db, &command).unwrap().is_none());
         commands::save_result(&db, &command, &result(1)).unwrap();
+        // Older persisted results omit derived fields. Recovery must still
+        // expose an authoritative passed flag to selection gates.
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE workflow_step_executions SET command_result = ?1 WHERE id = ?2",
+                rusqlite::params![
+                    serde_json::to_string(&result(1)).unwrap(),
+                    command.execution_id
+                ],
+            )
+        })
+        .unwrap();
         engine
             .on_task_completed(task_id, "completed", "model says success")
             .unwrap();
@@ -650,6 +662,10 @@ flows:
         assert_eq!(
             engine.load_variable_store(&id).unwrap()["test"]["exit_code"],
             1
+        );
+        assert_eq!(
+            engine.load_variable_store(&id).unwrap()["test"]["passed"],
+            false
         );
         let command = commands::for_task(&db, second.task_id.as_deref().unwrap())
             .unwrap()
@@ -688,7 +704,7 @@ flows:
     }
 
     #[test]
-    fn committed_command_result_is_reused_and_timeout_is_never_allowed() {
+    fn committed_command_results_preserve_pass_status_for_captured_timeouts() {
         let (db, _, id) = start(COMMAND);
         let instances = InstanceManager::new(db.clone());
         let first = instances.list_step_executions(&id).unwrap().remove(0);
@@ -703,7 +719,10 @@ flows:
         );
         let mut timed = result(0);
         timed.timed_out = true;
-        assert!(!timed.succeeds(true));
+        assert!(timed.succeeds(true));
+        assert!(!timed.succeeds(false));
+        let output: Value = serde_json::from_str(&timed.json_output().unwrap()).unwrap();
+        assert_eq!(output["passed"], false);
     }
 
     #[test]
@@ -731,25 +750,46 @@ flows:
         }
     }
     #[test]
-    fn team_solve_runs_both_repair_paths_and_requires_final_verification() {
-        let yaml = include_str!("../../../../frontend/src/lib/workflows/templates/team-solve.yaml")
-            .replace("__WORKFLOW_NAME__", "team-solve-test");
-        for repair in [true, false] {
-            let (db, engine, id) = start_with_inputs(
-                &yaml,
-                json!({
-                    "problem": "Solve the sample", "verification_command": "bash check.sh",
-                    "coordinator": "atlas", "ideator_a": "atlas", "ideator_b": "dev", "worker": "dev"
-                }),
-            );
-            let complete = |step: &str, output: Value| {
-                let execution = engine
+    fn choose_best_checks_each_candidate_and_delivers_only_a_verified_winner() {
+        let yaml =
+            include_str!("../../../../frontend/src/lib/workflows/templates/choose-best.yaml")
+                .replace("__WORKFLOW_NAME__", "choose-best-test");
+        for (a_exit, b_exit, winner, final_exit, remember) in [
+            (0, 0, "a", 0, false),
+            (0, 0, "b", 0, true),
+            (0, 1, "a", 0, true),
+            (1, 0, "b", 0, false),
+            (1, 0, "a", 0, true),
+            (0, 1, "b", 0, false),
+            (1, 1, "none", 0, true),
+            (0, 0, "invalid", 0, false),
+            (0, 0, "b", 1, true),
+            (-1, 0, "b", 0, false),
+            (-1, 0, "a", 0, true),
+            (0, -1, "a", 0, false),
+            (0, 0, "a", -1, true),
+        ] {
+            let mut inputs = json!({
+                "goal": "Complete the sample", "verification_command": "bash check.sh",
+                "priorities": "Correctness, then maintenance",
+                "refine_winner": false,
+                "coordinator": "atlas", "candidate_a": "atlas", "candidate_b": "dev", "worker": "dev"
+            });
+            if remember {
+                inputs["remember_decision"] = json!(true);
+            }
+            let (db, engine, id) = start_with_inputs(&yaml, inputs);
+            let execution = |step: &str| {
+                engine
                     .instances
                     .list_step_executions(&id)
                     .unwrap()
                     .into_iter()
                     .find(|execution| execution.step_id == step && execution.status == "running")
-                    .unwrap();
+                    .unwrap()
+            };
+            let complete = |step: &str, output: Value| {
+                let execution = execution(step);
                 engine
                     .on_task_completed(
                         execution.task_id.as_deref().unwrap(),
@@ -758,62 +798,282 @@ flows:
                     )
                     .unwrap();
             };
+            let execute_command = |step: &str, code: i32| {
+                let execution = execution(step);
+                let command = commands::for_task(&db, execution.task_id.as_deref().unwrap())
+                    .unwrap()
+                    .unwrap();
+                commands::begin(&db, &command).unwrap();
+                let mut outcome = result(code);
+                if code == -1 {
+                    outcome.exit_code = None;
+                    outcome.timed_out = true;
+                    outcome.signal = Some("SIGKILL".into());
+                }
+                commands::save_result(&db, &command, &outcome).unwrap();
+                complete(step, json!({}));
+                command
+            };
+            let all_steps = || engine.instances.list_step_executions(&id).unwrap();
             complete(
-                "plan",
-                json!({"brief":"Requirements and correctness checks"}),
+                "prepare",
+                json!({
+                    "baseline":"Pinned source and local patch", "destination":"/workspace/original",
+                    "project_context":"Use the project convention from note 42"
+                }),
             );
-            complete("proposal_b", json!({"proposal":"B"}));
-            complete("proposal_a", json!({"proposal":"A"}));
-            complete(
-                "solve",
-                json!({"implementation":"Source, decision, and changed files"}),
-            );
-            let test = engine
-                .instances
-                .list_step_executions(&id)
-                .unwrap()
-                .into_iter()
-                .find(|execution| execution.step_id == "test")
+            let rubric_task = TaskBoard::new(db.clone())
+                .get(execution("rubric").task_id.as_deref().unwrap())
                 .unwrap();
-            let command = commands::for_task(&db, test.task_id.as_deref().unwrap())
+            assert!(rubric_task
+                .description
                 .unwrap()
-                .unwrap();
-            commands::begin(&db, &command).unwrap();
-            commands::save_result(&db, &command, &result(if repair { 1 } else { 0 })).unwrap();
-            complete("test", json!({}));
+                .contains("Correctness, then maintenance"));
             complete(
-                "review",
-                json!({"repair_needed":repair,"instructions":"Checked the result"}),
+                "rubric",
+                json!({
+                    "requirements":["Required check passes"],
+                    "criteria":[{"id":"maintainability", "weight":100}],
+                    "tie_break":"Simpler implementation", "brief":"Use the same pinned source",
+                    "verification_script":"bash check.sh"
+                }),
             );
-            if repair {
-                complete("repair", json!({"summary":"Fixed"}));
+            assert!(!all_steps().iter().any(|step| step.step_id == "check_a"));
+            complete(
+                "alternative_b",
+                json!({"workspace":"/workspace/.worktrees/b", "change_set":"patch B", "rationale":"B approach"}),
+            );
+            assert!(!all_steps().iter().any(|step| step.step_id == "checks"));
+            complete(
+                "alternative_a",
+                json!({"workspace":"/workspace/.worktrees/a", "change_set":"patch A", "rationale":"A approach"}),
+            );
+            let check_a = execute_command("check_a", a_exit);
+            assert_eq!(check_a.script, "bash check.sh");
+            assert_eq!(check_a.cwd, "/workspace/.worktrees/a");
+            assert!(!all_steps().iter().any(|step| step.step_id == "evaluate"));
+            let check_b = execute_command("check_b", b_exit);
+            assert_eq!(check_b.script, check_a.script);
+            assert_eq!(check_b.cwd, "/workspace/.worktrees/b");
+            complete(
+                "evaluate",
+                json!({"winner":winner, "scorecard":[{"a_exit":a_exit, "b_exit":b_exit}], "rationale":"Compared against the predefined criteria"}),
+            );
+            let eligible = (winner == "a" && a_exit == 0) || (winner == "b" && b_exit == 0);
+            if !eligible {
+                assert_eq!(
+                    engine.instances.get_instance(&id).unwrap().current_flow,
+                    "no_winner"
+                );
+                assert!(!all_steps()
+                    .iter()
+                    .any(|step| matches!(step.step_id.as_str(), "adopt" | "remember" | "deliver")));
+                complete(
+                    "explain_no_winner",
+                    json!("No eligible selection; report attached."),
+                );
+                assert_eq!(execute_command("reject_selection", 1).script, "exit 1");
+                assert_eq!(engine.instances.get_instance(&id).unwrap().status, "failed");
+                continue;
             }
-            let verify = engine
-                .instances
-                .list_step_executions(&id)
-                .unwrap()
-                .into_iter()
-                .find(|execution| execution.step_id == "verify")
+            complete(
+                "adopt",
+                json!({"workspace":"/workspace/original", "summary":"Applied the chosen implementation"}),
+            );
+            let verify = execute_command("verify", final_exit);
+            assert_eq!(verify.script, check_a.script);
+            assert_eq!(verify.cwd, "/workspace/original");
+            assert!(!verify.allow_failure);
+            if final_exit != 0 {
+                assert_eq!(engine.instances.get_instance(&id).unwrap().status, "failed");
+                assert!(!all_steps()
+                    .iter()
+                    .any(|step| matches!(step.step_id.as_str(), "remember" | "deliver")));
+                continue;
+            }
+            if remember {
+                assert!(!all_steps().iter().any(|step| step.step_id == "deliver"));
+                complete("remember", json!({"note_id":"verified-decision"}));
+            } else {
+                assert!(!all_steps().iter().any(|step| step.step_id == "remember"));
+            }
+            let delivery = TaskBoard::new(db.clone())
+                .get(execution("deliver").task_id.as_deref().unwrap())
                 .unwrap();
-            let command = commands::for_task(&db, verify.task_id.as_deref().unwrap())
-                .unwrap()
-                .unwrap();
-            commands::begin(&db, &command).unwrap();
-            commands::save_result(&db, &command, &result(0)).unwrap();
-            complete("verify", json!({}));
+            let prompt = delivery.description.unwrap();
+            assert!(!prompt.contains("@remember.note_id"));
+            assert!(prompt.contains("Applied the chosen implementation"));
+            assert_eq!(prompt.contains("verified-decision"), remember);
+            complete(
+                "deliver",
+                json!("Completed and verified the task. Comparison report attached."),
+            );
             assert_eq!(
                 engine.instances.get_instance(&id).unwrap().status,
                 "completed"
             );
-            assert_eq!(
+        }
+    }
+
+    #[test]
+    fn choose_best_preserves_the_winner_unless_refinement_passes_and_scores_higher() {
+        let yaml =
+            include_str!("../../../../frontend/src/lib/workflows/templates/choose-best.yaml")
+                .replace("__WORKFLOW_NAME__", "refine-winner-test");
+        for (
+            worth_refining,
+            before_exit,
+            after_exit,
+            requirements_met,
+            after_score,
+            expected_flow,
+        ) in [
+            (false, 0, 0, true, 90, "adopt_original"),
+            (true, 0, 0, true, 90, "adopt_refined"),
+            (true, 0, 0, true, 80, "adopt_original"),
+            (true, 0, 0, true, 70, "adopt_original"),
+            (true, 0, 1, true, 90, "adopt_original"),
+            (true, 0, -1, true, 90, "adopt_original"),
+            (true, 1, 0, true, 90, "no_winner"),
+            (true, 0, 0, false, 90, "adopt_original"),
+        ] {
+            let (db, engine, id) = start_with_inputs(
+                &yaml,
+                json!({
+                    "goal":"Complete the task", "coordinator":"atlas",
+                    "candidate_a":"atlas", "candidate_b":"dev", "worker":"dev"
+                }),
+            );
+            let execution = |step: &str| {
+                engine
+                    .instances
+                    .list_step_executions(&id)
+                    .unwrap()
+                    .into_iter()
+                    .find(|execution| execution.step_id == step && execution.status == "running")
+                    .unwrap()
+            };
+            let complete = |step: &str, output: Value| {
+                engine
+                    .on_task_completed(
+                        execution(step).task_id.as_deref().unwrap(),
+                        "completed",
+                        &output.to_string(),
+                    )
+                    .unwrap();
+            };
+            let command = |step: &str, code: i32| {
+                let task = execution(step);
+                let command = commands::for_task(&db, task.task_id.as_deref().unwrap())
+                    .unwrap()
+                    .unwrap();
+                commands::begin(&db, &command).unwrap();
+                let mut outcome = result(code);
+                if code == -1 {
+                    outcome.exit_code = None;
+                    outcome.timed_out = true;
+                    outcome.signal = Some("SIGKILL".into());
+                }
+                commands::save_result(&db, &command, &outcome).unwrap();
+                complete(step, json!({}));
+                command
+            };
+            let has_step = |step: &str| {
                 engine
                     .instances
                     .list_step_executions(&id)
                     .unwrap()
                     .iter()
-                    .filter(|execution| execution.step_id == "repair")
-                    .count(),
-                usize::from(repair)
+                    .any(|execution| execution.step_id == step)
+            };
+            complete(
+                "prepare",
+                json!({"baseline":"Pinned baseline", "destination":"/workspace/target", "project_context":"Project conventions"}),
+            );
+            complete(
+                "rubric",
+                json!({"requirements":["Tests pass"], "criteria":[{"id":"quality","weight":100}], "tie_break":"Simpler", "brief":"Complete task", "verification_script":"bash checks.sh"}),
+            );
+            complete(
+                "alternative_a",
+                json!({"workspace":"/workspace/a","change_set":"Original winning patch","rationale":"A"}),
+            );
+            complete(
+                "alternative_b",
+                json!({"workspace":"/workspace/b","change_set":"Other candidate ideas","rationale":"B"}),
+            );
+            command("check_a", 0);
+            command("check_b", 0);
+            complete(
+                "evaluate",
+                json!({"winner":"a","scorecard":[],"rationale":"A wins"}),
+            );
+            assert!(!has_step("adopt"));
+            complete(
+                "refinement_review",
+                json!({"worth_refining":worth_refining,"improvements":["Use the other candidate's simpler parsing"],"rationale":"Potential quality gain"}),
+            );
+            if worth_refining {
+                complete(
+                    "refinement",
+                    json!({"before_workspace":"/workspace/unchanged-copy","after_workspace":"/workspace/experimental-copy","change_set":"Improved patch","summary":"Simpler parsing"}),
+                );
+                let before = command("refinement_before", before_exit);
+                assert!(!has_step("adopt"));
+                let after = command("refinement_after", after_exit);
+                assert_eq!(before.script, "bash checks.sh");
+                assert_eq!(after.script, before.script);
+                assert_eq!(before.cwd, "/workspace/unchanged-copy");
+                assert_eq!(after.cwd, "/workspace/experimental-copy");
+                if before_exit == 0 && after_exit == 0 {
+                    complete(
+                        "refinement_assessment",
+                        json!({"requirements_met":requirements_met,"before_score":80,"after_score":after_score,"scorecard":[],"rationale":"Same rubric, observed differences"}),
+                    );
+                } else {
+                    assert!(!has_step("refinement_assessment"));
+                }
+            } else {
+                assert!(!has_step("refinement"));
+            }
+            assert_eq!(
+                engine.instances.get_instance(&id).unwrap().current_flow,
+                expected_flow
+            );
+            if expected_flow == "no_winner" {
+                assert!(!has_step("adopt"));
+                complete(
+                    "explain_no_winner",
+                    json!("Staged baseline did not pass; destination unchanged."),
+                );
+                command("reject_selection", 1);
+                assert_eq!(engine.instances.get_instance(&id).unwrap().status, "failed");
+                continue;
+            }
+            let adopted = execution("adopt");
+            let prompt = TaskBoard::new(db.clone())
+                .get(adopted.task_id.as_deref().unwrap())
+                .unwrap()
+                .description
+                .unwrap();
+            if expected_flow == "adopt_refined" {
+                assert!(prompt.contains("Improved patch"));
+            } else {
+                assert!(prompt.contains("Original winning patch"));
+                assert!(!prompt.contains("Verified refined change set"));
+            }
+            complete(
+                "adopt",
+                json!({"workspace":"/workspace/target","summary":expected_flow}),
+            );
+            command("verify", 0);
+            complete(
+                "deliver",
+                json!("Completed task with the verified selected version."),
+            );
+            assert_eq!(
+                engine.instances.get_instance(&id).unwrap().status,
+                "completed"
             );
         }
     }

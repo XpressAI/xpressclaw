@@ -565,6 +565,11 @@
 
 	// --- Variables ---
 
+	function outputFields(block: Block): Record<string, OutputSchema> {
+		if (block.type !== 'command') return block.outputs ?? {};
+		return Object.fromEntries(Object.entries({ passed: 'boolean', exit_code: 'number', stdout: 'string', stderr: 'string', signal: 'string', timed_out: 'boolean', stdout_truncated: 'boolean', stderr_truncated: 'boolean' }).map(([name, type]) => [name, { type }]));
+	}
+
 	function availableVariables(upToIdx: number, loopContext?: { asVar: string; overVar: string }): { name: string; type?: string; source?: string }[] {
 		const vars: { name: string; type?: string; source?: string }[] = [];
 		if (workflow?.default_for_tasks) {
@@ -582,17 +587,14 @@
 		const blocks = flows[currentFlow]?.blocks ?? [];
 		for (let i = 0; i <= upToIdx && i < blocks.length; i++) {
 			const b = blocks[i];
-			if (b.outputs) {
-				for (const [name, schema] of Object.entries(b.outputs)) {
+			if (Object.keys(outputFields(b)).length) {
+				for (const [name, schema] of Object.entries(outputFields(b))) {
 					vars.push({ name: `${b.id}.${name}`, type: schema.type || 'any', source: b.label });
 				}
 			}
-			if (b.type === 'command') {
-				for (const [name, type] of Object.entries({ exit_code: 'number', stdout: 'string', stderr: 'string', signal: 'string', timed_out: 'boolean', stdout_truncated: 'boolean', stderr_truncated: 'boolean' })) vars.push({ name: `${b.id}.${name}`, type, source: b.label });
-			}
 			if (b.type === 'parallel' && i < upToIdx) {
 				for (const branch of b.children ?? []) {
-					for (const [name, schema] of Object.entries(branch.outputs ?? {})) vars.push({ name: `${branch.id}.${name}`, type: schema.type || 'any', source: branch.label });
+					for (const [name, schema] of Object.entries(outputFields(branch))) vars.push({ name: `${branch.id}.${name}`, type: schema.type || 'any', source: branch.label });
 				}
 			}
 			if (b.type === 'wait') {

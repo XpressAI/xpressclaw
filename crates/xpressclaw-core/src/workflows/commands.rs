@@ -35,12 +35,21 @@ pub(crate) struct CommandResult {
 }
 
 impl CommandResult {
+    pub fn passed(&self) -> bool {
+        !self.timed_out && self.signal.is_none() && self.exit_code == Some(0)
+    }
+
     pub fn succeeds(&self, allow_failure: bool) -> bool {
-        !self.timed_out
-            && self.signal.is_none()
-            && self
-                .exit_code
-                .is_some_and(|code| code == 0 || allow_failure)
+        self.passed()
+            || (allow_failure
+                && (self.exit_code.is_some() || self.signal.is_some() || self.timed_out))
+    }
+
+    pub fn json_output(&self) -> Result<String> {
+        let mut output =
+            serde_json::to_value(self).map_err(|error| Error::Workflow(error.to_string()))?;
+        output["passed"] = Value::Bool(self.passed());
+        Ok(output.to_string())
     }
 }
 
@@ -121,8 +130,7 @@ pub(crate) fn save_result(
     command: &WorkflowCommand,
     result: &CommandResult,
 ) -> Result<()> {
-    let output =
-        serde_json::to_string(result).map_err(|error| Error::Workflow(error.to_string()))?;
+    let output = result.json_output()?;
     db.with_conn(|conn| conn.execute(
         "UPDATE workflow_step_executions SET command_result = ?1 WHERE id = ?2 AND command_result IS NULL",
         rusqlite::params![output, command.execution_id],

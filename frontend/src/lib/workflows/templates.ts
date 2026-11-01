@@ -4,7 +4,7 @@ import codeReviewYaml from './templates/code-review.yaml?raw';
 import goalLoopYaml from './templates/goal-loop.yaml?raw';
 import repositoryCaretakerYaml from './templates/repository-caretaker.yaml?raw';
 import requirementsSpecificationYaml from './templates/requirements-specification.yaml?raw';
-import teamSolveYaml from './templates/team-solve.yaml?raw';
+import chooseBestYaml from './templates/choose-best.yaml?raw';
 
 export type WorkflowTemplateId =
 	| 'goal-loop'
@@ -12,7 +12,7 @@ export type WorkflowTemplateId =
 	| 'repository-caretaker'
 	| 'backlog-processor'
 	| 'requirements-specification'
-	| 'team-solve';
+	| 'choose-best';
 
 export interface WorkflowTemplateDefinition {
 	id: WorkflowTemplateId | 'blank';
@@ -83,13 +83,13 @@ export const WORKFLOW_TEMPLATES: readonly WorkflowTemplateDefinition[] = [
 		yaml: requirementsSpecificationYaml,
 	},
 	{
-		id: 'team-solve',
-		title: 'Team solve',
-		description: 'Plan, compare independent proposals, solve, test, and repair once before a final executable verification.',
-		defaultName: 'Team Solve',
-		apiDescription: 'Parallel proposals and fresh-context review with command-based verification.',
-		roleGuidance: 'Choose a coordinator, two ideators, and a worker. The worker owns the solution and test environment. Different ideator Agents can run concurrently; outputs carry the handoffs.',
-		yaml: teamSolveYaml,
+		id: 'choose-best',
+		title: 'Implement alternatives → choose best',
+		description: 'Build two alternatives against a shared rubric, choose the best, and keep refinements only when they improve the verified result.',
+		defaultName: 'Implement Alternatives → Choose Best',
+		apiDescription: 'Independent implementations with a predefined rubric, executable checks, evidence-based selection, and a final report.',
+		roleGuidance: 'Choose a coordinator, two implementers, and a worker. Different implementer Agents can run concurrently and use different models. Each candidate uses its own workspace; the worker adopts and verifies the winner.',
+		yaml: chooseBestYaml,
 	},
 ] as const;
 
