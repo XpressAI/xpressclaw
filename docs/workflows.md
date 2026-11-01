@@ -225,9 +225,8 @@ looping, or executing a task.
 
 ## Parallel proposals and executable verification
 
-The built-in **Team solve** template is inspired by
-[Memdoor's team-solve](https://github.com/guregodevo/memdoor/tree/main/examples/workflows/team-solve).
-It uses XpressClaw tasks and persisted outputs for its handoffs. Each Agent role
+The built-in **Team solve** template uses XpressClaw tasks and persisted outputs
+for its handoffs. Each Agent role
 starts a fresh session. The coordinator plans and reviews, two ideators propose
 approaches independently, and the worker owns the solution and test environment.
 The reviewer receives the implementation record and captured test results, so the
