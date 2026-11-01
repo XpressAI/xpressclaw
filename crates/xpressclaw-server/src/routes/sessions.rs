@@ -5,7 +5,9 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use xpressclaw_core::acp::{is_builtin_runner_image, is_host_runner_image};
+use xpressclaw_core::acp::{
+    is_builtin_runner_image, is_builtin_runner_image_for_kind, is_host_runner_image,
+};
 use xpressclaw_core::agents::registry::AgentRegistry;
 use xpressclaw_core::config::{default_native_runner_image, AgentConfig, ContainerEngineAccess};
 use xpressclaw_core::docker::manager::DockerManager;
@@ -15,9 +17,9 @@ use xpressclaw_core::tasks::board::{CreateTask, TaskBoard};
 use xpressclaw_core::tasks::conversation::TaskConversation;
 use xpressclaw_core::tasks::queue::TaskQueue;
 use xpressclaw_core::workers::native::{
-    host_ssh_agent_socket, local_runner_image_alias, presentation_runtime_available,
-    resolve_runner_kind, resolved_runner_image, runner_image_compatible,
-    subscription_auth_available,
+    compatible_retained_runner_image, host_ssh_agent_socket, local_runner_image_alias,
+    presentation_runtime_available, resolve_runner_kind, resolved_runner_image,
+    runner_image_compatible, subscription_auth_available,
 };
 
 use crate::state::AppState;
@@ -134,10 +136,8 @@ async fn prepare_runner(
             "host container-engine access requires a local Docker-compatible Unix socket",
         ));
     }
-    if available_runner_image(&docker, &image, &kind)
-        .await
-        .is_none()
-    {
+    let current = readiness(&state, &agent).await?;
+    if current["can_prepare"].as_bool().unwrap_or(false) {
         docker.pull_image(&image).await.map_err(internal_error)?;
     }
     let readiness = readiness(&state, &agent).await?;
@@ -173,10 +173,29 @@ async fn readiness(
             .is_some_and(|docker| docker.host_engine_socket().is_some());
     let ssh_agent_socket = host_ssh_agent_socket();
     let ssh_agent_available = ssh_agent_socket.is_some();
+    let mut retained_issue = None;
+    let mut using_retained = false;
     let runtime_image = match docker.as_ref() {
-        Some(docker) => available_runner_image(docker, &image, &kind).await,
+        Some(docker) => match compatible_retained_runner_image(
+            docker,
+            agent,
+            is_builtin_runner_image_for_kind(&image, &kind),
+        )
+        .await
+        {
+            Ok(Some(image)) => {
+                using_retained = true;
+                Some(image)
+            }
+            Ok(None) => available_runner_image(docker, &image, &kind).await,
+            Err(error) => {
+                retained_issue = Some(error.to_string());
+                None
+            }
+        },
         None => None,
     };
+    let can_prepare = docker_available && runtime_image.is_none() && retained_issue.is_none();
     let image_present = runtime_image.is_some();
     let presentation_supported = kind == "codex";
     let presentation_available = match (docker.as_ref(), runtime_image.as_deref()) {
@@ -188,6 +207,8 @@ async fn readiness(
     let mut issues = Vec::new();
     if !docker_available {
         issues.push("Docker or Podman is not available".to_string());
+    } else if let Some(issue) = retained_issue {
+        issues.push(issue);
     } else if !image_present {
         let detail = if default_native_runner_image(&kind, agent.runner.container_engine)
             == Some(image.as_str())
@@ -229,6 +250,8 @@ async fn readiness(
         "image": image,
         "runtime_image": runtime_image,
         "image_present": image_present,
+        "using_retained": using_retained,
+        "can_prepare": can_prepare,
         "workspace": workspace.display().to_string(),
         "workspace_present": workspace_present,
         "model": agent.runner.model,
@@ -782,6 +805,137 @@ mod tests {
             TaskBoard::new(db).get(&task_id).unwrap().status,
             TaskStatus::Completed
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Docker/Podman and XPRESSCLAW_RETENTION_TEST_IMAGE"]
+    async fn readiness_and_prepare_reuse_retained_environment_without_pulling() {
+        use futures_util::FutureExt;
+        use xpressclaw_core::docker::manager::ContainerSpec;
+
+        let Ok(image) = std::env::var("XPRESSCLAW_RETENTION_TEST_IMAGE") else {
+            eprintln!("skipping retained readiness integration test; set XPRESSCLAW_RETENTION_TEST_IMAGE to run it");
+            return;
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open_memory().unwrap());
+        let agent_id = format!("readiness-{}", uuid::Uuid::new_v4());
+        let mut agent = AgentConfig {
+            name: agent_id.clone(),
+            ..Default::default()
+        };
+        agent.runner.kind = "custom".into();
+        // No registry is listening here. A redundant Prepare pull must fail.
+        agent.runner.image = "127.0.0.1:1/runner:missing".into();
+        agent.runner.command = vec!["node".into()];
+        agent.runner.subscription_auth = false;
+        agent.runner.workspace = Some(directory.path().display().to_string());
+        let mut config = Config::default();
+        config.agents.push(agent);
+        AgentRegistry::new(db.clone())
+            .ensure(&agent_id, "custom")
+            .unwrap();
+        let state = AppState::new(
+            Arc::new(config.clone()),
+            db.clone(),
+            None,
+            directory.path().join("config.yaml"),
+            true,
+        );
+        let docker = Arc::new(
+            DockerManager::connect_for_installation(&db.installation_id().unwrap())
+                .await
+                .unwrap(),
+        );
+        *state.docker.write().unwrap() = Some(docker.clone());
+        let app = Router::new()
+            .nest("/sessions", routes())
+            .with_state(state.clone());
+        async fn request(app: &Router, agent: &str, method: &str) -> Value {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(format!("/sessions/{agent}/readiness"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+            serde_json::from_slice(&body).unwrap()
+        }
+        let missing = request(&app, &agent_id, "GET").await;
+        assert_eq!(missing["ready"], false);
+        assert_eq!(missing["can_prepare"], true);
+        let retained = docker
+            .launch_project_attached(
+                &agent_id,
+                &ContainerSpec {
+                    image,
+                    expose_port: None,
+                    cmd: Some(vec![
+                        "node".into(),
+                        "-e".into(),
+                        "setInterval(()=>{},1000)".into(),
+                    ]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let engine = bollard::Docker::connect_with_defaults().unwrap();
+        let result = std::panic::AssertUnwindSafe(async {
+            let before = engine
+                .inspect_container(&retained.info.container_id, None)
+                .await
+                .unwrap();
+            for method in ["GET", "POST", "POST"] {
+                let ready = request(&app, &agent_id, method).await;
+                assert_eq!(ready["ready"], true, "{ready}");
+                assert_eq!(ready["using_retained"], true);
+                assert_eq!(ready["can_prepare"], false);
+                assert_eq!(ready["runtime_image"].as_str(), before.image.as_deref());
+                assert_eq!(ready["issues"], json!([]));
+            }
+            // A retained custom image cannot satisfy a newly selected built-in
+            // harness. Pulling another tag would not repair that environment.
+            config.agents[0].runner.kind = "codex".into();
+            config.agents[0].runner.image = String::new();
+            state.apply_config(Arc::new(config), None);
+            for method in ["GET", "POST"] {
+                let incompatible = request(&app, &agent_id, method).await;
+                assert_eq!(incompatible["ready"], false);
+                assert_eq!(incompatible["can_prepare"], false);
+                assert!(incompatible["issues"][0]
+                    .as_str()
+                    .unwrap()
+                    .contains("retained environment"));
+            }
+            let after = engine
+                .inspect_container(&retained.info.container_id, None)
+                .await
+                .unwrap();
+            assert_eq!(before.id, after.id);
+            assert_eq!(before.image, after.image);
+            assert_eq!(
+                before.state.as_ref().unwrap().started_at,
+                after.state.as_ref().unwrap().started_at
+            );
+            assert_eq!(after.state.as_ref().unwrap().running, Some(true));
+            let containers = docker.list().await.unwrap();
+            assert_eq!(containers.len(), 1);
+            assert_eq!(containers[0].container_id, retained.info.container_id);
+        })
+        .catch_unwind()
+        .await;
+        docker.remove_owned_workload(&agent_id).await.unwrap();
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     #[tokio::test]

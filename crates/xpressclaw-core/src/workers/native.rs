@@ -2554,12 +2554,13 @@ fn session_start(db: &Arc<Database>, item: &QueueItem, runner: &str) -> Result<A
     )
 }
 
-async fn retained_runner_image_ready(
+/// Resolve the compatible image backing an Agent's retained environment.
+/// Readiness and preparation use the same non-mutating check as dispatch.
+pub async fn compatible_retained_runner_image(
     docker: &DockerManager,
     agent: &AgentConfig,
-    spec: &mut ContainerSpec,
     built_in_image: bool,
-) -> Result<bool> {
+) -> Result<Option<String>> {
     let retained = docker.retained_project_image(&agent.name).await?;
     if let Some(image) = retained.as_ref() {
         let requested_kind = resolve_runner_kind(agent)?;
@@ -2574,13 +2575,26 @@ async fn retained_runner_image_ready(
                 retained_kind.as_deref().map(|kind| format!("the {kind} harness")).unwrap_or_else(|| "an image without a declared harness".into())
             )));
         }
-        spec.image.clone_from(image);
     }
-    let ready = runner_image_ready(docker, &spec.image, built_in_image, agent).await;
-    if retained.is_some() && !ready {
-        return Err(Error::Backend("This Agent's retained environment does not support the selected harness capabilities. It has been preserved; restore the previous settings or explicitly rebuild it in Agent settings > Harness.".into()));
+    if let Some(image) = retained.as_deref() {
+        if !runner_image_ready(docker, image, built_in_image, agent).await {
+            return Err(Error::Backend("This Agent's retained environment does not support the selected harness capabilities. It has been preserved; restore the previous settings or explicitly rebuild it in Agent settings > Harness.".into()));
+        }
     }
-    Ok(ready)
+    Ok(retained)
+}
+
+async fn retained_runner_image_ready(
+    docker: &DockerManager,
+    agent: &AgentConfig,
+    spec: &mut ContainerSpec,
+    built_in_image: bool,
+) -> Result<bool> {
+    if let Some(image) = compatible_retained_runner_image(docker, agent, built_in_image).await? {
+        spec.image = image;
+        return Ok(true);
+    }
+    Ok(runner_image_ready(docker, &spec.image, built_in_image, agent).await)
 }
 
 async fn runner_image_ready(
@@ -4665,6 +4679,43 @@ mod tests {
                 assert!(message.contains("selected claude harness"));
                 assert_eq!(spec.image, "selected-claude-image");
             }
+            assert!(requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|request| request.starts_with("GET ")));
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_readiness_rejects_missing_runtime_capabilities() {
+        for (kind, engine, protocol) in [
+            ("claude", ContainerEngineAccess::None, "old-protocol"),
+            (
+                "codex",
+                ContainerEngineAccess::Host,
+                BUILT_IN_RUNNER_PROTOCOL,
+            ),
+            ("pi", ContainerEngineAccess::None, BUILT_IN_RUNNER_PROTOCOL),
+        ] {
+            let (docker, requests, server) =
+                crate::docker::manager::tests::mock_retained_image(json!({
+                    "io.xpressclaw.agent": kind, "io.xpressclaw.protocol": protocol,
+                }))
+                .await;
+            let mut agent = AgentConfig {
+                name: "agent".into(),
+                ..Default::default()
+            };
+            agent.runner.kind = kind.into();
+            agent.runner.container_engine = engine;
+            let error = compatible_retained_runner_image(&docker, &agent, true)
+                .await
+                .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("does not support the selected harness capabilities"));
             assert!(requests
                 .lock()
                 .unwrap()
