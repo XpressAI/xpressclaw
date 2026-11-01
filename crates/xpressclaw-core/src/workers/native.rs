@@ -1520,6 +1520,7 @@ async fn execute_item_once(runtime: NativeAttemptRuntime, item: QueueItem) -> Re
         .ok_or_else(|| Error::AgentNotFound {
             name: item.agent_id.clone(),
         })?;
+    let workflow_command = crate::workflows::commands::for_task(&db, &item.task_id)?;
     let connected_command =
         crate::connect::ConnectJournal::new(db.clone()).command_for_execution(attempt_id)?;
     let connected = connected_command.is_some();
@@ -1755,7 +1756,11 @@ async fn execute_item_once(runtime: NativeAttemptRuntime, item: QueueItem) -> Re
     let running = match sessions.transition_attempt(
         attempt_id,
         "running",
-        &format!("{kind} is working over ACP"),
+        &if workflow_command.is_some() {
+            "Running workflow command".into()
+        } else {
+            format!("{kind} is working over ACP")
+        },
         None,
         None,
     ) {
@@ -1775,6 +1780,85 @@ async fn execute_item_once(runtime: NativeAttemptRuntime, item: QueueItem) -> Re
         }
         let current = sessions.get_attempt(attempt_id)?;
         finish_terminal_dispatch_after_worker_exit(&db, &item, &current.status)?;
+        return Ok(TurnOutcome::Finished);
+    }
+
+    if let Some(command) = workflow_command {
+        let saved_result = match crate::workflows::commands::begin(&db, &command) {
+            Ok(saved) => saved,
+            Err(error) => {
+                sessions.clear_container(attempt_id)?;
+                return Err(error);
+            }
+        };
+        let result = match saved_result {
+            Some(result) => result,
+            None => {
+                let result = docker
+                    .workflow_command(workload_id, &container_workspace, &command)
+                    .await;
+                sessions.clear_container(attempt_id)?;
+                if finish_terminal_dispatch_after_worker_exit(
+                    &db,
+                    &item,
+                    &sessions.get_attempt(attempt_id)?.status,
+                )? {
+                    return Ok(TurnOutcome::Finished);
+                }
+                let result = result?;
+                crate::workflows::commands::save_result(&db, &command, &result)?;
+                result
+            }
+        };
+        sessions.clear_container(attempt_id)?;
+        let output =
+            serde_json::to_string(&result).map_err(|error| Error::Workflow(error.to_string()))?;
+        sessions.add_artifact(
+            attempt_id,
+            "result",
+            "Command result",
+            Some(&output),
+            None,
+            json!({"protocol": "command", "execution_id": command.execution_id}),
+        )?;
+        if !result.succeeds(command.allow_failure) {
+            fail_item(&db, &item, &output, &event_bus)?;
+            return Ok(TurnOutcome::Finished);
+        }
+        if TaskConversation::new(db.clone())
+            .complete_final_assistant_attempt(FinalAssistantAttempt {
+                task_id: &item.task_id,
+                queue_id: item.id,
+                attempt_id,
+                completion_summary: &format!(
+                    "Command exited with status {}",
+                    result.exit_code.unwrap_or(-1)
+                ),
+                content: &output,
+                visualizations: &[],
+                published_files: &[],
+            })?
+            .is_some()
+        {
+            // Command output is data, so it must not enter the model's
+            // user-question or review heuristics.
+            advance_workflow_attempt(&db, &item.task_id, attempt_id, "completed", &output);
+            board.update_status(&item.task_id, "completed", Some(&item.agent_id))?;
+            advance_workflow(&db, &item.task_id, "completed", &output);
+            sessions.refresh_status(&item.agent_id)?;
+            publish_conversation_result(
+                &db,
+                &event_bus,
+                &item,
+                &agent.context_label(),
+                &output,
+                attempt_id,
+                ConversationResultArtifacts {
+                    visualizations: &[],
+                    published_files: &[],
+                },
+            );
+        }
         return Ok(TurnOutcome::Finished);
     }
 

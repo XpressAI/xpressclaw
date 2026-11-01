@@ -91,7 +91,7 @@ pub struct SubWorkflow {
 pub struct Step {
     pub id: String,
     #[serde(rename = "type", default = "default_step_type")]
-    pub step_type: String, // step, sink, when, loop, jump
+    pub step_type: String, // step, command, parallel, continue, sink, when, loop, jump
     #[serde(default)]
     pub label: Option<String>,
     // Step (task) and continue-current-task fields
@@ -104,6 +104,12 @@ pub struct Step {
     /// the same command in the native product UI.
     #[serde(default)]
     pub command: Option<String>,
+    /// Command steps run in the selected Agent container, relative to its workspace.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// Capture a nonzero exit for a later step. Timeouts and launch errors fail.
+    #[serde(default)]
+    pub allow_failure: bool,
     /// ACP configuration values to apply before this step's prompt. Keys are
     /// the opaque IDs advertised by the selected harness (for example mode,
     /// model, or reasoning effort).
@@ -279,7 +285,7 @@ impl WorkflowDefinition {
         changed: &mut bool,
     ) -> Result<()> {
         for step in steps {
-            if matches!(step.step_type.as_str(), "step" | "wait") {
+            if matches!(step.step_type.as_str(), "step" | "wait" | "command") {
                 if let Some(configured) = step
                     .agent
                     .as_deref()
@@ -413,7 +419,8 @@ impl WorkflowDefinition {
             self.collect_step_ids(&sub.steps, &mut step_ids, flow_name)?;
 
             // Validate each step
-            self.validate_steps(&sub.steps, &step_ids, &flow_names, flow_name)?;
+            let top_level_ids = sub.steps.iter().map(|step| step.id.as_str()).collect();
+            self.validate_steps(&sub.steps, &top_level_ids, &flow_names, flow_name)?;
         }
 
         Ok(())
@@ -590,15 +597,60 @@ impl WorkflowDefinition {
                     }
                     // Validate nested steps in loop body
                     if let Some(ref body) = step.body {
-                        if let Some(unsupported) =
-                            body.iter().find(|body_step| body_step.step_type != "step")
-                        {
+                        if let Some(unsupported) = body.iter().find(|body_step| {
+                            !matches!(body_step.step_type.as_str(), "step" | "command")
+                        }) {
                             return Err(Error::Workflow(format!(
-                                "loop step '{}' in flow '{flow_name}' contains unsupported '{}' step '{}'; loop bodies currently accept agent task steps only",
+                                "loop step '{}' in flow '{flow_name}' contains unsupported '{}' step '{}'; loop bodies currently accept agent and command steps only",
                                 step.id, unsupported.step_type, unsupported.id
                             )));
                         }
                         self.validate_steps(body, step_ids, flow_names, flow_name)?;
+                    }
+                }
+                "parallel" => {
+                    let body = step.body.as_deref().unwrap_or_default();
+                    if body.is_empty() || body.len() > 16 {
+                        return Err(Error::Workflow(format!(
+                            "parallel step '{}' must contain between 1 and 16 branches",
+                            step.id
+                        )));
+                    }
+                    if body
+                        .iter()
+                        .any(|child| !matches!(child.step_type.as_str(), "step" | "command"))
+                    {
+                        return Err(Error::Workflow(format!(
+                            "parallel step '{}' accepts agent and command branches only",
+                            step.id
+                        )));
+                    }
+                    self.validate_steps(body, step_ids, flow_names, flow_name)?;
+                }
+                "command" => {
+                    self.validate_agent_reference(step, flow_name, true)?;
+                    if step
+                        .command
+                        .as_deref()
+                        .is_none_or(|command| command.trim().is_empty())
+                    {
+                        return Err(Error::Workflow(format!(
+                            "command step '{}' is missing 'command'",
+                            step.id
+                        )));
+                    }
+                    if let Some(cwd) = step.cwd.as_deref() {
+                        validate_command_cwd(cwd)?;
+                    }
+                    let duration = parse_wait_duration(step.timeout.as_deref().unwrap_or("5m"))
+                        .map_err(Error::Workflow)?;
+                    if duration.num_seconds() > 86400 {
+                        return Err(Error::Workflow(
+                            "command timeout must be at most 24h".into(),
+                        ));
+                    }
+                    if step.outputs.is_some() {
+                        return Err(Error::Workflow("command outputs are fixed: exit_code, stdout, stderr, signal, timed_out, stdout_truncated, stderr_truncated".into()));
                     }
                 }
                 "step" => self.validate_agent_reference(step, flow_name, false)?,
@@ -879,6 +931,20 @@ fn find_step_in_list<'a>(steps: &'a [Step], step_id: &str) -> Option<&'a Step> {
         }
     }
     None
+}
+
+/// The runner additionally resolves symlinks before entering this directory.
+pub(super) fn validate_command_cwd(cwd: &str) -> Result<()> {
+    if cwd.starts_with('/')
+        || cwd.contains('\\')
+        || cwd.contains(':')
+        || cwd.split('/').any(|part| part == "..")
+    {
+        return Err(Error::Workflow(
+            "command cwd must be relative to the Agent workspace and cannot contain '..'".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -218,6 +218,18 @@ impl TaskQueue {
                 conn,
                 rusqlite::TransactionBehavior::Immediate,
             )?;
+            let inactive_workflow: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM workflow_step_executions e
+                 JOIN workflow_instances i ON i.id = e.instance_id
+                 WHERE e.task_id = ?1 AND e.task_id IS NOT i.source_task_id
+                   AND (i.status != 'running' OR e.status != 'running'))",
+                [task_id],
+                |row| row.get(0),
+            )?;
+            if inactive_workflow {
+                transaction.commit()?;
+                return Ok(None);
+            }
             Self::ensure_locally_scheduled(&transaction, task_id)?;
             ensure_task_project_accepts_work(&transaction, task_id)?;
             let active = transaction

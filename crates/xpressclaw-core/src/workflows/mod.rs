@@ -1,3 +1,4 @@
+pub(crate) mod commands;
 pub mod condition;
 pub mod context;
 pub mod definition;

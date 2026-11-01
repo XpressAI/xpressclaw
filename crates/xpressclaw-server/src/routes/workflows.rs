@@ -127,6 +127,9 @@ async fn delete_workflow(
         let cancellation = engine
             .cancel_instance(&instance.id, "Workflow deleted by user")
             .map_err(internal_error)?;
+        for (task_id, attempts) in &cancellation.owned_tasks {
+            cleanup_cancelled_continuation(&state, task_id, attempts).await?;
+        }
         if let Some(task_id) = cancellation.continuation_task_id.as_deref() {
             cleanup_cancelled_continuation(&state, task_id, &cancellation.cancelled_attempts)
                 .await?;
@@ -309,6 +312,9 @@ async fn cancel_instance(
             xpressclaw_core::error::Error::WorkflowInstanceNotFound { .. } => not_found(&error),
             _ => internal_error(error),
         })?;
+    for (task_id, attempts) in &cancellation.owned_tasks {
+        cleanup_cancelled_continuation(&state, task_id, attempts).await?;
+    }
     if let Some(task_id) = cancellation.continuation_task_id.as_deref() {
         cleanup_cancelled_continuation(&state, task_id, &cancellation.cancelled_attempts).await?;
     }

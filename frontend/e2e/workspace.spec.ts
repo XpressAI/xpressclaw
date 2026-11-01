@@ -5625,7 +5625,7 @@ test('workflow gallery has six primary templates, distinct selection, and unique
 		workflows: [
 			existing('Goal Loop', 1),
 			existing('Goal Loop 2', 2),
-			existing('UI Regression Test', 3),
+			existing('Team Solve', 3),
 		],
 	});
 	await page.goto('/workflows/new');
@@ -5638,7 +5638,7 @@ test('workflow gallery has six primary templates, distinct selection, and unique
 		'repository-caretaker',
 		'backlog-processor',
 		'requirements-specification',
-		'ui-regression',
+		'team-solve',
 	]);
 	await expect(cards.filter({ hasText: 'Goal loop' })).toHaveAttribute('aria-pressed', 'true');
 	await expect(page.getByLabel('Name')).toHaveValue('Goal Loop 3');
@@ -5650,10 +5650,10 @@ test('workflow gallery has six primary templates, distinct selection, and unique
 	await expect(reviewCard).toHaveAttribute('aria-pressed', 'true');
 	await expect(page.getByLabel('Name')).toHaveValue('Code Review Loop');
 
-	await page.getByRole('button', { name: /UI regression tester/ }).click();
-	await expect(cards.filter({ hasText: 'UI regression tester' })).toHaveAttribute('aria-pressed', 'true');
+	await page.getByRole('button', { name: /Team solve/ }).click();
+	await expect(cards.filter({ hasText: 'Team solve' })).toHaveAttribute('aria-pressed', 'true');
 	await expect(cards.filter({ hasText: 'Goal loop' })).toHaveAttribute('aria-pressed', 'false');
-	await expect(page.getByLabel('Name')).toHaveValue('UI Regression Test 2');
+	await expect(page.getByLabel('Name')).toHaveValue('Team Solve 2');
 
 	await page.getByRole('button', { name: /Start blank/ }).click();
 	await expect(page.locator('[data-workflow-template-card][aria-pressed="true"]')).toHaveCount(0);
@@ -5684,7 +5684,7 @@ test('scheduled workflow templates bind a real agent and editable cron schedule'
 	expect(yaml).not.toContain('type: sink');
 });
 
-test('specialized templates generate bounded backlog, specification, and UI evidence flows', async ({ page }) => {
+test('specialized templates generate bounded backlog, specification, and Team solve flows', async ({ page }) => {
 	const workflowCreateRequests: { name: string; description?: string; yaml_content: string }[] = [];
 	await mockApi(page, { workflowCreateRequests });
 
@@ -5713,16 +5713,18 @@ test('specialized templates generate bounded backlog, specification, and UI evid
 	expect(specification).toContain('implementation_slices:');
 
 	await page.goto('/workflows/new');
-	await page.getByRole('button', { name: /UI regression tester/ }).click();
+	await page.getByRole('button', { name: /Team solve/ }).click();
 	await page.getByRole('button', { name: 'Create workflow' }).click();
 	await expect.poll(() => workflowCreateRequests.length).toBe(3);
-	const regression = workflowCreateRequests[2].yaml_content;
-	expect(regression).toContain('target_url:\n    type: string');
-	expect(regression).toContain('test_scope:\n    type: string');
-	expect(regression).toContain('switch: "@allow_fix"');
-	expect(regression).toContain('switch: "@apply_fix.outcome"');
-	expect(regression).toContain('Capture fresh evidence');
-	expect(regression).toContain('Do not commit, push, open or update a pull request');
+	const team = workflowCreateRequests[2].yaml_content;
+	expect(team).toContain('verification_command:\n    type: string');
+	expect(team).toContain('type: parallel');
+	expect(team).toContain('new_session: true');
+	expect(team).toContain('allow_failure: true');
+	expect(team).toContain('switch: "@review.repair_needed"');
+	expect(team).toContain('label: Verify the final solution');
+	expect(team.match(/type: command/g)).toHaveLength(2);
+
 });
 
 test('goal-loop workflow template is bounded and reusable across agents', async ({ page }) => {
@@ -7492,4 +7494,36 @@ test.describe('adaptive workspace', () => {
 			expect(await original!.evaluate(element => element.isConnected)).toBe(true);
 		}
 	});
+});
+
+test('Team solve workflow editor preserves branches and executable verification when saved', async ({ page }) => {
+	const workflowCreateRequests: { name: string; description?: string; yaml_content: string }[] = [];
+	await mockApi(page, { workflowCreateRequests });
+	await page.goto('/workflows/new');
+	await page.getByRole('button', { name: /Team solve/ }).click();
+	await page.getByRole('button', { name: 'Create workflow' }).click();
+	await expect(page).toHaveURL('/workflows/workflow-created');
+	const group = page.locator('[data-step-id="proposals"]');
+	await expect(group).toContainText('PARALLEL');
+	await expect(group).toContainText('Direct approach');
+	await expect(group).toContainText('Alternative approach');
+	const verify = page.locator('[data-step-id="verify"]');
+	await verify.getByRole('button', { name: 'Expand command' }).click();
+	await expect(verify.getByLabel('Command Agent')).toHaveValue('@worker');
+	await expect(verify.getByRole('checkbox')).not.toBeChecked();
+	await verify.getByLabel('Command working directory').fill('checks');
+	await verify.getByLabel('Command timeout').fill('2m');
+	await verify.getByLabel('Shell command').fill('bash verify.sh');
+	const request = page.waitForRequest((request) => request.url().endsWith('/api/workflows/workflow-created') && request.method() === 'PUT');
+	await page.getByRole('button', { name: 'Save', exact: true }).click();
+	const saved = (await request).postDataJSON().yaml_content as string;
+	expect(saved).toContain('type: parallel');
+	expect(saved).toContain('id: proposal_a');
+	expect(saved).toContain('id: proposal_b');
+	expect(saved).toContain('new_session: true');
+	expect(saved).toContain('allow_failure: true');
+	expect(saved).toContain('command: bash verify.sh');
+	expect(saved).toContain('cwd: checks');
+	expect(saved).toContain('timeout: 2m');
+	expect(saved.match(/type: command/g)).toHaveLength(2);
 });

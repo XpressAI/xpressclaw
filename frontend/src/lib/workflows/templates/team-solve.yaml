@@ -1,0 +1,189 @@
+name: __WORKFLOW_NAME__
+description: Plan, develop two independent proposals, solve, test, review, repair once, and verify with an executable test gate.
+version: 1
+
+inputs:
+  problem:
+    type: string
+    description: Problem to solve, including constraints and acceptance criteria.
+    required: true
+  context:
+    type: string
+    description: Relevant source files, background, or examples.
+    default: Use the problem statement and available workspace context.
+  verification_command:
+    type: string
+    description: Shell command that exits zero only when the solution passes (for example, bash scripts/check-samples.sh).
+    required: true
+  coordinator:
+    type: agent
+    description: Plans the work and reviews the implementation and recorded test results in a fresh session.
+    required: true
+  ideator_a:
+    type: agent
+    description: Proposes the most direct provable approach.
+    required: true
+  ideator_b:
+    type: agent
+    description: Proposes an alternative approach. Choose a different Agent to run both proposals concurrently.
+    required: true
+  worker:
+    type: agent
+    description: Owns the solution workspace, test commands, and repair.
+    required: true
+    primary: true
+
+flows:
+  main:
+    color: "#06b6d4"
+    steps:
+      - id: plan
+        type: step
+        label: Plan the solution
+        agent: "@coordinator"
+        new_session: true
+        prompt: |
+          Plan this problem from a fresh context:
+          @problem
+          Context: @context
+          Verification command: @verification_command
+
+          Identify constraints, acceptance criteria, candidate approaches, and
+          correctness checks. Give two independent ideators a common brief.
+          Use only the supplied context and evidence you inspect. Keep this step
+          analytical; downstream steps own implementation. The workflow schedules
+          the roles, so do not delegate additional tasks.
+        outputs:
+          brief:
+            type: string
+            description: Self-contained problem decomposition, constraints, and checks for both ideators.
+
+      - id: proposals
+        type: parallel
+        label: Develop independent proposals
+        steps:
+          - id: proposal_a
+            type: step
+            label: Direct approach
+            agent: "@ideator_a"
+            new_session: true
+            prompt: |
+              Independently propose the most direct approach you can justify.
+              Problem: @problem
+              Context: @context
+              Brief: @plan.brief
+              Include pseudocode or concrete steps, correctness reasoning,
+              complexity or resource costs, and edge cases. Return the proposal
+              as your output; do not edit solution files or delegate tasks.
+            outputs:
+              proposal: { type: string, description: Direct approach with reasoning and checks. }
+          - id: proposal_b
+            type: step
+            label: Alternative approach
+            agent: "@ideator_b"
+            new_session: true
+            prompt: |
+              Independently propose an approach from a different family of
+              techniques than the obvious solution and explain its tradeoffs.
+              Problem: @problem
+              Context: @context
+              Brief: @plan.brief
+              Include pseudocode or concrete steps, correctness reasoning,
+              complexity or resource costs, and edge cases. Return the proposal
+              as your output; do not edit solution files or delegate tasks.
+            outputs:
+              proposal: { type: string, description: Alternative approach with reasoning and checks. }
+
+      - id: solve
+        type: step
+        label: Implement the selected approach
+        agent: "@worker"
+        new_session: true
+        prompt: |
+          Solve the problem in your workspace using this explicit handoff:
+          Problem: @problem
+          Context: @context
+          Plan: @plan.brief
+          Proposal A: @proposal_a.proposal
+          Proposal B: @proposal_b.proposal
+          Verification command: @verification_command
+
+          Select and justify an approach, then implement it. Preserve the
+          acceptance criteria and existing test inputs and expected outputs.
+          Return a self-contained implementation record, including the relevant
+          source or patch and file paths, so the reviewer can inspect it from a
+          separate workspace. Keep the work local. Do not delegate other tasks.
+        outputs:
+          implementation:
+            type: string
+            description: Decision, relevant source or patch, and changed file paths for independent review.
+
+      - id: test
+        type: command
+        label: Capture initial test results
+        agent: "@worker"
+        command: "@verification_command"
+        timeout: 5m
+        allow_failure: true
+
+      - id: review
+        type: step
+        label: Review implementation and test evidence
+        agent: "@coordinator"
+        new_session: true
+        prompt: |
+          Review from a fresh context using the actual captured test result:
+          Problem: @problem
+          Plan: @plan.brief
+          Proposal A: @proposal_a.proposal
+          Proposal B: @proposal_b.proposal
+          Implementation: @solve.implementation
+          Test result: @test
+
+          Check the reasoning and test evidence. For any counterexample, derive
+          and check its expected answer before recommending a change. Produce
+          concrete repair instructions when tests failed or a demonstrated defect
+          remains. Otherwise return repair_needed=false. Do not edit files or
+          delegate tasks. Final verification determines workflow success.
+        outputs:
+          repair_needed: { type: boolean, description: Whether a demonstrated defect needs one repair pass. }
+          instructions: { type: string, description: Evidence-backed repair instructions or explanation that no repair is needed. }
+
+      - id: repair_gate
+        type: when
+        label: Repair decision
+        switch: "@review.repair_needed"
+        arms:
+          - match: "false"
+            goto: step verify
+          - match: default
+            continue: true
+
+      - id: repair
+        type: step
+        label: Apply one repair pass
+        agent: "@worker"
+        new_session: true
+        prompt: |
+          Apply one repair pass to your existing solution.
+          Problem: @problem
+          Plan: @plan.brief
+          Implementation: @solve.implementation
+          Test result: @test
+          Review: @review.instructions
+          Verification command: @verification_command
+
+          Inspect the actual files and evidence, correct demonstrated defects,
+          and preserve the acceptance criteria and existing test data. If the
+          solution already passes and the review identifies no demonstrated
+          defect, preserve it. Keep edits local and do not delegate more tasks.
+          The next command performs final verification; do not start another loop.
+        outputs:
+          summary: { type: string, description: Repair and the evidence supporting it. }
+
+      - id: verify
+        type: command
+        label: Verify the final solution
+        agent: "@worker"
+        command: "@verification_command"
+        timeout: 5m

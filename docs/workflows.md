@@ -28,9 +28,9 @@ Open **Automations → New workflow** to choose one of six working templates:
    high-level design, gives an independent role a clean-session challenge, and
    produces acceptance criteria plus independently useful delivery slices. It
    works for product, policy, operations, research, and software work.
-6. **UI regression tester** runs scoped browser flows, records concrete
-   evidence, classifies findings, and can optionally make one narrow local fix
-   and retest pass. It never publishes that fix automatically.
+6. **Team solve** plans a problem, runs two independent proposal tasks, implements
+   a solution, captures test output, reviews it in a fresh session, applies at most
+   one repair pass, and requires a final verification command to succeed.
 
 The compact **Start blank** action retains the original one-step starter for
 people who want an executable empty canvas instead of a primary gallery card.
@@ -210,19 +210,98 @@ timeout fails the workflow; otherwise it follows the named step or flow.
 - **Independent specification challenge:** give the challenger a reusable Agent
   role and `new_session: true`, then pass its structured gaps and recommendations
   to the final drafting step.
-- **Evidence-based UI regression:** keep the browser, optional local fix, and
-  retest in one Agent role so the workspace and captured evidence remain
-  coherent; branch around the fix when `allow_fix` is false.
+- **Team solve:** compare independent proposals, hand the selected approach to
+  a worker, review recorded test results, and verify after one optional repair.
 - **Failure handling:** an `on_error` flow catches failed agent tasks; explicit
   timeout flows handle external systems that never respond.
 
-Workflow execution is deliberately sequential today. Parallel fan-out and
-arbitrary webhook events are not represented as if they already work; they can
-be added on top of the persisted role, cursor, and wait model.
+Steps run in order, with explicit `parallel` groups for independent work. A
+parallel group waits for all its branches before advancing. GitHub events use
+`wait` blocks; arbitrary webhook triggers are not supported.
 
 Each run snapshots its workflow definition when it starts. Editing the reusable
 definition affects future runs without changing a run that is already waiting,
 looping, or executing a task.
+
+## Parallel proposals and executable verification
+
+The built-in **Team solve** template is inspired by
+[Memdoor's team-solve](https://github.com/guregodevo/memdoor/tree/main/examples/workflows/team-solve).
+It uses XpressClaw tasks and persisted outputs for its handoffs. Each Agent role
+starts a fresh session. The coordinator plans and reviews, two ideators propose
+approaches independently, and the worker owns the solution and test environment.
+The reviewer receives the implementation record and captured test results, so the
+roles can use separate workspaces. Supply a problem and a verification command
+that returns zero when its acceptance checks pass.
+
+A `parallel` block contains 1–16 Agent or command steps:
+
+```yaml
+      - id: proposals
+        type: parallel
+        steps:
+          - id: direct
+            agent: "@ideator_a"
+            new_session: true
+            prompt: "Find the most direct approach to @problem"
+            outputs:
+              proposal: { type: string }
+          - id: alternative
+            agent: "@ideator_b"
+            new_session: true
+            prompt: "Propose an alternative technique for @problem"
+            outputs:
+              proposal: { type: string }
+      - id: solve
+        agent: "@worker"
+        prompt: "Compare @direct.proposal and @alternative.proposal, then implement."
+```
+
+Branches receive the same input snapshot. Their outputs become available to later
+steps after the join. Choose different Agents for simultaneous execution; branches
+bound to one Agent use that Agent's serial task queue. The normal worker concurrency
+limit still applies. Branch failures are collected until every branch finishes,
+then the group enters `on_error` or fails the run. Cancellation retires the group's
+queued and running tasks. Branches and their join survive control-plane restarts.
+Nested parallel groups and control-flow branches are rejected by validation.
+
+A `command` block runs a shell script directly in the selected Agent's retained
+Linux container:
+
+```yaml
+      - id: test
+        type: command
+        agent: "@worker"
+        command: "@verification_command"
+        cwd: .
+        timeout: 5m
+        allow_failure: true
+      # An Agent can review @test and repair the solution here.
+      - id: verify
+        type: command
+        agent: "@worker"
+        command: "@verification_command"
+        timeout: 5m
+```
+
+The working directory is relative to the Agent's active workspace. The runner
+checks the resolved directory stays within it. Timeouts default to five minutes
+and support the same duration syntax as waits, up to 24 hours. A command exposes
+`exit_code`, `stdout`, `stderr`, `signal`, `timed_out`, `stdout_truncated`, and
+`stderr_truncated`; each output stream is capped at 1 MiB. These results also appear
+in the command task and its attempt artifacts. `allow_failure: true` captures a
+nonzero exit so a later step can review it. Timeouts, signals, and execution errors
+fail the step. The default requires exit code zero.
+
+Commands use the run's saved definition and execution result. Updating task text
+or reporting success cannot override the test gate. A saved command result is
+reused after restart. If execution was interrupted before its result was saved,
+the command fails with an interruption message; a new workflow run executes it
+again. A command's process group is terminated on timeout, disconnect, or exit.
+
+The `command` field on a normal Agent `step` still invokes a harness slash command.
+Use `type: command` for direct shell execution. Both the visual editor and YAML
+support parallel groups and command steps; serial loops also accept commands.
 
 ## Trigger a workflow automatically
 

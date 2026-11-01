@@ -4,7 +4,7 @@ import codeReviewYaml from './templates/code-review.yaml?raw';
 import goalLoopYaml from './templates/goal-loop.yaml?raw';
 import repositoryCaretakerYaml from './templates/repository-caretaker.yaml?raw';
 import requirementsSpecificationYaml from './templates/requirements-specification.yaml?raw';
-import uiRegressionYaml from './templates/ui-regression.yaml?raw';
+import teamSolveYaml from './templates/team-solve.yaml?raw';
 
 export type WorkflowTemplateId =
 	| 'goal-loop'
@@ -12,7 +12,7 @@ export type WorkflowTemplateId =
 	| 'repository-caretaker'
 	| 'backlog-processor'
 	| 'requirements-specification'
-	| 'ui-regression';
+	| 'team-solve';
 
 export interface WorkflowTemplateDefinition {
 	id: WorkflowTemplateId | 'blank';
@@ -83,13 +83,13 @@ export const WORKFLOW_TEMPLATES: readonly WorkflowTemplateDefinition[] = [
 		yaml: requirementsSpecificationYaml,
 	},
 	{
-		id: 'ui-regression',
-		title: 'UI regression tester',
-		description: 'Exercise scoped browser flows, capture evidence, classify findings, and optionally make one safe fix and retest pass.',
-		defaultName: 'UI Regression Test',
-		apiDescription: 'Evidence-based browser regression testing with an optional safe fix and retest pass.',
-		roleGuidance: 'Choose a browser-capable Agent. The same role runs the test, optional local fix, and retest so the workspace and evidence stay coherent.',
-		yaml: uiRegressionYaml,
+		id: 'team-solve',
+		title: 'Team solve',
+		description: 'Plan, compare independent proposals, solve, test, and repair once before a final executable verification.',
+		defaultName: 'Team Solve',
+		apiDescription: 'Parallel proposals and fresh-context review with command-based verification.',
+		roleGuidance: 'Choose a coordinator, two ideators, and a worker. The worker owns the solution and test environment. Different ideator Agents can run concurrently; outputs carry the handoffs.',
+		yaml: teamSolveYaml,
 	},
 ] as const;
 

@@ -6,6 +6,7 @@
 	import StepBlock from '$lib/components/blocks/StepBlock.svelte';
 	import ContinueTaskBlock from '$lib/components/blocks/ContinueTaskBlock.svelte';
 	import WhenBlock from '$lib/components/blocks/WhenBlock.svelte';
+	import CommandBlock from '$lib/components/blocks/CommandBlock.svelte';
 	import LoopBlock from '$lib/components/blocks/LoopBlock.svelte';
 	import JumpBlock from '$lib/components/blocks/JumpBlock.svelte';
 	import WaitBlock from '$lib/components/blocks/WaitBlock.svelte';
@@ -31,9 +32,10 @@
 
 	interface Block {
 		id: string;
-		type: 'trigger' | 'step' | 'continue' | 'when' | 'loop' | 'sink' | 'jump' | 'wait';
+		type: 'trigger' | 'step' | 'command' | 'parallel' | 'continue' | 'when' | 'loop' | 'sink' | 'jump' | 'wait';
 		label: string;
 		agent?: string; prompt?: string; command?: string; procedure?: string;
+		cwd?: string; allowFailure?: boolean;
 		sessionConfig?: Record<string, string | boolean>; newSession?: boolean;
 		mcpServer?: string; mcpTool?: string; mcpArguments?: string;
 		outputs?: Record<string, OutputSchema>;
@@ -149,6 +151,8 @@
 			block.mcpArguments = s.mcp_arguments == null ? '' : JSON.stringify(s.mcp_arguments, null, 2);
 			block.procedure = s.procedure; block.outputs = s.outputs;
 		}
+		if (type === 'command') { block.agent = s.agent; block.command = s.command; block.cwd = s.cwd; block.timeout = s.timeout; block.allowFailure = s.allow_failure; }
+		if (type === 'parallel') { block.children = (s.steps || s.body || []).map(stepToBlock); }
 		if (type === 'continue') { block.prompt = s.prompt; }
 		if (type === 'sink') { block.sinks = s.sinks; }
 		if (type === 'when') { block.switchVar = s.switch; block.arms = s.arms; }
@@ -198,6 +202,8 @@
 			if (b.procedure) s.procedure = b.procedure;
 			if (b.outputs && Object.keys(b.outputs).length) s.outputs = b.outputs;
 		}
+		if (b.type === 'command') { s.agent = b.agent ?? ''; s.command = b.command ?? ''; if (b.cwd) s.cwd = b.cwd; if (b.timeout) s.timeout = b.timeout; if (b.allowFailure) s.allow_failure = true; }
+		if (b.type === 'parallel') s.steps = (b.children ?? []).map(blockToStep);
 		if (b.type === 'continue') s.prompt = b.prompt ?? '';
 		if (b.type === 'sink') s.sinks = b.sinks ?? [];
 		if (b.type === 'when') { s.switch = b.switchVar ?? ''; s.arms = b.arms ?? []; }
@@ -466,6 +472,8 @@
 		let id: string;
 		switch (type) {
 			case 'step': label = `Step ${nextStepNumber()}`; break;
+			case 'command': label = 'Run command'; break;
+			case 'parallel': label = 'Parallel branches'; break;
 			case 'continue': label = 'Continue task'; break;
 			case 'when': label = 'Condition'; break;
 			case 'loop': label = 'For Each'; break;
@@ -481,6 +489,8 @@
 		let block: Block;
 		switch (type) {
 			case 'step': block = { id, type, label, agent: '', prompt: '', expanded: true }; break;
+			case 'command': block = { id, type, label, agent: '', command: '', timeout: '5m', cwd: '.', expanded: true }; break;
+			case 'parallel': block = { id, type, label, children: [], expanded: true }; break;
 			case 'continue': block = { id, type, label, prompt: '', expanded: true }; break;
 			case 'when': block = { id, type, label, switchVar: '', expanded: true,
 				arms: [{ match: 'approved', continue: true }, { match: 'rejected', goto: 'step ' }] }; break;
@@ -535,7 +545,7 @@
 			if (b.type === 'trigger') continue;
 			const n = prefix ? `${prefix}.${String.fromCharCode(96 + num)}` : String(num).padStart(2, '0');
 			result.push({ id: b.id, number: n, label: b.label });
-			if (b.type === 'loop' && b.children) {
+			if ((b.type === 'loop' || b.type === 'parallel') && b.children) {
 				result.push(...computeStepNumbers(b.children, n));
 			}
 			num++;
@@ -549,7 +559,7 @@
 	// All step IDs across flows for when block goto targets
 	let allStepIds = $derived(
 		Object.entries(flows).flatMap(([, flow]) =>
-			computeStepNumbers(flow.blocks)
+			computeStepNumbers(flow.blocks).filter((step) => flow.blocks.some((block) => block.id === step.id))
 		)
 	);
 
@@ -575,6 +585,14 @@
 			if (b.outputs) {
 				for (const [name, schema] of Object.entries(b.outputs)) {
 					vars.push({ name: `${b.id}.${name}`, type: schema.type || 'any', source: b.label });
+				}
+			}
+			if (b.type === 'command') {
+				for (const [name, type] of Object.entries({ exit_code: 'number', stdout: 'string', stderr: 'string', signal: 'string', timed_out: 'boolean', stdout_truncated: 'boolean', stderr_truncated: 'boolean' })) vars.push({ name: `${b.id}.${name}`, type, source: b.label });
+			}
+			if (b.type === 'parallel' && i < upToIdx) {
+				for (const branch of b.children ?? []) {
+					for (const [name, schema] of Object.entries(branch.outputs ?? {})) vars.push({ name: `${branch.id}.${name}`, type: schema.type || 'any', source: branch.label });
 				}
 			}
 			if (b.type === 'wait') {
@@ -645,7 +663,7 @@
 			if (loopEl) {
 				const loopId = loopEl.getAttribute('data-loop-id');
 				const loopBlock = currentBlocks.find(b => b.id === loopId);
-				if (loopBlock) {
+				if (loopBlock?.type === 'loop') {
 					loopContext = { asVar: loopBlock.asVar || 'item', overVar: loopBlock.overVar || '' };
 					const loopIdx = currentBlocks.findIndex(b => b.id === loopId);
 					if (loopIdx >= 0) blockIdx = loopIdx;
@@ -881,6 +899,10 @@
 								ontoggle={() => updateBlock(currentFlow, idx, { expanded: !block.expanded })}
 								onremove={() => removeBlock(currentFlow, idx)}
 							/>
+						{:else if block.type === 'command'}
+							<CommandBlock label={block.label} agent={block.agent || ''} command={block.command || ''} cwd={block.cwd || '.'} timeout={block.timeout || '5m'} allowFailure={block.allowFailure || false}
+								expanded={block.expanded} compact={compactView} {agentList} {agentRoles}
+								onupdate={(updates) => updateBlock(currentFlow, idx, updates)} ontoggle={() => updateBlock(currentFlow, idx, { expanded: !block.expanded })} onremove={() => removeBlock(currentFlow, idx)} />
 						{:else if block.type === 'continue'}
 							<ContinueTaskBlock
 								label={block.label} prompt={block.prompt || ''}
@@ -900,10 +922,10 @@
 								ontoggle={() => updateBlock(currentFlow, idx, { expanded: !block.expanded })}
 								onremove={() => removeBlock(currentFlow, idx)}
 							/>
-						{:else if block.type === 'loop'}
+						{:else if block.type === 'loop' || block.type === 'parallel'}
 							<div data-loop-id={block.id}>
 							<LoopBlock
-								label={block.label} overVar={block.overVar || ''} asVar={block.asVar || 'item'}
+								parallel={block.type === 'parallel'} label={block.label} overVar={block.overVar || ''} asVar={block.asVar || 'item'}
 								expanded={block.expanded} compact={compactView}
 								onupdate={(u) => updateBlock(currentFlow, idx, u)}
 								ontoggle={() => updateBlock(currentFlow, idx, { expanded: !block.expanded })}
@@ -937,6 +959,9 @@
 													capabilities={harnessCapabilities[child.agent || '']}
 									onupdate={childUpdate} ontoggle={childToggle} onremove={childRemove}
 								/>
+								{:else if child.type === 'command'}
+									<CommandBlock label={child.label} agent={child.agent || ''} command={child.command || ''} cwd={child.cwd || '.'} timeout={child.timeout || '5m'} allowFailure={child.allowFailure || false}
+										expanded={child.expanded} compact={compactView} {agentList} {agentRoles} onupdate={childUpdate} ontoggle={childToggle} onremove={childRemove} />
 								{:else if child.type === 'continue'}
 									<ContinueTaskBlock
 										label={child.label} prompt={child.prompt || ''}
@@ -957,11 +982,11 @@
 												{/if}
 											</div>
 										</div>
-										{#if ci < (block.children?.length ?? 0) - 1}
+										{#if block.type === 'loop' && ci < (block.children?.length ?? 0) - 1}
 											<div class="flex"><div class="w-8"></div><BlockConnector /></div>
 										{/if}
 									{/each}
-									<!-- Add step inside loop -->
+									<!-- Add a branch or loop body task -->
 									<div class="flex items-center gap-0 mt-2">
 										<div class="w-8"></div>
 										<button onclick={() => {
@@ -971,8 +996,12 @@
 											const children = [...(block.children || []), { id, type: 'step' as const, label, agent: '', prompt: '', expanded: true }];
 											updateBlock(currentFlow, idx, { children });
 										}} class="rounded border border-dashed border-border/40 px-3 py-1.5 text-[10px] text-muted-foreground hover:text-foreground hover:border-border transition-colors">
-											+ Add Step
+											{block.type === 'parallel' ? '+ Add branch' : '+ Add Step'}
 										</button>
+										<button onclick={() => {
+											const id = 'command_' + Date.now().toString(36);
+											updateBlock(currentFlow, idx, { children: [...(block.children || []), { id, type: 'command', label: 'Run command', agent: '', command: '', timeout: '5m', expanded: true }] });
+										}} class="ml-2 rounded border border-dashed border-border/40 px-3 py-1.5 text-[10px] text-muted-foreground hover:text-foreground">+ Add command</button>
 									</div>
 								{/snippet}
 							</LoopBlock>
@@ -1042,6 +1071,8 @@
 						<svg class="h-3 w-3" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M13.5 4.5L21 12m0 0l-7.5 7.5M21 12H3" /></svg>
 						Jump
 					</button>
+					<button onclick={() => addBlock('parallel')} class="rounded-lg border border-dashed border-border px-3 py-2 text-xs text-muted-foreground hover:text-foreground">Parallel</button>
+					<button onclick={() => addBlock('command')} class="rounded-lg border border-dashed border-border px-3 py-2 text-xs text-muted-foreground hover:text-foreground">Command</button>
 					<button onclick={() => addBlock('wait')}
 						class="rounded-lg border border-dashed border-border px-3 py-2 text-xs text-muted-foreground transition-all hover:border-cyan-500/50 hover:bg-cyan-950/20 hover:text-cyan-300">
 						Wait for event

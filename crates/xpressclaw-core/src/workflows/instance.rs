@@ -28,6 +28,8 @@ pub struct WorkflowInstance {
     pub status: String, // running, waiting, completed, failed, cancelled
     pub current_flow: String,
     pub current_step_index: i32,
+    #[serde(skip_serializing)]
+    pub current_execution_id: Option<String>,
     pub trigger_data: Option<String>, // JSON
     pub variable_store: String,       // JSON
     pub loop_state: Option<String>,   // JSON
@@ -48,6 +50,8 @@ pub struct StepExecution {
     pub flow_name: String,
     pub step_id: String,
     pub task_id: Option<String>,
+    #[serde(default)]
+    pub parent_execution_id: Option<String>,
     /// Exact work attempt owned by a same-task continuation. This internal
     /// link prevents workflow cancellation from affecting unrelated user
     /// turns on the source task.
@@ -459,7 +463,7 @@ impl InstanceManager {
     ) -> Result<()> {
         self.db.with_conn(|conn| {
             conn.execute(
-                "UPDATE workflow_instances SET current_flow = ?1, current_step_index = ?2 WHERE id = ?3",
+                "UPDATE workflow_instances SET current_flow = ?1, current_step_index = ?2, current_execution_id = NULL WHERE id = ?3",
                 rusqlite::params![flow, step_index, instance_id],
             )
             .map_err(|e| Error::Database(e.to_string()))
@@ -851,6 +855,9 @@ impl InstanceManager {
                     ],
                 )
                 .map_err(|error| Error::Database(error.to_string()))?;
+            if loop_state.is_none() {
+                transaction.execute("UPDATE workflow_instances SET current_execution_id = ?1 WHERE id = ?2", rusqlite::params![id, instance_id])?;
+            }
             if let Some(loop_state) = loop_state {
                 let changed = transaction
                     .execute(
@@ -1268,7 +1275,10 @@ fn dispatch_continuation_in_transaction(
     Ok((attempt_id, message.id))
 }
 
-fn ensure_instance_accepts_work(conn: &rusqlite::Connection, instance_id: &str) -> Result<()> {
+pub(super) fn ensure_instance_accepts_work(
+    conn: &rusqlite::Connection,
+    instance_id: &str,
+) -> Result<()> {
     let (project_id, conversation_project_id, status) = conn
         .query_row(
             "SELECT instance.project_id, conversation.project_id, instance.status
@@ -1426,6 +1436,7 @@ fn row_to_instance(row: &rusqlite::Row) -> WorkflowInstance {
             .get("current_flow")
             .unwrap_or_else(|_| "main".to_string()),
         current_step_index: row.get("current_step_index").unwrap_or(0),
+        current_execution_id: row.get("current_execution_id").unwrap_or_default(),
         trigger_data: row.get("trigger_data").unwrap_or_default(),
         variable_store: row
             .get("variable_store")
@@ -1445,6 +1456,7 @@ fn row_to_step_execution(row: &rusqlite::Row) -> StepExecution {
         flow_name: row.get("flow_name").unwrap_or_default(),
         step_id: row.get("step_id").unwrap_or_default(),
         task_id: row.get("task_id").unwrap_or_default(),
+        parent_execution_id: row.get("parent_execution_id").unwrap_or_default(),
         continuation_attempt_id: row.get("continuation_attempt_id").unwrap_or_default(),
         continuation_prompt_message_id: row
             .get("continuation_prompt_message_id")
