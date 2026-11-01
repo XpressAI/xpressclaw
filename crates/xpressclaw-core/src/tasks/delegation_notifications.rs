@@ -892,7 +892,17 @@ mod tests {
         reconcile(&db);
         // Recreate the immediately preceding persisted schema: origin was
         // unknown, so upgrading must not guess that a response is disposable.
-        db.conn().execute_batch("DROP TABLE task_delegation_automatic_responses; UPDATE config SET value='52' WHERE key='schema_version';").unwrap();
+        db.conn()
+            .execute_batch(
+                "DROP TABLE task_delegation_automatic_responses;
+            DROP INDEX idx_workflow_step_parent;
+            ALTER TABLE workflow_step_executions DROP COLUMN parent_execution_id;
+            ALTER TABLE workflow_step_executions DROP COLUMN command_started_at;
+            ALTER TABLE workflow_step_executions DROP COLUMN command_result;
+            ALTER TABLE workflow_instances DROP COLUMN current_execution_id;
+            UPDATE config SET value='52' WHERE key='schema_version';",
+            )
+            .unwrap();
         board.update_status(&child.id, "completed", None).unwrap();
         drop(queue);
         drop(board);

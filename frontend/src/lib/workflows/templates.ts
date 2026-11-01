@@ -4,7 +4,7 @@ import codeReviewYaml from './templates/code-review.yaml?raw';
 import goalLoopYaml from './templates/goal-loop.yaml?raw';
 import repositoryCaretakerYaml from './templates/repository-caretaker.yaml?raw';
 import requirementsSpecificationYaml from './templates/requirements-specification.yaml?raw';
-import uiRegressionYaml from './templates/ui-regression.yaml?raw';
+import chooseBestYaml from './templates/choose-best.yaml?raw';
 
 export type WorkflowTemplateId =
 	| 'goal-loop'
@@ -12,7 +12,7 @@ export type WorkflowTemplateId =
 	| 'repository-caretaker'
 	| 'backlog-processor'
 	| 'requirements-specification'
-	| 'ui-regression';
+	| 'choose-best';
 
 export interface WorkflowTemplateDefinition {
 	id: WorkflowTemplateId | 'blank';
@@ -83,13 +83,13 @@ export const WORKFLOW_TEMPLATES: readonly WorkflowTemplateDefinition[] = [
 		yaml: requirementsSpecificationYaml,
 	},
 	{
-		id: 'ui-regression',
-		title: 'UI regression tester',
-		description: 'Exercise scoped browser flows, capture evidence, classify findings, and optionally make one safe fix and retest pass.',
-		defaultName: 'UI Regression Test',
-		apiDescription: 'Evidence-based browser regression testing with an optional safe fix and retest pass.',
-		roleGuidance: 'Choose a browser-capable Agent. The same role runs the test, optional local fix, and retest so the workspace and evidence stay coherent.',
-		yaml: uiRegressionYaml,
+		id: 'choose-best',
+		title: 'Implement alternatives → choose best',
+		description: 'Build two alternatives against a shared rubric, choose the best, and keep refinements only when they improve the verified result.',
+		defaultName: 'Implement Alternatives → Choose Best',
+		apiDescription: 'Independent implementations with a predefined rubric, executable checks, evidence-based selection, and a final report.',
+		roleGuidance: 'Choose a coordinator, two implementers, and a worker. Different implementer Agents can run concurrently and use different models. Each candidate uses its own workspace; the worker adopts and verifies the winner.',
+		yaml: chooseBestYaml,
 	},
 ] as const;
 

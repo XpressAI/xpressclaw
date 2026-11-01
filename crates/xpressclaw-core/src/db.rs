@@ -2772,6 +2772,8 @@ const MIGRATION_V51: &str = include_str!("connect/task_dispatch.sql");
 const MIGRATION_V52: &str = include_str!("tasks/delegation_notifications.sql");
 const MIGRATION_V53: &str = include_str!("tasks/delegation_automatic_responses.sql");
 
+const MIGRATION_V54: &str = include_str!("workflows/parallel_commands.sql");
+
 fn schema_migrations() -> &'static [(u32, &'static str)] {
     &[
         (1, MIGRATION_V1),
@@ -2827,6 +2829,7 @@ fn schema_migrations() -> &'static [(u32, &'static str)] {
         (51, MIGRATION_V51),
         (52, MIGRATION_V52),
         (53, MIGRATION_V53),
+        (54, MIGRATION_V54),
     ]
 }
 
@@ -2964,7 +2967,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "53");
+        assert_eq!(version, "54");
         let visualization_table: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master

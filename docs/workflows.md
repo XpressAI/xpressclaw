@@ -28,9 +28,12 @@ Open **Automations → New workflow** to choose one of six working templates:
    high-level design, gives an independent role a clean-session challenge, and
    produces acceptance criteria plus independently useful delivery slices. It
    works for product, policy, operations, research, and software work.
-6. **UI regression tester** runs scoped browser flows, records concrete
-   evidence, classifies findings, and can optionally make one narrow local fix
-   and retest pass. It never publishes that fix automatically.
+6. **Implement alternatives → choose best** defines a rubric, builds two independent
+   implementations, runs common checks, and selects the strongest eligible result.
+   It can refine a copy using ideas from the other implementation, keeping it only
+   when the original rubric scores it higher and its checks pass. The worker adopts
+   and re-verifies the chosen version, then publishes a comparison report.
+   Saving a reusable decision to project memory is optional.
 
 The compact **Start blank** action retains the original one-step starter for
 people who want an executable empty canvas instead of a primary gallery card.
@@ -210,19 +213,157 @@ timeout fails the workflow; otherwise it follows the named step or flow.
 - **Independent specification challenge:** give the challenger a reusable Agent
   role and `new_session: true`, then pass its structured gaps and recommendations
   to the final drafting step.
-- **Evidence-based UI regression:** keep the browser, optional local fix, and
-  retest in one Agent role so the workspace and captured evidence remain
-  coherent; branch around the fix when `allow_fix` is false.
+- **Implement alternatives → choose best:** define the rubric before building,
+  evaluate independent implementations with shared checks, then adopt and verify
+  the selected result.
 - **Failure handling:** an `on_error` flow catches failed agent tasks; explicit
   timeout flows handle external systems that never respond.
 
-Workflow execution is deliberately sequential today. Parallel fan-out and
-arbitrary webhook events are not represented as if they already work; they can
-be added on top of the persisted role, cursor, and wait model.
+Steps run in order, with explicit `parallel` groups for independent work. A
+parallel group waits for all its branches before advancing. GitHub events use
+`wait` blocks; arbitrary webhook triggers are not supported.
 
 Each run snapshots its workflow definition when it starts. Editing the reusable
 definition affects future runs without changing a run that is already waiting,
 looping, or executing a task.
+
+## Parallel alternatives and executable verification
+
+The built-in **Implement alternatives → choose best** workflow completes a task
+through a common baseline, a predefined rubric, two independent implementations,
+shared verification, selection, adoption, and a final check.
+
+The worker inspects the destination and relevant project memory, then prepares a
+reproducible starting point. The coordinator defines mandatory requirements,
+weighted quality criteria, expected evidence, and a tie-break rule before either
+candidate starts. It creates the shared verification script, incorporating any
+existing command the user supplies. Both candidates receive the same baseline,
+brief, rubric, and checks. Each builds a complete alternative in its own uniquely
+named directory or Git worktree. Different Agents can run concurrently and use
+different configured models; two roles bound to one Agent run serially.
+
+After both implementations are ready, command steps run the saved verification
+script in each candidate's exact directory. The evaluator compares actual outputs
+and source changes against the original rubric, producing a scorecard and rationale.
+The engine checks the selected candidate's machine-derived `passed` flag before
+allowing adoption. A higher quality score cannot override failed required checks.
+A failed or timed-out candidate remains ineligible while the other can still win.
+If no eligible result is selected, the workflow publishes the comparison and fails
+without applying a candidate to the destination.
+
+`refine_winner` is enabled by default. An independent review looks for specific
+ideas from the other implementation that could improve the winner. When there is
+a concrete opportunity, the worker creates an unchanged copy of the winner and a
+separate experimental refinement. Both are checked in the worker's environment
+with the same saved script and rescored against the original rubric. The engine
+requires passing checks, confirmation that mandatory requirements still hold,
+and a strictly higher numeric score before choosing the refinement. Failed checks,
+ties, and lower scores retain the original winner. If the unchanged copy cannot
+pass its recheck, the run stops before applying either version. The original
+candidate workspaces and change sets remain available throughout.
+
+The worker applies the selected change set, preserving unrelated user changes,
+then runs the same verification script against the adopted result. A successful
+run ends with a human-readable answer and a downloadable report published through
+`publish_task_files`, including the rubric, scorecard, selection rationale,
+delivered files, test evidence, and any before/after refinement comparison. Results
+also reach a linked Project Conversation.
+The optional `remember_decision` input is off by default; when enabled, a separate
+step preserves reusable project knowledge only after final verification succeeds.
+
+Agent roles exchange source state and change sets through persisted step outputs,
+so candidates can use separate workspaces. Git worktrees belong under `.worktrees/`.
+Absolute command directories keep verification tied to the intended candidate even
+when an Agent adopts a different active repository between turns.
+
+A `parallel` block contains 1–16 Agent or command steps:
+
+```yaml
+      - id: proposals
+        type: parallel
+        steps:
+          - id: direct
+            agent: "@ideator_a"
+            new_session: true
+            prompt: "Find the most direct approach to @problem"
+            outputs:
+              proposal: { type: string }
+          - id: alternative
+            agent: "@ideator_b"
+            new_session: true
+            prompt: "Propose an alternative technique for @problem"
+            outputs:
+              proposal: { type: string }
+      - id: solve
+        agent: "@worker"
+        prompt: "Compare @direct.proposal and @alternative.proposal, then implement."
+```
+
+Branches receive the same input snapshot. Their outputs become available to later
+steps after the join. Choose different Agents for simultaneous execution; branches
+bound to one Agent use that Agent's serial task queue. The normal worker concurrency
+limit still applies. Branch failures are collected until every branch finishes,
+then the group enters `on_error` or fails the run. Cancellation retires the group's
+queued and running tasks. Branches and their join survive control-plane restarts.
+Nested parallel groups and control-flow branches are rejected by validation.
+
+A `command` block runs a shell script directly in the selected Agent's retained
+Linux container:
+
+```yaml
+      - id: test
+        type: command
+        agent: "@worker"
+        command: "@verification_command"
+        cwd: .
+        timeout: 5m
+        allow_failure: true
+      # An Agent can review @test and repair the solution here.
+      - id: verify
+        type: command
+        agent: "@worker"
+        command: "@verification_command"
+        timeout: 5m
+```
+
+Relative working directories start at the Agent's active repository. Absolute
+container paths are also accepted, and the runner resolves symlinks to check that
+the directory stays inside the Agent's configured workspace. Timeouts default to five minutes
+and support the same duration syntax as waits, up to 24 hours. A command exposes
+`passed`, `exit_code`, `stdout`, `stderr`, `signal`, `timed_out`, `stdout_truncated`, and
+`stderr_truncated`; each output stream is capped at 1 MiB. These results also appear
+in the command task and its attempt artifacts. `allow_failure: true` captures
+nonzero exits, signals, and timeouts so later steps can compare outcomes. Launch
+and transport errors fail the step. The derived `passed` flag is true only for
+exit code zero with no signal or timeout; strict command steps require it to be
+true. Use this flag for eligibility gates.
+
+Commands use the run's saved definition and execution result. Updating task text
+or reporting success cannot override the test gate. A saved command result is
+reused after restart. If execution was interrupted before its result was saved,
+the command fails with an interruption message; a new workflow run executes it
+again. A command's process group is terminated on timeout, disconnect, or exit.
+
+Numeric `when` switches can compare step outputs or a numeric literal with
+`>`, `>=`, `<`, or `<=`. For example:
+
+```yaml
+      - id: improvement_gate
+        type: when
+        switch: "@assessment.after_score > @assessment.before_score"
+        arms:
+          - match: "true"
+            goto: flow adopt_refined
+          - match: default
+            goto: flow adopt_original
+```
+
+The comparison runs in the engine using finite numbers. Missing or nonnumeric
+operands fail the step instead of accepting a claimed improvement.
+
+The `command` field on a normal Agent `step` still invokes a harness slash command.
+Use `type: command` for direct shell execution. Both the visual editor and YAML
+support parallel groups and command steps; serial loops also accept commands.
 
 ## Trigger a workflow automatically
 

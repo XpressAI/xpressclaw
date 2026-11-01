@@ -1,3 +1,6 @@
+#[path = "parallel.rs"]
+mod parallel;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -75,6 +78,7 @@ pub struct WorkflowContext {
 pub struct WorkflowCancellation {
     pub continuation_task_id: Option<String>,
     pub cancelled_attempts: Vec<WorkAttempt>,
+    pub owned_tasks: Vec<(String, Vec<WorkAttempt>)>,
 }
 
 impl WorkflowEngine {
@@ -121,7 +125,7 @@ impl WorkflowEngine {
         summary: &str,
     ) -> Result<WorkflowCancellation> {
         let sessions = SessionManager::new(self.db.clone());
-        let (continuation_task_id, cancelled_attempt) = self.db.with_conn(|conn| {
+        let (continuation_task_id, cancelled_attempt, owned_tasks) = self.db.with_conn(|conn| {
             let transaction = rusqlite::Transaction::new_unchecked(
                 conn,
                 rusqlite::TransactionBehavior::Immediate,
@@ -180,9 +184,32 @@ impl WorkflowEngine {
                 })
                 .transpose()?
                 .flatten();
+            let task_ids = {
+                let mut statement = transaction.prepare(
+                    "SELECT DISTINCT e.task_id FROM workflow_step_executions e
+                     JOIN workflow_instances i ON i.id = e.instance_id
+                     WHERE e.instance_id = ?1 AND e.task_id IS NOT NULL
+                       AND e.task_id IS NOT i.source_task_id AND e.status = 'running'"
+                )?;
+                let ids = statement.query_map([instance_id], |row| row.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                ids
+            };
+            let mut owned_tasks = Vec::new();
+            for task_id in task_ids {
+                if let Some(attempts) = sessions.cancel_task_attempts_in_transaction(&transaction, &task_id, summary)? {
+                    owned_tasks.push((task_id, attempts));
+                }
+            }
+            transaction.execute(
+                "UPDATE workflow_step_executions SET status = 'cancelled', completed_at = CURRENT_TIMESTAMP
+                 WHERE instance_id = ?1 AND status IN ('running', 'resuming')
+                   AND (task_id IS NULL OR task_id IS NOT (SELECT source_task_id FROM workflow_instances WHERE id = ?1))",
+                [instance_id],
+            )?;
             InstanceManager::cancel_instance_in_transaction(&transaction, instance_id)?;
             transaction.commit()?;
-            Ok::<_, Error>((continuation_task_id, cancelled_attempt))
+            Ok::<_, Error>((continuation_task_id, cancelled_attempt, owned_tasks))
         })?;
 
         let cancelled_attempts = match (continuation_task_id.as_deref(), cancelled_attempt) {
@@ -191,7 +218,16 @@ impl WorkflowEngine {
             }
             _ => Vec::new(),
         };
+        let owned_tasks = owned_tasks
+            .into_iter()
+            .map(|(task_id, attempts)| {
+                let attempts =
+                    sessions.record_task_attempt_cancellations(&task_id, summary, attempts)?;
+                Ok((task_id, attempts))
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(WorkflowCancellation {
+            owned_tasks,
             continuation_task_id,
             cancelled_attempts,
         })
@@ -599,9 +635,10 @@ impl WorkflowEngine {
         let ctx_json = serde_json::to_string(&ctx).unwrap_or_else(|_| "{}".to_string());
 
         match step.step_type.as_str() {
-            "step" => self
+            "step" | "command" => self
                 .execute_task_step(instance_id, flow_name, step, &ctx, &ctx_json)
                 .map(|_| ()),
+            "parallel" => self.execute_parallel_step(instance_id, flow_name, step, &ctx, &ctx_json),
             "continue" => self.execute_continue_step(instance_id, flow_name, step, &ctx, &ctx_json),
             "wait" => self.execute_wait_step(instance_id, flow_name, step, &ctx),
             "sink" => self.execute_sink_step(
@@ -802,7 +839,12 @@ impl WorkflowEngine {
             rendered_prompt
         };
 
-        let rendered_prompt = if let Some(command) = step
+        let rendered_prompt = if step.step_type == "command" {
+            format!(
+                "Run verification command:\n{}",
+                context::render_template(step.command.as_deref().unwrap_or_default(), ctx)
+            )
+        } else if let Some(command) = step
             .command
             .as_deref()
             .map(str::trim)
@@ -1096,7 +1138,7 @@ impl WorkflowEngine {
         ctx: &Value,
     ) -> Result<()> {
         let switch_expr = step.switch_var.as_deref().unwrap_or("");
-        let resolved_value = context::resolve_variable(switch_expr, ctx)
+        let resolved_value = condition::switch_value(switch_expr, ctx)?
             .map(|v| match v {
                 Value::String(s) => s,
                 other => serde_json::to_string(&other).unwrap_or_default(),
@@ -1595,6 +1637,50 @@ impl WorkflowEngine {
 
         let mut var_store = self.load_variable_store(&exec.instance_id)?;
 
+        // A command completion must be backed by the runner's saved result.
+        // Editing task text/status cannot substitute a claimed test success.
+        let command_completion = if task_status == "completed" {
+            definition
+                .find_step(&exec.flow_name, &exec.step_id)
+                .filter(|step| step.step_type == "command")
+                .map(|step| -> Result<(String, String)> {
+                    let saved: Option<String> = self.db.with_conn(|conn| {
+                        conn.query_row(
+                            "SELECT command_result FROM workflow_step_executions WHERE id = ?1",
+                            [&exec.id],
+                            |row| row.get(0),
+                        )
+                    })?;
+                    match saved {
+                        Some(output) => {
+                            let result: crate::workflows::commands::CommandResult =
+                                serde_json::from_str(&output)
+                                    .map_err(|error| Error::Workflow(error.to_string()))?;
+                            Ok((
+                                if result.succeeds(step.allow_failure) {
+                                    "completed"
+                                } else {
+                                    "failed"
+                                }
+                                .into(),
+                                result.json_output()?,
+                            ))
+                        }
+                        None => Ok((
+                            "failed".into(),
+                            "Command has no recorded execution result".into(),
+                        )),
+                    }
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let (task_status, task_output) = command_completion
+            .as_ref()
+            .map(|(status, output)| (status.as_str(), output.as_str()))
+            .unwrap_or((task_status, task_output));
+
         // Map task status to step status
         let step_status = match task_status {
             "completed" => "completed",
@@ -1608,6 +1694,10 @@ impl WorkflowEngine {
         } else {
             step_status
         };
+
+        if exec.parent_execution_id.is_some() {
+            return self.complete_parallel_branch(exec, step_status, task_output);
+        }
 
         if exec.step_id == SOURCE_TASK_STEP_ID {
             // A user message sent during the original turn may already have a
@@ -2232,6 +2322,49 @@ impl WorkflowEngine {
         Ok(None)
     }
 
+    /// Replay a command completion committed before its successor was dispatched.
+    fn recover_command_execution(&self, instance: &WorkflowInstance) -> Result<bool> {
+        let definition = self.definition_for_instance(instance)?;
+        let is_command = definition
+            .flows
+            .get(&instance.current_flow)
+            .and_then(|flow| flow.steps.get(instance.current_step_index as usize))
+            .is_some_and(|step| step.step_type == "command");
+        if !is_command {
+            return Ok(false);
+        }
+        let Some(execution_id) = instance.current_execution_id.as_deref() else {
+            let trigger = instance
+                .trigger_data
+                .as_deref()
+                .and_then(|value| serde_json::from_str(value).ok())
+                .unwrap_or(Value::Null);
+            self.execute_step(
+                &instance.id,
+                &instance.current_flow,
+                instance.current_step_index as usize,
+                &definition,
+                &trigger,
+                &self.load_variable_store(&instance.id)?,
+            )?;
+            return Ok(true);
+        };
+        let execution = self.instances.get_step_execution(execution_id)?;
+        if !matches!(execution.status.as_str(), "completed" | "failed") {
+            return Ok(false);
+        }
+        if let Some(task_id) = execution.task_id.as_deref() {
+            self.on_execution_task_completed(
+                &execution,
+                task_id,
+                &execution.status,
+                execution.output.as_deref().unwrap_or_default(),
+                None,
+            )?;
+        }
+        Ok(true)
+    }
+
     /// Recover running workflow instances after a restart.
     pub fn recover(&self) -> Result<()> {
         let running = self.instances.list_running_instances()?;
@@ -2244,8 +2377,16 @@ impl WorkflowEngine {
         let board = TaskBoard::new(self.db.clone());
 
         for instance in &running {
-            // Find the latest running step execution
             let execs = self.instances.list_step_executions(&instance.id)?;
+            let graph_started = instance.source_task_id.is_none()
+                || execs
+                    .iter()
+                    .any(|execution| execution.step_id != SOURCE_TASK_STEP_ID);
+            if graph_started
+                && (self.recover_parallel(instance)? || self.recover_command_execution(instance)?)
+            {
+                continue;
+            }
             if let Some(execution) = execs
                 .iter()
                 .rfind(|execution| execution.status == "resuming")

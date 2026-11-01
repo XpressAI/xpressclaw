@@ -208,6 +208,62 @@ impl DockerManager {
             .clone()
     }
 
+    pub(crate) async fn workflow_command(
+        &self,
+        agent_id: &str,
+        workspace: &str,
+        workspace_root: &str,
+        command: &crate::workflows::commands::WorkflowCommand,
+    ) -> Result<crate::workflows::commands::CommandResult> {
+        let mut attached = self
+            .open_project_process(
+                agent_id,
+                &[
+                    "node".into(),
+                    "-e".into(),
+                    include_str!("workflow-command.cjs").into(),
+                ],
+                Some(workspace),
+                &[],
+            )
+            .await?;
+        let request = json!({"script": command.script, "cwd": command.cwd, "workspace_root": workspace_root, "timeout_secs": command.timeout_secs});
+        let operation = async {
+            attached
+                .input
+                .write_all(format!("{request}\n").as_bytes())
+                .await
+                .map_err(io_error)?;
+            let mut data = Vec::new();
+            // JSON escaping can expand two 1 MiB output streams sixfold.
+            let limit = 12 * 1024 * 1024 + 4096;
+            stream_reader(&mut attached)
+                .take(limit + 1)
+                .read_to_end(&mut data)
+                .await
+                .map_err(io_error)?;
+            if data.len() as u64 > limit {
+                return Err(Error::Container(
+                    "Command response exceeded its transport limit".into(),
+                ));
+            }
+            let value: Value = serde_json::from_slice(&data)
+                .map_err(|error| Error::Container(format!("Invalid command result: {error}")))?;
+            if let Some(error) = value.get("error").and_then(Value::as_str) {
+                return Err(Error::Container(error.into()));
+            }
+            serde_json::from_value(value)
+                .map_err(|error| Error::Container(format!("Invalid command result: {error}")))
+        };
+        let result =
+            tokio::time::timeout(Duration::from_secs(command.timeout_secs + 15), operation)
+                .await
+                .unwrap_or_else(|_| Err(Error::Container("Command transport timed out".into())));
+        // The wrapper kills its process group when this pipe closes.
+        let _ = attached.input.shutdown().await;
+        result
+    }
+
     pub async fn container_files(&self, agent_id: &str, request: Value) -> Result<Value> {
         let response_limit = file_response_limit(&request)?;
         self.start_project_environment(agent_id).await?;
@@ -808,6 +864,32 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(10), BufReader::new(stream_reader(&mut main)).read_line(&mut ready)).await.unwrap().unwrap();
             assert!(ready.contains("ready"));
             eprintln!("container ready");
+            let mut command = crate::workflows::commands::WorkflowCommand {
+                execution_id: "test-command".into(), script: "printf captured; printf failure >&2; exit 7".into(),
+                cwd: ".".into(), timeout_secs: 5, allow_failure: true,
+            };
+            let captured = docker.workflow_command("loopback", "/tmp", "/tmp", &command).await.unwrap();
+            assert_eq!(captured.exit_code, Some(7));
+            assert_eq!(captured.stdout, "captured");
+            assert_eq!(captured.stderr, "failure");
+            assert!(captured.succeeds(true));
+            assert!(!captured.succeeds(false));
+            command.script = "sleep 30 & wait".into();
+            command.timeout_secs = 1;
+            let timed = docker.workflow_command("loopback", "/tmp", "/tmp", &command).await.unwrap();
+            assert!(timed.timed_out);
+            assert!(timed.succeeds(true));
+            assert!(!timed.passed());
+            assert!(!timed.succeeds(false));
+            command.script = "pwd".into();
+            command.cwd = "..".into();
+            assert!(docker.workflow_command("loopback", "/tmp", "/tmp", &command).await.is_err());
+            command.cwd = "/tmp".into();
+            let absolute = docker.workflow_command("loopback", "/tmp/artifacts", "/tmp", &command).await.unwrap();
+            assert_eq!(absolute.stdout.trim(), "/tmp");
+            command.cwd = "/".into();
+            assert!(docker.workflow_command("loopback", "/tmp/artifacts", "/tmp", &command).await.is_err());
+            eprintln!("workflow command verification passed");
             let echo = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
             let inbound = PortForward { id: "llm".into(), direction: ForwardDirection::HostToContainer, host_port: echo.local_addr().unwrap().port(), container_port: 18081 };
             let echo_task = tokio::spawn(async move {

@@ -114,7 +114,7 @@ jobs:
         run: bash build.sh --skip-tauri --skip-docker --skip-check
 
       - name: Test native control-plane MCP servers
-        run: node --test harnesses/native/common/*.test.mjs
+        run: node --test harnesses/native/common/*.test.mjs crates/xpressclaw-core/src/docker/workflow-command.test.mjs
 
       - name: Test retained container access
         run: |

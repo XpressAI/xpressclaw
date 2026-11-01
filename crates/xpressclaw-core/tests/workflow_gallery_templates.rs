@@ -29,8 +29,8 @@ const PRIMARY_TEMPLATES: [(&str, &str, bool); 6] = [
         false,
     ),
     (
-        "ui-regression",
-        include_str!("../../../frontend/src/lib/workflows/templates/ui-regression.yaml"),
+        "choose-best",
+        include_str!("../../../frontend/src/lib/workflows/templates/choose-best.yaml"),
         false,
     ),
 ];

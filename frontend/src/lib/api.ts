@@ -1483,6 +1483,7 @@ export interface WorkflowInstance {
 }
 
 export interface StepExecution {
+	parent_execution_id?: string | null;
 	id: string;
 	instance_id: string;
 	flow_name: string;
