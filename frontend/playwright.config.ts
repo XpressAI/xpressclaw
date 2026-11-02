@@ -32,14 +32,14 @@ export default defineConfig({
 			use: { ...devices['Desktop Chrome'], ...chromiumLaunch },
 		},
 		// Safari and the desktop app's WKWebView are supported engines, and
-		// gesture handling is where engines differ most, so the tab-strip suite
-		// runs on WebKit as well as Chromium.
+		// gesture handling is where engines differ most, so tab dragging and
+		// external links run on WebKit as well as Chromium.
 		{
 			name: 'webkit',
 			use: { ...devices['Desktop Safari'] },
 			testMatch: /workspace\.spec\.ts/,
-			// Tab gestures and mobile editing run on both browser engines.
-			grep: /dragging a tab|keyboard tab dragging|abandons the drag|marks where it will land|compact tab strip|compact strip|never starts a drag|freshly split pane|drag in flight|deleted mid-drag|touch swipe|mobile editing|adaptive workspace/,
+			// Tab gestures, mobile editing and external links run on both engines.
+			grep: /dragging a tab|keyboard tab dragging|abandons the drag|marks where it will land|compact tab strip|compact strip|never starts a drag|freshly split pane|drag in flight|deleted mid-drag|touch swipe|mobile editing|adaptive workspace|external links/,
 		},
 		// Chromium can inject real touch input through CDP, including native
 		// panning, which WebKit's driver cannot; this profile reproduces phone

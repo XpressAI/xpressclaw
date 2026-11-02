@@ -127,6 +127,26 @@ async function expectExternalPopup(page: Page, buttonName: string, expectedUrl: 
 	await popup.close();
 }
 
+async function mockDesktopExternalLinks(page: Page, local = true) {
+	const opened: string[] = [];
+	await page.exposeFunction('recordExternalUrl', (url: string) => opened.push(url));
+	await page.addInitScript((local) => {
+		Object.defineProperty(window, 'isTauri', { value: true });
+		const desktop = window as unknown as {
+			recordExternalUrl: (url: string) => Promise<void>;
+			__TAURI_INTERNALS__: { invoke: (command: string, args: { url: string }) => Promise<unknown> };
+		};
+		desktop.__TAURI_INTERNALS__ = {
+			invoke: async (command, args) => {
+				if (command === 'get_active_instance_profile') return { identity_status: 'matched', navigation_status: 'ready', local };
+				if (command === 'open_external_url') return desktop.recordExternalUrl(args.url);
+				throw new Error(`Unexpected Tauri command: ${command}`);
+			},
+		};
+	}, local);
+	return opened;
+}
+
 async function expectReadableCode(message: Locator) {
 	const inlineCode = message.locator('.prose-chat p code').first();
 	const fencedCode = message.locator('.prose-chat pre').first();
@@ -5544,6 +5564,85 @@ test('Harness discovery links use the identity-checked opener for remote Desktop
 	}]);
 });
 
+for (const local of [true, false]) {
+	test(`external links open in the browser for ${local ? 'local' : 'remote'} Desktop profiles`, async ({ page }) => {
+		const opened = await mockDesktopExternalLinks(page, local);
+		const content = [
+			'[**Pull request**](https://github.com/example/repo/pull/123?tab=files#diff)',
+			'[Other service](http://127.0.0.1:8936/docs)',
+			'[Protocol-relative](//example.com/docs)',
+			'[Control center](/dashboard)',
+		].join('\n\n');
+		await mockApi(page, {
+			taskDescription: content,
+			taskMessages: [{ id: 1, task_id: taskId, role: 'assistant', content, attachments: [], timestamp: timestamp(25) }],
+		});
+		await page.goto(`/tasks/${taskId}`);
+		const taskUrl = page.url();
+		const userLink = page.locator('[data-message-role="user"] a', { hasText: 'Pull request' });
+		const assistantLink = page.locator('[data-message-role="assistant"] a', { hasText: 'Pull request' });
+		await expect(userLink).not.toHaveAttribute('target');
+		await expect(assistantLink).toHaveAttribute('target', '_blank');
+		await userLink.locator('strong').click();
+		await assistantLink.locator('strong').click();
+		await assistantLink.click({ modifiers: ['Control'] });
+		await assistantLink.click({ modifiers: ['Meta'] });
+		await assistantLink.click({ modifiers: ['Shift'] });
+		await assistantLink.click({ button: 'middle' });
+		await assistantLink.focus();
+		await page.keyboard.press('Enter');
+		await expect.poll(() => opened).toEqual(Array(7).fill('https://github.com/example/repo/pull/123?tab=files#diff'));
+		await page.locator('[data-message-role="user"]').getByRole('link', { name: 'Other service' }).click();
+		await page.locator('[data-message-role="user"]').getByRole('link', { name: 'Protocol-relative' }).click();
+		await expect.poll(() => opened.slice(7)).toEqual(['http://127.0.0.1:8936/docs', 'http://example.com/docs']);
+		await expect(page).toHaveURL(taskUrl);
+		expect(page.context().pages()).toHaveLength(1);
+		await page.locator('[data-message-role="user"]').getByRole('link', { name: 'Control center' }).click();
+		await expect(page).toHaveURL(/\/dashboard$/);
+		expect(opened).toHaveLength(9);
+	});
+}
+
+test('external links show native opener errors and can be retried', async ({ page }) => {
+	const opened = await mockDesktopExternalLinks(page);
+	await mockApi(page, { taskDescription: '[Documentation](https://example.com/docs)' });
+	await page.goto(`/tasks/${taskId}`);
+	const taskUrl = page.url();
+	const link = page.locator('[data-message-role="user"]').getByRole('link', { name: 'Documentation' });
+	await expect(link).toBeVisible();
+	await page.evaluate(() => {
+		const desktop = window as unknown as { __TAURI_INTERNALS__: { invoke: (...args: unknown[]) => Promise<unknown> } };
+		const invoke = desktop.__TAURI_INTERNALS__.invoke;
+		let fail = true;
+		desktop.__TAURI_INTERNALS__.invoke = async (...args) => {
+			if (args[0] === 'open_external_url' && fail) {
+				fail = false;
+				throw new Error('Browser could not be started');
+			}
+			return invoke(...args);
+		};
+	});
+	await link.click();
+	await expect(page.getByRole('alert')).toContainText('Could not open link: Browser could not be started');
+	await expect(page).toHaveURL(taskUrl);
+	await link.click();
+	await expect.poll(() => opened).toEqual(['https://example.com/docs']);
+	await expect(page.getByRole('alert')).toHaveCount(0);
+});
+
+test('external links without a target open a new browser tab', async ({ page }) => {
+	await mockApi(page, { taskDescription: '[Documentation](https://example.com/docs)' });
+	await page.goto(`/tasks/${taskId}`);
+	const taskUrl = page.url();
+	await page.context().route('https://example.com/docs', route => route.fulfill({ body: '<title>Documentation</title>' }));
+	const popupPromise = page.waitForEvent('popup');
+	await page.locator('[data-message-role="user"]').getByRole('link', { name: 'Documentation' }).click();
+	const popup = await popupPromise;
+	await expect(popup).toHaveURL('https://example.com/docs');
+	await expect(page).toHaveURL(taskUrl);
+	await popup.close();
+});
+
 test('every supported harness resolves the intended documentation and custom stays neutral', async ({ page }) => {
 	const agentKind = { value: 'codex' };
 	const catalog = [
@@ -6353,6 +6452,28 @@ test('environment port forwarding saves both directions and removes mappings', a
 	await page.screenshot({ path: test.info().outputPath('environment-ports.png') });
 	await panel.getByRole('button', { name: 'Remove' }).first().click();
 	await expect.poll(() => ports.length).toBe(1);
+});
+
+test('terminal external links use the Desktop browser opener', async ({ page }) => {
+	const opened = await mockDesktopExternalLinks(page);
+	await mockApi(page);
+	await page.route('**/api/environments/**/terminal-sessions', route => route.fulfill({ json: { sessions: ['login'] } }));
+	await page.routeWebSocket('**/api/workspaces/**/terminal?**', websocket => {
+		websocket.send(JSON.stringify({ type: 'ready' }));
+		websocket.send('\r\nhttps://example.com/terminal\r\n');
+	});
+	await page.goto(`/agents/${agentId}?tab=files&terminal=login`);
+	const terminal = page.locator('[data-project-terminal]');
+	const link = terminal.getByText('https://example.com/terminal', { exact: true });
+	await expect(link).toBeVisible();
+	// xterm handles pointer input on a screen over the rendered text.
+	const bounds = (await link.boundingBox())!;
+	const point = { x: bounds.x + 5, y: bounds.y + bounds.height / 2 };
+	await page.mouse.move(point.x, point.y);
+	await expect(terminal.locator('.xterm-screen')).toHaveClass(/xterm-cursor-pointer/);
+	await page.mouse.click(point.x, point.y);
+	await expect.poll(() => opened).toEqual(['https://example.com/terminal']);
+	expect(page.context().pages()).toHaveLength(1);
 });
 
 test('shared terminals join named sessions, send interactive input and share the connected session', async ({ page }) => {

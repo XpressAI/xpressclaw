@@ -2,6 +2,7 @@
 	import { onMount } from 'svelte';
 	import '@xterm/xterm/css/xterm.css';
 	import { request, environments } from '$lib/api';
+	import { openExternal } from '$lib/utils';
 
 	let { agentId, initialSession = 'xpressclaw' }: { agentId: string; initialSession?: string } = $props();
 	let host = $state<HTMLDivElement>();
@@ -47,7 +48,9 @@
 			const fitAddon = new FitAddon();
 			terminal.loadAddon(fitAddon);
 			terminal.loadAddon(new WebLinksAddon((_event, uri) => {
-				window.open(uri, '_blank', 'noopener,noreferrer');
+				void openExternal(uri).catch((cause) => {
+					error = `Could not open link: ${String(cause)}`;
+				});
 			}));
 			terminal.open(host);
 			requestAnimationFrame(() => fitAddon.fit());

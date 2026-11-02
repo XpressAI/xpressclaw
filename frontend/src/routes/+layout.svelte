@@ -4,6 +4,7 @@
 	import { goto } from '$app/navigation';
 	import { page } from '$app/stores';
 	import WorkspaceShell from '$lib/components/workspace/WorkspaceShell.svelte';
+	import ExternalLinks from '$lib/components/ExternalLinks.svelte';
 	import { auth, type AuthBootstrap } from '$lib/api';
 	import { initializeTheme } from '$lib/theme';
 
@@ -101,6 +102,8 @@
 		void bootstrapAuthentication();
 	});
 </script>
+
+<ExternalLinks />
 
 {#if loginRoute}
 	{@render children()}
