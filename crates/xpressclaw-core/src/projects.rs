@@ -34,6 +34,8 @@ pub struct ProjectDeletionCounts {
     pub conversations: i64,
     pub conversation_messages: i64,
     pub memory_notes: i64,
+    #[serde(default)]
+    pub workflows: i64,
     pub workflow_runs: i64,
     pub schedules: i64,
 }
@@ -84,6 +86,37 @@ pub struct UpdateProject {
 
 pub struct ProjectManager {
     db: Arc<Database>,
+}
+
+/// Resolve a runner's live Project inside the transaction performing its work.
+pub(crate) fn agent_project(conn: &rusqlite::Connection, agent: &str) -> Result<String> {
+    let project = conn
+        .query_row(
+            "SELECT project_id FROM agents WHERE id = ?1",
+            [agent],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten()
+        .ok_or_else(|| {
+            Error::ProjectAccess("The calling Agent must belong to an active Project".into())
+        })?;
+    ensure_project_accepts_work(conn, &project)?;
+    Ok(project)
+}
+
+pub(crate) fn require_project_task(
+    conn: &rusqlite::Connection,
+    project: &str,
+    task: &str,
+) -> Result<()> {
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?1 AND project_id=?2 AND hidden=0 AND provenance!='native_plan')",
+        rusqlite::params![task, project], |row| row.get::<_, bool>(0),
+    )? {
+        return Err(Error::ProjectAccess("Task was not found in the current Project".into()));
+    }
+    Ok(())
 }
 
 /// Reject new Project-owned work after the first phase of cascading deletion.
@@ -471,7 +504,8 @@ impl ProjectManager {
                     "SELECT
                        (SELECT COUNT(*) FROM agents WHERE project_id = ?1)
                        + (SELECT COUNT(*) FROM conversations WHERE project_id = ?1)
-                       + (SELECT COUNT(*) FROM tasks WHERE project_id = ?1)",
+                       + (SELECT COUNT(*) FROM tasks WHERE project_id = ?1)
+                       + (SELECT COUNT(*) FROM workflows WHERE project_id = ?1)",
                     [&previous_project_id],
                     |row| row.get(0),
                 )?;
@@ -523,6 +557,7 @@ impl ProjectManager {
                    + (SELECT COUNT(*) FROM conversations WHERE project_id = ?1)
                    + (SELECT COUNT(*) FROM tasks WHERE project_id = ?1)
                    + (SELECT COUNT(*) FROM project_memory_notes WHERE project_id = ?1)
+                   + (SELECT COUNT(*) FROM workflows WHERE project_id = ?1)
                    + (SELECT COUNT(*) FROM workflow_instances
                       WHERE project_id = ?1
                          OR conversation_id IN
@@ -551,7 +586,7 @@ impl ProjectManager {
             )?;
             if owned_records > 0 {
                 return Err(Error::Project(
-                    "this Project is not empty; use explicit cascade acknowledgement to permanently delete its Agents, tasks, conversations, memory, workflow runs or schedules, and sync configuration".into(),
+                    "this Project is not empty; use explicit cascade acknowledgement to permanently delete its Agents, tasks, conversations, memory, workflow definitions, runs or schedules, and sync configuration".into(),
                 ));
             }
             transaction.execute("DELETE FROM projects WHERE id = ?1", [id])?;
@@ -1098,7 +1133,8 @@ fn row_to_project(
                  OR continuation_task_id IN
                     (SELECT id FROM tasks WHERE project_id = ?1)
                  OR conversation_id IN
-                    (SELECT id FROM conversations WHERE project_id = ?1))",
+                    (SELECT id FROM conversations WHERE project_id = ?1)),
+             (SELECT COUNT(*) FROM workflows WHERE project_id = ?1)",
         [&id],
         |count| {
             Ok(ProjectDeletionCounts {
@@ -1108,6 +1144,7 @@ fn row_to_project(
                 conversations: count.get(2)?,
                 conversation_messages: count.get(3)?,
                 memory_notes: count.get(4)?,
+                workflows: count.get(7)?,
                 workflow_runs: count.get(5)?,
                 schedules: count.get(6)?,
             })
@@ -1237,6 +1274,109 @@ mod tests {
             })
             .unwrap();
         assert_eq!(workflows, 1, "reusable workflow definitions are shared");
+    }
+
+    #[test]
+    fn moving_the_last_agent_preserves_planned_project_workflows() {
+        use crate::workflows::manager::{ProjectWorkflowInput, WorkflowManager};
+
+        for schedule in [
+            "",
+            "schedule:\n  run_at: '2099-01-01T12:00:00Z'\n",
+            "schedule:\n  cron: '0 9 * * Mon'\n",
+        ] {
+            for enabled in [false, true] {
+                let db = Arc::new(Database::open_memory().unwrap());
+                db.with_conn(|conn| {
+                    conn.execute_batch(
+                        "INSERT INTO projects (id, name) VALUES ('source', 'Source'), ('target', 'Target');
+                         INSERT INTO agents (id, name, backend, config, project_id)
+                            VALUES ('atlas', 'Atlas', 'native', '{}', 'source');",
+                    )
+                })
+                .unwrap();
+                let workflows = WorkflowManager::new(db.clone());
+                let planned = workflows
+                    .create_for_agent(
+                        "atlas",
+                        &[ProjectWorkflowInput {
+                            yaml_content: format!(
+                                "name: Planned work\n{schedule}flows:\n  main:\n    steps: []\n"
+                            ),
+                            enabled,
+                        }],
+                    )
+                    .unwrap()
+                    .remove(0);
+                let projects = ProjectManager::new(db);
+
+                assert_eq!(
+                    projects.assign_agent("target", "atlas").unwrap().agent_ids,
+                    vec!["atlas"]
+                );
+                let source = projects.get("source").unwrap();
+                assert!(source.agent_ids.is_empty());
+                assert_eq!(source.task_count, 0);
+                assert_eq!(source.conversation_count, 0);
+                assert_eq!(source.deletion_counts.workflows, 1);
+                assert_eq!(
+                    serde_json::to_value(workflows.get(&planned.id).unwrap()).unwrap(),
+                    serde_json::to_value(&planned).unwrap(),
+                    "moving the last Agent must preserve the workflow and its schedule"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn project_deletion_requires_cascade_for_owned_workflow_definitions() {
+        use crate::workflows::manager::WorkflowManager;
+
+        for enabled in [false, true] {
+            let db = Arc::new(Database::open_memory().unwrap());
+            db.with_conn(|conn| {
+                conn.execute_batch(
+                    "INSERT INTO projects (id, name) VALUES ('one', 'One'), ('two', 'Two');
+                     INSERT INTO workflows (id, name, yaml_content, project_id)
+                        VALUES ('owned', 'Owned', 'name: Owned', 'one'),
+                               ('other', 'Other', 'name: Other', 'two'),
+                               ('shared', 'Shared', 'name: Shared', NULL);",
+                )?;
+                conn.execute(
+                    "UPDATE workflows SET enabled = ?1 WHERE id = 'owned'",
+                    [enabled],
+                )
+            })
+            .unwrap();
+            let projects = ProjectManager::new(db.clone());
+            let workflows = WorkflowManager::new(db);
+            let planned = workflows.get("owned").unwrap();
+
+            let error = projects.delete("one").unwrap_err();
+            assert!(error.to_string().contains("explicit cascade"));
+            assert_eq!(projects.get("one").unwrap().deletion_counts.workflows, 1);
+            assert_eq!(
+                serde_json::to_value(workflows.get("owned").unwrap()).unwrap(),
+                serde_json::to_value(planned).unwrap()
+            );
+
+            projects.begin_cascade("one").unwrap();
+            projects.finish_cascade("one").unwrap();
+            assert!(matches!(
+                projects.get("one"),
+                Err(Error::ProjectNotFound { .. })
+            ));
+            assert!(matches!(
+                workflows.get("owned"),
+                Err(Error::WorkflowNotFound { .. })
+            ));
+            assert!(workflows.get("shared").is_ok());
+            assert_eq!(
+                workflows.get("other").unwrap().project_id.as_deref(),
+                Some("two")
+            );
+            assert!(projects.get("two").is_ok());
+        }
     }
 
     #[test]

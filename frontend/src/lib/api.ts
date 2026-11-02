@@ -177,6 +177,7 @@ export interface Project {
 		conversations: number;
 		conversation_messages: number;
 		memory_notes: number;
+		workflows?: number;
 		workflow_runs: number;
 		schedules: number;
 	};
@@ -1449,6 +1450,8 @@ export interface Connector {
 
 export interface Workflow {
 	id: string;
+	project_id?: string | null;
+	revision?: number;
 	name: string;
 	description: string | null;
 	yaml_content: string;

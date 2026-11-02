@@ -1,4 +1,6 @@
 use crate::state::AppState;
+#[path = "project_planning.rs"]
+mod planning;
 use axum::{
     body::Body,
     extract::{Path, Query, State},
@@ -11,7 +13,6 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use xpressclaw_core::{
-    agents::registry::AgentRegistry,
     docker::{
         environment::{
             check_forward_reservations, save_forwards, saved_forwards, ForwardDirection,
@@ -20,10 +21,7 @@ use xpressclaw_core::{
         manager::DockerManager,
     },
     tasks::{
-        attachments::DecodedImageAttachment,
-        board::{CreateTask, TaskBoard},
-        conversation::TaskConversation,
-        queue::TaskQueue,
+        attachments::DecodedImageAttachment, board::TaskBoard, conversation::TaskConversation,
     },
 };
 
@@ -62,7 +60,11 @@ pub fn routes() -> Router<AppState> {
 
 pub fn internal_routes() -> Router<AppState> {
     Router::new()
-        .route("/{agent_id}/tasks", post(create_agent_task))
+        .route(
+            "/{agent_id}/tasks",
+            get(planning::list_tasks).post(planning::create_task),
+        )
+        .merge(planning::routes())
         .route(
             "/{agent_id}/tasks/{task_id}/files",
             post(publish_task_files),
@@ -389,53 +391,6 @@ async fn terminal_sessions(
 }
 
 #[derive(Deserialize)]
-struct AgentTaskInput {
-    title: String,
-    description: Option<String>,
-    agent_id: Option<String>,
-    parent_task_id: Option<String>,
-    priority: Option<i32>,
-}
-async fn create_agent_task(
-    State(state): State<AppState>,
-    Path(agent_id): Path<String>,
-    headers: HeaderMap,
-    Json(input): Json<AgentTaskInput>,
-) -> ApiResult<Json<Value>> {
-    authorize(&state, &agent_id, &headers)?;
-    require_agent(&headers, &agent_id)?;
-    let registry = AgentRegistry::new(state.db.clone());
-    let caller = registry.get(&agent_id).map_err(bad)?;
-    let target_id = input.agent_id.as_deref().unwrap_or(&agent_id);
-    let target = registry.get(target_id).map_err(bad)?;
-    if caller.project_id.is_none() || caller.project_id != target.project_id {
-        return Err(forbidden());
-    }
-    let board = TaskBoard::new(state.db.clone());
-    if let Some(parent_id) = &input.parent_task_id {
-        let parent = board.get(parent_id).map_err(bad)?;
-        if parent.project_id != caller.project_id {
-            return Err(forbidden());
-        }
-    }
-    let task = board
-        .create(&CreateTask {
-            title: input.title,
-            description: input.description,
-            agent_id: Some(target_id.into()),
-            parent_task_id: input.parent_task_id,
-            priority: input.priority,
-            ..Default::default()
-        })
-        .map_err(bad)?;
-    TaskQueue::new(state.db.clone())
-        .enqueue(&task.id, target_id)
-        .map_err(bad)?;
-    let task = board.get(&task.id).map_err(bad)?;
-    Ok(Json(json!(task)))
-}
-
-#[derive(Deserialize)]
 struct PublishInput {
     #[serde(default)]
     content: String,
@@ -533,9 +488,196 @@ mod tests {
     use std::sync::Arc;
     use tower::ServiceExt;
     use xpressclaw_core::{
+        agents::registry::AgentRegistry,
         config::{AgentConfig, Config},
         db::Database,
+        tasks::board::CreateTask,
+        tasks::queue::TaskQueue,
     };
+
+    async fn planning_request(
+        app: &Router,
+        method: &str,
+        path: &str,
+        agent: &str,
+        body: Value,
+    ) -> (StatusCode, Value) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("x-xpressclaw-agent-id", agent)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn manager_discovers_agents_creates_a_plan_and_releases_future_work() {
+        let (app, db) = app();
+        let (status, roster) =
+            planning_request(&app, "GET", "/atlas/agents", "atlas", json!(null)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(roster["total"], 2);
+        assert_eq!(roster["project_id"], "shared");
+        assert!(roster["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|agent| agent["title"].is_string() && agent["config"].is_null()));
+        assert!(!roster.to_string().contains("outsider"));
+        let (status,created)=planning_request(&app,"POST","/atlas/tasks/batch","atlas",json!({
+            "parent_task_id":null,"tasks":[
+                {"ref":"read","title":"Read","agent_id":"helper","backlog":true},
+                {"title":"Implement","agent_id":"atlas","depends_on":["read"],"start_after":"2099-01-01T00:00:00Z"}
+            ]
+        })).await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        let id = created["refs"]["read"].as_str().unwrap();
+        assert_eq!(created["tasks"][0]["project_id"], "shared");
+        assert!(created["tasks"][0]["parent_task_id"].is_null());
+        assert!(TaskQueue::new(db.clone()).claim("atlas").unwrap().is_none());
+        assert!(TaskQueue::new(db.clone())
+            .claim("helper")
+            .unwrap()
+            .is_none());
+        let (status, page) = planning_request(
+            &app,
+            "GET",
+            "/atlas/tasks?project_id=other&status=all",
+            "atlas",
+            json!(null),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(page["total"], 2);
+        let (status, detail) = planning_request(
+            &app,
+            "GET",
+            &format!("/atlas/tasks/{id}"),
+            "atlas",
+            json!(null),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let revision = detail["task"]["revision"].as_i64().unwrap();
+        let (status,updated)=planning_request(&app,"PATCH",&format!("/atlas/tasks/{id}/planning"),"atlas",json!({
+            "expected_revision":revision,"action":"schedule","start_after":"2099-01-02T00:00:00Z","activate":true
+        })).await;
+        assert_eq!(status, StatusCode::OK, "{updated}");
+        assert_eq!(updated["backlog"], false);
+        assert!(TaskQueue::new(db).claim("helper").unwrap().is_none());
+        let (status, _) = planning_request(
+            &app,
+            "PATCH",
+            &format!("/atlas/tasks/{id}/planning"),
+            "atlas",
+            json!({
+                "expected_revision":revision,"action":"queue"
+            }),
+        )
+        .await;
+        assert_ne!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn manager_cannot_read_or_mutate_another_projects_plan() {
+        let (app, db) = app();
+        let outside = TaskBoard::new(db.clone())
+            .create(&CreateTask {
+                title: "Private title".into(),
+                agent_id: Some("outsider".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        for (method, path, body) in [
+            ("GET", format!("/atlas/tasks/{}", outside.id), json!(null)),
+            (
+                "PATCH",
+                format!("/atlas/tasks/{}/planning", outside.id),
+                json!({"expected_revision":outside.revision,"action":"backlog"}),
+            ),
+            (
+                "POST",
+                "/atlas/tasks/batch".into(),
+                json!({"tasks":[{"title":"Would be valid"},{"title":"Bad","agent_id":"outsider"}]}),
+            ),
+        ] {
+            let (status, body) = planning_request(&app, method, &path, "atlas", body).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            assert!(!body.to_string().contains("Private title"));
+        }
+        let count = db
+            .with_conn(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get::<_, i64>(0))
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+        let (status, _) =
+            planning_request(&app, "GET", "/atlas/agents", "outsider", json!(null)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn manager_can_schedule_workflow_copies_and_pause_only_project_owned_workflows() {
+        use xpressclaw_core::workflows::manager::{CreateWorkflow, WorkflowManager};
+        let (app, db) = app();
+        let manager = WorkflowManager::new(db);
+        let template=manager.create(&CreateWorkflow {
+            name:"Template".into(),description:None,
+            yaml_content:"name: Template\ninputs:\n  worker: {type: agent, required: true}\nflows:\n  main:\n    steps:\n      - id: run\n        agent: '@worker'\n        prompt: Audit\n".into()
+        }).unwrap();
+        let (status, catalog) =
+            planning_request(&app, "GET", "/atlas/workflows", "atlas", json!(null)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(catalog["workflows"][0]["id"], template.id);
+        let (status,created)=planning_request(&app,"POST","/atlas/workflows/schedule","atlas",json!({"schedules":[
+            {"workflow_id":template.id,"inputs":{"worker":"helper"},"run_at":"2099-01-01T00:00:00Z"},
+            {"workflow_id":template.id,"inputs":{"worker":"helper"},"cron":"0 9 * * 1","enabled":false}
+        ]})).await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        let id = created["workflows"][0]["id"].as_str().unwrap();
+        assert_eq!(created["workflows"][0]["project_id"], "shared");
+        let (status, paused) = planning_request(
+            &app,
+            "PATCH",
+            &format!("/atlas/workflows/{id}"),
+            "atlas",
+            json!({"expected_revision":0,"enabled":false}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{paused}");
+        assert_eq!(paused["enabled"], false);
+        let (status, _) = planning_request(
+            &app,
+            "GET",
+            &format!("/outsider/workflows/{id}"),
+            "outsider",
+            json!(null),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _) = planning_request(
+            &app,
+            "PATCH",
+            &format!("/atlas/workflows/{}", template.id),
+            "atlas",
+            json!({"expected_revision":0,"enabled":false}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(manager.get(&template.id).unwrap().enabled);
+    }
 
     #[tokio::test]
     async fn download_response_preserves_utf8_filename_and_file_bytes() {

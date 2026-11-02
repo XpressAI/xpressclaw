@@ -2774,6 +2774,12 @@ const MIGRATION_V53: &str = include_str!("tasks/delegation_automatic_responses.s
 
 const MIGRATION_V54: &str = include_str!("workflows/parallel_commands.sql");
 
+const MIGRATION_V55: &str = "
+ALTER TABLE workflows ADD COLUMN project_id TEXT REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE workflows ADD COLUMN revision INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX idx_workflows_project ON workflows(project_id);
+";
+
 fn schema_migrations() -> &'static [(u32, &'static str)] {
     &[
         (1, MIGRATION_V1),
@@ -2830,6 +2836,7 @@ fn schema_migrations() -> &'static [(u32, &'static str)] {
         (52, MIGRATION_V52),
         (53, MIGRATION_V53),
         (54, MIGRATION_V54),
+        (55, MIGRATION_V55),
     ]
 }
 
@@ -2967,7 +2974,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "54");
+        assert_eq!(version, "55");
         let visualization_table: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master

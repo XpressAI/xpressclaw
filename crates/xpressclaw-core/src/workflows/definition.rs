@@ -43,7 +43,11 @@ pub struct WorkflowTrigger {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowSchedule {
     /// Standard five-field cron expressions use server-local time.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub cron: String,
+    /// One-shot execution time, including its timezone. Exclusive with cron.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_at: Option<String>,
     /// Input overrides supplied to every scheduled run.
     #[serde(default)]
     pub inputs: HashMap<String, Value>,
@@ -396,14 +400,19 @@ impl WorkflowDefinition {
                         .into(),
                 ));
             }
-            if schedule.cron.trim().is_empty() {
+            if schedule.cron.trim().is_empty() == schedule.run_at.is_none() {
                 return Err(Error::Workflow(
-                    "workflow schedule cron cannot be empty".into(),
+                    "workflow schedule requires exactly one of cron or run_at".into(),
                 ));
             }
-            croner::Cron::new(schedule.cron.trim())
-                .parse()
-                .map_err(|e| Error::Workflow(format!("invalid workflow schedule cron: {e}")))?;
+            if let Some(run_at) = schedule.run_at.as_deref() {
+                crate::tasks::planning::normalize_start_after(Some(run_at))
+                    .map_err(|e| Error::Workflow(e.to_string()))?;
+            } else {
+                croner::Cron::new(schedule.cron.trim())
+                    .parse()
+                    .map_err(|e| Error::Workflow(format!("invalid workflow schedule cron: {e}")))?;
+            }
             self.resolve_inputs(&Value::Object(
                 schedule
                     .inputs

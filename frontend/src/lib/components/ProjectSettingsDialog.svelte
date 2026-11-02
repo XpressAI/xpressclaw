@@ -34,6 +34,7 @@
 		conversations: deletionProject.conversation_count,
 		conversation_messages: 0,
 		memory_notes: 0,
+		workflows: 0,
 		workflow_runs: 0,
 		schedules: 0,
 	});
@@ -140,6 +141,7 @@
 						<li><strong class="text-foreground">{deletionCounts.tasks}</strong> task{deletionCounts.tasks === 1 ? '' : 's'} and <strong class="text-foreground">{deletionCounts.task_messages}</strong> task message{deletionCounts.task_messages === 1 ? '' : 's'}, including attachments</li>
 						<li><strong class="text-foreground">{deletionCounts.conversations}</strong> conversation{deletionCounts.conversations === 1 ? '' : 's'} and <strong class="text-foreground">{deletionCounts.conversation_messages}</strong> conversation message{deletionCounts.conversation_messages === 1 ? '' : 's'}, including turns and attachments</li>
 						<li><strong class="text-foreground">{deletionCounts.memory_notes}</strong> Project memory note{deletionCounts.memory_notes === 1 ? '' : 's'}</li>
+						<li><strong class="text-foreground">{deletionCounts.workflows ?? 0}</strong> Project workflow definition{deletionCounts.workflows === 1 ? '' : 's'}, including paused and scheduled workflows</li>
 						<li><strong class="text-foreground">{deletionCounts.workflow_runs}</strong> Project workflow run{deletionCounts.workflow_runs === 1 ? '' : 's'}, including steps and waits, and <strong class="text-foreground">{deletionCounts.schedules}</strong> owned schedule{deletionCounts.schedules === 1 ? '' : 's'}, plus sync and runtime metadata</li>
 					</ul>
 					<p class="mt-3 text-xs leading-relaxed text-muted-foreground"><strong class="text-foreground">Kept:</strong> source repositories, workspace folders, and reusable workflow definitions shared outside this Project.</p>

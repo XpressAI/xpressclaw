@@ -1,5 +1,8 @@
 # Workflows
 
+For Agent-driven task plans and batches of one-time or recurring workflow
+schedules, see [Project management with an Agent](project-management.md).
+
 Workflows coordinate reusable steps across one or more Agents. Each run is a
 durable workflow instance; task steps enter the normal Agent queue and their
 declared outputs become available to later steps. A run can be independent or

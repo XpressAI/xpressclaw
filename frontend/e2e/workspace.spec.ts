@@ -1,4 +1,5 @@
 import { expect, test, type Locator, type Page, type Route } from '@playwright/test';
+import yaml from 'js-yaml';
 
 const taskId = 'task-browser-test';
 const agentId = 'project-browser-test';
@@ -280,6 +281,7 @@ interface MockProject {
 		conversations: number;
 		conversation_messages: number;
 		memory_notes: number;
+		workflows?: number;
 		workflow_runs: number;
 		schedules: number;
 	};
@@ -3140,6 +3142,7 @@ test('project settings rename and delete a project', async ({ page }) => {
 			conversations: 2,
 			conversation_messages: 11,
 			memory_notes: 4,
+			workflows: 8,
 			workflow_runs: 5,
 			schedules: 2,
 		},
@@ -3173,6 +3176,7 @@ test('project settings rename and delete a project', async ({ page }) => {
 	await expect(dialog.getByText('7 task messages', { exact: false })).toBeVisible();
 	await expect(dialog.getByText('11 conversation messages', { exact: false })).toBeVisible();
 	await expect(dialog.getByText('local collaboration access', { exact: false })).toBeVisible();
+	await expect(dialog.getByText('8 Project workflow definitions, including paused and scheduled workflows')).toBeVisible();
 	await expect(dialog.getByText('including steps and waits', { exact: false })).toBeVisible();
 	await expect(dialog.getByText('source repositories, workspace folders, and reusable workflow definitions', { exact: false })).toBeVisible();
 	const permanentDelete = dialog.getByRole('button', { name: 'Permanently delete project' });
@@ -3206,6 +3210,7 @@ test('project deletion refreshes the authoritative name and counts before confir
 			conversations: 4,
 			conversation_messages: 17,
 			memory_notes: 3,
+			workflows: 1,
 			workflow_runs: 5,
 			schedules: 6,
 		},
@@ -3221,6 +3226,7 @@ test('project deletion refreshes the authoritative name and counts before confir
 	await expect(dialog.getByText('9 tasks', { exact: false })).toBeVisible();
 	await expect(dialog.getByText('13 task messages', { exact: false })).toBeVisible();
 	await expect(dialog.getByText('17 conversation messages', { exact: false })).toBeVisible();
+	await expect(dialog.getByText('1 Project workflow definition, including paused and scheduled workflows')).toBeVisible();
 	await expect(dialog.getByLabel('Type Current Project name to confirm')).toBeVisible();
 	await expect(dialog.getByLabel('Type Browser collaboration project to confirm')).toHaveCount(0);
 });
@@ -5919,6 +5925,64 @@ test('workflow gallery has six primary templates, distinct selection, and unique
 	await expect(page.locator('[data-workflow-template-card][aria-pressed="true"]')).toHaveCount(0);
 	await expect(page.getByLabel('Name')).toHaveValue('New Workflow');
 	await expect(page.getByText('One-step starter')).toBeVisible();
+});
+
+test.describe('project workflow schedules', () => {
+	// Keep navigation requests in Playwright's API mocks after the first page.
+	test.use({ timezoneId: 'Asia/Tokyo', serviceWorkers: 'block' });
+	test('one-off dates remain visible and survive visual editing and trigger changes', async ({ page }) => {
+		const workflow = {
+			id: 'project-checkpoint', name: 'Project checkpoint', description: 'Quarterly check',
+			project_id: projectId, enabled: true, default_for_tasks: false, version: 1, revision: 0,
+			created_at: timestamp(1), updated_at: timestamp(2), last_triggered_at: null, trigger_count: 0, trigger_error: null,
+			yaml_content: `name: Project checkpoint
+inputs:
+  worker: {type: agent, required: true}
+schedule:
+  run_at: '2099-06-01T00:00:00Z'
+  inputs: {worker: ${agentId}}
+flows:
+  main:
+    steps:
+      - id: audit
+        agent: '@worker'
+        prompt: Review project progress
+`,
+		};
+		await mockApi(page, { workflows: [workflow] });
+		await page.route('**/api/workflows/project-checkpoint', async route => {
+			if (route.request().method() === 'PUT') {
+				Object.assign(workflow, route.request().postDataJSON());
+				workflow.revision++;
+			}
+			await route.fulfill({ json: workflow });
+		});
+		await page.goto('/automations');
+		await expect(page.locator('[data-workflow-card]')).toContainText('Scheduled · Once');
+		await page.goto('/workflows/project-checkpoint');
+		const trigger = page.getByLabel(/AUTOMATIC TRIGGER/);
+		await expect(trigger).toHaveValue('once');
+		await expect(page.getByLabel('Workflow run time')).toHaveValue('2099-06-01T09:00');
+		async function save() {
+			const sent = page.waitForRequest(request => request.url().endsWith('/api/workflows/project-checkpoint') && request.method() === 'PUT');
+			await page.getByRole('button', { name: 'Save', exact: true }).click();
+			const content = (await sent).postDataJSON().yaml_content;
+			await expect(page.getByRole('button', { name: 'Save', exact: true })).toBeEnabled();
+			return yaml.load(content) as { schedule: { run_at?: string; cron?: string; inputs: Record<string,string> } };
+		}
+		let saved = await save();
+		expect(saved.schedule.run_at).toBe('2099-06-01T00:00:00Z');
+		expect(saved.schedule.inputs.worker).toBe(agentId);
+		await page.getByLabel('Workflow run time').fill('2099-06-02T13:45');
+		saved = await save();
+		expect(saved.schedule.run_at).toBe('2099-06-02T04:45:00.000Z');
+		await trigger.selectOption('schedule');
+		await page.getByLabel('Workflow cron schedule').fill('0 9 * * 1');
+		saved = await save();
+		expect(saved.schedule.cron).toBe('0 9 * * 1');
+		expect(saved.schedule.run_at).toBeUndefined();
+		expect(saved.schedule.inputs.worker).toBe(agentId);
+	});
 });
 
 test('scheduled workflow templates bind a real agent and editable cron schedule', async ({ page }) => {

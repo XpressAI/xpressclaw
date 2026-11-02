@@ -272,6 +272,9 @@ pub struct PortableConversationMessage {
 #[serde(deny_unknown_fields)]
 pub struct PortableWorkflow {
     pub id: String,
+    /// Owned by the enclosing Project rather than a shared template.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub project_owned: bool,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -924,6 +927,10 @@ pub struct SnapshotCounts {
 
 fn empty_object() -> Value {
     Value::Object(Default::default())
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 fn is_empty_object(value: &Value) -> bool {

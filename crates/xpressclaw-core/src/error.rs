@@ -114,6 +114,8 @@ pub enum Error {
 
     #[error("project error: {0}")]
     Project(String),
+    #[error("project access denied: {0}")]
+    ProjectAccess(String),
 
     #[error("project synchronization error: {0}")]
     Sync(String),
@@ -138,6 +140,8 @@ pub enum Error {
     // Workflows
     #[error("workflow error: {0}")]
     Workflow(String),
+    #[error("workflow schedule changed before dispatch")]
+    WorkflowScheduleChanged,
 
     #[error("workflow not found: {id}")]
     WorkflowNotFound { id: String },

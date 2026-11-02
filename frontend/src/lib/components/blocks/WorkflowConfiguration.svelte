@@ -1,5 +1,6 @@
 <script lang="ts">
 	import type { Agent } from '$lib/api';
+	import { dateLabel, localInput, scheduleTimestamp } from '$lib/taskPlanning';
 
 	export type WorkflowInputType = 'string' | 'number' | 'boolean' | 'json' | 'agent';
 	export interface WorkflowInputDefinition {
@@ -11,6 +12,7 @@
 	}
 	export interface WorkflowScheduleDefinition {
 		cron: string;
+		run_at?: string;
 		inputs: Record<string, unknown>;
 	}
 
@@ -98,11 +100,25 @@
 	}
 
 	function setTriggerMode(mode: string) {
+		delete valueErrors['schedule:run_at'];
 		if (mode === 'schedule') {
-			onupdate(inputs, schedule ?? { cron: '0 9 * * *', inputs: {} });
+			onupdate(inputs, { cron: schedule?.cron || '0 9 * * *', inputs: schedule?.inputs || {} });
+		} else if (mode === 'once') {
+			onupdate(inputs, { cron: '', run_at: schedule?.run_at || new Date(Date.now() + 3600000).toISOString(), inputs: schedule?.inputs || {} });
 		} else {
 			valueErrors = Object.fromEntries(Object.entries(valueErrors).filter(([key]) => !key.startsWith('schedule:')));
 			onupdate(inputs, null);
+		}
+	}
+
+	function setRunTime(value: string) {
+		try {
+			const run_at = scheduleTimestamp(value);
+			if (!run_at) throw new Error('Choose a date and time.');
+			delete valueErrors['schedule:run_at'];
+			updateSchedule({ run_at, cron: '' });
+		} catch (error) {
+			valueErrors['schedule:run_at'] = error instanceof Error ? error.message : String(error);
 		}
 	}
 
@@ -164,7 +180,7 @@
 		<div class="min-w-0 flex-1">
 			<div class="text-sm font-medium text-foreground">Inputs & trigger</div>
 			<div class="truncate text-[10px] text-muted-foreground">
-				{Object.keys(inputs).length} input{Object.keys(inputs).length === 1 ? '' : 's'} · {schedule ? schedule.cron : 'manual runs'}
+				{Object.keys(inputs).length} input{Object.keys(inputs).length === 1 ? '' : 's'} · {schedule?.run_at ? dateLabel(schedule.run_at) : schedule ? schedule.cron : 'manual runs'}
 			</div>
 		</div>
 		<button type="button" onclick={() => (expanded = !expanded)} aria-label={expanded ? 'Collapse workflow configuration' : 'Expand workflow configuration'} class="text-muted-foreground hover:text-foreground">
@@ -176,12 +192,17 @@
 		<div class="space-y-4 border-t border-border/40 px-3 py-3">
 			<div class="grid gap-3 sm:grid-cols-[12rem_1fr]">
 				<label class="text-[10px] font-medium text-muted-foreground">AUTOMATIC TRIGGER
-					<select value={schedule ? 'schedule' : 'manual'} onchange={(event) => setTriggerMode(event.currentTarget.value)} class="mt-1 w-full rounded border border-input bg-background px-2 py-1.5 text-xs text-foreground">
+					<select value={schedule?.run_at ? 'once' : schedule ? 'schedule' : 'manual'} onchange={(event) => setTriggerMode(event.currentTarget.value)} class="mt-1 w-full rounded border border-input bg-background px-2 py-1.5 text-xs text-foreground">
 						<option value="manual">Manual only</option>
 						<option value="schedule">Cron schedule</option>
+						<option value="once">Run once</option>
 					</select>
 				</label>
-				{#if schedule}
+				{#if schedule?.run_at}
+					<label class="text-[10px] font-medium text-muted-foreground">RUN AT (YOUR LOCAL TIME)
+						<input aria-label="Workflow run time" type="datetime-local" value={localInput(schedule.run_at)} onchange={(event) => setRunTime(event.currentTarget.value)} class="mt-1 w-full rounded border border-input bg-background px-2 py-1.5 text-xs text-foreground" />
+					</label>
+				{:else if schedule}
 					<label class="text-[10px] font-medium text-muted-foreground">CRON (SERVER-LOCAL TIME)
 						<input aria-label="Workflow cron schedule" type="text" value={schedule.cron} oninput={(event) => updateSchedule({ cron: event.currentTarget.value })} placeholder="0 9 * * 1" class="mt-1 w-full rounded border border-input bg-background px-2 py-1.5 font-mono text-xs text-foreground" />
 					</label>

@@ -118,7 +118,7 @@ pub struct PlanningState {
     pub queued: bool,
     pub actual_started_at: Option<String>,
 }
-#[derive(Default, Deserialize)]
+#[derive(Default, Clone, Deserialize)]
 pub struct PlanningFilter {
     pub project_id: Option<String>,
     pub agent_id: Option<String>,
@@ -170,6 +170,14 @@ impl TaskPlanner {
     }
 
     pub fn list(&self, filter: &PlanningFilter) -> Result<PlanningPage> {
+        self.list_inner(filter, None)
+    }
+
+    pub fn list_for_agent(&self, filter: &PlanningFilter, agent: &str) -> Result<PlanningPage> {
+        self.list_inner(filter, Some(agent))
+    }
+
+    fn list_inner(&self, filter: &PlanningFilter, agent: Option<&str>) -> Result<PlanningPage> {
         if filter
             .search
             .as_ref()
@@ -180,6 +188,10 @@ impl TaskPlanner {
             ));
         }
         self.db.with_conn(|conn| {
+            let mut filter = filter.clone();
+            if let Some(agent) = agent {
+                filter.project_id = Some(crate::projects::agent_project(conn, agent)?);
+            }
             let mut predicate = " FROM planned tasks WHERE 1=1".to_string();
             let mut values: Vec<Box<dyn rusqlite::types::ToSql>> = vec![];
             for (column, value) in [("project_id", &filter.project_id), ("agent_id", &filter.agent_id)] {
@@ -220,9 +232,54 @@ impl TaskPlanner {
         self.db.with_conn(|conn| read_planning(conn, id))
     }
 
+    pub fn detail_for_agent(&self, id: &str, agent: &str) -> Result<serde_json::Value> {
+        self.db.with_conn(|conn| {
+            let project = crate::projects::agent_project(conn, agent)?;
+            crate::projects::require_project_task(conn, &project, id)?;
+            let task = read_planning(conn, id)?;
+            let mut statement = conn.prepare(
+                "SELECT id,role,content,timestamp FROM task_messages WHERE task_id=?1 ORDER BY id DESC LIMIT 20"
+            )?;
+            let mut messages = statement.query_map([id], |row| Ok(serde_json::json!({
+                "id": row.get::<_, i64>(0)?, "role": row.get::<_, String>(1)?,
+                "content": row.get::<_, String>(2)?, "timestamp": row.get::<_, String>(3)?,
+            })))?.collect::<std::result::Result<Vec<_>, _>>()?;
+            messages.reverse();
+            Ok(serde_json::json!({"task": task, "messages": messages}))
+        })
+    }
+
     pub fn change(&self, id: &str, request: &PlanningChange) -> Result<PlanningTask> {
+        self.change_inner(id, request, None)
+    }
+
+    pub fn change_for_agent(
+        &self,
+        id: &str,
+        request: &PlanningChange,
+        agent: &str,
+    ) -> Result<PlanningTask> {
+        self.change_inner(id, request, Some(agent))
+    }
+
+    fn change_inner(
+        &self,
+        id: &str,
+        request: &PlanningChange,
+        agent: Option<&str>,
+    ) -> Result<PlanningTask> {
         self.db.with_conn(|conn| {
             let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+            let project = agent.map(|agent| crate::projects::agent_project(&tx, agent)).transpose()?;
+            if let Some(project) = project.as_deref() {
+                crate::projects::require_project_task(&tx, project, id)?;
+                if let PlanningAction::Assign { agent_id } = &request.change {
+                    if !tx.query_row("SELECT EXISTS(SELECT 1 FROM agents WHERE id=?1 AND project_id=?2)",
+                        params![agent_id, project], |row| row.get::<_, bool>(0))? {
+                        return Err(Error::ProjectAccess("Assigned Agent was not found in the current Project".into()));
+                    }
+                }
+            }
             TaskQueue::ensure_locally_scheduled(&tx, id)?;
             let current = read_planning(&tx, id)?;
             if current.task.revision != request.expected_revision {
@@ -262,6 +319,9 @@ impl TaskPlanner {
                         _ => return Err(Error::Task("Choose exactly one neighboring task".into())),
                     };
                     if target == id { return Err(Error::Task("Choose a different neighboring task".into())); }
+                    if let Some(project) = project.as_deref() {
+                        crate::projects::require_project_task(&tx, project, target)?;
+                    }
                     let target = read_planning(&tx, target)?;
                     if target.planning.disabled_reason.is_some() || target.planning.lane != current.planning.lane {
                         return Err(Error::Task("Reorder within the same editable column".into()));

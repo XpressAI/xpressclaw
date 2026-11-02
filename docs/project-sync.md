@@ -14,7 +14,8 @@ The version 1 store carries portable Project data:
 - Project metadata and Project Agents;
 - tasks, dependencies, and task messages;
 - Conversations, participants, and messages;
-- reusable workflows associated with the Project; and
+- Project-owned workflow plans, including paused and future work, and reusable
+  workflows associated with the Project; and
 - Project memory notes, tags, and links, unless disabled by the manifest.
 
 Conversation and task messages are written as separate append-oriented records.
@@ -25,7 +26,7 @@ that task is linked or deleted. This avoids a single frequently rewritten
 transcript and allows Git to merge independent message additions more cleanly.
 
 Runtime state remains local: work attempts, queues, active turns, hidden idle
-tasks, internal task context, workflow instances, schedules, logs, connector
+tasks, internal task context, workflow instances, wake-up schedules, logs, connector
 state, binary attachments, generated embeddings, and retained runner sessions
 are not synchronized. Existing local records that are absent from a fetched
 snapshot are retained; version 1 fetches do not apply remote deletions.
@@ -46,7 +47,12 @@ directory as its local workspace and no credentials.
 
 Imported workflow definitions are disabled when they are new to an
 installation, preventing a fetch from activating scheduled automation.
-Existing local enable/disable state is preserved.
+Existing local enable/disable state is preserved. Workflow YAML includes its
+one-time or recurring timing and inputs; execution history stays local.
+Project-owned workflows retain their ownership so the Project's manager can
+edit or enable them after fetch. The optional `project_owned: true` field binds
+a definition to the enclosing Project; records without it remain shared
+templates. Fetch rejects attempts to change an existing workflow's ownership.
 
 ## Manifest
 

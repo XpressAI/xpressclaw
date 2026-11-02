@@ -9,6 +9,9 @@ use super::queue::TaskQueue;
 use crate::db::Database;
 use crate::error::{Error, Result};
 use crate::projects::ensure_project_accepts_work;
+#[cfg(test)]
+#[path = "project_planning_tests.rs"]
+mod project_planning_tests;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1515,8 +1518,12 @@ impl TaskBoard {
     ) -> Result<bool> {
         let mut visited = std::collections::HashSet::new();
         let mut stack = vec![depends_on_id.to_string()];
-        let mut dependencies =
-            conn.prepare("SELECT depends_on_id FROM task_dependencies WHERE task_id = ?1")?;
+        // Parent completion also waits on durable blocking children. Include
+        // those edges so indirect dependencies cannot deadlock a whole plan.
+        let mut dependencies = conn.prepare(
+            "SELECT depends_on_id FROM task_dependencies WHERE task_id=?1
+             UNION SELECT id FROM tasks WHERE parent_task_id=?1 AND blocks_parent=1",
+        )?;
         while let Some(current) = stack.pop() {
             if current == task_id {
                 return Ok(true);
@@ -1595,54 +1602,105 @@ impl TaskBoard {
         tasks: &[BatchTaskInput],
         parent_task_id: Option<&str>,
     ) -> Result<Vec<Task>> {
-        // Validate every schedule before the first task commits. A bad date in
-        // a later entry must not leave a partially created batch behind.
-        let schedules = tasks
-            .iter()
-            .map(|input| super::planning::normalize_start_after(input.start_after.as_deref()))
-            .collect::<Result<Vec<_>>>()?;
-        let mut ref_to_id: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-        let mut created = Vec::new();
+        self.create_batch_inner(tasks, parent_task_id, None)
+    }
 
-        // First pass: create all tasks and map refs to UUIDs
-        for (input, start_after) in tasks.iter().zip(schedules) {
-            let task = self.create(&CreateTask {
-                start_after,
-                backlog: input.backlog,
-                title: input.title.clone(),
-                description: input.description.clone(),
-                agent_id: input.agent_id.clone(),
-                parent_task_id: parent_task_id.map(|s| s.to_string()),
-                sop_id: None,
-                conversation_id: None,
-                priority: input.priority,
-                context: Some(serde_json::json!({
-                    "session_mode": if input.new_session { "new" } else { "continue" },
-                })),
-            })?;
-            if let Some(ref r) = input.ref_name {
-                ref_to_id.insert(r.clone(), task.id.clone());
-            }
-            created.push(task);
+    /// Commit a manager's complete plan and its queue entries together.
+    pub fn create_batch_for_agent(
+        &self,
+        tasks: &[BatchTaskInput],
+        parent_task_id: Option<&str>,
+        creator: &str,
+    ) -> Result<Vec<Task>> {
+        self.create_batch_inner(tasks, parent_task_id, Some(creator))
+    }
+
+    fn create_batch_inner(
+        &self,
+        tasks: &[BatchTaskInput],
+        parent_task_id: Option<&str>,
+        creator: Option<&str>,
+    ) -> Result<Vec<Task>> {
+        if tasks.is_empty() || tasks.len() > 100 {
+            return Err(Error::Task(
+                "Create between 1 and 100 tasks per batch".into(),
+            ));
         }
-
-        // Second pass: add dependency edges
-        for (i, input) in tasks.iter().enumerate() {
-            if let Some(ref deps) = input.depends_on {
-                let task_id = &created[i].id;
-                for dep_ref in deps {
-                    // Resolve ref to UUID — could be a batch ref or an existing task UUID
-                    let dep_id = ref_to_id
-                        .get(dep_ref)
-                        .cloned()
-                        .unwrap_or_else(|| dep_ref.clone());
-                    self.add_dependency(task_id, &dep_id)?;
+        self.db.with_conn(|conn| {
+            let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+            let project = creator.map(|agent| crate::projects::agent_project(&tx, agent)).transpose()?;
+            if let (Some(project), Some(parent)) = (project.as_deref(), parent_task_id) {
+                // Idle turns have a hidden current task, which must still be
+                // able to delegate through the existing default-parent contract.
+                if !tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?1 AND project_id=?2
+                     AND provenance!='native_plan' AND (hidden=0 OR agent_id=?3))",
+                    rusqlite::params![parent, project, creator], |row| row.get::<_, bool>(0),
+                )? {
+                    return Err(Error::ProjectAccess("Parent task was not found in the current Project".into()));
                 }
             }
-        }
-
-        Ok(created)
+            let mut references = std::collections::HashMap::new();
+            let mut ids = Vec::new();
+            for input in tasks {
+                if input.title.trim().is_empty() {
+                    return Err(Error::Task("Task titles must not be empty".into()));
+                }
+                if input.priority.is_some_and(|priority| !(-1000..=1000).contains(&priority)) {
+                    return Err(Error::Task("Priority must be between -1000 and 1000".into()));
+                }
+                let mut context = serde_json::json!({
+                    "session_mode": if input.new_session { "new" } else { "continue" },
+                });
+                if let Some(project) = &project {
+                    let assigned = input.agent_id.as_deref().or(creator).unwrap();
+                    if !tx.query_row("SELECT EXISTS(SELECT 1 FROM agents WHERE id=?1 AND project_id=?2)",
+                        rusqlite::params![assigned, project], |row| row.get::<_, bool>(0))? {
+                        return Err(Error::ProjectAccess("Assigned Agent was not found in the current Project; use list_project_agents to obtain its ID".into()));
+                    }
+                    context["project_id"] = project.clone().into();
+                }
+                let id = Self::create_in_transaction(&tx, &CreateTask {
+                    start_after: input.start_after.clone(), backlog: input.backlog,
+                    title: input.title.clone(), description: input.description.clone(),
+                    agent_id: input.agent_id.clone().or_else(|| creator.map(str::to_owned)),
+                    parent_task_id: parent_task_id.map(str::to_owned),
+                    priority: input.priority, context: Some(context), ..Default::default()
+                }, None)?;
+                if let Some(reference) = &input.ref_name {
+                    if reference.trim().is_empty() || references.insert(reference.clone(), id.clone()).is_some() {
+                        return Err(Error::Task("Batch task refs must be non-empty and unique".into()));
+                    }
+                }
+                ids.push(id);
+            }
+            for (input, id) in tasks.iter().zip(&ids) {
+                for reference in input.depends_on.iter().flatten() {
+                    let dependency = references.get(reference).unwrap_or(reference);
+                    if let Some(project) = project.as_deref() {
+                        crate::projects::require_project_task(&tx, project, dependency)?;
+                    }
+                    if Self::would_create_cycle(&tx, id, dependency)? {
+                        return Err(Error::Task("Task dependencies would create a completion cycle".into()));
+                    }
+                    TaskQueue::ensure_locally_scheduled(&tx, dependency)?;
+                    tx.execute("INSERT OR IGNORE INTO task_dependencies(task_id,depends_on_id) VALUES(?1,?2)",
+                        rusqlite::params![id, dependency])?;
+                }
+            }
+            if creator.is_some() {
+                for (input, id) in tasks.iter().zip(&ids).filter(|(input, _)| !input.backlog) {
+                    TaskQueue::enqueue_in_transaction(&tx, id,
+                        input.agent_id.as_deref().or(creator).unwrap())?;
+                }
+            }
+            let created = ids.iter().map(|id| {
+                tx.query_row("SELECT * FROM tasks WHERE id=?1", [id], |row| Ok(row_to_task(row)))
+                    .map_err(Error::from)?
+            }).collect::<Result<Vec<_>>>()?;
+            tx.commit()?;
+            Ok(created)
+        })
     }
 }
 
@@ -2000,7 +2058,7 @@ pub(super) fn append_task_search(
 }
 
 /// Input for batch task creation.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 pub struct BatchTaskInput {
     #[serde(default)]
     pub backlog: bool,

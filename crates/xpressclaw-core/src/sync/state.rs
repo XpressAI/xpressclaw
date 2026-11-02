@@ -15,6 +15,7 @@ use crate::db::{task_search_key, Database};
 use crate::error::{Error, Result};
 use crate::memory::vector::simple_embedding;
 use crate::projects::ensure_project_accepts_work;
+use crate::workflows::definition::WorkflowDefinition;
 
 use super::manifest::ProjectSyncManifest;
 use super::model::{
@@ -25,6 +26,10 @@ use super::model::{
     PortableTaskDependency, PortableTaskMessage, PortableWakeOnSettings, PortableWorkflow,
     StoreDescriptor, CONVERSATION_MESSAGE_DELETED_AT_KEY, STORE_VERSION,
 };
+
+#[cfg(test)]
+#[path = "workflow_tests.rs"]
+mod workflow_tests;
 
 #[derive(Debug, Clone)]
 pub(super) struct SyncState {
@@ -410,14 +415,20 @@ fn export_transaction(
     let workflows = query_records(
         connection,
         "SELECT workflow.id, workflow.name, workflow.description, workflow.yaml_content,
-                workflow.version, workflow.created_at, workflow.updated_at
+                workflow.version, workflow.created_at, workflow.updated_at,
+                workflow.project_id IS NOT NULL
          FROM workflows workflow
-         JOIN project_workflows project_workflow ON project_workflow.workflow_id = workflow.id
-         WHERE project_workflow.project_id = ?1 ORDER BY workflow.id",
+         WHERE workflow.project_id = ?1
+            OR (workflow.project_id IS NULL AND EXISTS (
+                SELECT 1 FROM project_workflows association
+                WHERE association.workflow_id = workflow.id AND association.project_id = ?1
+            ))
+         ORDER BY workflow.id",
         [&manifest.project_id],
         |row| {
             Ok(PortableWorkflow {
                 id: row.get(0)?,
+                project_owned: row.get(7)?,
                 name: row.get(1)?,
                 description: row.get(2)?,
                 yaml_content: row.get(3)?,
@@ -1020,6 +1031,14 @@ fn import_transaction(
 }
 
 fn validate_local_scopes(connection: &Connection, snapshot: &PortableSnapshot) -> Result<()> {
+    struct LocalWorkflow {
+        name: String,
+        description: Option<String>,
+        yaml_content: String,
+        version: u32,
+        project_id: Option<String>,
+    }
+
     for agent in &snapshot.agents {
         reject_foreign_owner(
             connection,
@@ -1096,13 +1115,31 @@ fn validate_local_scopes(connection: &Connection, snapshot: &PortableSnapshot) -
                 workflow.name
             )));
         }
-        let existing: Option<(String, Option<String>, String, u32)> = connection
+        let existing = connection
             .query_row(
-                "SELECT name, description, yaml_content, version FROM workflows WHERE id = ?1",
+                "SELECT name, description, yaml_content, version, project_id FROM workflows WHERE id = ?1",
                 [&workflow.id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok(LocalWorkflow {
+                    name: row.get(0)?,
+                    description: row.get(1)?,
+                    yaml_content: row.get(2)?,
+                    version: row.get(3)?,
+                    project_id: row.get(4)?,
+                }),
             )
             .optional()?;
+        let expected_owner = workflow
+            .project_owned
+            .then_some(snapshot.project.id.as_str());
+        if existing
+            .as_ref()
+            .is_some_and(|local| local.project_id.as_deref() != expected_owner)
+        {
+            return Err(Error::Sync(format!(
+                "workflow '{}' has different local ownership; synchronization cannot change workflow ownership",
+                workflow.id
+            )));
+        }
         let associated_with_project: bool = connection.query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM project_workflows
@@ -1119,12 +1156,13 @@ fn validate_local_scopes(connection: &Connection, snapshot: &PortableSnapshot) -
             params![workflow.id, snapshot.project.id],
             |row| row.get(0),
         )?;
-        if (!associated_with_project || shared_elsewhere)
-            && existing.is_some_and(|(name, description, yaml, version)| {
-                name != workflow.name
-                    || description != workflow.description
-                    || yaml != workflow.yaml_content
-                    || version != workflow.version
+        if !workflow.project_owned
+            && (!associated_with_project || shared_elsewhere)
+            && existing.is_some_and(|local| {
+                local.name != workflow.name
+                    || local.description != workflow.description
+                    || local.yaml_content != workflow.yaml_content
+                    || local.version != workflow.version
             })
         {
             return Err(Error::Sync(format!(
@@ -1429,16 +1467,39 @@ fn import_task_messages(connection: &Connection, snapshot: &PortableSnapshot) ->
 
 fn import_workflows(connection: &Connection, snapshot: &PortableSnapshot) -> Result<()> {
     for workflow in &snapshot.workflows {
+        let previous_yaml: Option<String> = connection
+            .query_row(
+                "SELECT yaml_content FROM workflows WHERE id = ?1",
+                [&workflow.id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let schedule_changed = previous_yaml
+            .as_deref()
+            .map(|yaml| -> Result<bool> {
+                Ok(WorkflowDefinition::parse(yaml)?.schedule
+                    != WorkflowDefinition::parse(&workflow.yaml_content)?.schedule)
+            })
+            .transpose()?
+            .unwrap_or(false);
         connection.execute(
             "INSERT INTO workflows
-                (id, name, description, yaml_content, enabled, version, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7)
+                (id, name, description, yaml_content, enabled, version, created_at, updated_at, project_id)
+             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, ?8)
              ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 description = excluded.description,
                 yaml_content = excluded.yaml_content,
                 version = excluded.version,
-                updated_at = excluded.updated_at",
+                updated_at = excluded.updated_at,
+                revision = workflows.revision + 1,
+                last_triggered_at = CASE WHEN ?9 THEN NULL ELSE workflows.last_triggered_at END,
+                trigger_error = CASE WHEN ?9 THEN NULL ELSE workflows.trigger_error END
+             WHERE workflows.name IS NOT excluded.name
+                OR workflows.description IS NOT excluded.description
+                OR workflows.yaml_content IS NOT excluded.yaml_content
+                OR workflows.version IS NOT excluded.version
+                OR workflows.updated_at IS NOT excluded.updated_at",
             params![
                 workflow.id,
                 workflow.name,
@@ -1446,7 +1507,9 @@ fn import_workflows(connection: &Connection, snapshot: &PortableSnapshot) -> Res
                 workflow.yaml_content,
                 workflow.version,
                 workflow.created_at,
-                workflow.updated_at
+                workflow.updated_at,
+                workflow.project_owned.then_some(snapshot.project.id.as_str()),
+                schedule_changed
             ],
         )?;
         connection.execute(
@@ -2319,6 +2382,7 @@ mod tests {
         let mut snapshot = export_snapshot(&db, &config, &manifest()).unwrap();
         snapshot.workflows.push(PortableWorkflow {
             id: "workflow-one".into(),
+            project_owned: false,
             name: "shared-name".into(),
             description: None,
             yaml_content: "remote definition".into(),

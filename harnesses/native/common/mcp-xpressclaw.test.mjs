@@ -48,6 +48,39 @@ test('native environment tools bind ports, task creation and publication to thei
     for (const name of ['create_task', 'forward_port', 'expose_port', 'list_port_forwards', 'remove_port_forward', 'publish_task_files']) assert.ok(names.includes(name));
     await call('create_task', { title: 'Delegated work', agent_id: 'reviewer' });
     assert.deepEqual(requests.at(-1), { url: '/api/environments/atlas/tasks', agent: 'atlas', body: { title: 'Delegated work', agent_id: 'reviewer', parent_task_id: 'parent-task' } });
+    await call('list_project_agents', { limit: 25, offset: 25 });
+    assert.equal(requests.at(-1).url, '/api/environments/atlas/agents?limit=25&offset=25');
+    await call('create_task', { title: 'Next quarter', parent_task_id: null, backlog: true, start_after: '2099-01-01T00:00:00Z' });
+    assert.equal(requests.at(-1).body.parent_task_id, null);
+    assert.equal(requests.at(-1).body.backlog, true);
+    const tasks = [
+      { ref: 'research', title: 'Research', agent_id: 'reviewer', backlog: true },
+      { title: 'Implement', depends_on: ['research'], start_after: '2099-02-01T00:00:00Z' },
+    ];
+    await call('create_tasks', { tasks, parent_task_id: null });
+    assert.deepEqual(requests.at(-1), { url: '/api/environments/atlas/tasks/batch', agent: 'atlas', body: { tasks, parent_task_id: null } });
+    await call('create_tasks', { tasks });
+    assert.equal(requests.at(-1).body.parent_task_id, 'parent-task');
+    await call('list_project_tasks', { status: 'scheduled', offset: 100 });
+    assert.equal(requests.at(-1).url, '/api/environments/atlas/tasks?status=scheduled&offset=100');
+    await call('get_project_task', { task_id: 'task-one' });
+    assert.equal(requests.at(-1).url, '/api/environments/atlas/tasks/task-one');
+    await call('update_task_planning', { task_id: 'task-one', expected_revision: 2, action: 'queue' });
+    assert.deepEqual(requests.at(-1).body, { expected_revision: 2, action: 'queue' });
+    assert.equal(requests.at(-1).url, '/api/environments/atlas/tasks/task-one/planning');
+    await call('list_project_workflows', { include_templates: false });
+    assert.equal(requests.at(-1).url, '/api/environments/atlas/workflows?include_templates=false');
+    await call('get_project_workflow', { workflow_id: 'template-one' });
+    assert.equal(requests.at(-1).url, '/api/environments/atlas/workflows/template-one');
+    const schedules = [{ workflow_id: 'template-one', inputs: { worker: 'reviewer' }, cron: '0 9 * * 1', enabled: false }];
+    await call('schedule_workflows', { schedules });
+    assert.deepEqual(requests.at(-1), { url: '/api/environments/atlas/workflows/schedule', agent: 'atlas', body: { schedules } });
+    const workflows = [{ yaml_content: 'name: Draft\nflows: {main: {steps: []}}', enabled: false }];
+    await call('create_workflows', { workflows });
+    assert.deepEqual(requests.at(-1).body, { workflows });
+    await call('update_project_workflow', { workflow_id: 'owned-one', expected_revision: 1, enabled: false });
+    assert.equal(requests.at(-1).url, '/api/environments/atlas/workflows/owned-one');
+    assert.deepEqual(requests.at(-1).body, { expected_revision: 1, enabled: false });
     await call('expose_port', { container_port: 3000 });
     assert.deepEqual(requests.at(-1).body, { direction: 'container_to_host', container_port: 3000, host_port: 3000 });
     await call('forward_port', { direction: 'host_to_container', host_port: 8080, container_port: 8081 });
@@ -56,6 +89,19 @@ test('native environment tools bind ports, task creation and publication to thei
     assert.equal(requests.at(-1).url, '/api/environments/atlas/tasks/parent-task/files');
     assert.deepEqual(requests.at(-1).body.files, ['/tmp/report', path.resolve('results')]);
   } finally { child.kill(); await new Promise(resolve => server.close(resolve)); }
+});
+
+test('project planning schemas expose dates, approval holds, independent parents and bounded batches', () => {
+  const tool = (name) => TOOLS.find(tool => tool.name === name).inputSchema;
+  assert.deepEqual(tool('create_task').properties.parent_task_id.type, ['string', 'null']);
+  assert.deepEqual(tool('create_task').properties.start_after.type, ['string', 'null']);
+  assert.equal(tool('create_task').properties.backlog.type, 'boolean');
+  assert.equal(tool('create_tasks').properties.tasks.maxItems, 100);
+  assert.equal(tool('create_tasks').properties.tasks.items.properties.depends_on.type, 'array');
+  assert.equal(tool('schedule_workflows').properties.schedules.maxItems, 100);
+  assert.equal(tool('schedule_workflows').properties.schedules.items.oneOf.length, 2);
+  assert.ok(tool('update_task_planning').required.includes('expected_revision'));
+  assert.ok(tool('update_project_workflow').required.includes('expected_revision'));
 });
 
 test('binds a scheduled wake-up to the task that armed it', () => {

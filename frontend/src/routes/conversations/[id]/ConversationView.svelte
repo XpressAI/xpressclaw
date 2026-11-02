@@ -69,7 +69,7 @@
 	));
 	let workflowDefinition = $derived(parseWorkflow(workflowList.find((workflow) => workflow.id === taskWorkflow)));
 	let workflowInputs = $derived(Object.entries(workflowDefinition?.inputs ?? {}));
-	let manualWorkflowList = $derived(workflowList.filter((workflow) => !workflowContinuesSourceTask(parseWorkflow(workflow))));
+	let manualWorkflowList = $derived(workflowList.filter((workflow) => (!workflow.project_id || workflow.project_id === conversation?.project_id) && !workflowContinuesSourceTask(parseWorkflow(workflow))));
 
 	interface WorkflowInput {
 		type?: 'string' | 'number' | 'boolean' | 'agent';

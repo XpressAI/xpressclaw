@@ -1,8 +1,10 @@
 # Projects and deletion
 
 A Project is XpressClaw's collaboration and memory boundary. It owns its
-Agents, Conversations, Tasks, Project memory, and the runs and schedules that
-were started for that Project. Reusable workflow definitions and connectors
+Agents, Conversations, Tasks, Project memory, manager-created workflow
+definitions, and the runs and schedules planned or started for that Project.
+Moving the last Agent out of a Project preserves its owned workflows and
+schedules, including paused plans. Reusable workflow definitions and connectors
 can be shared by several Projects and are not owned by one Project merely
 because it used them.
 
@@ -21,8 +23,9 @@ Confirmed deletion:
 - removes every Project Agent from `xpressclaw.yaml` and from local
   collaboration-service access assignments;
 - deletes the Project's Tasks, task messages and attachments, Conversations,
-  messages, attachments and turns, Project memory, workflow runs, owned
-  schedules, sync state, and other Project runtime records; and
+  messages, attachments and turns, Project memory, owned workflow definitions
+  and schedules (including paused workflows), workflow runs, sync state, and
+  other Project runtime records; and
 - removes only the deleted Project's association with reusable workflows.
   Shared/global workflow definitions and connectors remain available.
 
