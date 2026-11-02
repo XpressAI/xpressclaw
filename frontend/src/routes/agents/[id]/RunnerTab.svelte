@@ -4,7 +4,7 @@
 	import { canonicalHarnessKind, harnessName, inferHarnessKindFromBackend, openExternal } from '$lib/utils';
 	import DirectoryPicker from '$lib/components/DirectoryPicker.svelte';
 	import HostSshAccess from '$lib/components/HostSshAccess.svelte';
-	import type { AcpAgentCatalogEntry, AcpConfigOption, AcpModeState, LiveConfig, McpServerDefinition, McpVerificationResult, NativeRunnerConfig, PreservedEnvironment } from '$lib/api';
+	import type { AcpAgentCatalogEntry, AcpConfigOption, AcpModeState, LiveConfig, McpServerDefinition, McpVerificationResult, NativeRunnerConfig, PreservedEnvironment, RunnerReadiness } from '$lib/api';
 
 	interface Props {
 		agentConfig: LiveConfig['agents'][0] | null;
@@ -51,6 +51,8 @@
 	let rebuildingEnvironment = $state(false);
 	let rebuildResult = $state<{ message: string; error: boolean } | null>(null);
 	let runnerImageUpdate = $state<{ message: string; error: boolean } | null>(null);
+	let runnerReadiness = $state<RunnerReadiness | null>(null);
+	let readinessRequest = 0;
 	let savedKind = $state('');
 	let savedContainerEngine = $state<'none' | 'host'>('none');
 	let modelOptions = $derived(selectChoices(configOptions.find((option) => option.category === 'model' || option.id === 'model')));
@@ -142,6 +144,7 @@
 			const result = await agents.updateRunnerImage(id);
 			if (id !== agentId) return;
 			image = result.image;
+			void refreshRunnerReadiness(id);
 			const version = result.version ? ` ${result.version}` : '';
 			runnerImageUpdate = {
 				message: result.changed
@@ -170,6 +173,7 @@
 			if (id !== agentId) return;
 			preservedEnvironments = result.preserved_environments;
 			confirmingRebuild = false;
+			void refreshRunnerReadiness(id);
 			rebuildResult = { message: 'Ready for a fresh environment. New work will use your saved settings and selected image.', error: false };
 		} catch (error) {
 			if (id !== agentId) return;
@@ -187,6 +191,14 @@
 			return typeof item.id === 'string' && typeof item.name === 'string'
 				&& (item.type === 'select' || item.type === 'boolean');
 		});
+	}
+
+	async function refreshRunnerReadiness(id: string) {
+		const request = ++readinessRequest;
+		try {
+			const result = await sessions.readiness(id);
+			if (id === agentId && request === readinessRequest) runnerReadiness = result;
+		} catch {}
 	}
 
 	function modeOption(value: unknown): AcpConfigOption | null {
@@ -238,10 +250,12 @@
 		rebuildResult = null;
 		runnerImageUpdate = null;
 		confirmingRebuild = false;
+		runnerReadiness = null;
+		void refreshRunnerReadiness(id);
 		void agents.environment(id).then((result) => {
 			if (!disposed) preservedEnvironments = result.preserved_environments;
 		}).catch(() => {});
-		return () => { disposed = true; };
+		return () => { disposed = true; readinessRequest++; };
 	});
 
 	let initializedAgentId = '';
@@ -478,6 +492,12 @@
 
 		<div class="mt-4">
 			<label for="runner-image" class="mb-1 block text-xs font-medium text-muted-foreground">Image for new environments</label>
+			{#if runnerReadiness?.runner_update}
+				<p data-runner-upgrade-details class="mb-3 text-xs text-muted-foreground">
+					Harness update available: current environment {runnerReadiness.runner_update.current_version}; downloaded {runnerReadiness.runner_update.available_version}.
+					The downloaded version takes effect after an environment rebuild.
+				</p>
+			{/if}
 			<div class="flex gap-2">
 				<input id="runner-image" bind:value={image} class="min-w-0 flex-1 rounded-md border border-input bg-background px-3 py-2 font-mono text-sm outline-none focus:ring-1 focus:ring-ring" />
 				{#if canUpdateRunnerImage}

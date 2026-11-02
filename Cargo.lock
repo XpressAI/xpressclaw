@@ -8311,6 +8311,7 @@ dependencies = [
  "reqwest 0.12.28",
  "ring",
  "rust-embed",
+ "semver",
  "serde",
  "serde_json",
  "sha2",

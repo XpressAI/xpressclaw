@@ -622,6 +622,7 @@ export interface RunnerReadiness {
 	image_present: boolean;
 	using_retained?: boolean;
 	can_prepare?: boolean;
+	runner_update?: { current_version: string; available_version: string } | null;
 	workspace: string;
 	workspace_present: boolean;
 	model: string | null;

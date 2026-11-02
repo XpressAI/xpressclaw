@@ -2,7 +2,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use xpressclaw_core::acp::{
@@ -197,6 +197,12 @@ async fn readiness(
     };
     let can_prepare = docker_available && runtime_image.is_none() && retained_issue.is_none();
     let image_present = runtime_image.is_some();
+    let runner_update = match (docker.as_ref(), runtime_image.as_deref()) {
+        (Some(docker), Some(current)) if using_retained => {
+            downloaded_runner_update(docker, current, &image, &kind).await
+        }
+        _ => None,
+    };
     let presentation_supported = kind == "codex";
     let presentation_available = match (docker.as_ref(), runtime_image.as_deref()) {
         (Some(docker), Some(image)) if presentation_supported => {
@@ -252,6 +258,7 @@ async fn readiness(
         "image_present": image_present,
         "using_retained": using_retained,
         "can_prepare": can_prepare,
+        "runner_update": runner_update,
         "workspace": workspace.display().to_string(),
         "workspace_present": workspace_present,
         "model": agent.runner.model,
@@ -277,6 +284,53 @@ async fn readiness(
         },
         "issues": issues,
     }))
+}
+
+#[derive(Debug, Serialize)]
+struct RunnerUpdate {
+    current_version: String,
+    available_version: String,
+}
+
+impl RunnerUpdate {
+    fn from_versions(current: &str, available: &str) -> Option<Self> {
+        let parse =
+            |value: &str| semver::Version::parse(value.strip_prefix('v').unwrap_or(value)).ok();
+        if !parse(available)?.cmp_precedence(&parse(current)?).is_gt() {
+            return None;
+        }
+        Some(Self {
+            current_version: current.to_string(),
+            available_version: available.to_string(),
+        })
+    }
+}
+
+// Compare version labels on the retained base and the locally available selected
+// image. Checking readiness never contacts the registry or changes an environment.
+async fn downloaded_runner_update(
+    docker: &DockerManager,
+    current: &str,
+    selected: &str,
+    kind: &str,
+) -> Option<RunnerUpdate> {
+    if !is_builtin_runner_image_for_kind(selected, kind) {
+        return None;
+    }
+    let available = available_runner_image(docker, selected, kind).await?;
+    if !docker
+        .image_has_label(&available, "io.xpressclaw.agent", kind)
+        .await
+    {
+        return None;
+    }
+    let current_version = docker
+        .image_label(current, "io.xpressclaw.runner.version")
+        .await?;
+    let available_version = docker
+        .image_label(&available, "io.xpressclaw.runner.version")
+        .await?;
+    RunnerUpdate::from_versions(&current_version, &available_version)
 }
 
 async fn available_runner_image(docker: &DockerManager, image: &str, kind: &str) -> Option<String> {
@@ -580,6 +634,26 @@ mod tests {
     use xpressclaw_core::tasks::board::TaskStatus;
 
     use super::*;
+
+    #[test]
+    fn upgrade_notice_requires_newer_version_precedence() {
+        for (current, available, expected) in [
+            ("2.1.1", "2.2.2", true),
+            ("2.9.0", "2.10.0", true),
+            ("2.2.2", "2.1.1", false),
+            ("2.2.2", "2.2.2", false),
+            ("2.2.2+old-image", "2.2.2+new-image", false),
+            ("2.2.2-rc.1", "2.2.2", true),
+            ("2.2.2", "2.2.2-rc.1", false),
+            ("v2.1.1", "v2.2.2", true),
+            ("", "2.2.2", false),
+            ("2.1.1", "latest", false),
+            ("custom", "2.2.2", false),
+        ] {
+            let update = RunnerUpdate::from_versions(current, available);
+            assert_eq!(update.is_some(), expected, "{current} -> {available}");
+        }
+    }
 
     fn test_app_with_db() -> (Router, Arc<Database>) {
         let db = Arc::new(Database::open_memory().unwrap());
@@ -900,6 +974,7 @@ mod tests {
                 assert_eq!(ready["can_prepare"], false);
                 assert_eq!(ready["runtime_image"].as_str(), before.image.as_deref());
                 assert_eq!(ready["issues"], json!([]));
+                assert!(ready["runner_update"].is_null());
             }
             // A retained custom image cannot satisfy a newly selected built-in
             // harness. Pulling another tag would not repair that environment.
