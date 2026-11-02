@@ -122,6 +122,8 @@ jobs:
           test_name=docker::environment::tests::retained_environment_roundtrip
           cargo test -p xpressclaw-core --lib "$test_name" -- --ignored --exact --list | grep -Fx "$test_name: test"
           XPRESSCLAW_ENVIRONMENT_TEST_IMAGE=xpressclaw-environment-test:local cargo test -p xpressclaw-core --lib "$test_name" -- --ignored --exact --nocapture
+          test_name=docker::manager::recovery::tests::macos_user_recovery_restores_image_identity_and_keeps_files
+          XPRESSCLAW_ENVIRONMENT_TEST_IMAGE=xpressclaw-environment-test:local cargo test -p xpressclaw-core --lib "$test_name" -- --ignored --exact --nocapture
           test_name=workers::native::tests::image_update_retains_installed_files_and_dependent_container
           XPRESSCLAW_RETENTION_TEST_IMAGE=xpressclaw-environment-test:local cargo test -p xpressclaw-core --lib "$test_name" -- --ignored --exact --nocapture
           # BuildKit's base-image cache does not load this tag into the daemon.

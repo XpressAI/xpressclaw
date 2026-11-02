@@ -172,6 +172,12 @@ npm --prefix frontend run test:e2e -- --grep 'adaptive workspace|mobile editing'
 
 ## Native runner images
 
+Native runners use the CLI version installed in their image, independently of
+the host's CLI version. Rootful macOS runtimes retain the image's user so its
+home directory is writable. Linux runtimes use the host UID/GID, and rootless
+engines use container root to map bind mounts to the engine's user. Changes to
+this policy use the normal retained-environment recovery, preserving files.
+
 Build all standard and host-engine runner variants:
 
 ```bash

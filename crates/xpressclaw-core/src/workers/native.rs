@@ -3552,6 +3552,13 @@ fn container_descendant_path(repository: &RuntimeRepository, host_path: &Path) -
     }
 }
 
+fn native_runner_uses_host_user(macos_host: bool, rootless: bool) -> bool {
+    // macOS UIDs belong to the host, not the Linux VM. Keep the image's user
+    // so its home remains writable. Rootless engines still need container root
+    // to map bind mounts to the user running the engine.
+    !macos_host || rootless
+}
+
 fn build_spec(
     config: &Config,
     agent: &AgentConfig,
@@ -3664,7 +3671,10 @@ fn build_spec(
         expose_port: None,
         cmd: Some(command),
         working_dir: Some(repository.container_root.clone()),
-        run_as_host_user: true,
+        run_as_host_user: native_runner_uses_host_user(
+            cfg!(target_os = "macos"),
+            docker.is_rootless(),
+        ),
     })
 }
 
@@ -4645,6 +4655,34 @@ fn truncate(value: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn macos_rootful_runners_keep_the_image_user() {
+        assert!(!native_runner_uses_host_user(true, false));
+    }
+
+    #[test]
+    fn native_linux_and_rootless_runners_keep_host_user_mapping() {
+        assert!(native_runner_uses_host_user(false, false));
+        assert!(native_runner_uses_host_user(false, true));
+        assert!(native_runner_uses_host_user(true, true));
+    }
+
+    #[test]
+    fn macos_user_policy_changes_the_retained_container_spec() {
+        let previous = ContainerSpec {
+            run_as_host_user: true,
+            ..Default::default()
+        };
+        let corrected = ContainerSpec {
+            run_as_host_user: native_runner_uses_host_user(true, false),
+            ..previous.clone()
+        };
+        assert_ne!(
+            container_spec_fingerprint(&previous).unwrap(),
+            container_spec_fingerprint(&corrected).unwrap(),
+        );
+    }
+
     #[tokio::test]
     async fn retained_images_require_the_selected_harness_before_recovery() {
         for (identity, built_in, allowed) in [

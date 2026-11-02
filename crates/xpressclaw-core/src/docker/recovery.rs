@@ -778,6 +778,72 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires Docker/Podman and XPRESSCLAW_ENVIRONMENT_TEST_IMAGE"]
+    async fn macos_user_recovery_restores_image_identity_and_keeps_files() {
+        let Ok(image) = std::env::var("XPRESSCLAW_ENVIRONMENT_TEST_IMAGE") else {
+            eprintln!("skipping macOS user recovery integration test; set XPRESSCLAW_ENVIRONMENT_TEST_IMAGE to run it");
+            return;
+        };
+        let installation = format!("macos-user-test-{}", uuid::Uuid::new_v4());
+        let docker = DockerManager::connect_for_installation(&installation)
+            .await
+            .unwrap();
+        let name = docker.owned_project_container_name("agent").unwrap();
+        let previous = ContainerSpec {
+            image: image.clone(),
+            expose_port: None,
+            environment: vec!["HOME=/home/node".into()],
+            cmd: Some(vec![
+                "node".into(),
+                "-e".into(),
+                "setInterval(()=>{},1000)".into(),
+            ]),
+            run_as_host_user: true,
+            ..Default::default()
+        };
+        // Reproduce the old macOS override on any test host.
+        let original = docker
+            .docker
+            .create_container(
+                Some(CreateContainerOptions {
+                    name: name.clone(),
+                    platform: None,
+                }),
+                ContainerConfig {
+                    image: Some(image),
+                    user: Some("501:20".into()),
+                    env: Some(previous.environment.clone()),
+                    cmd: previous.cmd.clone(),
+                    labels: Some(project_container_labels(
+                        &container_spec_fingerprint(&previous).unwrap(),
+                        &installation,
+                        "agent",
+                    )),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let result = std::panic::AssertUnwindSafe(async {
+            docker.docker.start_container::<String>(&original.id, None).await.unwrap();
+            let denied = exec_output(&docker, &original.id, "const fs=require('fs');fs.writeFileSync('/tmp/retained-file','keep');try{fs.mkdirSync('/home/node/.local/share/opencode/log',{recursive:true});console.log('unexpected success')}catch(error){console.log(error.code)}").await;
+            assert_eq!(denied.trim(), "EACCES");
+            let corrected = ContainerSpec { run_as_host_user: false, ..previous };
+            assert!(docker.project_configuration_needs_recovery("agent", &corrected).await.unwrap());
+            docker.recover_project_configuration("agent", &corrected).await.unwrap();
+            let actual = run(&docker, "const fs=require('fs');fs.mkdirSync('/home/node/.local/share/opencode/log',{recursive:true});fs.writeFileSync('/home/node/.local/share/opencode/log/opencode.log','ready');console.log(JSON.stringify([process.getuid(),fs.readFileSync('/tmp/retained-file','utf8'),fs.readFileSync('/home/node/.local/share/opencode/log/opencode.log','utf8')]));").await;
+            assert_eq!(actual.trim(), r#"[1000,"keep","ready"]"#);
+            docker.finish_project_recovery("agent").await.unwrap();
+            assert!(!docker.project_configuration_needs_recovery("agent", &corrected).await.unwrap());
+        }).catch_unwind().await;
+        let _ = docker.rollback_project_recovery("agent").await;
+        let _ = docker.remove_owned_workload("agent").await;
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    #[tokio::test]
     #[ignore = "requires Docker/Podman and XPRESSCLAW_RETENTION_TEST_IMAGE"]
     async fn stopped_helpers_preserve_their_files_without_blocking_recovery_or_rebuild() {
         let Ok(image) = std::env::var("XPRESSCLAW_RETENTION_TEST_IMAGE") else {
