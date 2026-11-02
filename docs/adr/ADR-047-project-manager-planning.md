@@ -40,6 +40,12 @@ workflow scheduler.
 Schema version 55 adds nullable Project ownership and a revision to workflows.
 Existing definitions retain their current global ownership and cron behavior.
 New Project-owned definitions are removed by cascading Project deletion.
+Project synchronization exports owned definitions before their first run and
+preserves ownership through an optional `project_owned` flag in portable
+workflow records. Existing shared records retain their representation. Fetch
+keeps new workflows disabled, preserves existing local enablement, and rejects
+ownership changes to an existing definition. Imported edits advance the local
+revision and reset the occurrence timestamp when scheduling changes.
 
 Expose the resulting work through the existing Tasks and Automations views,
 including editable one-time workflow dates. Backlog tasks and disabled
