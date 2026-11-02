@@ -1,0 +1,3 @@
+OpenCode runner startup on macOS failed because the container ran with the host UID 501 while the image home and log belonged to node UID 1000. Reproduced the exact permission error with the pinned OpenCode 1.19.4; the host CLI version does not choose the container binary.
+
+Keep the image user for rootful macOS runtimes and serialize that selection so retained-environment recovery applies it while preserving files. Linux and rootless mappings retain their existing behavior. Validation: 946 core unit tests passed; formatting and Clippy passed; Docker-compatible recovery regression reproduced UID 501 denial and verified UID 1000 logging plus retained-file contents.
