@@ -208,6 +208,7 @@
 	}
 
 	function supportsNewWork(workflow: Workflow): boolean {
+		if (workflow.project_id && workflow.project_id !== selectedProject) return false;
 		const definition = workflowDefinition(workflow);
 		if (!definition || definition.trigger) return false;
 		if (Object.values(definition.flows ?? {}).some((flow) => usesConnectorSink(flow.steps ?? []))) return false;

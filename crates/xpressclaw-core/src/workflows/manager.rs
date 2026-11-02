@@ -8,6 +8,9 @@ use crate::db::Database;
 use crate::error::{Error, Result};
 
 use super::definition::WorkflowDefinition;
+#[path = "project_planning.rs"]
+mod project_planning;
+pub use project_planning::{ProjectWorkflowInput, ScheduledWorkflowInput};
 
 /// A workflow definition record as stored in the database.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,6 +31,10 @@ pub struct WorkflowRecord {
     pub last_triggered_at: Option<String>,
     pub trigger_count: i64,
     pub trigger_error: Option<String>,
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub revision: i64,
 }
 
 /// Request to create a new workflow.
@@ -146,6 +153,7 @@ impl WorkflowManager {
             conn.execute(
                 "UPDATE workflows
                  SET yaml_content = ?1,
+                     revision = revision + 1,
                      version = ?2,
                      name = ?3,
                      description = ?4,
@@ -216,7 +224,7 @@ impl WorkflowManager {
 
         let affected = self.db.with_conn(|conn| {
             conn.execute(
-                "UPDATE workflows SET enabled = ?1, updated_at = ?2 WHERE id = ?3",
+                "UPDATE workflows SET enabled = ?1, updated_at = ?2, revision = revision + 1 WHERE id = ?3",
                 rusqlite::params![enabled as i32, now, id],
             )
             .map_err(|e| Error::Database(e.to_string()))
@@ -255,6 +263,7 @@ impl WorkflowManager {
             conn.execute(
                 "UPDATE workflows
                  SET default_for_tasks = ?1,
+                     revision = revision + 1,
                      enabled = CASE WHEN ?1 = 1 THEN 1 ELSE enabled END,
                      updated_at = ?2
                  WHERE id = ?3",
@@ -319,6 +328,8 @@ fn row_to_workflow(row: &rusqlite::Row) -> WorkflowRecord {
         last_triggered_at: row.get("last_triggered_at").unwrap_or_default(),
         trigger_count: row.get("trigger_count").unwrap_or(0),
         trigger_error: row.get("trigger_error").unwrap_or_default(),
+        project_id: row.get("project_id").unwrap_or_default(),
+        revision: row.get("revision").unwrap_or(0),
     }
 }
 

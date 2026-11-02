@@ -114,7 +114,7 @@
 	interface YamlDef {
 		name?: string; description?: string; version?: number;
 		trigger?: { connector: string; channel: string; event: string; filter?: Record<string, unknown> };
-		schedule?: { cron: string; inputs?: Record<string, unknown> };
+		schedule?: { cron: string; run_at?: string; inputs?: Record<string, unknown> };
 		inputs?: Record<string, WorkflowInputDefinition>;
 		variables?: Record<string, unknown>;
 		flows?: Record<string, { color?: string; steps?: any[] }>;
@@ -135,7 +135,7 @@
 		return {
 			flows: result,
 			trigger: def.trigger || null,
-			schedule: def.schedule ? { cron: def.schedule.cron || '', inputs: def.schedule.inputs || {} } : null,
+			schedule: def.schedule ? { cron: def.schedule.cron || '', ...(def.schedule.run_at ? { run_at: def.schedule.run_at } : {}), inputs: def.schedule.inputs || {} } : null,
 			inputs: def.inputs || {},
 			variables: def.variables || {},
 		};
@@ -258,7 +258,7 @@
 			const [wf, al] = await Promise.all([
 				workflows.get(id), agents.list().catch(() => [])
 			]);
-				workflow = wf; workflowName = wf.name; yamlContent = wf.yaml_content; agentList = al;
+				workflow = wf; workflowName = wf.name; yamlContent = wf.yaml_content; agentList = wf.project_id ? al.filter(agent => agent.project_id === wf.project_id) : al;
 			const capabilities = await Promise.all(al.map(async (agent) => {
 				const events = await sessions.events(agent.id).catch(() => []);
 				return [agent.name, controlsFromEvents(events, agent.config?.runner?.mcp_servers ?? [])] as const;
@@ -738,14 +738,14 @@
 
 		{#if workflow && scheduleConfig}
 			<label class="relative inline-flex items-center cursor-pointer shrink-0" title={workflow.enabled ? 'Disable' : 'Enable'}>
-				<input type="checkbox" checked={workflow.enabled} onchange={toggleEnabled} class="sr-only peer" />
+				<input type="checkbox" checked={workflow.enabled} disabled={Boolean(scheduleConfig.run_at && workflow.last_triggered_at)} onchange={toggleEnabled} class="sr-only peer" />
 				<div class="w-8 h-[18px] bg-muted rounded-full peer peer-checked:bg-emerald-600 transition-colors after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:rounded-full after:h-3.5 after:w-3.5 after:transition-all peer-checked:after:translate-x-full"></div>
 			</label>
 		{/if}
 		{#if workflow}
-			<label class="flex shrink-0 cursor-pointer items-center gap-2 rounded-md border border-border px-2.5 py-1.5 text-xs" title="Attach this workflow once to every ordinary Agent task">
+			<label class="flex shrink-0 cursor-pointer items-center gap-2 rounded-md border border-border px-2.5 py-1.5 text-xs" title={workflow.project_id ? 'Attach this workflow once to each ordinary task in its Project' : 'Attach this workflow once to every ordinary Agent task'}>
 				<input aria-label="Run for every new task" type="checkbox" checked={workflow.default_for_tasks} onchange={toggleDefaultForTasks} class="accent-primary" />
-				Run for every task
+				{workflow.project_id ? 'Run for each Project task' : 'Run for every task'}
 			</label>
 		{/if}
 

@@ -86,6 +86,37 @@ pub struct ProjectManager {
     db: Arc<Database>,
 }
 
+/// Resolve a runner's live Project inside the transaction performing its work.
+pub(crate) fn agent_project(conn: &rusqlite::Connection, agent: &str) -> Result<String> {
+    let project = conn
+        .query_row(
+            "SELECT project_id FROM agents WHERE id = ?1",
+            [agent],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten()
+        .ok_or_else(|| {
+            Error::ProjectAccess("The calling Agent must belong to an active Project".into())
+        })?;
+    ensure_project_accepts_work(conn, &project)?;
+    Ok(project)
+}
+
+pub(crate) fn require_project_task(
+    conn: &rusqlite::Connection,
+    project: &str,
+    task: &str,
+) -> Result<()> {
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?1 AND project_id=?2 AND hidden=0 AND provenance!='native_plan')",
+        rusqlite::params![task, project], |row| row.get::<_, bool>(0),
+    )? {
+        return Err(Error::ProjectAccess("Task was not found in the current Project".into()));
+    }
+    Ok(())
+}
+
 /// Reject new Project-owned work after the first phase of cascading deletion.
 ///
 /// Callers use this inside the same write transaction that attaches the new

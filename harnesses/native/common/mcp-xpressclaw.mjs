@@ -27,17 +27,110 @@ const LOCAL_COLLABORATION = process.env.XPRESSCLAW_LOCAL_COLLABORATION === '1';
 const COLLABORATION_TOKEN = process.env.XPRESSCLAW_COLLABORATION_TOKEN ?? '';
 const execFile = promisify(execFileCallback);
 
-const INSTRUCTIONS = CONNECTED ? `This turn belongs to Xpress AI. Your final response is returned to its chat or task automatically. Use send_conversation_message for interim updates and files (8 MiB per file, 20 MiB per turn), and list_platform_attachments and download_conversation_attachment for platform chat uploads. Use create_conversation_task to create independent follow-up work assigned to you in the same platform project. Local wake-ups and delegation are unavailable for connected turns; leave a clear final status when waiting. The platform owns task scheduling and cancellation. When executing an assigned task, perform the work in that task; never create a replacement task for the same assignment. For an assigned task, call get_task to read its checklist, update_task_step for completed or skipped steps (zero-based step_num), then update_task_status with Done, Failed, Waiting, or Doing before your final reply. The requested status takes effect with the final reply, subject to the platform completion gates. Workspace paths are not download links; publish files before your final response.` : `Container paths such as /tmp are not user download links. Use publish_task_files for task deliverables, or send_conversation_message with files for conversation deliverables. Both support files and folder archives. Users can browse the container and download larger folders from Files → Container. Use forward_port for a host-local LLM and expose_port for a container server. For shared interactive logins, run tmux new-session -s NAME; the user can join NAME from the Files terminal.\n\nUse schedule_wakeup whenever work must pause and resume later.
+const INSTRUCTIONS = CONNECTED ? `This turn belongs to Xpress AI. Your final response is returned to its chat or task automatically. Use send_conversation_message for interim updates and files (8 MiB per file, 20 MiB per turn), and list_platform_attachments and download_conversation_attachment for platform chat uploads. Use create_conversation_task to create independent follow-up work assigned to you in the same platform project. Local wake-ups and delegation are unavailable for connected turns; leave a clear final status when waiting. The platform owns task scheduling and cancellation. When executing an assigned task, perform the work in that task; never create a replacement task for the same assignment. For an assigned task, call get_task to read its checklist, update_task_step for completed or skipped steps (zero-based step_num), then update_task_status with Done, Failed, Waiting, or Doing before your final reply. The requested status takes effect with the final reply, subject to the platform completion gates. Workspace paths are not download links; publish files before your final response.` : `Container paths such as /tmp are not user download links. Use publish_task_files for task deliverables, or send_conversation_message with files for conversation deliverables. Both support files and folder archives. Users can browse the container and download larger folders from Files → Container. Use forward_port for a host-local LLM and expose_port for a container server. For shared interactive logins, run tmux new-session -s NAME; the user can join NAME from the Files terminal.\n\nFor project management, discover teammates with list_project_agents and use their exact IDs. create_tasks can commit up to 100 tasks with ref-based dependencies, start_after and Backlog placement. For independent long-term work set parent_task_id to null so this planning turn can finish. When asked only for a plan, keep tasks in Backlog and workflows disabled until execution is authorized. Inspect progress with list_project_tasks and get_project_task; change future work with update_task_planning. Discover workflow templates with list_project_workflows and get_project_workflow, then schedule independent project-owned copies with schedule_workflows, or author definitions with create_workflows. update_project_workflow can pause, enable or reschedule the Project’s copies.\n\nUse schedule_wakeup whenever work must pause and resume later.
 
 The wake-up is stored by XpressClaw, survives control-plane restarts, and starts exactly one future turn in this project's existing ACP conversation. After it is armed, end the current turn instead of sleeping, polling, or claiming that an OS timer can initiate a model turn.
 
 XpressClaw also provides durable, project-scoped memory. Read memory://project/briefing or call get_project_memory_index near the start of work that depends on project conventions or prior decisions. Search before making a project-wide choice. Store only durable, reusable knowledge as an atomic note; do not use memory as a task log. Typed links are explicit claims, while vector similarity is only a retrieval aid.${CONVERSATION_ID ? '\n\nThis turn is linked to a project conversation. Your normal final response is automatically delivered to this project conversation; use it for your one final reply. Reserve send_conversation_message for genuine interim updates or publishing workspace files while you continue working. Never use the tool to duplicate your final response. Use download_conversation_attachment to inspect files people or other Agents published, and create_conversation_task when substantial work should continue independently.' : ''}`;
 
+const taskProperties = {
+  title: { type: 'string', minLength: 1 }, description: { type: 'string' },
+  agent_id: { type: 'string', description: 'Exact ID from list_project_agents; omitted means the calling Agent.' },
+  priority: { type: 'integer', minimum: -1000, maximum: 1000 },
+  start_after: { type: ['string', 'null'], description: 'Earliest start as an RFC 3339 timestamp including timezone. Omit for immediate eligibility.' },
+  backlog: { type: 'boolean', description: 'True parks work for approval. It cannot run until moved to the queue, even after start_after.' },
+  new_session: { type: 'boolean' },
+  depends_on: { type: 'array', items: { type: 'string' }, description: 'Task IDs in this Project, or refs in this batch, that must complete first.' },
+};
+const parentTaskProperty = {
+  type: ['string', 'null'],
+  description: 'Omit to make blocking children of the current task. Use null for independent long-term work that should not block this planning turn.',
+};
+const pageProperties = {
+  limit: { type: 'integer', minimum: 1, maximum: 200 }, offset: { type: 'integer', minimum: 0 },
+};
+
 export const TOOLS = [
   {
+    name: 'list_project_agents',
+    description: 'Discover Agents in your current Project, including exact IDs, display titles, harnesses and status. Use these IDs for assignments instead of guessing names.',
+    inputSchema: { type: 'object', properties: pageProperties, additionalProperties: false },
+  },
+  {
+    name: 'list_project_tasks',
+    description: 'Inspect and paginate durable work in the current Project, with scheduling state, dependencies and revisions. Use status=all for completed work too.',
+    inputSchema: { type: 'object', properties: { ...pageProperties, agent_id: { type: 'string' }, status: { type: 'string', enum: ['active','all','attention','backlog','queue','scheduled','working','input','blocked','review','done'] }, search: { type: 'string', maxLength: 200 } }, additionalProperties: false },
+  },
+  {
+    name: 'get_project_task',
+    description: 'Read a Project task, its current planning revision and its latest 20 messages, including worker results.',
+    inputSchema: { type: 'object', properties: { task_id: { type: 'string', minLength: 1 } }, required: ['task_id'], additionalProperties: false },
+  },
+  {
     name: 'create_task',
-    description: 'Create durable work in the current project, optionally assigned to another Agent in this project. Defaults to the current task as parent; unfinished child tasks block the parent from completing.',
-    inputSchema: { type: 'object', properties: { title: { type: 'string', minLength: 1 }, description: { type: 'string' }, agent_id: { type: 'string' }, parent_task_id: { type: 'string' }, priority: { type: 'integer' } }, required: ['title'], additionalProperties: false },
+    description: 'Create durable Project work assigned to an Agent, optionally in Backlog, with an earliest start and dependencies. Eligible work is queued; Backlog is held for approval. Omit parent_task_id for a blocking child, or set it to null for independent future work.',
+    inputSchema: { type: 'object', properties: { ...taskProperties, parent_task_id: parentTaskProperty }, required: ['title'], additionalProperties: false },
+  },
+  {
+    name: 'create_tasks',
+    description: 'Atomically create 1–100 Project tasks with assignments, future starts, Backlog and dependencies. Give tasks unique refs to reference prerequisites within the batch. Invalid batches create nothing. Larger plans can use multiple batches and returned task IDs.',
+    inputSchema: { type: 'object', properties: {
+      tasks: { type: 'array', minItems: 1, maxItems: 100, items: { type: 'object', properties: { ...taskProperties, ref: { type: 'string', minLength: 1 } }, required: ['title'], additionalProperties: false } },
+      parent_task_id: parentTaskProperty,
+    }, required: ['tasks'], additionalProperties: false },
+  },
+  {
+    name: 'update_task_planning',
+    description: 'Schedule, park, release, reassign or reprioritize a Project task. Read its revision first. queue releases Backlog but preserves its date and dependencies; schedule with activate=true also releases Backlog. Running work cannot be changed with this tool.',
+    inputSchema: { type: 'object', properties: {
+      task_id: { type: 'string', minLength: 1 }, expected_revision: { type: 'integer' },
+      action: { type: 'string', enum: ['schedule','backlog','queue','assign','priority'] },
+      start_after: taskProperties.start_after, activate: { type: 'boolean' },
+      agent_id: taskProperties.agent_id, priority: taskProperties.priority,
+    }, required: ['task_id','expected_revision','action'], additionalProperties: false },
+  },
+  {
+    name: 'list_project_workflows',
+    description: 'Discover shared workflow templates and workflows owned by this Project. Includes IDs, input schemas, schedules, execution counts and errors. Set include_templates=false to inspect only this Project’s work.',
+    inputSchema: { type: 'object', properties: { ...pageProperties, include_templates: { type: 'boolean' } }, additionalProperties: false },
+  },
+  {
+    name: 'get_project_workflow',
+    description: 'Read a shared template or this Project’s workflow, including its YAML and current revision.',
+    inputSchema: { type: 'object', properties: { workflow_id: { type: 'string' } }, required: ['workflow_id'], additionalProperties: false },
+  },
+  {
+    name: 'create_workflows',
+    description: 'Atomically create 1–100 workflows owned by this Project from validated YAML. Workflows may include schedule.run_at (RFC 3339) or schedule.cron (server-local time), and schedule.inputs. All assigned Agents must belong to this Project. Use enabled=false to hold a proposal for approval. Workflows appear in Automations.',
+    inputSchema: { type: 'object', properties: {
+      workflows: { type: 'array', minItems: 1, maxItems: 100, items: {
+        type: 'object', properties: { yaml_content: { type: 'string', minLength: 1 }, enabled: { type: 'boolean' } },
+        required: ['yaml_content'], additionalProperties: false,
+      } },
+    }, required: ['workflows'], additionalProperties: false },
+  },
+  {
+    name: 'schedule_workflows',
+    description: 'Atomically schedule 1–100 independent copies of existing workflows in this Project. Each entry supplies its own inputs and exactly one of run_at or cron. Templates remain unchanged. One-time copies disable after firing; recurring copies keep running. Use enabled=false for approval.',
+    inputSchema: { type: 'object', properties: {
+      schedules: { type: 'array', minItems: 1, maxItems: 100, items: {
+        type: 'object', properties: {
+          workflow_id: { type: 'string' }, name: { type: 'string' },
+          inputs: { type: 'object', additionalProperties: true },
+          run_at: { type: 'string', description: 'RFC 3339 date and time including timezone.' },
+          cron: { type: 'string', description: 'Cron expression in the server’s local timezone.' },
+          enabled: { type: 'boolean' },
+        }, required: ['workflow_id'], oneOf: [{ required: ['run_at'], not: { required: ['cron'] } }, { required: ['cron'], not: { required: ['run_at'] } }], additionalProperties: false,
+      } },
+    }, required: ['schedules'], additionalProperties: false },
+  },
+  {
+    name: 'update_project_workflow',
+    description: 'Pause or enable a Project-owned workflow, or replace its YAML to change its schedule, inputs or steps. Read its revision first. This cannot edit shared templates or interrupt an already-started run.',
+    inputSchema: { type: 'object', properties: {
+      workflow_id: { type: 'string' }, expected_revision: { type: 'integer' },
+      enabled: { type: 'boolean' }, yaml_content: { type: 'string' },
+    }, required: ['workflow_id','expected_revision'], additionalProperties: false },
   },
   {
     name: 'forward_port',
@@ -1174,7 +1267,32 @@ async function callTool(name, argumentsValue) {
     }
   }
   const environmentPath = `/api/environments/${encodeURIComponent(AGENT_ID)}`;
-  if (name === 'create_task') return api(`${environmentPath}/tasks`, { method: 'POST', body: JSON.stringify({ ...argumentsValue, parent_task_id: argumentsValue?.parent_task_id ?? (TASK_ID || undefined) }) });
+  if (name === 'list_project_agents' || name === 'list_project_tasks') {
+    const query = new URLSearchParams(Object.entries(argumentsValue ?? {}).filter(([, value]) => value !== null && value !== undefined));
+    return api(`${environmentPath}/${name === 'list_project_agents' ? 'agents' : 'tasks'}?${query}`);
+  }
+  if (name === 'get_project_task') return api(`${environmentPath}/tasks/${encodeURIComponent(argumentsValue.task_id)}`);
+  if (name === 'create_task' || name === 'create_tasks') {
+    const args = argumentsValue ?? {};
+    const parent_task_id = Object.hasOwn(args, 'parent_task_id') ? args.parent_task_id : (TASK_ID || null);
+    return api(`${environmentPath}/tasks${name === 'create_tasks' ? '/batch' : ''}`, { method: 'POST', body: JSON.stringify({ ...args, parent_task_id }) });
+  }
+  if (name === 'update_task_planning') {
+    const { task_id, ...change } = argumentsValue;
+    return api(`${environmentPath}/tasks/${encodeURIComponent(task_id)}/planning`, { method: 'PATCH', body: JSON.stringify(change) });
+  }
+  if (name === 'list_project_workflows') {
+    const query = new URLSearchParams(Object.entries(argumentsValue ?? {}).filter(([, value]) => value !== null && value !== undefined));
+    return api(`${environmentPath}/workflows?${query}`);
+  }
+  if (name === 'get_project_workflow') return api(`${environmentPath}/workflows/${encodeURIComponent(argumentsValue.workflow_id)}`);
+  if (name === 'create_workflows' || name === 'schedule_workflows') {
+    return api(`${environmentPath}/workflows${name === 'schedule_workflows' ? '/schedule' : ''}`, { method: 'POST', body: JSON.stringify(argumentsValue) });
+  }
+  if (name === 'update_project_workflow') {
+    const { workflow_id, ...change } = argumentsValue;
+    return api(`${environmentPath}/workflows/${encodeURIComponent(workflow_id)}`, { method: 'PATCH', body: JSON.stringify(change) });
+  }
   if (name === 'forward_port') return api(`${environmentPath}/ports`, { method: 'POST', body: JSON.stringify(argumentsValue) });
   if (name === 'expose_port') return api(`${environmentPath}/ports`, { method: 'POST', body: JSON.stringify({ direction: 'container_to_host', container_port: argumentsValue?.container_port, host_port: argumentsValue?.host_port ?? argumentsValue?.container_port }) });
   if (name === 'list_port_forwards') return api(`${environmentPath}/ports`);

@@ -1,11 +1,10 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, Local, NaiveDateTime, Utc};
-use serde_json::Value;
 use tracing::{debug, error, info};
 
 use crate::db::Database;
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 use super::definition::{WorkflowDefinition, WorkflowSchedule};
 use super::engine::WorkflowEngine;
@@ -64,25 +63,18 @@ fn check_scheduled_workflows_at(db: &Arc<Database>, now: DateTime<Utc>) -> Resul
         }
 
         let triggered_at = now.naive_utc().format("%Y-%m-%d %H:%M:%S").to_string();
-        if !manager.claim_scheduled_run(
-            &workflow.id,
-            workflow.last_triggered_at.as_deref(),
-            &triggered_at,
-        )? {
-            debug!(
-                workflow_id = workflow.id,
-                "scheduled workflow was already claimed"
-            );
-            continue;
-        }
-
-        let inputs = Value::Object(schedule.inputs.clone().into_iter().collect());
-        match engine.start_instance(&workflow.id, inputs) {
+        match engine.start_scheduled_instance(workflow, &triggered_at) {
             Ok(instance_id) => {
                 started += 1;
                 info!(
                     workflow_id = workflow.id,
                     instance_id, "started scheduled workflow instance"
+                );
+            }
+            Err(Error::WorkflowScheduleChanged) => {
+                debug!(
+                    workflow_id = workflow.id,
+                    "workflow schedule was updated or claimed"
                 );
             }
             Err(error) => {
@@ -104,6 +96,10 @@ fn should_trigger(
     schedule: &WorkflowSchedule,
     now: DateTime<Utc>,
 ) -> bool {
+    if let Some(run_at) = schedule.run_at.as_deref() {
+        return workflow.last_triggered_at.is_none()
+            && DateTime::parse_from_rfc3339(run_at).is_ok_and(|deadline| deadline <= now);
+    }
     let cron = match croner::Cron::new(schedule.cron.trim()).parse() {
         Ok(cron) => cron,
         Err(error) => {
@@ -143,6 +139,146 @@ mod tests {
     use crate::agents::registry::AgentRegistry;
     use crate::workflows::instance::InstanceManager;
     use crate::workflows::manager::CreateWorkflow;
+    use crate::workflows::manager::ScheduledWorkflowInput;
+
+    #[test]
+    fn project_once_schedule_survives_reload_and_fires_once_in_its_project() {
+        let db = setup();
+        let manager = WorkflowManager::new(db.clone());
+        let template=manager.create(&CreateWorkflow {name:"Once".into(),description:None,
+            yaml_content:"name: Once\nflows:\n  main:\n    steps:\n      - id: report\n        agent: atlas\n        prompt: Report\n".into()}).unwrap();
+        let copies = manager
+            .schedule_for_agent(
+                "atlas",
+                &[ScheduledWorkflowInput {
+                    workflow_id: template.id.clone(),
+                    name: None,
+                    inputs: Default::default(),
+                    run_at: Some("2099-06-01T09:00:00+09:00".into()),
+                    cron: None,
+                    enabled: true,
+                }],
+            )
+            .unwrap();
+        let id = &copies[0].id;
+        let deadline = DateTime::parse_from_rfc3339("2099-06-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            check_scheduled_workflows_at(&db, deadline - chrono::Duration::seconds(1)).unwrap(),
+            0
+        );
+        assert_eq!(check_scheduled_workflows_at(&db, deadline).unwrap(), 1);
+        assert_eq!(
+            check_scheduled_workflows_at(&db, deadline + chrono::Duration::days(1)).unwrap(),
+            0
+        );
+        let reloaded = WorkflowManager::new(db.clone()).get(id).unwrap();
+        assert!(!reloaded.enabled);
+        assert_eq!(reloaded.trigger_count, 1);
+        let instances = InstanceManager::new(db.clone())
+            .list_instances(id, 10)
+            .unwrap();
+        assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0].project_id.as_deref(), Some("atlas"));
+        // Re-enabling a fired one-shot cannot replay its occurrence.
+        manager.set_enabled(id, true).unwrap();
+        assert_eq!(
+            check_scheduled_workflows_at(&db, deadline + chrono::Duration::days(1)).unwrap(),
+            0
+        );
+        assert!(manager.get(&template.id).unwrap().enabled);
+    }
+
+    #[test]
+    fn scheduled_instance_and_occurrence_commit_together_and_reject_stale_edits() {
+        let db = setup();
+        let manager = WorkflowManager::new(db.clone());
+        let workflow = manager
+            .create(&CreateWorkflow {
+                name: "scheduled".into(),
+                description: None,
+                yaml_content: SCHEDULED_WORKFLOW.into(),
+            })
+            .unwrap();
+        let engine = WorkflowEngine::new(db.clone());
+        manager.set_enabled(&workflow.id, false).unwrap();
+        assert!(matches!(
+            engine.start_scheduled_instance(&workflow, "2099-01-01 00:00:00"),
+            Err(Error::WorkflowScheduleChanged)
+        ));
+        assert!(InstanceManager::new(db.clone())
+            .list_instances(&workflow.id, 10)
+            .unwrap()
+            .is_empty());
+        let ready = manager.set_enabled(&workflow.id, true).unwrap();
+        engine
+            .start_scheduled_instance(&ready, "2099-01-01 00:00:00")
+            .unwrap();
+        assert!(matches!(
+            engine.start_scheduled_instance(&ready, "2099-01-01 00:00:00"),
+            Err(Error::WorkflowScheduleChanged)
+        ));
+        assert_eq!(
+            InstanceManager::new(db)
+                .list_instances(&workflow.id, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn scheduled_project_work_cannot_follow_an_agent_into_another_project() {
+        let db = setup();
+        AgentRegistry::new(db.clone())
+            .ensure("other", "codex")
+            .unwrap();
+        let manager = WorkflowManager::new(db.clone());
+        let template = manager
+            .create(&CreateWorkflow {
+                name: "Report".into(),
+                description: None,
+                yaml_content: SCHEDULED_WORKFLOW.into(),
+            })
+            .unwrap();
+        let record = manager
+            .schedule_for_agent(
+                "atlas",
+                &[ScheduledWorkflowInput {
+                    workflow_id: template.id.clone(),
+                    name: None,
+                    inputs: std::collections::HashMap::from([(
+                        "topic".into(),
+                        serde_json::json!("Audit"),
+                    )]),
+                    run_at: Some("2099-01-01T00:00:00Z".into()),
+                    cron: None,
+                    enabled: true,
+                }],
+            )
+            .unwrap()
+            .remove(0);
+        manager.set_enabled(&template.id, false).unwrap();
+        db.with_conn(|conn| {
+            conn.execute("UPDATE agents SET project_id='other' WHERE id='atlas'", [])
+        })
+        .unwrap();
+        let now = DateTime::parse_from_rfc3339("2099-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(check_scheduled_workflows_at(&db, now).unwrap(), 0);
+        assert!(InstanceManager::new(db.clone())
+            .list_instances(&record.id, 10)
+            .unwrap()
+            .is_empty());
+        assert!(manager.get(&record.id).unwrap().last_triggered_at.is_none());
+        db.with_conn(|conn| {
+            conn.execute("UPDATE agents SET project_id='atlas' WHERE id='atlas'", [])
+        })
+        .unwrap();
+        assert_eq!(check_scheduled_workflows_at(&db, now).unwrap(), 1);
+    }
 
     const SCHEDULED_WORKFLOW: &str = r#"
 name: scheduled-report

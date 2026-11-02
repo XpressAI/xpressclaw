@@ -176,7 +176,34 @@ fn environment_agent_capability_route(
             *method == Method::DELETE
         }
         ["", "api", "environments", agent, "tasks"] if *agent == agent_id => {
+            matches!(*method, Method::GET | Method::POST)
+        }
+        ["", "api", "environments", agent, "agents"] if *agent == agent_id => {
+            *method == Method::GET
+        }
+        ["", "api", "environments", agent, "workflows"] if *agent == agent_id => {
+            matches!(*method, Method::GET | Method::POST)
+        }
+        ["", "api", "environments", agent, "workflows", "schedule"] if *agent == agent_id => {
             *method == Method::POST
+        }
+        ["", "api", "environments", agent, "workflows", workflow]
+            if *agent == agent_id && !workflow.is_empty() =>
+        {
+            matches!(*method, Method::GET | Method::PATCH)
+        }
+        ["", "api", "environments", agent, "tasks", "batch"] if *agent == agent_id => {
+            *method == Method::POST
+        }
+        ["", "api", "environments", agent, "tasks", task]
+            if *agent == agent_id && !task.is_empty() =>
+        {
+            *method == Method::GET
+        }
+        ["", "api", "environments", agent, "tasks", task, "planning"]
+            if *agent == agent_id && !task.is_empty() =>
+        {
+            *method == Method::PATCH
         }
         ["", "api", "environments", agent, "tasks", task, "files"]
             if *agent == agent_id && !task.is_empty() =>
@@ -619,6 +646,49 @@ mod tests {
                 response.status() != StatusCode::UNAUTHORIZED,
                 allowed,
                 "{method} {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn project_planning_capabilities_are_bound_to_the_calling_agent() {
+        for (method, path) in [
+            ("GET", "/api/environments/atlas/agents"),
+            ("GET", "/api/environments/atlas/tasks"),
+            ("POST", "/api/environments/atlas/tasks/batch"),
+            ("GET", "/api/environments/atlas/tasks/task-1"),
+            ("PATCH", "/api/environments/atlas/tasks/task-1/planning"),
+            ("GET", "/api/environments/atlas/workflows"),
+            ("POST", "/api/environments/atlas/workflows"),
+            ("POST", "/api/environments/atlas/workflows/schedule"),
+            ("GET", "/api/environments/atlas/workflows/workflow-1"),
+            ("PATCH", "/api/environments/atlas/workflows/workflow-1"),
+        ] {
+            let method = method.parse().unwrap();
+            assert!(
+                environment_agent_capability_route(&method, path, "atlas"),
+                "{path}"
+            );
+            assert!(
+                !environment_agent_capability_route(&method, path, "other"),
+                "{path}"
+            );
+            assert!(!connected_capability_route(&method, path), "{path}");
+        }
+        for path in [
+            "/api/agents",
+            "/api/tasks",
+            "/api/workflows",
+            "/api/environments/atlas/workflows/id/delete",
+            "/api/environments/atlas/tasks/id/admin",
+        ] {
+            assert!(
+                !environment_agent_capability_route(&axum::http::Method::GET, path, "atlas"),
+                "{path}"
+            );
+            assert!(
+                !environment_agent_capability_route(&axum::http::Method::POST, path, "atlas"),
+                "{path}"
             );
         }
     }

@@ -1449,6 +1449,8 @@ export interface Connector {
 
 export interface Workflow {
 	id: string;
+	project_id?: string | null;
+	revision?: number;
 	name: string;
 	description: string | null;
 	yaml_content: string;

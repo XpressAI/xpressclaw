@@ -6,6 +6,7 @@
 	import type { Agent, Schedule, Workflow } from '$lib/api';
 	import { timeAgo } from '$lib/utils';
 	import { serverTimestampMs } from '$lib/serverTime';
+	import { dateLabel } from '$lib/taskPlanning';
 	import yaml from 'js-yaml';
 
 	let workflowList = $state<Workflow[]>([]);
@@ -37,7 +38,7 @@
 		|| (serverTimestampMs(right.last_run ?? right.created_at) ?? 0) - (serverTimestampMs(left.last_run ?? left.created_at) ?? 0)
 		|| right.id.localeCompare(left.id)
 	));
-	let enabledWorkflowCount = $derived(workflowList.filter((workflow) => workflow.enabled && (workflow.default_for_tasks || workflowMetadata(workflow.yaml_content).cron)).length);
+	let enabledWorkflowCount = $derived(workflowList.filter((workflow) => workflow.enabled && (workflow.default_for_tasks || workflowMetadata(workflow.yaml_content).timing)).length);
 	let activeScheduleCount = $derived(scheduleList.filter((schedule) => scheduleEnabled(schedule)).length);
 
 	$effect(() => {
@@ -81,10 +82,10 @@
 		if (!scheduleForm.agent_id && agentList.length > 0) scheduleForm.agent_id = agentList[0].id;
 	}
 
-	function workflowMetadata(yamlContent: string): { steps: number; flows: number; inputs: number; cron: string | null; sourceTaskOnly: boolean } {
+	function workflowMetadata(yamlContent: string): { steps: number; flows: number; inputs: number; cron: string | null; runAt: string | null; timing: string | null; sourceTaskOnly: boolean } {
 		const stepMatches = yamlContent.match(/^\s+- id:/gm);
 		type StepSummary = { type?: string; steps?: StepSummary[]; body?: StepSummary[] };
-		let definition: { inputs?: Record<string, unknown>; schedule?: { cron?: string }; flows?: Record<string, { steps?: StepSummary[] }> } = {};
+		let definition: { inputs?: Record<string, unknown>; schedule?: { cron?: string; run_at?: string }; flows?: Record<string, { steps?: StepSummary[] }> } = {};
 		try { definition = yaml.load(yamlContent) as typeof definition; } catch {}
 		const continuesSourceTask = (steps: StepSummary[]): boolean =>
 			steps.some((step) => step.type === 'continue' || continuesSourceTask(step.steps ?? step.body ?? []));
@@ -93,6 +94,8 @@
 			flows: Math.max(1, Object.keys(definition?.flows ?? {}).length),
 			inputs: Object.keys(definition?.inputs ?? {}).length,
 			cron: definition?.schedule?.cron?.trim() || null,
+			runAt: definition?.schedule?.run_at || null,
+			timing: definition?.schedule?.run_at ? dateLabel(definition.schedule.run_at) : definition?.schedule?.cron?.trim() || null,
 			sourceTaskOnly: Object.values(definition?.flows ?? {}).some((flow) => continuesSourceTask(flow.steps ?? [])),
 		};
 	}
@@ -258,9 +261,9 @@
 								<div class="flex shrink-0 items-center gap-2">
 									{#if workflow.default_for_tasks}<span class="rounded-full bg-violet-500/10 px-2 py-0.5 text-[10px] text-violet-400">Every task</span>{/if}
 									{#if metadata.sourceTaskOnly && !workflow.default_for_tasks}<span class="rounded-full bg-violet-500/10 px-2 py-0.5 text-[10px] text-violet-400">Default only</span>{/if}
-									{#if metadata.cron}
+									{#if metadata.timing}
 										<label class="relative inline-flex cursor-pointer items-center" title={workflow.enabled ? 'Disable schedule' : 'Enable schedule'}>
-											<input type="checkbox" checked={workflow.enabled} onchange={() => toggleWorkflow(workflow)} class="peer sr-only" />
+											<input type="checkbox" checked={workflow.enabled} disabled={Boolean(metadata.runAt && workflow.last_triggered_at)} onchange={() => toggleWorkflow(workflow)} class="peer sr-only" />
 											<span class="h-[18px] w-8 rounded-full bg-muted transition-colors after:absolute after:start-[2px] after:top-[2px] after:h-3.5 after:w-3.5 after:rounded-full after:bg-white after:transition-all after:content-[''] peer-checked:bg-emerald-600 peer-checked:after:translate-x-full"></span>
 										</label>
 									{:else if !workflow.default_for_tasks}
@@ -269,7 +272,7 @@
 								</div>
 							</div>
 							<div class="flex flex-wrap items-center gap-3 text-[10px] text-muted-foreground"><span>{metadata.steps} step{metadata.steps !== 1 ? 's' : ''}</span><span>{metadata.flows} flow{metadata.flows !== 1 ? 's' : ''}</span><span>{metadata.inputs} input{metadata.inputs !== 1 ? 's' : ''}</span><span>v{workflow.version}</span></div>
-							{#if metadata.cron}<div class="rounded bg-muted/50 px-2 py-1 font-mono text-[10px] text-muted-foreground">{workflow.enabled ? 'Scheduled' : 'Schedule paused'} · {metadata.cron}</div>{/if}
+							{#if metadata.timing}<div class="rounded bg-muted/50 px-2 py-1 font-mono text-[10px] text-muted-foreground">{metadata.runAt && workflow.last_triggered_at ? 'Started' : workflow.enabled ? 'Scheduled' : 'Schedule paused'} · {metadata.runAt ? 'Once · ' : ''}{metadata.timing}</div>{/if}
 							{#if workflow.trigger_error}<div class="line-clamp-2 text-[10px] text-destructive" title={workflow.trigger_error}>Last trigger failed: {workflow.trigger_error}</div>{/if}
 							<div class="flex flex-wrap items-center justify-between gap-2">
 								<span class="text-[10px] text-muted-foreground">Updated {timeAgo(workflow.updated_at)}</span>

@@ -52,6 +52,30 @@ impl AgentRegistry {
         Self { db }
     }
 
+    pub fn project_roster(
+        &self,
+        caller: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<serde_json::Value> {
+        self.db.with_conn(|conn| {
+            let project = crate::projects::agent_project(conn, caller)?;
+            let total: i64 = conn.query_row("SELECT COUNT(*) FROM agents WHERE project_id=?1",
+                [&project], |row| row.get(0))?;
+            let mut statement = conn.prepare(
+                "SELECT a.id,a.name,a.backend,COALESCE(s.status,'idle') FROM agents a
+                 LEFT JOIN logical_sessions s ON s.id=a.id
+                 WHERE a.project_id=?1 ORDER BY a.id LIMIT ?2 OFFSET ?3"
+            )?;
+            let agents = statement.query_map(rusqlite::params![project, limit.clamp(1,200), offset.max(0)],
+                |row| Ok(serde_json::json!({
+                    "id":row.get::<_, String>(0)?, "name":row.get::<_, String>(1)?,
+                    "backend":row.get::<_, String>(2)?, "status":row.get::<_, String>(3)?,
+                })))?.collect::<std::result::Result<Vec<_>,_>>()?;
+            Ok(serde_json::json!({"project_id":project,"caller_agent_id":caller,"agents":agents,"total":total}))
+        })
+    }
+
     /// Ensure an agent exists in the runtime state table.
     /// Called on startup to sync YAML agents into the DB.
     /// Does NOT overwrite status if the agent already exists.

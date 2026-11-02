@@ -28,7 +28,7 @@ use super::instance::{
     task_has_active_response, InstanceManager, StepExecution, WorkflowInstance,
     WorkflowInstanceScope, CONTINUATION_WAITING_STATUS, SOURCE_TASK_STEP_ID,
 };
-use super::manager::WorkflowManager;
+use super::manager::{WorkflowManager, WorkflowRecord};
 use super::waits::{activity_cursor_from_parts, validate_resource, WaitState};
 
 /// Maximum number of times a single step can be re-executed within one
@@ -97,6 +97,37 @@ impl WorkflowEngine {
     /// Returns the instance ID.
     pub fn start_instance(&self, workflow_id: &str, trigger_data: Value) -> Result<String> {
         self.start_instance_in_context(workflow_id, trigger_data, WorkflowContext::default())
+    }
+
+    /// Claim the occurrence in the same transaction as its durable instance.
+    /// A restart can resume the instance without losing or duplicating the run.
+    pub(crate) fn start_scheduled_instance(
+        &self,
+        record: &WorkflowRecord,
+        triggered_at: &str,
+    ) -> Result<String> {
+        let definition = WorkflowDefinition::parse(&record.yaml_content)?;
+        let schedule = definition
+            .schedule
+            .as_ref()
+            .ok_or_else(|| Error::Workflow("Workflow has no schedule".into()))?;
+        let once = schedule.run_at.is_some();
+        let (id, ()) = self.start_instance_in_context_inner_with(
+            &record.id, serde_json::json!(schedule.inputs),
+            WorkflowContext { project_id: record.project_id.clone(), conversation_id: None },
+            None, None, |tx, _| {
+                let changed = tx.execute(
+                    "UPDATE workflows SET last_triggered_at=?1,trigger_count=trigger_count+1,
+                     trigger_error=NULL,revision=revision+1,enabled=CASE WHEN ?2 THEN 0 ELSE enabled END
+                     WHERE id=?3 AND enabled=1 AND revision=?4
+                     AND last_triggered_at IS ?5",
+                    rusqlite::params![triggered_at, once, record.id, record.revision, record.last_triggered_at],
+                )?;
+                if changed != 1 { return Err(Error::WorkflowScheduleChanged); }
+                Ok(())
+            },
+        )?;
+        Ok(id)
     }
 
     pub fn start_instance_in_context(
@@ -272,6 +303,13 @@ impl WorkflowEngine {
         let mut attached = Vec::new();
         let mut errors = Vec::new();
         for workflow in defaults {
+            if workflow
+                .project_id
+                .as_deref()
+                .is_some_and(|project| task.project_id.as_deref() != Some(project))
+            {
+                continue;
+            }
             match self.attach_default_workflow_to_task(&workflow.id, &task) {
                 Ok(instance_id) => attached.push(instance_id),
                 Err(error) => {
@@ -381,6 +419,18 @@ impl WorkflowEngine {
         F: FnOnce(&rusqlite::Transaction<'_>, &str) -> Result<T>,
     {
         let record = self.manager.get(workflow_id)?;
+        if let Some(project) = record.project_id.as_deref() {
+            if workflow_context
+                .project_id
+                .as_deref()
+                .is_some_and(|requested| requested != project)
+            {
+                return Err(Error::Workflow(
+                    "Workflow belongs to a different Project".into(),
+                ));
+            }
+            workflow_context.project_id = Some(project.to_string());
+        }
         let mut definition = WorkflowDefinition::parse(&record.yaml_content)?;
         if source_task.is_none() && definition.continues_source_task() {
             return Err(Error::Workflow(

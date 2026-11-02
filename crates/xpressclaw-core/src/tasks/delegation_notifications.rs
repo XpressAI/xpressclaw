@@ -890,11 +890,14 @@ mod tests {
         let (db, board, queue, parent, child) = setup_db(Arc::new(Database::open(&path).unwrap()));
         fail(&db, &board, &queue, &child);
         reconcile(&db);
-        // Recreate the immediately preceding persisted schema: origin was
+        // Recreate the v52 persisted schema: origin was
         // unknown, so upgrading must not guess that a response is disposable.
         db.conn()
             .execute_batch(
                 "DROP TABLE task_delegation_automatic_responses;
+            DROP INDEX idx_workflows_project;
+            ALTER TABLE workflows DROP COLUMN project_id;
+            ALTER TABLE workflows DROP COLUMN revision;
             DROP INDEX idx_workflow_step_parent;
             ALTER TABLE workflow_step_executions DROP COLUMN parent_execution_id;
             ALTER TABLE workflow_step_executions DROP COLUMN command_started_at;
