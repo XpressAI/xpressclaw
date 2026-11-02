@@ -281,6 +281,7 @@ interface MockProject {
 		conversations: number;
 		conversation_messages: number;
 		memory_notes: number;
+		workflows?: number;
 		workflow_runs: number;
 		schedules: number;
 	};
@@ -3141,6 +3142,7 @@ test('project settings rename and delete a project', async ({ page }) => {
 			conversations: 2,
 			conversation_messages: 11,
 			memory_notes: 4,
+			workflows: 8,
 			workflow_runs: 5,
 			schedules: 2,
 		},
@@ -3174,6 +3176,7 @@ test('project settings rename and delete a project', async ({ page }) => {
 	await expect(dialog.getByText('7 task messages', { exact: false })).toBeVisible();
 	await expect(dialog.getByText('11 conversation messages', { exact: false })).toBeVisible();
 	await expect(dialog.getByText('local collaboration access', { exact: false })).toBeVisible();
+	await expect(dialog.getByText('8 Project workflow definitions, including paused and scheduled workflows')).toBeVisible();
 	await expect(dialog.getByText('including steps and waits', { exact: false })).toBeVisible();
 	await expect(dialog.getByText('source repositories, workspace folders, and reusable workflow definitions', { exact: false })).toBeVisible();
 	const permanentDelete = dialog.getByRole('button', { name: 'Permanently delete project' });
@@ -3207,6 +3210,7 @@ test('project deletion refreshes the authoritative name and counts before confir
 			conversations: 4,
 			conversation_messages: 17,
 			memory_notes: 3,
+			workflows: 1,
 			workflow_runs: 5,
 			schedules: 6,
 		},
@@ -3222,6 +3226,7 @@ test('project deletion refreshes the authoritative name and counts before confir
 	await expect(dialog.getByText('9 tasks', { exact: false })).toBeVisible();
 	await expect(dialog.getByText('13 task messages', { exact: false })).toBeVisible();
 	await expect(dialog.getByText('17 conversation messages', { exact: false })).toBeVisible();
+	await expect(dialog.getByText('1 Project workflow definition, including paused and scheduled workflows')).toBeVisible();
 	await expect(dialog.getByLabel('Type Current Project name to confirm')).toBeVisible();
 	await expect(dialog.getByLabel('Type Browser collaboration project to confirm')).toHaveCount(0);
 });

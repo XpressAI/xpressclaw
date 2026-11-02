@@ -443,6 +443,8 @@ mod tests {
                     VALUES ('note-one', 'one', 'Delete note', 'body', 'summary', 'delete note');
                  INSERT INTO workflows (id, name, yaml_content)
                     VALUES ('shared', 'Shared workflow', 'name: Shared');
+                 INSERT INTO workflows (id, name, yaml_content, project_id, enabled)
+                    VALUES ('planned', 'Planned workflow', 'name: Planned', 'one', 0);
                  INSERT INTO workflow_instances
                     (id, workflow_id, status, project_id, conversation_id)
                     VALUES ('run-one', 'shared', 'completed', 'one', 'conversation-one'),
@@ -468,6 +470,7 @@ mod tests {
         assert_eq!(project["deletion_counts"]["conversations"], 1);
         assert_eq!(project["deletion_counts"]["conversation_messages"], 1);
         assert_eq!(project["deletion_counts"]["memory_notes"], 1);
+        assert_eq!(project["deletion_counts"]["workflows"], 1);
         assert_eq!(project["deletion_counts"]["workflow_runs"], 1);
 
         let response = app

@@ -177,6 +177,7 @@ export interface Project {
 		conversations: number;
 		conversation_messages: number;
 		memory_notes: number;
+		workflows?: number;
 		workflow_runs: number;
 		schedules: number;
 	};
