@@ -716,7 +716,7 @@ def main():
                         "capabilities": {"tools": {}},
                         "serverInfo": {
                             "name": "xpressclaw-apps",
-                            "version": "0.4.26",
+                            "version": "0.4.35",
                         },
                     },
                 )
