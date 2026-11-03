@@ -80,7 +80,9 @@ Only the Agent assigned to the parent task can review its child. A newer
 attempt invalidates an older review request. An incomplete response, such as
 “waiting for a login refresh,” stays unfinished even if the worker ended its
 turn without requesting input through a tool. Historical completed tasks keep
-their status when upgrading; open delegations adopt the review gate.
+their status when upgrading; open delegations adopt the review gate. After
+inspecting an older result, the parent can explicitly return incorrectly
+completed work to `wait` or `revise`.
 
 Task priority orders eligible responses. Backlog holds, earliest-start dates,
 explicit `depends_on` prerequisites, and an Agent's active response still

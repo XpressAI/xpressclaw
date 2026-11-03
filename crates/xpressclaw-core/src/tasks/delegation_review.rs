@@ -144,11 +144,11 @@ pub fn review(
                 let message = TaskConversation::insert_text_message_in_transaction(&tx, child_id, "user",
                     &format!("Your parent task reviewed the result and requested revisions. Continue this same assignment.\n\n{guidance}"))?;
                 TaskQueue::enqueue_continuation_for_message_in_transaction(&tx, child_id, &agent, message.id, &message.timestamp)?;
-                tx.execute("UPDATE tasks SET parent_review_required=1 WHERE id=?1", [child_id])?;
+                tx.execute("UPDATE tasks SET parent_review_required=blocks_parent WHERE id=?1", [child_id])?;
             }
             ReviewDecision::Wait => {
                 if !active {
-                    tx.execute("UPDATE tasks SET status='blocked',completed_at=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?1 AND status!='completed'", [child_id])?;
+                    tx.execute("UPDATE tasks SET parent_review_required=blocks_parent,status='blocked',completed_at=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?1", [child_id])?;
                 }
                 TaskConversation::insert_text_message_in_transaction(&tx, child_id, "user",
                     &format!("Your parent task reviewed the result. Keep this assignment open while the following blocker remains; do not treat it as completed.\n\n{guidance}"))?;

@@ -240,6 +240,33 @@ fn request(
 }
 
 #[test]
+fn parent_can_hold_an_incomplete_result_previously_marked_completed() {
+    let (db, board, queue, parent, child) = setup();
+    let attempt = finish_child(
+        &db,
+        &board,
+        &queue,
+        &child,
+        "D1 remains incomplete. Waiting for login refresh.",
+    );
+    db.conn().execute("UPDATE tasks SET parent_review_required=0,status='completed',completed_at=CURRENT_TIMESTAMP WHERE id=?1", [&child.id]).unwrap();
+    let hold = request(&board, &parent, &child, &attempt, ReviewDecision::Wait);
+    let (held, _) = review(db.clone(), "manager", &child.id, &hold).unwrap();
+    assert_eq!(held.status, TaskStatus::Blocked);
+    assert!(held.parent_review_required);
+    assert!(held.completed_at.is_none());
+    assert!(!board.subtasks_complete(&parent.id).unwrap());
+    assert!(
+        queue.claim("worker").unwrap().is_none(),
+        "waiting records the blocker without retrying"
+    );
+    assert!(
+        queue.claim("manager").unwrap().is_none(),
+        "acknowledging a wait does not create another notification"
+    );
+}
+
+#[test]
 fn incomplete_response_wakes_parent_without_completing_child_or_releasing_dependencies() {
     let (db, board, queue, parent, child) = setup();
     let sibling = board
