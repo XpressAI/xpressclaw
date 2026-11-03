@@ -65,6 +65,11 @@ test('native environment tools bind ports, task creation and publication to thei
     assert.equal(requests.at(-1).url, '/api/environments/atlas/tasks?status=scheduled&offset=100');
     await call('get_project_task', { task_id: 'task-one' });
     assert.equal(requests.at(-1).url, '/api/environments/atlas/tasks/task-one');
+    await call('review_delegated_task', { task_id: 'task-one', expected_attempt_id: 'worker-attempt', expected_revision: 4, decision: 'revise', guidance: 'Finish the deployment before verification.' });
+    assert.deepEqual(requests.at(-1), {
+      url: '/api/environments/atlas/tasks/task-one/review', agent: 'atlas',
+      body: { expected_attempt_id: 'worker-attempt', expected_revision: 4, decision: 'revise', guidance: 'Finish the deployment before verification.', parent_task_id: 'parent-task' },
+    });
     await call('update_task_planning', { task_id: 'task-one', expected_revision: 2, action: 'queue' });
     assert.deepEqual(requests.at(-1).body, { expected_revision: 2, action: 'queue' });
     assert.equal(requests.at(-1).url, '/api/environments/atlas/tasks/task-one/planning');

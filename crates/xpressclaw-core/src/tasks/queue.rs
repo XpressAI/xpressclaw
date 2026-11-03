@@ -625,6 +625,7 @@ impl TaskQueue {
                     message_id,
                     &message_timestamp,
                 )?;
+                Self::preserve_queued_response(&transaction, task_id)?;
                 transaction.execute(
                     "UPDATE tasks SET status = 'in_progress', completed_at = NULL,
                         updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
@@ -927,6 +928,19 @@ impl TaskQueue {
                         [id],
                     )?;
                     if changed == 1 {
+                        tx.execute(
+                            "UPDATE tasks SET parent_review_required=1 WHERE id=(SELECT task_id FROM task_queue WHERE id=?1)
+                             AND blocks_parent=1 AND hidden=0 AND provenance!='native_plan'
+                             AND EXISTS (SELECT 1 FROM tasks parent JOIN agents owner ON owner.id=parent.agent_id
+                                WHERE parent.id=tasks.parent_task_id AND parent.project_id=tasks.project_id
+                                  AND owner.project_id=parent.project_id AND parent.status NOT IN ('completed','cancelled')
+                                  AND parent.hidden=0 AND parent.provenance!='native_plan'
+                                  AND NOT EXISTS (SELECT 1 FROM connect_work w WHERE w.kind='task_turn' AND w.local_id=parent.id))
+                             AND NOT EXISTS (SELECT 1 FROM connect_work w WHERE w.kind='task_turn' AND w.local_id=tasks.id)
+                             AND NOT EXISTS (SELECT 1 FROM workflow_step_executions e JOIN workflow_instances i ON i.id=e.instance_id
+                                              WHERE e.task_id=tasks.id AND e.task_id IS NOT i.source_task_id)",
+                            [id],
+                        )?;
                         tx.commit()?;
                         return Ok(Some(id));
                     }

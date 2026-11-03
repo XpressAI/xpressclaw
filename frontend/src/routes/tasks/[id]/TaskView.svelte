@@ -353,7 +353,7 @@
 	let waitingForDelegation = $derived(
 		blockingDelegates.length > 0 && !runningAttempt && !pendingElicitation
 		&& ['pending', 'in_progress'].includes(task?.status ?? '')
-		&& !['awaiting_review', 'backlog', 'scheduled'].includes(task?.activity_status ?? '')
+		&& !['awaiting_review', 'awaiting_parent_review', 'backlog', 'scheduled', 'queued'].includes(task?.activity_status ?? '')
 	);
 	let taskActivityStatus = $derived(waitingForDelegation ? (failedDelegates.length ? 'blocked' : 'waiting_for_subtasks') : task?.activity_status ?? task?.status ?? '');
 	function delegatedAgentName(item: DelegatedWork): string {
@@ -1306,7 +1306,7 @@
 		switch (status) {
 			case 'completed': return 'text-emerald-400';
 			case 'in_progress': return 'text-blue-400';
-			case 'awaiting_review': return 'text-violet-400';
+			case 'awaiting_review': case 'awaiting_parent_review': return 'text-violet-400';
 			case 'waiting_for_subtasks': return 'text-amber-400';
 			case 'idle': return 'text-muted-foreground';
 			case 'pending': return 'text-amber-400';
@@ -1321,6 +1321,7 @@
 		if (status === 'pending') return 'to do';
 		if (status === 'in_progress') return 'working';
 		if (status === 'awaiting_review') return 'awaiting review';
+		if (status === 'awaiting_parent_review') return 'awaiting parent review';
 		if (status === 'waiting_for_subtasks') return 'waiting for delegated work';
 		if (status === 'idle') return 'not running';
 		return status.replaceAll('_', ' ');
@@ -1608,7 +1609,7 @@
 							<span data-task-activity-status={taskActivityStatus} class="h-2 w-2 rounded-full {taskActivityStatus === 'in_progress' ? 'animate-pulse' : ''}
 								{taskActivityStatus === 'completed' ? 'bg-emerald-400' :
 								 taskActivityStatus === 'in_progress' ? 'bg-blue-400' :
-								 taskActivityStatus === 'awaiting_review' ? 'bg-violet-400' :
+								 ['awaiting_review', 'awaiting_parent_review'].includes(taskActivityStatus) ? 'bg-violet-400' :
 								 ['pending', 'waiting_for_subtasks'].includes(taskActivityStatus) ? 'bg-amber-400' :
 								 taskActivityStatus === 'waiting_for_input' ? 'bg-orange-400' :
 								 taskActivityStatus === 'blocked' ? 'bg-red-400' :
@@ -1631,7 +1632,7 @@
 							<button type="button" class="task-action text-primary" aria-label="Start task" title="Start task when eligible" disabled={statusUpdating} onclick={() => updateStatus('in_progress')}><Play size={17} aria-hidden="true" /></button>
 						{/if}
 						{#if ['in_progress', 'pending', 'waiting_for_input', 'blocked'].includes(task.status)}
-							<button type="button" class="task-action text-emerald-600 dark:text-emerald-400" aria-label="Complete task" title="Complete task" disabled={statusUpdating} onclick={() => updateStatus('completed')}><Check size={18} aria-hidden="true" /></button>
+							<button type="button" class="task-action text-emerald-600 dark:text-emerald-400" aria-label="Complete task" title={task.parent_review_required ? 'The parent Agent must accept this result' : 'Complete task'} disabled={statusUpdating || task.parent_review_required} onclick={() => updateStatus('completed')}><Check size={18} aria-hidden="true" /></button>
 							<button type="button" class="task-action" aria-label={task.status === 'in_progress' ? 'Stop and cancel task' : 'Cancel task'} title={task.status === 'in_progress' ? 'Stop and cancel task' : 'Cancel task'} disabled={statusUpdating} onclick={() => updateStatus('cancelled')}>
 								{#if task.status === 'in_progress'}<Square size={14} aria-hidden="true" />{:else}<X size={18} aria-hidden="true" />{/if}
 							</button>
@@ -2037,15 +2038,15 @@
 					{:else if waitingForDelegation}
 						<div role="status" class="space-y-1 py-2 text-sm text-amber-600 dark:text-amber-400" data-delegation-wait>
 							{#if failedDelegates.length > 0}
-                                <p class="font-medium text-destructive">Delegated work needs attention. This task cannot resume yet.</p>
+                                <p class="font-medium text-destructive">Delegated work needs attention before this task can complete.</p>
                                 {#each failedDelegates as item}<p><a class="underline" href="/tasks/{item.task_id}">{delegatedAgentName(item)}: {item.title}</a> — {item.activity_status.replaceAll('_', ' ')}</p>{/each}
                             {:else if blockingDelegates.length === 1}
 								<p>Waiting for {delegatedAgentName(blockingDelegates[0])}: <a class="underline" href="/tasks/{blockingDelegates[0].task_id}">{blockingDelegates[0].title}</a>.</p>
 							{:else}
 								<p>Waiting for {blockingDelegates.length} required delegated tasks.</p>
 							{/if}
-							{#if queuedAttempt?.trigger_message_id}<p class="text-xs text-muted-foreground">Your message is saved and will be handled after the required work is resolved.</p>
-							{:else if queuedAttempt}<p class="text-xs text-muted-foreground">Queued work will continue after the required work is resolved.</p>{/if}
+							{#if queuedAttempt}<p class="text-xs text-muted-foreground">Queued work will run when its prerequisites are resolved.</p>
+							{:else}<p class="text-xs text-muted-foreground">Coordination messages and scheduled checks can run while delegated work continues.</p>{/if}
 						</div>
 					{:else if queuedAttempt}
 						<div class="py-2 pl-10"><AgentLoading label="The agent is queued to respond" phase="queued" startedAt={queuedAttempt.response_queued_at ?? queuedAttempt.created_at} /></div>
@@ -2054,6 +2055,10 @@
 							<span class="h-2 w-2 rounded-full bg-orange-400 animate-pulse"></span>
 							Waiting for your response...
 						</div>
+					{:else if taskActivityStatus === 'awaiting_parent_review'}
+						<p role="status" class="py-2 text-sm text-violet-500" data-parent-review-wait>
+							The worker response is finished. Waiting for the parent Agent to review and accept the result.
+						</p>
 					{:else if taskActivityStatus === 'awaiting_review'}
 						<div class="flex items-center gap-2 text-xs text-violet-400">
 							<span class="h-2 w-2 rounded-full bg-violet-400"></span>

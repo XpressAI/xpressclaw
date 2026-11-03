@@ -35,7 +35,8 @@ pub fn list(db: &Database, parent_task_id: &str) -> Result<Vec<DelegatedWork>> {
                        AND child.blocks_parent=1 AND child.status!='completed') AS child_pending,
                 EXISTS(SELECT 1 FROM task_dependencies d JOIN tasks dependency ON dependency.id=d.depends_on_id
                        WHERE d.task_id=t.id AND dependency.status!='completed') AS dependency_pending,
-                CASE WHEN t.status NOT IN ('completed','cancelled') AND a.status='failed' THEN a.error_message END
+                CASE WHEN t.status NOT IN ('completed','cancelled') AND a.status='failed' THEN a.error_message END,
+                t.parent_review_required
          FROM tasks t
          LEFT JOIN work_attempts a ON a.id=(
              SELECT id FROM work_attempts WHERE task_id=t.id
@@ -77,6 +78,8 @@ pub fn list(db: &Database, parent_task_id: &str) -> Result<Vec<DelegatedWork>> {
             "waiting_for_dependencies"
         } else if attempt.as_deref() == Some("queued") {
             "queued"
+        } else if row.get::<_, bool>(19)? && attempt.as_deref() == Some("completed") {
+            "awaiting_parent_review"
         } else if matches!(
             attempt.as_deref(),
             Some("failed" | "interrupted" | "cancelled")

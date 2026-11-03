@@ -205,6 +205,11 @@ fn environment_agent_capability_route(
         {
             *method == Method::PATCH
         }
+        ["", "api", "environments", agent, "tasks", task, "review"]
+            if *agent == agent_id && !task.is_empty() =>
+        {
+            *method == Method::POST
+        }
         ["", "api", "environments", agent, "tasks", task, "files"]
             if *agent == agent_id && !task.is_empty() =>
         {
@@ -658,6 +663,7 @@ mod tests {
             ("POST", "/api/environments/atlas/tasks/batch"),
             ("GET", "/api/environments/atlas/tasks/task-1"),
             ("PATCH", "/api/environments/atlas/tasks/task-1/planning"),
+            ("POST", "/api/environments/atlas/tasks/task-1/review"),
             ("GET", "/api/environments/atlas/workflows"),
             ("POST", "/api/environments/atlas/workflows"),
             ("POST", "/api/environments/atlas/workflows/schedule"),

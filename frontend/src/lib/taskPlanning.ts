@@ -23,6 +23,7 @@ export function taskLane(task: Task): string {
       scheduled: "scheduled",
       backlog: "backlog",
       awaiting_review: "review",
+      awaiting_parent_review: "review",
     }[task.activity_status ?? task.status] ??
     "queue"
   );

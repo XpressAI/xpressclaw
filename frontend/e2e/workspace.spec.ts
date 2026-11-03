@@ -322,6 +322,8 @@ async function mockApi(
 		taskStatus?: string;
 		taskAgentId?: string | null;
 		taskActivityStatus?: string;
+		taskParentId?: string | null;
+		taskParentReviewRequired?: boolean;
 		taskSubtasks?: Record<string, unknown>[];
 		taskMessages?: Record<string, unknown>[];
 		taskActivityEvents?: Record<string, unknown>[];
@@ -490,7 +492,8 @@ async function mockApi(
 		status,
 		priority: 0,
 		agent_id: options.taskAgentId === undefined ? agentId : options.taskAgentId,
-		parent_task_id: null,
+		parent_task_id: options.taskParentId ?? null,
+		parent_review_required: options.taskParentReviewRequired ?? false,
 		sop_id: null,
 		conversation_id: null,
 		created_at: timestamp(0),
@@ -7209,13 +7212,13 @@ function delegatedFixture(overrides: Record<string, unknown> = {}) {
 	};
 }
 
-async function delegatedApi(page: Page, options: { parentStatus?: string; parentAttempt?: string; child?: Record<string, unknown>; pendingInput?: boolean } = {}) {
+async function delegatedApi(page: Page, options: { parentStatus?: string; parentActivity?: string; parentAttempt?: string; child?: Record<string, unknown>; pendingInput?: boolean } = {}) {
 	const state = {
 		attempts: [attempt(options.parentAttempt ?? 'queued', 10_000, null, null, { trigger_message_id: 2 })],
 		children: [delegatedFixture(options.child)],
 	};
 	await mockApi(page, {
-		taskStatus: options.parentStatus ?? 'in_progress', taskActivityStatus: options.parentStatus ?? 'in_progress',
+		taskStatus: options.parentStatus ?? 'in_progress', taskActivityStatus: options.parentActivity ?? options.parentStatus ?? 'in_progress',
 		pendingElicitation: options.pendingInput ? { mode: 'form', message: 'Approve this operation?', requestedSchema: { type: 'object', properties: {} } } : undefined,
 		taskSubtasks: [
 			{ id: 'plan-only', title: 'Validate the implementation', provenance: 'native_plan', status: 'completed', parent_task_id: taskId },
@@ -7237,17 +7240,16 @@ async function delegatedApi(page: Page, options: { parentStatus?: string; parent
 }
 
 for (const width of [390, 1440]) {
-	test(`delegated work explains a queued reply at ${width}px`, async ({ page }, testInfo) => {
+	test(`delegated work keeps coordination replies runnable at ${width}px`, async ({ page }, testInfo) => {
 		await page.setViewportSize({ width, height: 900 });
-		await delegatedApi(page);
+		await delegatedApi(page, { parentActivity: 'queued' });
 		await page.goto(`/tasks/${taskId}`);
 		const composer = page.locator(`#task-message-input-${taskId}`);
 		await composer.fill('Keep this draft while checking delegated work.');
 		await expect(page.locator('[data-task-transcript-scroll] [data-delegated-task]')).toHaveCount(0);
-		await expect(page.locator('[data-delegation-wait]')).toContainText('Waiting for senior-reviewer: Review authorized recovery and SDK retries');
-		await expect(page.locator('[data-delegation-wait]')).toContainText('Your message is saved');
-		await expect(page.getByText('The agent is queued to respond', { exact: true })).toHaveCount(0);
-		await expect(page.locator('[data-task-activity-status="waiting_for_subtasks"]').first()).toBeVisible();
+		await expect(page.locator('[data-delegation-wait]')).toHaveCount(0);
+		await expect(page.getByText('The agent is queued to respond', { exact: true })).toBeVisible();
+		await expect(page.locator('[data-task-activity-status="queued"]').first()).toBeVisible();
 		if (width === 390) {
 			await expect(page.getByRole('region', { name: 'Delegated work', exact: true })).toHaveCount(0);
 			await page.getByRole('button', { name: 'Show task details' }).click();
@@ -7381,14 +7383,28 @@ for (const mobile of [false, true]) {
 }
 
 for (const width of [390, 1440]) {
- test(`blocked delegated work exposes the failure and saved wakeup at ${width}px`, async ({ page }) => {
+ test(`delegated worker results await parent acceptance at ${width}px`, async ({ page }) => {
   await page.setViewportSize({ width, height: 900 });
-  const state = await delegatedApi(page, { child: { status: 'blocked', activity_status: 'blocked', finished_at: recentSqliteTimestamp(5 * 60 * 60_000), error_message: 'The reviewer environment needs different container settings. Installed files are preserved.' } });
+  await mockApi(page, {
+   taskStatus: 'in_progress', taskActivityStatus: 'awaiting_parent_review',
+   taskParentId: 'manager-parent', taskParentReviewRequired: true,
+   taskAttempts: [attempt('completed', 10000, null, 'D1 remains incomplete; waiting for a login refresh.')],
+  });
   await page.goto(`/tasks/${taskId}`);
-  await expect(page.locator('[data-delegation-wait]')).toContainText('Delegated work needs attention');
-  await expect(page.locator('[data-delegation-wait]')).toContainText('Your message is saved');
-  await expect(page.getByText('The agent is queued to respond', { exact: true })).toHaveCount(0);
-  await expect(page.locator('[data-delegation-wait] a')).toHaveAttribute('href', '/tasks/review-child');
+  await expect(page.locator('[data-task-activity-status="awaiting_parent_review"]').first()).toBeVisible();
+  await expect(page.locator('[data-parent-review-wait]')).toContainText('Waiting for the parent Agent to review and accept');
+  await expect(page.getByRole('button', { name: 'Complete task', exact: true })).toBeDisabled();
+  await expect(page.locator('[data-task-activity-status="completed"]')).toHaveCount(0);
+ });
+}
+
+for (const width of [390, 1440]) {
+ test(`blocked delegated work keeps its failure visible while a wakeup is queued at ${width}px`, async ({ page }) => {
+  await page.setViewportSize({ width, height: 900 });
+  const state = await delegatedApi(page, { parentActivity: 'queued', child: { status: 'blocked', activity_status: 'blocked', finished_at: recentSqliteTimestamp(5 * 60 * 60_000), error_message: 'The reviewer environment needs different container settings. Installed files are preserved.' } });
+  await page.goto(`/tasks/${taskId}`);
+  await expect(page.locator('[data-delegation-wait]')).toHaveCount(0);
+  await expect(page.getByText('The agent is queued to respond', { exact: true })).toBeVisible();
   if (width === 390) await page.getByRole('button', { name: 'Show task details' }).click();
   const panel = page.getByRole('region', { name: 'Delegated work', exact: true });
   await expect(panel.locator('[data-delegated-error]')).toBeVisible();
@@ -7398,7 +7414,7 @@ for (const width of [390, 1440]) {
   Object.assign(state.children[0], { status: 'in_progress', activity_status: 'running', error_message: null });
   await expect(panel.locator('[data-delegated-error]')).toHaveCount(0, { timeout: 10_000 });
   if (width === 390) await page.getByRole('button', { name: 'Close task details' }).click();
-  await expect(page.locator('[data-delegation-wait]')).toContainText('Waiting for');
+  await expect(page.getByText('The agent is queued to respond', { exact: true })).toBeVisible();
  });
 
  test(`delegated reviewer failure is visible from agent and project at ${width}px`, async ({ page }) => {

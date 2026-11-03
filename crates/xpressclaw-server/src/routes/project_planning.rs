@@ -13,6 +13,7 @@ use xpressclaw_core::{
     agents::registry::AgentRegistry,
     tasks::{
         board::{BatchTaskInput, TaskBoard},
+        delegation_review::{self, ReviewDecision, ReviewRequest},
         planning::{PlanningChange, PlanningFilter, TaskPlanner},
     },
     workflows::manager::{ProjectWorkflowInput, ScheduledWorkflowInput, WorkflowManager},
@@ -24,6 +25,10 @@ pub(super) fn routes() -> Router<AppState> {
         .route("/{agent_id}/tasks/batch", post(create_tasks))
         .route("/{agent_id}/tasks/{task_id}", get(get_task))
         .route("/{agent_id}/tasks/{task_id}/planning", patch(update_task))
+        .route(
+            "/{agent_id}/tasks/{task_id}/review",
+            post(review_delegation),
+        )
         .route(
             "/{agent_id}/workflows",
             get(list_workflows).post(create_workflows),
@@ -168,6 +173,25 @@ async fn update_task(
         .change_for_agent(&task, &change, &agent)
         .map_err(planning_error)?;
     Ok(Json(json!(task)))
+}
+
+async fn review_delegation(
+    State(state): State<AppState>,
+    Path((agent, task)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(request): Json<ReviewRequest>,
+) -> ApiResult<Json<Value>> {
+    require_caller(&state, &agent, &headers)?;
+    let (task, output) = delegation_review::review(state.db.clone(), &agent, &task, &request)
+        .map_err(planning_error)?;
+    if request.decision == ReviewDecision::Accept {
+        xpressclaw_core::workflows::engine::WorkflowEngine::new(state.db.clone())
+            .on_task_completed(&task.id, "completed", &output)
+            .map_err(planning_error)?;
+    }
+    Ok(Json(json!(TaskBoard::new(state.db.clone())
+        .get(&task.id)
+        .map_err(planning_error)?)))
 }
 
 async fn list_workflows(

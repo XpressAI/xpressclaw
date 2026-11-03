@@ -52,9 +52,40 @@ For larger plans, create multiple batches and use returned IDs for dependencies
 between batches. Responses contain both the tasks and a `refs` map.
 
 Omitting `parent_task_id` creates children of the current task. Required
-children block that parent's completion. Set `parent_task_id: null` for
+children block that parent's completion, while user messages, scheduled
+coordination checks, and delegated results can still resume the parent.
+Set `parent_task_id: null` for
 independent project work that will continue after the planning conversation.
 The singular `create_task` supports the same dates, Backlog, and dependencies.
+
+## Coordinate and review delegated work
+
+A worker finishing a response hands its result back to the parent. Required
+delegated work remains open until the parent accepts it. The parent receives
+the task ID, attempt ID, and saved result in a durable notification; results
+arriving together share one queued response. A running parent finishes its
+current response before handling the next one.
+
+Use `get_project_task` to inspect the current result, then
+`review_delegated_task` with `task_id`, `expected_attempt_id`, the current
+`expected_revision`, and a decision:
+
+| Decision | Result |
+| --- | --- |
+| `accept` | Completes the child after its own required work and PR review pass, allowing dependent tasks to run. |
+| `revise` | Sends concrete `guidance` to the same child and queues another response. |
+| `wait` | Records the unresolved blocker in `guidance` and keeps the child open without retrying it. |
+
+Only the Agent assigned to the parent task can review its child. A newer
+attempt invalidates an older review request. An incomplete response, such as
+“waiting for a login refresh,” stays unfinished even if the worker ended its
+turn without requesting input through a tool. Historical completed tasks keep
+their status when upgrading; open delegations adopt the review gate.
+
+Task priority orders eligible responses. Backlog holds, earliest-start dates,
+explicit `depends_on` prerequisites, and an Agent's active response still
+control when a queued response may run. Parent completion waits for accepted
+required results; it does not prevent the parent from coordinating them.
 
 Use `update_task_planning` with the latest `expected_revision` to change
 future work. Its actions are `schedule`, `backlog`, `queue`, `assign`, and

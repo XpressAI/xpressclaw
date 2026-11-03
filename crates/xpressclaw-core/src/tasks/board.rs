@@ -80,6 +80,9 @@ pub struct Task {
     /// Whether an unfinished child prevents its parent from completing.
     #[serde(default = "default_blocks_parent")]
     pub blocks_parent: bool,
+    /// A delegated worker result needs acceptance by its parent before completion.
+    #[serde(default)]
+    pub parent_review_required: bool,
     /// Task type: "normal" or "IDLE" (hidden single-turn idle tasks).
     #[serde(default = "default_task_type")]
     pub task_type: String,
@@ -786,6 +789,18 @@ impl TaskBoard {
                     id: task_id.to_string(),
                 });
             }
+            if parsed == TaskStatus::Completed
+                && transaction.query_row(
+                    "SELECT parent_review_required FROM tasks WHERE id=?1",
+                    [task_id],
+                    |row| row.get::<_, bool>(0),
+                )?
+            {
+                return Err(Error::Task(
+                    "The parent Agent must accept this delegated result before it can complete"
+                        .into(),
+                ));
+            }
             if parsed != TaskStatus::Cancelled {
                 let project_id = transaction.query_row(
                     "SELECT project_id FROM tasks WHERE id = ?1",
@@ -1078,7 +1093,7 @@ impl TaskBoard {
         })
     }
 
-    fn defer_reported_subtasks_on_conn(
+    pub(super) fn defer_reported_subtasks_on_conn(
         conn: &rusqlite::Connection,
         parent_task_id: &str,
         reason: &str,
@@ -1225,12 +1240,22 @@ impl TaskBoard {
                 [&task.id], |row| row.get(0),
             )?;
             if awaiting_subtasks {
+                if super::planning::has_eligible_response(conn, &task.id)? {
+                    return Ok("queued".into());
+                }
                 let needs_attention: bool = conn.query_row(
                     "SELECT EXISTS(SELECT 1 FROM tasks WHERE parent_task_id=?1 AND blocks_parent=1
                      AND status IN ('blocked','waiting_for_input','cancelled'))",
                     [&task.id], |row| row.get(0),
                 )?;
                 return Ok(if needs_attention { "blocked" } else { "waiting_for_subtasks" }.to_string());
+            }
+            if task.parent_review_required && conn.query_row(
+                "SELECT NOT EXISTS(SELECT 1 FROM task_queue WHERE task_id=?1 AND status IN ('queued','running'))
+                    AND (SELECT status FROM work_attempts WHERE task_id=?1 ORDER BY created_at DESC,rowid DESC LIMIT 1)='completed'",
+                [&task.id], |row| row.get::<_, Option<bool>>(0),
+            )?.unwrap_or(false) {
+                return Ok("awaiting_parent_review".into());
             }
             let queued: bool = conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM work_attempts WHERE task_id=?1 AND status='queued')
@@ -1325,9 +1350,11 @@ impl TaskBoard {
                 [task_id],
                 |row| row.get(0),
             )?;
-            super::delegation_notifications::retire_stale_in_transaction(
-                &transaction,
-                Some(task_id),
+            super::delegation_notifications::reconcile_in_transaction(&transaction)?;
+            let parent_review_required: bool = transaction.query_row(
+                "SELECT parent_review_required FROM tasks WHERE id=?1",
+                [task_id],
+                |row| row.get(0),
             )?;
             let has_open_attempt: bool = transaction.query_row(
                 "SELECT EXISTS(
@@ -1337,7 +1364,11 @@ impl TaskBoard {
                 [task_id],
                 |row| row.get(0),
             )?;
-            if !pull_request_gate_satisfied || !subtasks_complete || has_open_attempt {
+            if !pull_request_gate_satisfied
+                || !subtasks_complete
+                || has_open_attempt
+                || parent_review_required
+            {
                 transaction.commit()?;
                 return Ok(None);
             }
@@ -1366,6 +1397,8 @@ impl TaskBoard {
         let transaction =
             rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
         TaskQueue::ensure_locally_scheduled(&transaction, task_id)?;
+        transaction.execute("UPDATE tasks SET parent_task_id=NULL,parent_review_required=0
+            WHERE parent_task_id=?1 AND NOT EXISTS(SELECT 1 FROM connect_work w WHERE w.kind='task_turn' AND w.local_id=tasks.id)", [task_id])?;
         transaction.execute("DELETE FROM tasks WHERE id = ?1", [task_id])?;
         transaction.commit()?;
         Ok(())
@@ -1373,12 +1406,19 @@ impl TaskBoard {
 
     pub fn delete_by_status(&self, status: &str) -> Result<i64> {
         let conn = self.db.conn();
-        let count = conn.execute(
+        let transaction =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+        transaction.execute("UPDATE tasks SET parent_task_id=NULL,parent_review_required=0
+            WHERE parent_task_id IN (SELECT parent.id FROM tasks parent WHERE parent.status=?1
+                AND NOT EXISTS(SELECT 1 FROM connect_work w WHERE w.kind='task_turn' AND w.local_id=parent.id))
+              AND NOT EXISTS(SELECT 1 FROM connect_work w WHERE w.kind='task_turn' AND w.local_id=tasks.id)", [status])?;
+        let count = transaction.execute(
             "DELETE FROM tasks WHERE status = ?1 AND NOT EXISTS (
                 SELECT 1 FROM connect_work WHERE kind='task_turn' AND local_id=tasks.id
             )",
             [status],
         )?;
+        transaction.commit()?;
         Ok(count as i64)
     }
 
@@ -2110,6 +2150,7 @@ pub(super) fn row_to_task(row: &rusqlite::Row) -> Result<Task> {
             .get::<_, String>("provenance")
             .unwrap_or_else(|_| default_task_provenance()),
         blocks_parent: row.get::<_, i32>("blocks_parent").unwrap_or(1) != 0,
+        parent_review_required: row.get("parent_review_required").unwrap_or(false),
         task_type: row
             .get::<_, String>("task_type")
             .unwrap_or_else(|_| "normal".to_string()),

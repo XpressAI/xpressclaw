@@ -13,7 +13,7 @@ use crate::{
     projects::ensure_project_accepts_work,
 };
 use chrono::{DateTime, SecondsFormat, Utc};
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -67,13 +67,55 @@ pub(super) const ELIGIBLE: &str = "
     AND (NOT EXISTS (
       SELECT 1 FROM tasks child
       WHERE child.parent_task_id = t.id AND child.blocks_parent = 1 AND child.status != 'completed'
-    ) OR ({recovery_grant}))";
+    ) OR ({recovery_grant}) OR (
+      candidate.session_id = t.agent_id AND q.agent_id = t.agent_id
+      AND EXISTS (SELECT 1 FROM task_messages message
+                  WHERE message.id = candidate.trigger_message_id AND message.task_id = t.id AND message.role = 'user')
+      AND NOT EXISTS (SELECT 1 FROM connect_work w WHERE w.kind = 'task_turn' AND w.local_id = t.id)
+      AND NOT EXISTS (SELECT 1 FROM workflow_step_executions execution
+                      WHERE execution.continuation_attempt_id = candidate.id
+                        AND (execution.continuation_prompt_message_id IS NULL
+                             OR execution.continuation_prompt_message_id = candidate.trigger_message_id))
+    ))";
+
+pub(super) fn eligible_sql() -> String {
+    ELIGIBLE.replace(
+        "{recovery_grant}",
+        &super::delegation_notifications::recovery_grant_sql(),
+    )
+}
+
+pub(super) fn has_eligible_response(conn: &rusqlite::Connection, task_id: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM task_queue q
+        JOIN work_attempts candidate ON candidate.id=q.attempt_id JOIN tasks t ON t.id=q.task_id
+        WHERE q.task_id=?2 AND q.status='queued' AND candidate.status='queued' AND ({}))",
+            eligible_sql()
+        ),
+        params![
+            Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            task_id
+        ],
+        |row| row.get(0),
+    )?)
+}
+
+fn snapshot_sql() -> String {
+    SNAPSHOT.replace(
+        "{eligible}",
+        &eligible_sql().replace("?1", "strftime('%Y-%m-%dT%H:%M:%fZ','now')"),
+    )
+}
 
 const SNAPSHOT: &str = "WITH facts AS (
  SELECT tasks.*,
    EXISTS(SELECT 1 FROM task_queue q WHERE q.task_id = tasks.id AND q.status = 'running') AS claimed,
    EXISTS(SELECT 1 FROM work_attempts a WHERE a.task_id = tasks.id AND a.status IN ('preparing','running')) AS live,
    EXISTS(SELECT 1 FROM task_queue q WHERE q.task_id = tasks.id AND q.status = 'queued') AS queued,
+   EXISTS(SELECT 1 FROM task_queue q JOIN work_attempts candidate ON candidate.id=q.attempt_id JOIN tasks t ON t.id=q.task_id
+          WHERE t.id=tasks.id AND q.status='queued' AND candidate.status='queued' AND ({eligible})) AS response_ready,
+   (SELECT status FROM work_attempts WHERE task_id=tasks.id ORDER BY created_at DESC,rowid DESC LIMIT 1) AS latest_response_status,
    EXISTS(SELECT 1 FROM task_pull_requests pr WHERE pr.task_id = tasks.id AND pr.status IN ('waiting','attention')) OR EXISTS(SELECT 1 FROM work_attempts a WHERE a.task_id = tasks.id AND a.status = 'review') AS reviewing,
    EXISTS(SELECT 1 FROM task_dependencies d JOIN tasks t ON t.id = d.depends_on_id WHERE d.task_id = tasks.id AND t.status != 'completed') AS dependencies_blocked,
    EXISTS(SELECT 1 FROM tasks child WHERE child.parent_task_id = tasks.id AND child.blocks_parent = 1 AND child.status != 'completed') AS children_blocked,
@@ -89,7 +131,8 @@ const SNAPSHOT: &str = "WITH facts AS (
    WHEN reviewing THEN 'review'
    WHEN claimed THEN 'working'
    WHEN backlog THEN 'backlog'
-   WHEN dependencies_blocked OR children_blocked OR status = 'blocked' THEN 'blocked'
+   WHEN parent_review_required=1 AND latest_response_status='completed' AND NOT queued THEN 'review'
+   WHEN dependencies_blocked OR (children_blocked AND NOT response_ready) OR status = 'blocked' THEN 'blocked'
    WHEN start_after IS NOT NULL AND julianday(start_after) > julianday('now') THEN 'scheduled'
    ELSE 'queue'
  END AS lane,
@@ -178,6 +221,7 @@ impl TaskPlanner {
     }
 
     fn list_inner(&self, filter: &PlanningFilter, agent: Option<&str>) -> Result<PlanningPage> {
+        let snapshot = snapshot_sql();
         if filter
             .search
             .as_ref()
@@ -202,7 +246,7 @@ impl TaskPlanner {
             append_task_search(&mut predicate, &mut values, filter.search.as_deref());
             let refs: Vec<&dyn rusqlite::types::ToSql> = values.iter().map(|v| v.as_ref()).collect();
             let mut counts = BTreeMap::new();
-            for row in conn.prepare(&format!("{SNAPSHOT} SELECT lane, COUNT(*) {predicate} GROUP BY lane"))?
+            for row in conn.prepare(&format!("{snapshot} SELECT lane, COUNT(*) {predicate} GROUP BY lane"))?
                 .query_map(refs.as_slice(), |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))? {
                 let (lane, count) = row?; counts.insert(lane, count);
             }
@@ -219,7 +263,7 @@ impl TaskPlanner {
             values.push(Box::new(filter.limit.unwrap_or(100).clamp(1, 200)));
             values.push(Box::new(filter.offset.unwrap_or(0).max(0)));
             let refs: Vec<&dyn rusqlite::types::ToSql> = values.iter().map(|v| v.as_ref()).collect();
-            let sql = format!("{SNAPSHOT} SELECT tasks.* {predicate} ORDER BY priority DESC, position, id LIMIT ? OFFSET ?");
+            let sql = format!("{snapshot} SELECT tasks.* {predicate} ORDER BY priority DESC, position, id LIMIT ? OFFSET ?");
             let mut statement = conn.prepare(&sql)?;
             let mut rows = statement.query(refs.as_slice())?;
             let mut tasks = vec![];
@@ -245,7 +289,11 @@ impl TaskPlanner {
                 "content": row.get::<_, String>(2)?, "timestamp": row.get::<_, String>(3)?,
             })))?.collect::<std::result::Result<Vec<_>, _>>()?;
             messages.reverse();
-            Ok(serde_json::json!({"task": task, "messages": messages}))
+            let latest_attempt = conn.query_row(
+                "SELECT id,status,COALESCE(result,error_message,'') FROM work_attempts WHERE task_id=?1 ORDER BY created_at DESC,rowid DESC LIMIT 1", [id],
+                |row| Ok(serde_json::json!({"id":row.get::<_,String>(0)?,"status":row.get::<_,String>(1)?,"result":row.get::<_,String>(2)?})),
+            ).optional()?;
+            Ok(serde_json::json!({"task": task, "messages": messages, "latest_attempt":latest_attempt}))
         })
     }
 
@@ -374,7 +422,7 @@ fn insertion_position(
     )
 }
 fn read_planning(conn: &rusqlite::Connection, id: &str) -> Result<PlanningTask> {
-    let sql = format!("{SNAPSHOT} SELECT * FROM planned WHERE id = ?1");
+    let sql = format!("{} SELECT * FROM planned WHERE id = ?1", snapshot_sql());
     let mut statement = conn.prepare(&sql)?;
     let mut rows = statement.query([id])?;
     let row = rows
@@ -452,7 +500,7 @@ mod tests {
         for by_agent in [false, true] {
             let db = Arc::new(Database::open_memory().unwrap());
             let (board, queue, planner) = setup(db.clone());
-            let sessions = crate::sessions::SessionManager::new(db);
+            let sessions = crate::sessions::SessionManager::new(db.clone());
             let claim = || {
                 (if by_agent {
                     queue.claim("atlas")
@@ -517,9 +565,23 @@ mod tests {
             assert_eq!(queue.get(continuation.id).unwrap().status, "queued");
 
             finish(&child_turn);
-            board.update_status(&child.id, "completed", None).unwrap();
+            board.complete_and_roll_up(&child.id, None).unwrap();
+            assert!(board.get(&child.id).unwrap().parent_review_required);
             assert_eq!(planner.get(&parent.id).unwrap().planning.lane, "queue");
             assert_eq!(claim().unwrap().id, continuation.id);
+            super::super::delegation_review::review(
+                db.clone(),
+                "atlas",
+                &child.id,
+                &super::super::delegation_review::ReviewRequest {
+                    parent_task_id: parent.id.clone(),
+                    expected_attempt_id: child_turn.attempt_id.clone().unwrap(),
+                    expected_revision: board.get(&child.id).unwrap().revision,
+                    decision: super::super::delegation_review::ReviewDecision::Accept,
+                    guidance: None,
+                },
+            )
+            .unwrap();
             assert!(claim().is_none());
         }
     }
