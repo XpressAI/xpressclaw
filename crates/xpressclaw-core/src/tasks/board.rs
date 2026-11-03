@@ -831,6 +831,7 @@ impl TaskBoard {
                      WHERE task_id = ?2 AND status IN ('waiting', 'attention')",
                     rusqlite::params![checked_at, task_id],
                 )?;
+                Self::release_child_parent_reviews_in_transaction(&transaction, task_id)?;
             }
 
             // Set agent_id if transitioning to in_progress
@@ -1390,6 +1391,23 @@ impl TaskBoard {
             transaction.commit()?;
             Ok(Some(task))
         })
+    }
+
+    /// A cancelled parent can no longer accept results. Its locally reviewed
+    /// children survive independently, with their attempts and task status intact.
+    pub(crate) fn release_child_parent_reviews_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        task_id: &str,
+    ) -> Result<()> {
+        transaction.execute(
+            "UPDATE tasks SET parent_task_id=NULL, parent_review_required=0, updated_at=CURRENT_TIMESTAMP
+             WHERE parent_task_id=?1 AND parent_review_required=1
+               AND NOT EXISTS(SELECT 1 FROM connect_work w WHERE w.kind='task_turn' AND w.local_id=tasks.id)
+               AND NOT EXISTS(SELECT 1 FROM workflow_step_executions e JOIN workflow_instances i ON i.id=e.instance_id
+                   WHERE e.task_id=tasks.id AND e.task_id IS NOT i.source_task_id)",
+            [task_id],
+        )?;
+        Ok(())
     }
 
     pub fn delete(&self, task_id: &str) -> Result<()> {

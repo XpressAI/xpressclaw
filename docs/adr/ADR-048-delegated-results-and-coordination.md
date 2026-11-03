@@ -34,11 +34,14 @@ Migration 56 retains notification receipts and adds the completion-review gate.
 Open native delegations adopt it; historical completed work is preserved.
 Deleting a parent retains its surviving native children as independent,
 unfinished work rather than leaving an approval gate with no owner.
+Cancelling a parent likewise detaches children waiting on its review, without
+completing or retrying them. Their own nested reviews and other completion
+requirements remain in place; accepted historical children retain their links.
 
 ## Validation
 
 Exercise incomplete worker responses, parent-only acceptance, stale attempts,
 revisions, waits, queued wake-ups, unchanged scheduling constraints, upgrade
-receipts, and parent deletion. Verify API capability boundaries, MCP transport,
-and UI distinction between a queued coordination response and a result awaiting
-parent review.
+receipts, and parent deletion/cancellation. Verify API capability boundaries,
+MCP transport, and UI distinction between a queued coordination response and a
+result awaiting parent review.

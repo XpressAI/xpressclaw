@@ -752,6 +752,10 @@ impl SessionManager {
                  WHERE id = ?1 AND status != 'completed'",
             [task_id],
         )?;
+        crate::tasks::board::TaskBoard::release_child_parent_reviews_in_transaction(
+            transaction,
+            task_id,
+        )?;
         transaction.execute(
             "UPDATE task_pull_requests SET status = 'cancelled', next_poll_at = NULL,
                     last_checked_at = CURRENT_TIMESTAMP, last_error = NULL

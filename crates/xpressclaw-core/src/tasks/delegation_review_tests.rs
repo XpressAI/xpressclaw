@@ -142,6 +142,178 @@ fn deleting_parent_retains_child_as_independent_unfinished_work() {
 }
 
 #[test]
+fn cancelling_parent_through_board_releases_surviving_child_review_gates() {
+    assert_parent_cancellation_releases_reviews(false);
+}
+
+#[test]
+fn cancelling_parent_through_sessions_releases_surviving_child_review_gates() {
+    assert_parent_cancellation_releases_reviews(true);
+}
+
+fn assert_parent_cancellation_releases_reviews(cancel_attempts: bool) {
+    for state in ["running", "finished", "held"] {
+        let (db, board, queue, parent, child) = setup();
+        let sessions = SessionManager::new(db.clone());
+        let historical = board
+            .create(&CreateTask {
+                title: "Previously accepted work".into(),
+                agent_id: Some("worker".into()),
+                parent_task_id: Some(parent.id.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        board
+            .update_status(&historical.id, "completed", None)
+            .unwrap();
+        let dependent = board
+            .create(&CreateTask {
+                title: "Verify the completed deployment".into(),
+                agent_id: Some("peer".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        board.add_dependency(&dependent.id, &child.id).unwrap();
+        queue.enqueue(&dependent.id, "peer").unwrap();
+        queue.enqueue(&child.id, "worker").unwrap();
+        let response = queue.claim("worker").unwrap().unwrap();
+        let attempt = response.attempt_id.as_deref().unwrap();
+        board
+            .update_status(&child.id, "in_progress", Some("worker"))
+            .unwrap();
+        if state != "running" {
+            sessions
+                .transition_attempt(
+                    attempt,
+                    "completed",
+                    "Worker finished",
+                    Some("Waiting for deployment authorization"),
+                    None,
+                )
+                .unwrap();
+            queue
+                .complete(response.id, "Waiting for deployment authorization")
+                .unwrap();
+            assert!(board
+                .complete_and_roll_up(&child.id, None)
+                .unwrap()
+                .is_empty());
+        }
+        if state == "held" {
+            review(
+                db.clone(),
+                "manager",
+                &child.id,
+                &request(&board, &parent, &child, attempt, ReviewDecision::Wait),
+            )
+            .unwrap();
+        }
+        let before = board.get(&child.id).unwrap();
+        let worker = sessions.get_attempt(attempt).unwrap();
+        assert!(before.parent_review_required);
+
+        if cancel_attempts {
+            sessions
+                .cancel_task_attempts(&parent.id, "Cancel coordination")
+                .unwrap()
+                .unwrap();
+        } else {
+            board.update_status(&parent.id, "cancelled", None).unwrap();
+        }
+
+        let independent = board.get(&child.id).unwrap();
+        assert!(!independent.parent_review_required, "{state}");
+        assert!(independent.parent_task_id.is_none());
+        assert_eq!(independent.status, before.status);
+        assert!(independent.completed_at.is_none());
+        assert_eq!(sessions.get_attempt(attempt).unwrap().status, worker.status);
+        assert_eq!(sessions.get_attempt(attempt).unwrap().result, worker.result);
+        assert_eq!(
+            board.get(&historical.id).unwrap().parent_task_id,
+            Some(parent.id.clone())
+        );
+        assert!(queue.claim("worker").unwrap().is_none());
+        assert!(queue.claim("peer").unwrap().is_none());
+        assert!(queue.claim("manager").unwrap().is_none());
+
+        if state == "running" {
+            sessions
+                .transition_attempt(
+                    attempt,
+                    "completed",
+                    "Deployment finished",
+                    Some("Deployed and verified"),
+                    None,
+                )
+                .unwrap();
+            queue
+                .complete(response.id, "Deployed and verified")
+                .unwrap();
+            assert_eq!(
+                board.complete_and_roll_up(&child.id, None).unwrap().len(),
+                1
+            );
+        } else {
+            // An independent result can now be explicitly completed without
+            // requiring acceptance by the cancelled parent.
+            board.update_status(&child.id, "completed", None).unwrap();
+        }
+        assert_eq!(board.get(&child.id).unwrap().status, TaskStatus::Completed);
+        assert_eq!(queue.claim("peer").unwrap().unwrap().task_id, dependent.id);
+        assert_eq!(board.get(&parent.id).unwrap().status, TaskStatus::Cancelled);
+    }
+}
+
+#[test]
+fn cancelling_parent_preserves_its_surviving_childs_own_review_authority() {
+    let (db, board, queue, parent, child) = setup();
+    queue.enqueue(&child.id, "worker").unwrap();
+    queue.claim("worker").unwrap().unwrap();
+    let nested = board
+        .create(&CreateTask {
+            title: "Verify a deployment prerequisite".into(),
+            agent_id: Some("peer".into()),
+            parent_task_id: Some(child.id.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+    queue.enqueue(&nested.id, "peer").unwrap();
+    let response = queue.claim("peer").unwrap().unwrap();
+    let attempt = response.attempt_id.as_deref().unwrap();
+
+    board.update_status(&parent.id, "cancelled", None).unwrap();
+
+    assert!(!board.get(&child.id).unwrap().parent_review_required);
+    let owned = board.get(&nested.id).unwrap();
+    assert!(owned.parent_review_required);
+    assert_eq!(owned.parent_task_id, Some(child.id.clone()));
+    SessionManager::new(db.clone())
+        .transition_attempt(
+            attempt,
+            "completed",
+            "Verified",
+            Some("Prerequisite verified"),
+            None,
+        )
+        .unwrap();
+    queue
+        .complete(response.id, "Prerequisite verified")
+        .unwrap();
+    assert!(board
+        .complete_and_roll_up(&nested.id, None)
+        .unwrap()
+        .is_empty());
+    let (accepted, _) = review(
+        db,
+        "worker",
+        &nested.id,
+        &request(&board, &child, &nested, attempt, ReviewDecision::Accept),
+    )
+    .unwrap();
+    assert_eq!(accepted.status, TaskStatus::Completed);
+}
+
+#[test]
 fn many_completed_workers_coalesce_without_flooding_the_parent_prompt() {
     let (db, board, queue, parent, first) = setup();
     let output = "Detailed worker evidence. ".repeat(300);
