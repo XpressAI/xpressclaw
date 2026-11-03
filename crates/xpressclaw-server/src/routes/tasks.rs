@@ -585,6 +585,19 @@ async fn update_task_status(
     board
         .ensure_locally_managed(&id)
         .map_err(task_write_error)?;
+    if req.status == "completed"
+        && board
+            .get(&id)
+            .map_err(internal_error)?
+            .parent_review_required
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(
+                json!({"error":"The parent Agent must review and accept this delegated result before completion"}),
+            ),
+        ));
+    }
     if req.status == "completed" && !board.subtasks_complete(&id).map_err(internal_error)? {
         return Err((
             StatusCode::CONFLICT,

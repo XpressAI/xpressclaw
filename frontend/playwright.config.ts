@@ -39,7 +39,7 @@ export default defineConfig({
 			use: { ...devices['Desktop Safari'] },
 			testMatch: /workspace\.spec\.ts/,
 			// Tab gestures, mobile editing and external links run on both engines.
-			grep: /dragging a tab|keyboard tab dragging|abandons the drag|marks where it will land|compact tab strip|compact strip|never starts a drag|freshly split pane|drag in flight|deleted mid-drag|touch swipe|mobile editing|adaptive workspace|external links|project workflow schedules/,
+			grep: /dragging a tab|keyboard tab dragging|abandons the drag|marks where it will land|compact tab strip|compact strip|never starts a drag|freshly split pane|drag in flight|deleted mid-drag|touch swipe|mobile editing|adaptive workspace|external links|project workflow schedules|delegated worker results await parent acceptance|delegated work keeps coordination replies runnable/,
 		},
 		// Chromium can inject real touch input through CDP, including native
 		// panning, which WebKit's driver cannot; this profile reproduces phone

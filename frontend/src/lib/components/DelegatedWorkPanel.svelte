@@ -32,6 +32,7 @@
 		const labels: Record<string, string> = {
 			running: 'Working', preparing: 'Starting', queued: 'Queued', idle: 'Not running',
 			waiting_for_input: 'Needs input', awaiting_review: 'Awaiting review',
+			awaiting_parent_review: 'Awaiting parent review',
 			waiting_for_subtasks: 'Waiting for delegated work', waiting_for_dependencies: 'Waiting for dependencies',
 			completed: 'Completed', cancelled: 'Cancelled', failed: 'Failed', interrupted: 'Interrupted',
 			blocked: 'Blocked', backlog: 'Backlog', scheduled: 'Scheduled',

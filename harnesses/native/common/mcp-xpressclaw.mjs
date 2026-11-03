@@ -27,7 +27,7 @@ const LOCAL_COLLABORATION = process.env.XPRESSCLAW_LOCAL_COLLABORATION === '1';
 const COLLABORATION_TOKEN = process.env.XPRESSCLAW_COLLABORATION_TOKEN ?? '';
 const execFile = promisify(execFileCallback);
 
-const INSTRUCTIONS = CONNECTED ? `This turn belongs to Xpress AI. Your final response is returned to its chat or task automatically. Use send_conversation_message for interim updates and files (8 MiB per file, 20 MiB per turn), and list_platform_attachments and download_conversation_attachment for platform chat uploads. Use create_conversation_task to create independent follow-up work assigned to you in the same platform project. Local wake-ups and delegation are unavailable for connected turns; leave a clear final status when waiting. The platform owns task scheduling and cancellation. When executing an assigned task, perform the work in that task; never create a replacement task for the same assignment. For an assigned task, call get_task to read its checklist, update_task_step for completed or skipped steps (zero-based step_num), then update_task_status with Done, Failed, Waiting, or Doing before your final reply. The requested status takes effect with the final reply, subject to the platform completion gates. Workspace paths are not download links; publish files before your final response.` : `Container paths such as /tmp are not user download links. Use publish_task_files for task deliverables, or send_conversation_message with files for conversation deliverables. Both support files and folder archives. Users can browse the container and download larger folders from Files → Container. Use forward_port for a host-local LLM and expose_port for a container server. For shared interactive logins, run tmux new-session -s NAME; the user can join NAME from the Files terminal.\n\nFor project management, discover teammates with list_project_agents and use their exact IDs. create_tasks can commit up to 100 tasks with ref-based dependencies, start_after and Backlog placement. For independent long-term work set parent_task_id to null so this planning turn can finish. When asked only for a plan, keep tasks in Backlog and workflows disabled until execution is authorized. Inspect progress with list_project_tasks and get_project_task; change future work with update_task_planning. Discover workflow templates with list_project_workflows and get_project_workflow, then schedule independent project-owned copies with schedule_workflows, or author definitions with create_workflows. update_project_workflow can pause, enable or reschedule the Project’s copies.\n\nUse schedule_wakeup whenever work must pause and resume later.
+const INSTRUCTIONS = CONNECTED ? `This turn belongs to Xpress AI. Your final response is returned to its chat or task automatically. Use send_conversation_message for interim updates and files (8 MiB per file, 20 MiB per turn), and list_platform_attachments and download_conversation_attachment for platform chat uploads. Use create_conversation_task to create independent follow-up work assigned to you in the same platform project. Local wake-ups and delegation are unavailable for connected turns; leave a clear final status when waiting. The platform owns task scheduling and cancellation. When executing an assigned task, perform the work in that task; never create a replacement task for the same assignment. For an assigned task, call get_task to read its checklist, update_task_step for completed or skipped steps (zero-based step_num), then update_task_status with Done, Failed, Waiting, or Doing before your final reply. The requested status takes effect with the final reply, subject to the platform completion gates. Workspace paths are not download links; publish files before your final response.` : `Container paths such as /tmp are not user download links. Use publish_task_files for task deliverables, or send_conversation_message with files for conversation deliverables. Both support files and folder archives. Users can browse the container and download larger folders from Files → Container. Use forward_port for a host-local LLM and expose_port for a container server. For shared interactive logins, run tmux new-session -s NAME; the user can join NAME from the Files terminal.\n\nFor project management, discover teammates with list_project_agents and use their exact IDs. create_tasks can commit up to 100 tasks with ref-based dependencies, start_after and Backlog placement. For independent long-term work set parent_task_id to null so this planning turn can finish. When asked only for a plan, keep tasks in Backlog and workflows disabled until execution is authorized. Inspect progress with list_project_tasks and get_project_task; change future work with update_task_planning. Worker results wake their parent for review. Use review_delegated_task to accept fulfilled assignments, revise the same child with guidance, or wait on a blocker. Required children prevent completion, while explicit coordination wake-ups and replies can still run. Discover workflow templates with list_project_workflows and get_project_workflow, then schedule independent project-owned copies with schedule_workflows, or author definitions with create_workflows. update_project_workflow can pause, enable or reschedule the Project’s copies.\n\nUse schedule_wakeup whenever work must pause and resume later.
 
 The wake-up is stored by XpressClaw, survives control-plane restarts, and starts exactly one future turn in this project's existing ACP conversation. After it is armed, end the current turn instead of sleeping, polling, or claiming that an OS timer can initiate a model turn.
 
@@ -78,6 +78,16 @@ export const TOOLS = [
       tasks: { type: 'array', minItems: 1, maxItems: 100, items: { type: 'object', properties: { ...taskProperties, ref: { type: 'string', minLength: 1 } }, required: ['title'], additionalProperties: false } },
       parent_task_id: parentTaskProperty,
     }, required: ['tasks'], additionalProperties: false },
+  },
+  {
+    name: 'review_delegated_task',
+    description: 'Review a result from a child of this task. A finished worker response is a handoff, not automatic completion. Inspect the result and accept only fulfilled assignments; revise continues the same child with guidance; wait records an unresolved blocker without starting more work. Use the attempt ID from the notification or get_project_task. Only the parent Agent can decide.',
+    inputSchema: { type: 'object', properties: {
+      task_id: { type: 'string', minLength: 1 }, expected_attempt_id: { type: 'string' },
+      expected_revision: { type: 'integer', description: 'Current task revision from get_project_task.' },
+      decision: { type: 'string', enum: ['accept', 'revise', 'wait'] },
+      guidance: { type: 'string', maxLength: 20000, description: 'Concrete corrections or the unresolved blocker; required for revise and wait.' },
+    }, required: ['task_id', 'expected_attempt_id', 'expected_revision', 'decision'], additionalProperties: false },
   },
   {
     name: 'update_task_planning',
@@ -1302,6 +1312,13 @@ async function callTool(name, argumentsValue) {
     if (!Array.isArray(argumentsValue?.files)) throw new Error('files is required');
     return api(`${environmentPath}/tasks/${encodeURIComponent(TASK_ID)}/files`, { method: 'POST', body: JSON.stringify({ content: argumentsValue.content ?? '', files: argumentsValue.files.map(file => path.resolve(file)) }) });
   }
+  if (name === 'review_delegated_task') {
+    if (!TASK_ID) throw new Error('Review delegated results from their parent task.');
+    const { task_id, ...review } = argumentsValue;
+    return api(`${environmentPath}/tasks/${encodeURIComponent(task_id)}/review`, {
+      method: 'POST', body: JSON.stringify({ ...review, parent_task_id: TASK_ID }),
+    });
+  }
   if (name === 'schedule_wakeup') return scheduleWakeup(argumentsValue);
   if (name === 'list_wakeups') return { wakeups: await wakeups() };
   if (name === 'cancel_wakeup') return cancelWakeup(argumentsValue);
@@ -1349,7 +1366,7 @@ async function handle(message) {
         tools: {},
         resources: { listChanged: true },
       },
-      serverInfo: { name: 'xpressclaw-control', version: '0.4.26' },
+      serverInfo: { name: 'xpressclaw-control', version: '0.4.35' },
       instructions: buildInstructions(memoryIndex),
     });
     return;

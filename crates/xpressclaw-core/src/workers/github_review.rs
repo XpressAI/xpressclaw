@@ -887,18 +887,19 @@ fn finalize_if_satisfied(
         let transaction = conn.unchecked_transaction()?;
         let task = transaction
             .query_row(
-                "SELECT status, agent_id, parent_task_id FROM tasks WHERE id = ?1",
+                "SELECT status, agent_id, parent_task_id, parent_review_required FROM tasks WHERE id = ?1",
                 [&item.task_id],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, Option<String>>(1)?,
                         row.get::<_, Option<String>>(2)?,
+                        row.get::<_, bool>(3)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((task_status, agent_id, parent_task_id)) = task else {
+        let Some((task_status, agent_id, parent_task_id, parent_review_required)) = task else {
             transaction.commit()?;
             return Ok::<_, Error>(None);
         };
@@ -986,7 +987,7 @@ fn finalize_if_satisfied(
             [&item.task_id],
             |row| row.get(0),
         )?;
-        if !subtasks_complete || has_open_attempt {
+        if !subtasks_complete || has_open_attempt || parent_review_required {
             transaction.commit()?;
             return Ok(None);
         }
@@ -1532,6 +1533,142 @@ mod tests {
             .unwrap();
         assert_eq!(messages.len(), 1);
         assert!(messages[0].content.contains("GitHub review complete"));
+    }
+
+    #[test]
+    fn github_completion_keeps_delegated_result_open_until_parent_accepts() {
+        use crate::agents::registry::AgentRegistry;
+        use crate::tasks::delegation_review::{review, ReviewDecision, ReviewRequest};
+
+        for outcome in [ReviewOutcome::Approved, ReviewOutcome::Merged] {
+            for parent_waits in [false, true] {
+                let db = Arc::new(Database::open_memory().unwrap());
+                let agents = AgentRegistry::new(db.clone());
+                for agent in ["manager", "worker", "peer"] {
+                    agents.ensure(agent, "native").unwrap();
+                }
+                db.conn()
+                    .execute(
+                        "UPDATE agents SET project_id='manager' WHERE id IN ('worker','peer')",
+                        [],
+                    )
+                    .unwrap();
+                let board = TaskBoard::new(db.clone());
+                let queue = TaskQueue::new(db.clone());
+                let parent = board
+                    .create(&CreateTask {
+                        title: "Coordinate the release".into(),
+                        agent_id: Some("manager".into()),
+                        ..Default::default()
+                    })
+                    .unwrap();
+                let child = board
+                    .create(&CreateTask {
+                        title: "Publish the change".into(),
+                        agent_id: Some("worker".into()),
+                        parent_task_id: Some(parent.id.clone()),
+                        ..Default::default()
+                    })
+                    .unwrap();
+                let dependent = board
+                    .create(&CreateTask {
+                        title: "Deploy the accepted change".into(),
+                        agent_id: Some("peer".into()),
+                        ..Default::default()
+                    })
+                    .unwrap();
+                board.add_dependency(&dependent.id, &child.id).unwrap();
+                queue.enqueue(&dependent.id, "peer").unwrap();
+                queue.enqueue(&child.id, "worker").unwrap();
+                let response = queue.claim("worker").unwrap().unwrap();
+                let attempt = response.attempt_id.unwrap();
+                board
+                    .update_status(&child.id, "in_progress", Some("worker"))
+                    .unwrap();
+                let manager = GithubReviewManager::new(db.clone());
+                let item = manager
+                    .register(
+                        &child.id,
+                        "worker",
+                        "XpressAI/xpressclaw",
+                        "https://github.com/XpressAI/xpressclaw/pull/151",
+                    )
+                    .unwrap();
+                let output = "Implementation finished; PR ready for review.";
+                SessionManager::new(db.clone())
+                    .transition_attempt(
+                        &attempt,
+                        "completed",
+                        "Response finished",
+                        Some(output),
+                        None,
+                    )
+                    .unwrap();
+                queue.complete(response.id, output).unwrap();
+                assert!(board
+                    .complete_and_roll_up(&child.id, None)
+                    .unwrap()
+                    .is_empty());
+                let request = |decision| ReviewRequest {
+                    parent_task_id: parent.id.clone(),
+                    expected_attempt_id: attempt.clone(),
+                    expected_revision: board.get(&child.id).unwrap().revision,
+                    decision,
+                    guidance: Some(
+                        "Keep this open until I verify the release prerequisites.".into(),
+                    ),
+                };
+                assert!(review(
+                    db.clone(),
+                    "manager",
+                    &child.id,
+                    &request(ReviewDecision::Accept)
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("pull-request review"));
+                if parent_waits {
+                    review(
+                        db.clone(),
+                        "manager",
+                        &child.id,
+                        &request(ReviewDecision::Wait),
+                    )
+                    .unwrap();
+                }
+                let before = board.get(&child.id).unwrap();
+                assert!(before.parent_review_required);
+                assert!(queue.claim("peer").unwrap().is_none());
+
+                finalize_if_satisfied(&db, &item, outcome).unwrap();
+
+                assert_eq!(
+                    manager.gate(&child.id).unwrap(),
+                    GithubReviewGate::Satisfied
+                );
+                let pending = board.get(&child.id).unwrap();
+                assert_eq!(pending.status, before.status);
+                assert!(pending.parent_review_required);
+                assert!(pending.completed_at.is_none());
+                assert_ne!(board.get(&parent.id).unwrap().status, TaskStatus::Completed);
+                assert!(queue.claim("peer").unwrap().is_none());
+                assert!(board
+                    .complete_and_roll_up(&child.id, None)
+                    .unwrap()
+                    .is_empty());
+                let (accepted, result) = review(
+                    db.clone(),
+                    "manager",
+                    &child.id,
+                    &request(ReviewDecision::Accept),
+                )
+                .unwrap();
+                assert_eq!(accepted.status, TaskStatus::Completed);
+                assert!(!accepted.parent_review_required);
+                assert_eq!(result, output);
+                assert_eq!(queue.claim("peer").unwrap().unwrap().task_id, dependent.id);
+            }
+        }
     }
 
     #[test]

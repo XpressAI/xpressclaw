@@ -523,6 +523,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn only_parent_agent_can_accept_the_current_delegated_result() {
+        let (app, db) = app();
+        let board = TaskBoard::new(db.clone());
+        let parent = board
+            .create(&CreateTask {
+                title: "Coordinate rollout".into(),
+                agent_id: Some("atlas".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let child = board
+            .create(&CreateTask {
+                title: "Deploy".into(),
+                agent_id: Some("helper".into()),
+                parent_task_id: Some(parent.id.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        let queue = TaskQueue::new(db.clone());
+        queue.enqueue(&child.id, "helper").unwrap();
+        let work = queue.claim("helper").unwrap().unwrap();
+        xpressclaw_core::sessions::SessionManager::new(db.clone())
+            .transition_attempt(
+                work.attempt_id.as_deref().unwrap(),
+                "completed",
+                "Worker response",
+                Some("Deployment checked"),
+                None,
+            )
+            .unwrap();
+        queue.complete(work.id, "Deployment checked").unwrap();
+        board.complete_and_roll_up(&child.id, None).unwrap();
+        let (status, detail) = planning_request(
+            &app,
+            "GET",
+            &format!("/atlas/tasks/{}", child.id),
+            "atlas",
+            json!(null),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(detail["task"]["parent_review_required"], true);
+        assert_eq!(
+            detail["latest_attempt"]["id"],
+            work.attempt_id.as_deref().unwrap()
+        );
+        let review = json!({"parent_task_id":parent.id,"expected_attempt_id":work.attempt_id,"expected_revision":detail["task"]["revision"],"decision":"accept"});
+        for caller in ["helper", "outsider"] {
+            let (status, _) = planning_request(
+                &app,
+                "POST",
+                &format!("/{caller}/tasks/{}/review", child.id),
+                caller,
+                review.clone(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+        }
+        let (status, accepted) = planning_request(
+            &app,
+            "POST",
+            &format!("/atlas/tasks/{}/review", child.id),
+            "atlas",
+            review,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{accepted}");
+        assert_eq!(accepted["status"], "completed");
+        assert_eq!(accepted["parent_review_required"], false);
+    }
+
+    #[tokio::test]
     async fn manager_discovers_agents_creates_a_plan_and_releases_future_work() {
         let (app, db) = app();
         let (status, roster) =

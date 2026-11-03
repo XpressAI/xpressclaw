@@ -117,7 +117,7 @@ def main():
                         "capabilities": {"tools": {}},
                         "serverInfo": {
                             "name": "xpressclaw-skills",
-                            "version": "0.4.26",
+                            "version": "0.4.35",
                         },
                     },
                 )

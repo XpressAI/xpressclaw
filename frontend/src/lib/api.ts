@@ -831,6 +831,7 @@ export interface Task {
 	context: unknown;
 	provenance?: string;
 	blocks_parent?: boolean;
+	parent_review_required?: boolean;
 	activity_status?: string;
 	depends_on?: string[];
 	dependents?: string[];

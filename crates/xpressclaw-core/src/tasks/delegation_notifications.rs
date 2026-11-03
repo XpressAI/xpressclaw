@@ -1,4 +1,4 @@
-//! Durable child failures wake their parent once, without opening its completion gate.
+//! Durable delegated results wake their parent once, without opening completion gates.
 
 use rusqlite::{params, OptionalExtension, Transaction};
 
@@ -11,20 +11,33 @@ use crate::{
 // This is also used at claim time: an old notification must not grant a recovery
 // turn after the child has retried, completed, or moved to another parent.
 const OUTCOMES: &str = "
+ SELECT reported.* FROM (
  SELECT child.id AS child_id, child.parent_task_id AS parent_id, child.title,
         child.agent_id, COALESCE(a.id, '') AS attempt_id,
-        CASE WHEN child.status='cancelled' THEN 'cancelled'
-             WHEN child.status='blocked' THEN 'blocked'
+        child.status AS task_status, a.status AS response_status,
+        CASE WHEN child.status='completed' THEN CASE WHEN a.status='completed' THEN 'completed' END
+             WHEN child.status='cancelled' OR a.status='cancelled' THEN 'cancelled'
+             WHEN child.status='blocked' OR a.status IN ('failed','interrupted') THEN 'blocked'
              WHEN child.status='waiting_for_input' OR a.status='waiting_for_input'
-             THEN 'waiting_for_input' END AS outcome,
-        CASE WHEN a.status='failed' THEN a.error_message END AS error_message
+             THEN 'waiting_for_input'
+             WHEN a.status='completed' OR child.status='completed' THEN 'completed' END AS outcome,
+        CASE WHEN a.status IN ('failed','interrupted') THEN substr(a.error_message,1,1500) ELSE substr(a.result,1,1500) END AS error_message
  FROM tasks child
  LEFT JOIN work_attempts a ON a.id=(SELECT id FROM work_attempts
      WHERE task_id=child.id ORDER BY created_at DESC, rowid DESC LIMIT 1)
  WHERE child.parent_task_id IS NOT NULL AND child.hidden=0
-   AND child.provenance!='native_plan' AND child.status!='completed'
+   AND child.provenance!='native_plan'
    AND NOT EXISTS (SELECT 1 FROM work_attempts active WHERE active.task_id=child.id
-       AND active.status IN ('queued','preparing','running','review'))";
+       AND active.status IN ('queued','preparing','running','review'))
+ ) reported
+ WHERE NOT EXISTS (SELECT 1 FROM task_delegation_notifications reviewed
+       JOIN tasks parent ON parent.id=reported.parent_id
+       WHERE reviewed.child_task_id=reported.child_id AND reviewed.parent_task_id=reported.parent_id
+         AND reviewed.parent_agent_id=parent.agent_id AND reviewed.child_attempt_id=reported.attempt_id
+         AND reviewed.decision IS NOT NULL
+         AND (reviewed.child_status=reported.outcome
+              OR (reviewed.decision='wait' AND reviewed.child_status='completed'
+                  AND reported.task_status='blocked' AND reported.response_status='completed')))";
 
 pub(super) fn recovery_grant_sql() -> String {
     format!(
@@ -67,7 +80,7 @@ pub(super) fn retire_stale_in_transaction(
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let reason = "Delegated blocker is no longer current; unused notification response superseded";
+    let reason = "Delegated result is no longer current; unused notification response superseded";
     for (attempt, queue, task, agent) in stale {
         tx.execute("UPDATE work_attempts SET status='cancelled', completed_at=CURRENT_TIMESTAMP, result=?2 WHERE id=?1", params![attempt,reason])?;
         tx.execute("UPDATE task_queue SET status='failed', completed_at=CURRENT_TIMESTAMP, harness_response=?2 WHERE id=?1", params![queue,reason])?;
@@ -121,8 +134,13 @@ pub(super) fn reconcile_in_transaction(tx: &Transaction<'_>) -> Result<()> {
             "task_id": child, "title": title, "agent_id": agent, "status": status,
             "error": error, "attempt_id": child_attempt,
         });
+        let heading = if status == "completed" {
+            "Delegated result ready for review"
+        } else {
+            "Delegated task needs attention"
+        };
         let content = format!(
-            "Delegated task needs attention: {title}\nTask: {child}\nAgent: {}\nStatus: {status}\n{}\n\nThe parent has been notified. Required delegated work still needs to be resolved before completion.",
+            "{heading}: {title}\nTask: {child}\nAttempt: {child_attempt}\nAgent: {}\nStatus: {status}\n{}\n\nReview this result in the parent task. Use review_delegated_task with this task and attempt ID to accept completed work, request revisions, or keep incomplete work waiting. A finished response alone does not mean the assignment is complete. Required delegated work still needs to be resolved before completion.",
             agent.as_deref().unwrap_or("Unassigned"),
             error.as_deref().unwrap_or("Open the child task for details."),
         );
@@ -146,13 +164,18 @@ pub(super) fn reconcile_in_transaction(tx: &Transaction<'_>) -> Result<()> {
         tx.execute(
             "INSERT INTO session_events
              (session_id, attempt_id, task_id, source_type, source_id, event_type, summary, payload)
-             VALUES (?1, ?2, ?3, 'task', ?3, 'delegation_attention', ?4, ?5)",
+             VALUES (?1, ?2, ?3, 'task', ?3, ?6, ?4, ?5)",
             params![
                 owner,
                 response,
                 parent,
-                format!("Delegated task needs attention: {title}"),
-                details.to_string()
+                format!("{heading}: {title}"),
+                details.to_string(),
+                if status == "completed" {
+                    "delegation_result"
+                } else {
+                    "delegation_attention"
+                }
             ],
         )?;
     }
@@ -198,9 +221,14 @@ pub(crate) fn prompt(db: &Database, task_id: &str, attempt_id: &str) -> Result<O
             // The child may resolve after claim, or this response may also own
             // user guidance. Preserve that work without replaying stale errors
             // or falling back to the original task description.
-            return Ok(Some("Previously reported delegated blockers are no longer current. Check current task state and handle any pending user guidance. Do not retry or replace work based on the old failure notification, or restart the parent's original work. Keep required reviews and completion gates intact.".into()));
+            return Ok(Some("Previously reported delegated results are no longer current. Check current task state and handle any pending user guidance. Do not retry or replace work based on an old notification, or restart the parent's original work. Keep required reviews and completion gates intact.".into()));
         }
-        Ok(Some(format!("A delegated task reported a problem. Handle this notification in the existing parent task. Inspect each child's latest state before acting. Diagnose the cause; do not blindly retry or create replacement tasks. If safe recovery needs user input or an environment/settings change, report the blocker and ask the user. Keep required reviews and completion gates intact. Do not restart the parent's original work just to handle this notification.\n\n{}", content.join("\n\n"))))
+        let additional = content.len().saturating_sub(20);
+        let mut reports = content.into_iter().take(20).collect::<Vec<_>>().join("\n\n");
+        if additional > 0 {
+            reports.push_str(&format!("\n\n{additional} additional delegated reports are saved. Use list_project_tasks and get_project_task to review the remaining children and their current results."));
+        }
+        Ok(Some(format!("Delegated work has a result or needs attention. Handle this notification in the existing parent task, like a scheduled coordination wake-up. Inspect each child's latest state and saved result before acting. Use review_delegated_task to accept only work that satisfies its assignment, request revisions with concrete guidance, or wait for an external dependency. An incomplete report or missing authorization is not completed work. Do not blindly retry or create replacement tasks. Keep required reviews and completion gates intact. Do not restart the parent's original work just to handle this notification.\n\n{reports}")))
     })
 }
 
@@ -326,7 +354,10 @@ mod tests {
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert!(queue.claim("parent").unwrap().is_none());
+            assert!(
+                super::super::planning::has_eligible_response(&db.conn(), &parent.id).unwrap(),
+                "explicit guidance is runnable even before a child reports a blocker"
+            );
             fail(&db, &board, &queue, &child);
             // Failure occurred before any native session was started.
             let claimed = if by_agent {
@@ -688,7 +719,7 @@ mod tests {
     }
 
     #[test]
-    fn resolved_delegation_does_not_block_parent_roll_up() {
+    fn finished_delegation_delivers_its_result_before_parent_roll_up() {
         let (db, board, queue, parent, child) = setup();
         fail(&db, &board, &queue, &child);
         reconcile(&db);
@@ -698,10 +729,22 @@ mod tests {
             .complete_and_roll_up(&child.id, Some("reviewer"))
             .unwrap();
         assert!(
-            completed.iter().any(|t| t.id == parent.id),
-            "obsolete recovery cannot hold the completed review open"
+            completed.iter().all(|t| t.id != parent.id),
+            "the parent must receive the completed worker result before roll-up"
         );
-        assert!(queue.claim_next().unwrap().is_none());
+        let response = queue.claim("parent").unwrap().unwrap();
+        assert!(
+            prompt(&db, &parent.id, response.attempt_id.as_deref().unwrap())
+                .unwrap()
+                .unwrap()
+                .contains("result")
+        );
+        finish(&db, &queue, &response);
+        assert!(board
+            .complete_and_roll_up(&parent.id, None)
+            .unwrap()
+            .iter()
+            .any(|task| task.id == parent.id));
     }
 
     #[test]
@@ -892,9 +935,11 @@ mod tests {
         reconcile(&db);
         // Recreate the v52 persisted schema: origin was
         // unknown, so upgrading must not guess that a response is disposable.
+        board.update_status(&child.id, "completed", None).unwrap();
         db.conn()
             .execute_batch(
                 "DROP TABLE task_delegation_automatic_responses;
+            ALTER TABLE tasks DROP COLUMN parent_review_required;
             DROP INDEX idx_workflows_project;
             ALTER TABLE workflows DROP COLUMN project_id;
             ALTER TABLE workflows DROP COLUMN revision;
@@ -906,7 +951,6 @@ mod tests {
             UPDATE config SET value='52' WHERE key='schema_version';",
             )
             .unwrap();
-        board.update_status(&child.id, "completed", None).unwrap();
         drop(queue);
         drop(board);
         drop(db);
