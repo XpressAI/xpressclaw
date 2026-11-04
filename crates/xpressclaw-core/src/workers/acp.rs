@@ -41,6 +41,11 @@ use crate::tasks::board::{ReportedSubtask, TaskBoard, TaskStatus};
 use crate::tasks::conversation::PromptImageAttachment;
 
 const MAX_TRANSCRIPT_UPDATES: usize = 500;
+
+#[path = "acp_retry.rs"]
+mod provider_retry;
+pub(crate) use provider_retry::{DispatchPermit, RetryCapacity};
+
 const MAX_DIAGNOSTIC_BYTES: usize = 200_000;
 const CONFIG_UPDATE_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
 const CLAUDE_OAUTH_REFRESH_RETRIES: usize = 3;
@@ -64,6 +69,10 @@ fn is_claude_oauth_refresh_notice(runner: &str, text: &str) -> bool {
     text.starts_with(CLAUDE_OAUTH_REFRESH_CONFLICT)
 }
 
+fn is_prompt_error_notice(runner: &str, text: &str) -> bool {
+    is_claude_oauth_refresh_notice(runner, text) || provider_retry::is_notice(text)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcpInterruptMode {
     /// Finish any tool that is already in flight, then start the queued turn.
@@ -72,12 +81,33 @@ pub enum AcpInterruptMode {
     Immediate,
 }
 
-#[derive(Default)]
 struct PendingTurnControl {
     sender: Option<mpsc::UnboundedSender<()>>,
     active_tools: HashSet<String>,
     requested: Option<AcpInterruptMode>,
     sent: bool,
+    delivery: watch::Sender<InterruptDelivery>,
+    timeout_registered: bool,
+}
+
+#[derive(Clone, Copy)]
+enum InterruptDelivery {
+    Pending,
+    Sent(tokio::time::Instant),
+    Acknowledged,
+}
+
+impl Default for PendingTurnControl {
+    fn default() -> Self {
+        Self {
+            sender: None,
+            active_tools: HashSet::new(),
+            requested: None,
+            sent: false,
+            delivery: watch::channel(InterruptDelivery::Pending).0,
+            timeout_registered: false,
+        }
+    }
 }
 
 /// Routes task-page guidance into an active ACP prompt turn.
@@ -122,6 +152,52 @@ impl AcpTurnControlBroker {
         }
         Self::send_if_ready(control);
         true
+    }
+
+    /// Wait only after cancellation was delivered, so preparation and active
+    /// tools keep their normal lifetime. One monitor owns each attempt.
+    pub async fn interruption_timed_out(
+        &self,
+        attempt_id: &str,
+        grace: std::time::Duration,
+    ) -> bool {
+        let mut delivery = {
+            let mut turns = self.turns.lock().unwrap();
+            let Some(control) = turns.get_mut(attempt_id) else {
+                return false;
+            };
+            if control.timeout_registered {
+                return false;
+            }
+            control.timeout_registered = true;
+            control.delivery.subscribe()
+        };
+        let sent_at = loop {
+            let progress = *delivery.borrow_and_update();
+            match progress {
+                InterruptDelivery::Sent(at) => break at,
+                InterruptDelivery::Acknowledged => return false,
+                InterruptDelivery::Pending => {}
+            }
+            if delivery.changed().await.is_err() {
+                return false;
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = delivery.changed() => false,
+            _ = tokio::time::sleep_until(sent_at + grace) => true,
+        }
+    }
+
+    fn acknowledge_interrupt(&self, attempt_id: &str) {
+        if let Some(control) = self.turns.lock().unwrap().get_mut(attempt_id) {
+            if control.sent {
+                control
+                    .delivery
+                    .send_replace(InterruptDelivery::Acknowledged);
+            }
+        }
     }
 
     fn register(&self, attempt_id: &str) -> mpsc::UnboundedReceiver<()> {
@@ -177,6 +253,9 @@ impl AcpTurnControlBroker {
         if sender.send(()).is_ok() {
             control.requested = None;
             control.sent = true;
+            control
+                .delivery
+                .send_replace(InterruptDelivery::Sent(tokio::time::Instant::now()));
         } else {
             control.sender = None;
         }
@@ -341,6 +420,7 @@ pub struct AcpTurnRuntime {
     elicitation_broker: Arc<AcpElicitationBroker>,
     turn_controls: Arc<AcpTurnControlBroker>,
     allow_elicitation: bool,
+    retry_capacity: Option<Arc<RetryCapacity>>,
 }
 
 /// A live, initialized ACP process. One handle is retained for each project so
@@ -469,6 +549,7 @@ impl AcpTurnRuntime {
             elicitation_broker,
             turn_controls,
             allow_elicitation: true,
+            retry_capacity: None,
         }
     }
 
@@ -482,7 +563,13 @@ impl AcpTurnRuntime {
             elicitation_broker,
             turn_controls,
             allow_elicitation: false,
+            retry_capacity: None,
         }
+    }
+
+    pub(crate) fn with_retry_capacity(mut self, capacity: Arc<RetryCapacity>) -> Self {
+        self.retry_capacity = Some(capacity);
+        self
     }
 }
 
@@ -503,7 +590,7 @@ impl TurnState {
     fn has_prompt_activity(&self, runner: &str) -> bool {
         self.prompt_activity_seen
             || (!self.assistant_text.trim().is_empty()
-                && !is_claude_oauth_refresh_notice(runner, &self.assistant_text))
+                && !is_prompt_error_notice(runner, &self.assistant_text))
     }
 }
 
@@ -992,14 +1079,14 @@ impl AcpEventRecorder {
             if message.is_empty() {
                 return Ok(());
             }
-            let refresh_notice = is_claude_oauth_refresh_notice(&self.runner, &message);
-            if !refresh_notice {
+            let retry_notice = is_prompt_error_notice(&self.runner, &message);
+            if !retry_notice {
                 state.prompt_activity_seen = true;
             }
             // The same text can be a legitimate quote in a successful response.
             // Keep it, and subsequent messages in order, until the JSON-RPC
-            // response tells us whether this prompt actually hit the conflict.
-            if refresh_notice || !state.deferred_agent_messages.is_empty() {
+            // response confirms a retryable provider failure.
+            if retry_notice || !state.deferred_agent_messages.is_empty() {
                 state.deferred_agent_messages.push((message_id, message));
                 return Ok(());
             }
@@ -1032,19 +1119,17 @@ impl AcpEventRecorder {
         )
     }
 
-    fn resolve_prompt_output(&self, refresh_conflict: bool) -> Result<()> {
+    fn resolve_prompt_output(&self, retryable_error: bool) -> Result<()> {
         let deferred = {
             let mut state = self.state.lock().unwrap();
-            if refresh_conflict
-                && is_claude_oauth_refresh_notice(&self.runner, &state.assistant_text)
-            {
+            if retryable_error && is_prompt_error_notice(&self.runner, &state.assistant_text) {
                 state.assistant_text.clear();
                 state.current_message_id = None;
             }
             std::mem::take(&mut state.deferred_agent_messages)
         };
         for (message_id, message) in deferred {
-            if !refresh_conflict || !is_claude_oauth_refresh_notice(&self.runner, &message) {
+            if !retryable_error || !is_prompt_error_notice(&self.runner, &message) {
                 self.publish_agent_message(message_id, message)?;
             }
         }
@@ -1482,6 +1567,7 @@ async fn serve_process(
                     elicitation_broker,
                     turn_controls,
                     allow_elicitation,
+                    retry_capacity,
                 } = runtime;
                 *active_turn.lock().unwrap() = Some(ActiveTurn {
                     recorder: recorder.clone(),
@@ -1491,19 +1577,38 @@ async fn serve_process(
                 });
                 stderr_for_connection.lock().unwrap().clear();
 
-                let result = run_connected_turn(
-                    &connection,
-                    &initialized,
-                    &sessions,
-                    &recorder,
-                    &turn_controls,
-                    session_start,
-                    cwd,
-                    prompt,
-                    options,
-                    &mut shutdown,
-                )
-                .await;
+                let (result, disconnected) = {
+                    let turn = run_connected_turn(
+                        &connection,
+                        &initialized,
+                        &sessions,
+                        &recorder,
+                        &turn_controls,
+                        session_start,
+                        cwd,
+                        prompt,
+                        options,
+                        &mut shutdown,
+                        retry_capacity.as_deref(),
+                    );
+                    tokio::pin!(turn);
+                    tokio::select! {
+                        biased;
+                        result = &mut turn => (result, false),
+                        _ = &mut output_closed_receiver => {
+                            // Let a final response already buffered in stdout drain.
+                            // A missing response must not hold the worker forever.
+                            let result = tokio::time::timeout(std::time::Duration::from_secs(1), &mut turn)
+                                .await.unwrap_or_else(|_| Err(agent_client_protocol::util::internal_error(
+                                    "ACP process output closed before the prompt completed"
+                                )));
+                            (result, true)
+                        }
+                    }
+                };
+                if disconnected {
+                    turns.close();
+                }
                 *active_turn.lock().unwrap() = None;
                 let turn_stderr = std::mem::take(&mut *stderr_for_connection.lock().unwrap());
 
@@ -1544,6 +1649,9 @@ async fn serve_process(
                         // Request/provider failures do not imply a broken
                         // transport. The stream watcher handles actual exits.
                     }
+                }
+                if disconnected {
+                    break;
                 }
             }
 
@@ -1820,6 +1928,7 @@ async fn run_connected_turn(
     prompt: String,
     options: AcpTurnOptions,
     shutdown: &mut watch::Receiver<bool>,
+    retry_capacity: Option<&RetryCapacity>,
 ) -> std::result::Result<(String, String, bool), agent_client_protocol::Error> {
     let AcpTurnOptions {
         model,
@@ -2281,6 +2390,7 @@ async fn run_connected_turn(
     let interrupt_sent_for_turn = interrupt_sent.clone();
     let mut controls_open = true;
     let mut retries = 0;
+    let retry_started = tokio::time::Instant::now();
     let response = loop {
         let prompt_request = connection.send_request(PromptRequest::new(
             session_id.clone(),
@@ -2302,28 +2412,62 @@ async fn run_connected_turn(
                         None => controls_open = false,
                     }
                 }
+                _ = shutdown.changed() => {
+                    interrupt_sent_for_turn.store(true, Ordering::SeqCst);
+                    break Err(agent_client_protocol::Error::request_cancelled());
+                }
             }
         };
-        let retryable = response
-            .as_ref()
-            .err()
-            .is_some_and(|error| is_claude_oauth_refresh_conflict(&recorder.runner, error));
-        if !retryable
-            || retries >= CLAUDE_OAUTH_REFRESH_RETRIES
-            || recorder.has_prompt_activity()
+        turn_controls.acknowledge_interrupt(&recorder.attempt_id);
+        let retry = response.as_ref().err().and_then(|error| {
+            if is_claude_oauth_refresh_conflict(&recorder.runner, error) {
+                (retries < CLAUDE_OAUTH_REFRESH_RETRIES).then_some((
+                    CLAUDE_OAUTH_REFRESH_RETRY_DELAY,
+                    "Sign-in refresh is busy",
+                    CLAUDE_OAUTH_REFRESH_RETRIES,
+                ))
+            } else {
+                let advice = provider_retry::classify(error)?;
+                Some((
+                    advice.delay(&recorder.attempt_id, retries)?,
+                    advice.reason,
+                    provider_retry::MAX_RETRIES,
+                ))
+            }
+        });
+        let Some((delay, reason, retry_limit)) = retry else {
+            break response;
+        };
+        if recorder.has_prompt_activity()
             || interrupt_sent.load(Ordering::SeqCst)
             || !controls_open
+            || retry_started.elapsed() + delay > provider_retry::RETRY_WINDOW
         {
             break response;
         }
         retries += 1;
+        recorder.append_event(
+            "provider_retry",
+            &format!("{reason}; retry {retries}/{retry_limit} in {} seconds", delay.as_secs_f64().ceil()),
+            json!({
+                "retry": retries,
+                "retry_limit": retry_limit,
+                "delay_ms": delay.as_millis(),
+                "retry_at": (chrono::Utc::now() + chrono::Duration::from_std(delay).unwrap()).to_rfc3339(),
+            }),
+        ).map_err(agent_client_protocol::Error::into_internal_error)?;
         warn!(
             attempt_id = %recorder.attempt_id,
             retry = retries,
-            "Claude OAuth refresh is busy; retrying the ACP prompt in one minute"
+            delay_seconds = delay.as_secs_f64(),
+            reason,
+            "temporary provider failure; retrying the ACP prompt"
         );
         // Remain within the same task/conversation attempt and native session.
         // No failed lifecycle event or chat error escapes while recovery is pending.
+        if let Some(capacity) = retry_capacity {
+            capacity.release();
+        }
         let cancelled = if *shutdown.borrow() {
             true
         } else {
@@ -2331,12 +2475,27 @@ async fn run_connected_turn(
                 biased;
                 _ = shutdown.changed() => true,
                 _ = interrupt_receiver.recv() => true,
-                _ = tokio::time::sleep(CLAUDE_OAUTH_REFRESH_RETRY_DELAY) => false,
+                _ = tokio::time::sleep(delay) => false,
             }
         };
         if cancelled {
             interrupt_sent.store(true, Ordering::SeqCst);
             break response;
+        }
+        if let Some(capacity) = retry_capacity {
+            let acquired = tokio::select! {
+                biased;
+                _ = shutdown.changed() => { interrupt_sent.store(true, Ordering::SeqCst); false },
+                _ = interrupt_receiver.recv() => { interrupt_sent.store(true, Ordering::SeqCst); false },
+                _ = tokio::time::sleep_until(retry_started + provider_retry::RETRY_WINDOW) => false,
+                acquired = capacity.reacquire() => {
+                    if !acquired { interrupt_sent.store(true, Ordering::SeqCst); }
+                    acquired
+                },
+            };
+            if !acquired {
+                break response;
+            }
         }
         // An update can arrive after the error response while we're backing off.
         if !recorder.prepare_prompt_retry() {
@@ -2344,13 +2503,12 @@ async fn run_connected_turn(
         }
     };
     recorder
-        .resolve_prompt_output(
-            response
-                .as_ref()
-                .err()
-                .is_some_and(|error| is_claude_oauth_refresh_conflict(&recorder.runner, error)),
-        )
+        .resolve_prompt_output(response.as_ref().err().is_some_and(|error| {
+            is_claude_oauth_refresh_conflict(&recorder.runner, error)
+                || provider_retry::classify(error).is_some()
+        }))
         .map_err(agent_client_protocol::Error::into_internal_error)?;
+    turn_controls.acknowledge_interrupt(&recorder.attempt_id);
     let interrupted = interrupt_sent.load(Ordering::SeqCst);
     if let Err(error) = DashboardManager::new(recorder.db.clone()).record_prompt_usage(
         &prompt_id,
@@ -2568,6 +2726,199 @@ mod tests {
     use crate::docker::manager::ContainerInfo;
 
     const OAUTH_REFRESH_CONFLICT: &str = "Failed to refresh OAuth token: another Claude Code process is refreshing it or exited mid-refresh. This is usually transient; retry in a minute, and if it persists close other Claude Code processes or sign in again";
+
+    #[tokio::test(start_paused = true)]
+    async fn temporary_model_capacity_errors_retry_across_harnesses() {
+        for runner in ["codex", "claude", "opencode"] {
+            let (result, times) = oauth_retry_scenario(
+                runner,
+                "The model is currently at capacity. Please try again later.",
+                3,
+                None,
+                RetryTestAction::None,
+            )
+            .await;
+            assert_eq!(result.unwrap().summary, "Work complete", "{runner}");
+            assert_eq!(times.len(), 4);
+            for (pair, delay) in times.windows(2).zip([15, 30, 60]) {
+                let elapsed = pair[1] - pair[0];
+                let base = std::time::Duration::from_secs(delay);
+                assert!(elapsed >= base && elapsed <= base.mul_f64(1.25));
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn capacity_notices_retry_only_with_a_failed_provider_rpc() {
+        let notice = "API Error: The model is currently at capacity. Please try again later.";
+        for failures in [0, 2] {
+            let (result, times) = oauth_retry_scenario(
+                "opencode",
+                "Model is at capacity",
+                failures,
+                Some(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                    ContentBlock::Text(TextContent::new(notice)),
+                ))),
+                RetryTestAction::None,
+            )
+            .await;
+            assert_eq!(
+                result.unwrap().summary,
+                if failures == 0 {
+                    notice
+                } else {
+                    "Work complete"
+                }
+            );
+            assert_eq!(times.len(), failures + 1);
+        }
+        let db = Arc::new(Database::open_memory().unwrap());
+        let (recorder, _) = test_recorder(db);
+        recorder.reset_prompt_output();
+        recorder
+            .record_notification(SessionNotification::new(
+                "session",
+                SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                    TextContent::new(notice),
+                ))),
+            ))
+            .unwrap();
+        recorder.flush_prompt_output().unwrap();
+        recorder.resolve_prompt_output(false).unwrap();
+        assert_eq!(
+            recorder.finish().unwrap().0,
+            notice,
+            "successful quotes and unrelated errors preserve the text"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn user_guidance_interrupts_capacity_backoff_without_another_prompt() {
+        let (result, times) = oauth_retry_scenario(
+            "codex",
+            "The model is currently at capacity. Please try again later.",
+            10,
+            None,
+            RetryTestAction::Interrupt,
+        )
+        .await;
+        assert!(result.unwrap().interrupted);
+        assert_eq!(times.len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provider_retries_are_bounded_and_honor_reported_retry_delays() {
+        let (result, times) = oauth_retry_scenario(
+            "codex",
+            "Model is at capacity",
+            100,
+            None,
+            RetryTestAction::None,
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(times.len(), provider_retry::MAX_RETRIES + 1);
+
+        let (result, times) = oauth_retry_scenario(
+            "opencode",
+            r#"{"status":429,"retry_after":300}"#,
+            100,
+            None,
+            RetryTestAction::None,
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            times.len(),
+            3,
+            "total retry window also bounds long provider hints"
+        );
+        assert_eq!(times[2] - times[0], std::time::Duration::from_secs(600));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provider_failure_never_replays_partial_work_or_permanent_quota_failures() {
+        for update in [
+            SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                TextContent::new("Deployed the service"),
+            ))),
+            SessionUpdate::ToolCall(
+                ToolCall::new("deploy", "Deploy service").status(ToolCallStatus::Completed),
+            ),
+            SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(
+                TextContent::new("Preparing the change"),
+            ))),
+        ] {
+            let (result, times) = oauth_retry_scenario(
+                "codex",
+                "Model is at capacity",
+                1,
+                Some(update),
+                RetryTestAction::None,
+            )
+            .await;
+            assert!(result.is_err());
+            assert_eq!(times.len(), 1);
+        }
+        let (result, times) = oauth_retry_scenario(
+            "claude",
+            r#"{"status":429,"error":{"code":"insufficient_quota"}}"#,
+            1,
+            None,
+            RetryTestAction::None,
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(times.len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provider_backoff_releases_shared_dispatch_capacity_until_the_retry() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let owner = DispatchPermit::new(
+            semaphore.clone(),
+            semaphore.clone().acquire_owned().await.unwrap(),
+        );
+        let request = retry_scenario_in_lane_with_capacity(
+            "codex",
+            "Model is at capacity",
+            1,
+            None,
+            RetryTestAction::None,
+            false,
+            Some(owner.retry_capacity()),
+        );
+        let other_agent = async {
+            let _permit = semaphore.clone().acquire_owned().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(90)).await;
+        };
+        let ((result, times), ()) = tokio::join!(request, other_agent);
+        assert_eq!(result.unwrap().summary, "Work complete");
+        assert_eq!(times.len(), 2);
+        assert!(times[1] - times[0] >= std::time::Duration::from_secs(90));
+        assert_eq!(
+            semaphore.available_permits(),
+            0,
+            "retry reacquires its dispatch slot"
+        );
+        drop(owner);
+        assert_eq!(semaphore.available_permits(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn capacity_retry_keeps_the_same_conversation_turn() {
+        let (result, times) = oauth_retry_scenario_in_lane(
+            "opencode",
+            "Model is at capacity",
+            2,
+            None,
+            RetryTestAction::None,
+            true,
+        )
+        .await;
+        assert_eq!(result.unwrap().summary, "Work complete");
+        assert_eq!(times.len(), 3);
+    }
 
     #[tokio::test(start_paused = true)]
     async fn claude_oauth_refresh_conflict_retries_the_same_prompt_and_session() {
@@ -2916,6 +3267,27 @@ mod tests {
         action: RetryTestAction,
         conversation_lane: bool,
     ) -> (Result<AcpTurnResult>, Vec<tokio::time::Instant>) {
+        retry_scenario_in_lane_with_capacity(
+            runner,
+            error,
+            failures,
+            update,
+            action,
+            conversation_lane,
+            None,
+        )
+        .await
+    }
+
+    async fn retry_scenario_in_lane_with_capacity(
+        runner: &str,
+        error: &str,
+        failures: usize,
+        update: Option<SessionUpdate>,
+        action: RetryTestAction,
+        conversation_lane: bool,
+        retry_capacity: Option<Arc<RetryCapacity>>,
+    ) -> (Result<AcpTurnResult>, Vec<tokio::time::Instant>) {
         let db = Arc::new(Database::open_memory().unwrap());
         let (mut recorder, _) = test_recorder(db.clone());
         recorder.runner = runner.to_string();
@@ -3093,17 +3465,19 @@ mod tests {
                 }
             }
         });
+        let mut runtime = if conversation_lane {
+            AcpTurnRuntime::for_conversation(
+                recorder,
+                Arc::new(AcpElicitationBroker::new()),
+                controls,
+            )
+        } else {
+            AcpTurnRuntime::new(recorder, Arc::new(AcpElicitationBroker::new()), controls)
+        };
+        runtime.retry_capacity = retry_capacity;
         let result = process
             .run_turn(
-                if conversation_lane {
-                    AcpTurnRuntime::for_conversation(
-                        recorder,
-                        Arc::new(AcpElicitationBroker::new()),
-                        controls,
-                    )
-                } else {
-                    AcpTurnRuntime::new(recorder, Arc::new(AcpElicitationBroker::new()), controls)
-                },
+                runtime,
                 AcpSessionStart::New,
                 Path::new("/workspace"),
                 "Do the work",
@@ -3141,6 +3515,67 @@ mod tests {
                     && event.summary.contains(OAUTH_REFRESH_CONFLICT)));
         }
         (result, mock_agent.await.unwrap())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn interruption_deadline_starts_after_tools_finish_and_is_deduplicated() {
+        let broker = AcpTurnControlBroker::new();
+        broker.begin_attempt("attempt");
+        let mut receiver = broker.register("attempt");
+        broker.observe_update(
+            "attempt",
+            &SessionUpdate::ToolCall(
+                ToolCall::new("tool", "Run tests").status(ToolCallStatus::InProgress),
+            ),
+        );
+        broker.request_interrupt("attempt", AcpInterruptMode::AfterTool);
+        let monitor = broker.interruption_timed_out("attempt", std::time::Duration::from_secs(30));
+        tokio::pin!(monitor);
+        tokio::select! {
+            result = &mut monitor => panic!("active tool must not be interrupted: {result}"),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(120)) => {},
+        }
+        assert!(
+            !broker
+                .interruption_timed_out("attempt", std::time::Duration::from_secs(30))
+                .await
+        );
+        assert!(receiver.try_recv().is_err());
+        broker.observe_update(
+            "attempt",
+            &SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                "tool",
+                ToolCallUpdateFields::new().status(ToolCallStatus::Completed),
+            )),
+        );
+        receiver.recv().await.unwrap();
+        let sent = tokio::time::Instant::now();
+        assert!(monitor.await);
+        assert_eq!(sent.elapsed(), std::time::Duration::from_secs(30));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn acknowledged_or_finished_attempts_do_not_trigger_forced_interruption() {
+        for acknowledge in [false, true] {
+            let broker = AcpTurnControlBroker::new();
+            broker.begin_attempt("attempt");
+            let mut receiver = broker.register("attempt");
+            broker.request_interrupt("attempt", AcpInterruptMode::AfterTool);
+            receiver.recv().await.unwrap();
+            let monitor =
+                broker.interruption_timed_out("attempt", std::time::Duration::from_secs(30));
+            tokio::pin!(monitor);
+            tokio::select! {
+                result = &mut monitor => panic!("deadline fired early: {result}"),
+                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {},
+            }
+            if acknowledge {
+                broker.acknowledge_interrupt("attempt");
+            } else {
+                broker.finish_attempt("attempt");
+            }
+            assert!(!monitor.await);
+        }
     }
 
     #[test]
@@ -3220,6 +3655,95 @@ mod tests {
             .expect("explicit shutdown should stop an idle ACP actor");
         assert!(!process.is_alive());
         mock_agent.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn active_prompts_release_the_process_on_exit_or_shutdown() {
+        for mode in ["eof", "final_reply", "shutdown"] {
+            let db = Arc::new(Database::open_memory().unwrap());
+            let (recorder, _) = test_recorder(db);
+            let controls = Arc::new(AcpTurnControlBroker::new());
+            controls.begin_attempt(&recorder.attempt_id);
+            let (client_input, agent_input) = tokio::io::duplex(64 * 1024);
+            let (output_tx, output_rx) = tokio::sync::mpsc::channel(8);
+            let (prompt_tx, prompt_rx) = oneshot::channel();
+            let mock = tokio::spawn(async move {
+                let mut lines = BufReader::new(agent_input).lines();
+                let mut prompt_tx = Some(prompt_tx);
+                while let Some(line) = lines.next_line().await.unwrap() {
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    let result = match request["method"].as_str().unwrap() {
+                        "initialize" => json!(InitializeResponse::new(ProtocolVersion::V1)),
+                        "session/new" => json!(NewSessionResponse::new("exit-session")),
+                        "session/prompt" => {
+                            prompt_tx.take().unwrap().send(()).unwrap();
+                            if mode == "eof" {
+                                break;
+                            }
+                            if mode == "shutdown" {
+                                continue;
+                            }
+                            send_json(&output_tx, json!({
+                                "jsonrpc":"2.0", "method":"session/update",
+                                "params":SessionNotification::new("exit-session", SessionUpdate::AgentMessageChunk(
+                                    ContentChunk::new(ContentBlock::Text(TextContent::new("Finished before exit")))
+                                )),
+                            })).await;
+                            json!(PromptResponse::new(StopReason::EndTurn))
+                        }
+                        method => panic!("unexpected method: {method}"),
+                    };
+                    send_json(
+                        &output_tx,
+                        json!({"jsonrpc":"2.0","id":request["id"],"result":result}),
+                    )
+                    .await;
+                    if request["method"] == "session/prompt" {
+                        break;
+                    }
+                }
+            });
+            let process = AcpProcess::start(AttachedContainer {
+                info: ContainerInfo {
+                    container_id: "test-container".into(),
+                    agent_id: "test-agent".into(),
+                    status: "running".into(),
+                    host_port: None,
+                },
+                input: Box::pin(client_input),
+                output: Box::pin(ReceiverStream::new(output_rx)),
+            })
+            .await
+            .unwrap();
+            let turn = process.run_turn(
+                AcpTurnRuntime::new(recorder, Arc::new(AcpElicitationBroker::new()), controls),
+                AcpSessionStart::New,
+                Path::new("/workspace"),
+                "Do the work",
+                AcpTurnOptions::default(),
+            );
+            let stop = async {
+                prompt_rx.await.unwrap();
+                if mode == "shutdown" {
+                    process.shutdown();
+                }
+            };
+            let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(turn, stop)
+            })
+            .await
+            .expect("a disconnected or stopped prompt must release the process");
+            match mode {
+                "eof" => assert!(result.is_err()),
+                "final_reply" => assert_eq!(result.unwrap().summary, "Finished before exit"),
+                _ => assert!(result.unwrap().interrupted),
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(5), process.wait_for_exit())
+                .await
+                .unwrap();
+            assert!(!process.is_alive());
+            mock.await.unwrap();
+        }
     }
 
     #[tokio::test]

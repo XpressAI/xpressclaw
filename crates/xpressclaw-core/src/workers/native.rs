@@ -59,7 +59,7 @@ use crate::visualizations::{
 };
 use crate::workers::acp::{
     AcpElicitationBroker, AcpEventRecorder, AcpProcess, AcpSessionStart, AcpTurnControlBroker,
-    AcpTurnOptions, AcpTurnRuntime,
+    AcpTurnOptions, AcpTurnRuntime, DispatchPermit, RetryCapacity,
 };
 use crate::workers::github;
 use crate::workers::presentations::{
@@ -99,6 +99,7 @@ struct NativeAttemptRuntime {
     event_bus: Arc<ConversationEventBus>,
     elicitation_broker: Arc<AcpElicitationBroker>,
     turn_controls: Arc<AcpTurnControlBroker>,
+    retry_capacity: Arc<RetryCapacity>,
     processes: Arc<ProjectAcpProcesses>,
     conversation_processes: Arc<ConversationAcpProcesses>,
     runtime_lifecycle: Arc<NativeRuntimeLifecycle>,
@@ -631,6 +632,8 @@ pub async fn start_dispatcher(
                 let conversation_processes = task_conversation_processes.clone();
                 let runtime_lifecycle = runtime_lifecycle.clone();
                 let control_plane_token = control_plane_token.clone();
+                let permit = DispatchPermit::new(concurrency.clone(), permit);
+                let retry_capacity = permit.retry_capacity();
                 if let Some(attempt_id) = item.attempt_id.as_deref() {
                     turn_controls.begin_attempt(attempt_id);
                 }
@@ -648,6 +651,7 @@ pub async fn start_dispatcher(
                                 event_bus: event_bus.clone(),
                                 elicitation_broker,
                                 turn_controls: turn_controls.clone(),
+                                retry_capacity,
                                 processes,
                                 conversation_processes,
                                 runtime_lifecycle,
@@ -731,6 +735,7 @@ async fn start_conversation_dispatcher(
         };
         match ConversationTurnQueue::new(db.clone()).claim_next() {
             Ok(Some(turn)) => {
+                let permit = DispatchPermit::new(concurrency.clone(), permit);
                 let runtime = ConversationAttemptRuntime {
                     db: db.clone(),
                     config: config.clone(),
@@ -738,6 +743,7 @@ async fn start_conversation_dispatcher(
                     event_bus: event_bus.clone(),
                     elicitation_broker: elicitation_broker.clone(),
                     turn_controls: turn_controls.clone(),
+                    retry_capacity: permit.retry_capacity(),
                     project_processes: project_processes.clone(),
                     conversation_processes: conversation_processes.clone(),
                     runtime_lifecycle: runtime_lifecycle.clone(),
@@ -799,6 +805,7 @@ struct ConversationAttemptRuntime {
     event_bus: Arc<ConversationEventBus>,
     elicitation_broker: Arc<AcpElicitationBroker>,
     turn_controls: Arc<AcpTurnControlBroker>,
+    retry_capacity: Arc<RetryCapacity>,
     project_processes: Arc<ProjectAcpProcesses>,
     conversation_processes: Arc<ConversationAcpProcesses>,
     runtime_lifecycle: Arc<NativeRuntimeLifecycle>,
@@ -834,6 +841,7 @@ async fn execute_conversation_turn_once(
         event_bus,
         elicitation_broker,
         turn_controls,
+        retry_capacity,
         project_processes,
         conversation_processes,
         runtime_lifecycle,
@@ -1083,7 +1091,8 @@ async fn execute_conversation_turn_once(
     let result = live
         .process
         .run_turn(
-            AcpTurnRuntime::for_conversation(recorder, elicitation_broker, turn_controls.clone()),
+            AcpTurnRuntime::for_conversation(recorder, elicitation_broker, turn_controls.clone())
+                .with_retry_capacity(retry_capacity),
             session_start,
             Path::new(&container_workspace),
             &prompt.content,
@@ -1489,6 +1498,7 @@ async fn execute_item_once(runtime: NativeAttemptRuntime, item: QueueItem) -> Re
         event_bus,
         elicitation_broker,
         turn_controls,
+        retry_capacity,
         processes,
         conversation_processes,
         runtime_lifecycle,
@@ -1892,7 +1902,8 @@ async fn execute_item_once(runtime: NativeAttemptRuntime, item: QueueItem) -> Re
     let turn = live
         .process
         .run_turn(
-            AcpTurnRuntime::new(recorder, elicitation_broker, turn_controls),
+            AcpTurnRuntime::new(recorder, elicitation_broker, turn_controls)
+                .with_retry_capacity(retry_capacity),
             session_start,
             Path::new(&container_workspace),
             &prompt.content,

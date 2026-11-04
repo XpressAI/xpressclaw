@@ -95,6 +95,23 @@ future work. Its actions are `schedule`, `backlog`, `queue`, `assign`, and
 dependencies. `schedule` can also release it with `activate: true`.
 An active turn retains its existing task lifecycle.
 
+## Temporary provider failures and queued guidance
+
+When a provider reports a capacity or rate-limit failure before the Agent has
+produced output or started work, XpressClaw retries the same prompt and session.
+The task timeline shows the next retry. Delays increase from 15 to 30, 60, and
+120 seconds, with jitter to spread requests from different Agents. There are
+at most five retries within ten minutes; supported provider retry-delay hints
+are respected. Longer waits and exhausted retries return the error for review.
+Authentication and billing failures do not enter this retry loop.
+These waits release shared worker capacity so other Agents can run, while
+preserving task ordering for the retrying Agent.
+
+New guidance interrupts a retry wait. For a running prompt, normal message
+delivery first lets the current tool finish. If the harness then ignores the
+interruption for 30 seconds, XpressClaw uses the existing worker-interruption
+path and preserves the queued message for the next response.
+
 ## Schedule workflows
 
 `schedule_workflows` accepts up to 100 entries, each with a template

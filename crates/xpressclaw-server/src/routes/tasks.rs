@@ -1079,6 +1079,7 @@ async fn add_message(
                 state
                     .turn_controls
                     .request_interrupt(&active_attempt.id, AcpInterruptMode::AfterTool);
+                state.monitor_guidance_interrupt(active_attempt.id.clone());
                 "after_tool"
             }
         } else {
@@ -3161,6 +3162,161 @@ flows:
             TaskBoard::new(db).get(&task_id).unwrap().status,
             TaskStatus::InProgress
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_guidance_recovers_when_the_harness_ignores_cancellation() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use xpressclaw_core::docker::manager::{AttachedContainer, ContainerInfo};
+        use xpressclaw_core::workers::acp::{
+            AcpEventRecorder, AcpProcess, AcpSessionStart, AcpTurnOptions, AcpTurnRuntime,
+        };
+
+        let db = Arc::new(Database::open_memory().unwrap());
+        xpressclaw_core::agents::registry::AgentRegistry::new(db.clone())
+            .ensure("developer", "native")
+            .unwrap();
+        let state = AppState::new(
+            Arc::new(Config::default()),
+            db.clone(),
+            None,
+            "test.yaml".into(),
+            true,
+        );
+        let app = Router::new()
+            .nest("/tasks", routes())
+            .with_state(state.clone());
+        let board = TaskBoard::new(db.clone());
+        let task = board
+            .create(&CreateTask {
+                title: "Resume stalled work".into(),
+                agent_id: Some("developer".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let queue = TaskQueue::new(db.clone());
+        queue.enqueue(&task.id, "developer").unwrap();
+        let active = queue.claim("developer").unwrap().unwrap();
+        let attempt = active.attempt_id.clone().unwrap();
+        let sessions = SessionManager::new(db.clone());
+        sessions
+            .transition_attempt(&attempt, "running", "Working", None, None)
+            .unwrap();
+        board.update_status(&task.id, "in_progress", None).unwrap();
+        state.turn_controls.begin_attempt(&attempt);
+
+        let (client_input, agent_input) = tokio::io::duplex(64 * 1024);
+        let (output, input) = tokio::sync::mpsc::channel(8);
+        let (prompt_tx, prompt_rx) = tokio::sync::oneshot::channel();
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+        let mock = tokio::spawn(async move {
+            let mut lines = BufReader::new(agent_input).lines();
+            let mut prompt_tx = Some(prompt_tx);
+            let mut cancel_tx = Some(cancel_tx);
+            while let Some(line) = lines.next_line().await.unwrap() {
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let result = match request["method"].as_str().unwrap() {
+                    "initialize" => json!({"protocolVersion":1,"agentCapabilities":{}}),
+                    "session/new" => json!({"sessionId":"stalled-session"}),
+                    "session/prompt" => {
+                        prompt_tx.take().unwrap().send(()).unwrap();
+                        continue;
+                    }
+                    "session/cancel" => {
+                        cancel_tx.take().unwrap().send(()).unwrap();
+                        continue;
+                    }
+                    method => panic!("unexpected method: {method}"),
+                };
+                let mut bytes = serde_json::to_vec(
+                    &json!({"jsonrpc":"2.0","id":request["id"],"result":result}),
+                )
+                .unwrap();
+                bytes.push(b'\n');
+                output
+                    .send(Ok(bollard::container::LogOutput::StdOut {
+                        message: bytes.into(),
+                    }))
+                    .await
+                    .unwrap();
+            }
+        });
+        let process = AcpProcess::start(AttachedContainer {
+            info: ContainerInfo {
+                container_id: "mock-container".into(),
+                agent_id: "developer".into(),
+                status: "running".into(),
+                host_port: None,
+            },
+            input: Box::pin(client_input),
+            output: Box::pin(tokio_stream::wrappers::ReceiverStream::new(input)),
+        })
+        .await
+        .unwrap();
+        let runner = process.clone();
+        let runtime = AcpTurnRuntime::new(
+            AcpEventRecorder::new(db.clone(), "developer", &attempt, &task.id, "codex"),
+            state.elicitations.clone(),
+            state.turn_controls.clone(),
+        );
+        let work = tokio::spawn(async move {
+            runner
+                .run_turn(
+                    runtime,
+                    AcpSessionStart::New,
+                    std::path::Path::new("/workspace"),
+                    "Original assignment",
+                    AcpTurnOptions::default(),
+                )
+                .await
+        });
+        prompt_rx.await.unwrap();
+        let (_, queued) = TaskConversation::new(db.clone())
+            .add_user_message_with_attachments_and_enqueue(
+                &task.id,
+                Some("developer"),
+                "First queued message",
+                &[],
+            )
+            .unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/tasks/{}/messages", task.id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"role":"user","content":"Please resume with this guidance"})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert_eq!(body_json(resp.into_body()).await["delivery"], "after_tool");
+        cancel_rx.await.unwrap();
+        tokio::time::advance(std::time::Duration::from_secs(29)).await;
+        assert_eq!(sessions.get_attempt(&attempt).unwrap().status, "running");
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            sessions.get_attempt(&attempt).unwrap().status,
+            "interrupted"
+        );
+        assert_eq!(queue.pending_count("developer").unwrap(), 1);
+        assert_eq!(
+            queue.claim("developer").unwrap().unwrap().id,
+            queued.unwrap().id
+        );
+        assert_eq!(board.get(&task.id).unwrap().status, TaskStatus::InProgress);
+        state.turn_controls.finish_attempt(&attempt);
+        mock.abort();
+        let _ = mock.await;
+        process.shutdown();
+        let _ = work.await;
     }
 
     #[tokio::test]
