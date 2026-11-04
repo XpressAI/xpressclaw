@@ -322,6 +322,7 @@ async function mockApi(
 		taskStatus?: string;
 		taskAgentId?: string | null;
 		taskActivityStatus?: string;
+		taskDependency?: { id: string; title: string; status: string };
 		taskParentId?: string | null;
 		taskParentReviewRequired?: boolean;
 		taskSubtasks?: Record<string, unknown>[];
@@ -503,9 +504,9 @@ async function mockApi(
 		provenance: options.connectedTask ? 'xpress_ai_connect' : 'durable',
 		blocks_parent: true,
 		activity_status: options.taskActivityStatus ?? status,
-		depends_on: [],
+		depends_on: options.taskDependency ? [options.taskDependency.id] : [],
 		dependents: [],
-		blocked_by: [],
+		blocked_by: options.taskDependency ? [options.taskDependency.id] : [],
 		ready: true,
 	};
 	const agentRunnerKind = options.agentRunnerKind ?? 'codex';
@@ -568,6 +569,9 @@ async function mockApi(
 			created_at: timestamp(index),
 			updated_at: timestamp(second),
 		})) ?? [task];
+	if (options.taskDependency) {
+		listedTasks.push({ ...task, ...options.taskDependency, activity_status: options.taskDependency.status, depends_on: [], blocked_by: [] });
+	}
 	const counts = listedTasks.reduce((result, listedTask) => {
 		result[listedTask.status as keyof typeof result] += 1;
 		return result;
@@ -7271,6 +7275,24 @@ for (const width of [390, 1440]) {
 		await page.screenshot({ path: testInfo.outputPath(`delegated-details-${width}.png`) });
 		if (width === 390) await page.getByRole('button', { name: 'Close task details' }).click();
 		await expect(composer).toHaveValue('Keep this draft while checking delegated work.');
+	});
+}
+
+for (const width of [390, 1440]) {
+	test(`prerequisite waits explain queued messages at ${width}px`, async ({ page }) => {
+		await page.setViewportSize({ width, height: 900 });
+		await mockApi(page, {
+			taskStatus: 'in_progress', taskActivityStatus: 'waiting_for_dependencies',
+			taskDependency: { id: 'approval-prerequisite', title: 'Approve prerequisite', status: 'blocked' },
+			taskAttempts: [attempt('queued', 10_000, null, null, { trigger_message_id: 2 })],
+		});
+		await page.goto(`/tasks/${taskId}`);
+		await expect(page.locator('[data-task-activity-status="waiting_for_dependencies"]').first()).toBeVisible();
+		const notice = page.locator('[data-dependency-wait]');
+		await expect(notice).toBeVisible();
+		await expect(notice).toContainText('Your message is saved');
+		await expect(notice.getByRole('link', { name: 'Approve prerequisite' })).toHaveAttribute('href', '/tasks/approval-prerequisite');
+		await expect(page.getByText('The agent is queued to respond', { exact: true })).toHaveCount(0);
 	});
 }
 

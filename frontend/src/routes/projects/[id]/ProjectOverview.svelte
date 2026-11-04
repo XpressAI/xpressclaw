@@ -143,7 +143,7 @@
 	function taskDot(status: string): string {
 		if (['failed', 'blocked', 'error'].includes(status)) return 'bg-red-500';
 		if (status === 'in_progress' || status === 'running') return 'bg-blue-500 animate-pulse';
-		if (['waiting_for_input', 'waiting_for_subtasks'].includes(status)) return 'bg-orange-500';
+		if (['waiting_for_input', 'waiting_for_subtasks', 'waiting_for_dependencies'].includes(status)) return 'bg-orange-500';
 		if (status === 'pending' || status === 'queued') return 'bg-amber-400';
 		return 'bg-emerald-500';
 	}

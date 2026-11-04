@@ -88,6 +88,9 @@ Task priority orders eligible responses. Backlog holds, earliest-start dates,
 explicit `depends_on` prerequisites, and an Agent's active response still
 control when a queued response may run. Parent completion waits for accepted
 required results; it does not prevent the parent from coordinating them.
+An unfinished prerequisite also holds queued replies. Task details show
+“Waiting for dependencies” with links to the prerequisites and confirm that
+the message is saved. Sending another message does not waive those prerequisites.
 
 Use `update_task_planning` with the latest `expected_revision` to change
 future work. Its actions are `schedule`, `backlog`, `queue`, `assign`, and
@@ -104,6 +107,8 @@ The task timeline shows the next retry. Delays increase from 15 to 30, 60, and
 at most five retries within ten minutes; supported provider retry-delay hints
 are respected. Longer waits and exhausted retries return the error for review.
 Authentication and billing failures do not enter this retry loop.
+Codex's typed `systemError` status is treated as failure even when its adapter
+ends the prompt with `end_turn`; ordinary assistant text alone is not a failure signal.
 These waits release shared worker capacity so other Agents can run, while
 preserving task ordering for the retrying Agent.
 

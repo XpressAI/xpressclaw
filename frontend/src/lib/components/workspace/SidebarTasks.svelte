@@ -67,7 +67,7 @@
 		if (status === 'running' || status === 'in_progress' || status === 'preparing' || status === 'review') return 'bg-blue-500 animate-pulse';
 		if (status === 'queued' || status === 'pending') return 'bg-amber-400';
 		if (['awaiting_review', 'awaiting_parent_review'].includes(status)) return 'bg-violet-400';
-		if (status === 'waiting_for_subtasks') return 'bg-amber-400';
+		if (status === 'waiting_for_subtasks' || status === 'waiting_for_dependencies') return 'bg-amber-400';
 		if (status === 'scheduled') return 'bg-sky-500';
 		if (status === 'backlog') return 'bg-stone-400';
 		if (status === 'idle') return 'bg-muted-foreground';
@@ -85,6 +85,7 @@
 		if (status === 'awaiting_review') return 'Awaiting review';
 		if (status === 'awaiting_parent_review') return 'Awaiting parent review';
 		if (status === 'waiting_for_subtasks') return 'Waiting for delegated work';
+		if (status === 'waiting_for_dependencies') return 'Waiting for dependencies';
 		if (status === 'scheduled') return 'Scheduled';
 		if (status === 'backlog') return 'Backlog';
 		if (status === 'idle') return 'Not running';

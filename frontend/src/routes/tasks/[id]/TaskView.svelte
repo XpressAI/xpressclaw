@@ -353,7 +353,7 @@
 	let waitingForDelegation = $derived(
 		blockingDelegates.length > 0 && !runningAttempt && !pendingElicitation
 		&& ['pending', 'in_progress'].includes(task?.status ?? '')
-		&& !['awaiting_review', 'awaiting_parent_review', 'backlog', 'scheduled', 'queued'].includes(task?.activity_status ?? '')
+		&& !['awaiting_review', 'awaiting_parent_review', 'waiting_for_dependencies', 'backlog', 'scheduled', 'queued'].includes(task?.activity_status ?? '')
 	);
 	let taskActivityStatus = $derived(waitingForDelegation ? (failedDelegates.length ? 'blocked' : 'waiting_for_subtasks') : task?.activity_status ?? task?.status ?? '');
 	function delegatedAgentName(item: DelegatedWork): string {
@@ -1307,7 +1307,7 @@
 			case 'completed': return 'text-emerald-400';
 			case 'in_progress': return 'text-blue-400';
 			case 'awaiting_review': case 'awaiting_parent_review': return 'text-violet-400';
-			case 'waiting_for_subtasks': return 'text-amber-400';
+			case 'waiting_for_subtasks': case 'waiting_for_dependencies': return 'text-amber-400';
 			case 'idle': return 'text-muted-foreground';
 			case 'pending': return 'text-amber-400';
 			case 'blocked': return 'text-red-400';
@@ -1323,6 +1323,7 @@
 		if (status === 'awaiting_review') return 'awaiting review';
 		if (status === 'awaiting_parent_review') return 'awaiting parent review';
 		if (status === 'waiting_for_subtasks') return 'waiting for delegated work';
+		if (status === 'waiting_for_dependencies') return 'waiting for dependencies';
 		if (status === 'idle') return 'not running';
 		return status.replaceAll('_', ' ');
 	}
@@ -1610,7 +1611,7 @@
 								{taskActivityStatus === 'completed' ? 'bg-emerald-400' :
 								 taskActivityStatus === 'in_progress' ? 'bg-blue-400' :
 								 ['awaiting_review', 'awaiting_parent_review'].includes(taskActivityStatus) ? 'bg-violet-400' :
-								 ['pending', 'waiting_for_subtasks'].includes(taskActivityStatus) ? 'bg-amber-400' :
+								 ['pending', 'waiting_for_subtasks', 'waiting_for_dependencies'].includes(taskActivityStatus) ? 'bg-amber-400' :
 								 taskActivityStatus === 'waiting_for_input' ? 'bg-orange-400' :
 								 taskActivityStatus === 'blocked' ? 'bg-red-400' :
 								 'bg-muted-foreground'}"></span>
@@ -2047,6 +2048,14 @@
 							{/if}
 							{#if queuedAttempt}<p class="text-xs text-muted-foreground">Queued work will run when its prerequisites are resolved.</p>
 							{:else}<p class="text-xs text-muted-foreground">Coordination messages and scheduled checks can run while delegated work continues.</p>{/if}
+						</div>
+					{:else if taskActivityStatus === 'waiting_for_dependencies'}
+						<div role="status" class="space-y-1 py-2 text-sm text-amber-600 dark:text-amber-400" data-dependency-wait>
+							<p>Waiting for prerequisite tasks to complete.</p>
+							{#each task.blocked_by ?? [] as blockerId}
+								<p><a class="underline" href="/tasks/{blockerId}">{taskLabel(blockerId)}</a></p>
+							{/each}
+							{#if queuedAttempt}<p class="text-xs text-muted-foreground">Your message is saved and will run when these prerequisites are complete.</p>{/if}
 						</div>
 					{:else if queuedAttempt}
 						<div class="py-2 pl-10"><AgentLoading label="The agent is queued to respond" phase="queued" startedAt={queuedAttempt.response_queued_at ?? queuedAttempt.created_at} /></div>

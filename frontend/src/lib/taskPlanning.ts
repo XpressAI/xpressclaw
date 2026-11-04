@@ -24,6 +24,7 @@ export function taskLane(task: Task): string {
       backlog: "backlog",
       awaiting_review: "review",
       awaiting_parent_review: "review",
+      waiting_for_dependencies: "blocked",
     }[task.activity_status ?? task.status] ??
     "queue"
   );

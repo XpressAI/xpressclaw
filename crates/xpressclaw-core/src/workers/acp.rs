@@ -69,8 +69,13 @@ fn is_claude_oauth_refresh_notice(runner: &str, text: &str) -> bool {
     text.starts_with(CLAUDE_OAUTH_REFRESH_CONFLICT)
 }
 
-fn is_prompt_error_notice(runner: &str, text: &str) -> bool {
-    is_claude_oauth_refresh_notice(runner, text) || provider_retry::is_notice(text)
+fn is_prompt_error_notice(runner: &str, text: &str, codex_system_error: bool) -> bool {
+    is_claude_oauth_refresh_notice(runner, text)
+        || provider_retry::is_notice(text)
+        || (runner == "codex"
+            && codex_system_error
+            && provider_retry::classify(&agent_client_protocol::Error::internal_error().data(text))
+                .is_some())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -584,13 +589,15 @@ struct TurnState {
     transcript: Vec<Value>,
     capture_prompt_output: bool,
     prompt_activity_seen: bool,
+    codex_system_error: bool,
+    prompt_session_id: Option<String>,
 }
 
 impl TurnState {
     fn has_prompt_activity(&self, runner: &str) -> bool {
         self.prompt_activity_seen
             || (!self.assistant_text.trim().is_empty()
-                && !is_prompt_error_notice(runner, &self.assistant_text))
+                && !is_prompt_error_notice(runner, &self.assistant_text, self.codex_system_error))
     }
 }
 
@@ -664,6 +671,8 @@ impl AcpEventRecorder {
         state.pending_thought.clear();
         state.capture_prompt_output = true;
         state.prompt_activity_seen = false;
+        state.codex_system_error = false;
+        state.prompt_session_id = None;
     }
 
     fn has_prompt_activity(&self) -> bool {
@@ -680,7 +689,25 @@ impl AcpEventRecorder {
         state.assistant_text.clear();
         state.current_message_id = None;
         state.deferred_agent_messages.clear();
+        state.codex_system_error = false;
         true
+    }
+
+    fn codex_response_error(&self) -> Option<agent_client_protocol::Error> {
+        let state = self.state.lock().unwrap();
+        if self.runner != "codex" || !state.codex_system_error {
+            return None;
+        }
+        let message = if !state.assistant_text.trim().is_empty() {
+            state.assistant_text.trim()
+        } else if let Some((_, message)) = state.deferred_agent_messages.last() {
+            message.as_str()
+        } else {
+            "Codex reported a system error"
+        };
+        Some(agent_client_protocol::Error::internal_error().data(json!({
+            "message":message, "codex_thread_status":"systemError",
+        })))
     }
 
     fn mark_prompt_activity(&self) {
@@ -691,6 +718,7 @@ impl AcpEventRecorder {
     }
 
     fn persist_native_session(&self, native_session_id: &str) -> Result<()> {
+        self.state.lock().unwrap().prompt_session_id = Some(native_session_id.to_string());
         if self.conversation_id.is_some() {
             return Ok(());
         }
@@ -868,6 +896,20 @@ impl AcpEventRecorder {
             }
             SessionUpdate::SessionInfoUpdate(update) => {
                 self.flush_prompt_output()?;
+                if self.runner == "codex" {
+                    if let Some(status) = payload
+                        .pointer("/_meta/codex/threadStatus/type")
+                        .and_then(Value::as_str)
+                    {
+                        let mut state = self.state.lock().unwrap();
+                        if state.capture_prompt_output
+                            && state.prompt_session_id.as_deref()
+                                == Some(notification.session_id.0.as_ref())
+                        {
+                            state.codex_system_error = status == "systemError";
+                        }
+                    }
+                }
                 if let Some(title) = update.title.take() {
                     self.append_event("session_info", &format!("Session title: {title}"), payload)?;
                 }
@@ -1079,7 +1121,8 @@ impl AcpEventRecorder {
             if message.is_empty() {
                 return Ok(());
             }
-            let retry_notice = is_prompt_error_notice(&self.runner, &message);
+            let retry_notice =
+                is_prompt_error_notice(&self.runner, &message, state.codex_system_error);
             if !retry_notice {
                 state.prompt_activity_seen = true;
             }
@@ -1120,16 +1163,27 @@ impl AcpEventRecorder {
     }
 
     fn resolve_prompt_output(&self, retryable_error: bool) -> Result<()> {
-        let deferred = {
+        let (deferred, codex_system_error) = {
             let mut state = self.state.lock().unwrap();
-            if retryable_error && is_prompt_error_notice(&self.runner, &state.assistant_text) {
+            if retryable_error
+                && is_prompt_error_notice(
+                    &self.runner,
+                    &state.assistant_text,
+                    state.codex_system_error,
+                )
+            {
                 state.assistant_text.clear();
                 state.current_message_id = None;
             }
-            std::mem::take(&mut state.deferred_agent_messages)
+            (
+                std::mem::take(&mut state.deferred_agent_messages),
+                state.codex_system_error,
+            )
         };
         for (message_id, message) in deferred {
-            if !retryable_error || !is_prompt_error_notice(&self.runner, &message) {
+            if !retryable_error
+                || !is_prompt_error_notice(&self.runner, &message, codex_system_error)
+            {
                 self.publish_agent_message(message_id, message)?;
             }
         }
@@ -2381,7 +2435,6 @@ async fn run_connected_turn(
             attachment.mime_type,
         ))
     }));
-    let prompt_id = uuid::Uuid::new_v4().to_string();
     recorder
         .persist_native_session(&native_session_id)
         .map_err(agent_client_protocol::Error::into_internal_error)?;
@@ -2392,6 +2445,7 @@ async fn run_connected_turn(
     let mut retries = 0;
     let retry_started = tokio::time::Instant::now();
     let response = loop {
+        let prompt_id = uuid::Uuid::new_v4().to_string();
         let prompt_request = connection.send_request(PromptRequest::new(
             session_id.clone(),
             prompt_blocks.clone(),
@@ -2419,6 +2473,36 @@ async fn run_connected_turn(
             }
         };
         turn_controls.acknowledge_interrupt(&recorder.attempt_id);
+        if let Err(error) = DashboardManager::new(recorder.db.clone()).record_prompt_usage(
+            &prompt_id,
+            if recorder.conversation_id.is_some() {
+                "conversation_turn"
+            } else {
+                "attempt"
+            },
+            &recorder.attempt_id,
+            &recorder.runner,
+            response
+                .as_ref()
+                .ok()
+                .and_then(|response| response.usage.as_ref()),
+        ) {
+            tracing::warn!(%error, "Could not record ACP token usage");
+        }
+        // Codex can return end_turn after its typed thread status reports a
+        // system error. Preserve that failure instead of completing the task.
+        let response = match response {
+            Ok(response)
+                if response.stop_reason
+                    == agent_client_protocol::schema::v1::StopReason::EndTurn =>
+            {
+                match recorder.codex_response_error() {
+                    Some(error) => Err(error),
+                    None => Ok(response),
+                }
+            }
+            other => other,
+        };
         let retry = response.as_ref().err().and_then(|error| {
             if is_claude_oauth_refresh_conflict(&recorder.runner, error) {
                 (retries < CLAUDE_OAUTH_REFRESH_RETRIES).then_some((
@@ -2510,22 +2594,6 @@ async fn run_connected_turn(
         .map_err(agent_client_protocol::Error::into_internal_error)?;
     turn_controls.acknowledge_interrupt(&recorder.attempt_id);
     let interrupted = interrupt_sent.load(Ordering::SeqCst);
-    if let Err(error) = DashboardManager::new(recorder.db.clone()).record_prompt_usage(
-        &prompt_id,
-        if recorder.conversation_id.is_some() {
-            "conversation_turn"
-        } else {
-            "attempt"
-        },
-        &recorder.attempt_id,
-        &recorder.runner,
-        response
-            .as_ref()
-            .ok()
-            .and_then(|response| response.usage.as_ref()),
-    ) {
-        tracing::warn!(%error, "Could not record ACP token usage");
-    }
     let response = match response {
         Ok(response) => response,
         Err(_) if interrupted => {
@@ -2726,6 +2794,114 @@ mod tests {
     use crate::docker::manager::ContainerInfo;
 
     const OAUTH_REFRESH_CONFLICT: &str = "Failed to refresh OAuth token: another Claude Code process is refreshing it or exited mid-refresh. This is usually transient; retry in a minute, and if it persists close other Claude Code processes or sign in again";
+
+    #[tokio::test(start_paused = true)]
+    async fn codex_system_error_metadata_prevents_false_success_and_retries_only_before_work() {
+        const CAPACITY: &str = "Selected model is at capacity. Please try a different model.";
+        for (runner, system_error, did_work, foreign_session) in [
+            ("codex", true, false, false),
+            ("codex", true, true, false),
+            ("codex", false, false, false),
+            ("codex", true, false, true),
+            ("claude", true, false, false),
+        ] {
+            let db = Arc::new(Database::open_memory().unwrap());
+            let (mut recorder, _) = test_recorder(db);
+            recorder.runner = runner.into();
+            let controls = Arc::new(AcpTurnControlBroker::new());
+            controls.begin_attempt(&recorder.attempt_id);
+            let (client_input, agent_input) = tokio::io::duplex(64 * 1024);
+            let (output, input) = tokio::sync::mpsc::channel(8);
+            let mock = tokio::spawn(async move {
+                let mut lines = BufReader::new(agent_input).lines();
+                let mut prompts = 0;
+                while let Some(line) = lines.next_line().await.unwrap() {
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    let result = match request["method"].as_str().unwrap() {
+                        "initialize" => json!(InitializeResponse::new(ProtocolVersion::V1)),
+                        "session/new" => {
+                            send_json(&output, json!({"jsonrpc":"2.0","method":"session/update","params":{
+                                "sessionId":"capacity-session","update":{"sessionUpdate":"tool_call","toolCallId":"mcp_startup.example","title":"MCP startup notice","status":"failed"}
+                            }})).await;
+                            json!(NewSessionResponse::new("capacity-session"))
+                        }
+                        "session/prompt" => {
+                            prompts += 1;
+                            send_json(&output, json!({"jsonrpc":"2.0","method":"session/update","params":{
+                                "sessionId":"capacity-session","update":{"sessionUpdate":"session_info_update","_meta":{"codex":{"threadStatus":{"type":"active","activeFlags":[]}}}}
+                            }})).await;
+                            if did_work {
+                                send_json(&output, json!({"jsonrpc":"2.0","method":"session/update","params":{
+                                    "sessionId":"capacity-session","update":{"sessionUpdate":"tool_call","toolCallId":"work","title":"Run a command","status":"completed"}
+                                }})).await;
+                            }
+                            if system_error && prompts <= 2 {
+                                send_json(&output, json!({"jsonrpc":"2.0","method":"session/update","params":{
+                                    "sessionId":if foreign_session {"different-session"} else {"capacity-session"},"update":{"sessionUpdate":"session_info_update","_meta":{"codex":{"threadStatus":{"type":"systemError"}}}}
+                                }})).await;
+                            }
+                            send_json(&output, json!({"jsonrpc":"2.0","method":"session/update","params":{
+                                "sessionId":"capacity-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":if prompts <= 2 {CAPACITY} else {"Work complete"}}}
+                            }})).await;
+                            send_json(&output, json!({"jsonrpc":"2.0","method":"session/update","params":SessionNotification::new(
+                                "capacity-session", SessionUpdate::UsageUpdate(agent_client_protocol::schema::v1::UsageUpdate::new(1,100))
+                            )})).await;
+                            json!(PromptResponse::new(StopReason::EndTurn))
+                        }
+                        method => panic!("unexpected method: {method}"),
+                    };
+                    send_json(
+                        &output,
+                        json!({"jsonrpc":"2.0","id":request["id"],"result":result}),
+                    )
+                    .await;
+                }
+                prompts
+            });
+            let process = AcpProcess::start(AttachedContainer {
+                info: ContainerInfo {
+                    container_id: "test-container".into(),
+                    agent_id: "test-agent".into(),
+                    status: "running".into(),
+                    host_port: None,
+                },
+                input: Box::pin(client_input),
+                output: Box::pin(ReceiverStream::new(input)),
+            })
+            .await
+            .unwrap();
+            let result = process
+                .run_turn(
+                    AcpTurnRuntime::new(recorder, Arc::new(AcpElicitationBroker::new()), controls),
+                    AcpSessionStart::New,
+                    Path::new("/workspace"),
+                    "Continue the task",
+                    AcpTurnOptions::default(),
+                )
+                .await;
+            process.shutdown();
+            let prompts = mock.await.unwrap();
+            if runner == "codex" && system_error && !foreign_session {
+                if did_work {
+                    assert!(
+                        result.is_err(),
+                        "a provider failure after work is still a failure"
+                    );
+                    assert_eq!(prompts, 1, "never replay tool work");
+                } else {
+                    assert_eq!(result.unwrap().summary, "Work complete");
+                    assert_eq!(prompts, 3);
+                }
+            } else {
+                assert_eq!(
+                    result.unwrap().summary,
+                    CAPACITY,
+                    "text alone is not a provider failure"
+                );
+                assert_eq!(prompts, 1);
+            }
+        }
+    }
 
     #[tokio::test(start_paused = true)]
     async fn temporary_model_capacity_errors_retry_across_harnesses() {

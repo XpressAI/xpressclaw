@@ -44,7 +44,7 @@
 			...taskList.filter((task) => (task.project_id ? task.project_id === project.id : task.agent_id && agentIds.has(task.agent_id)) && !['completed', 'cancelled'].includes(task.status)).map((task) => task.activity_status ?? task.status),
 		];
 		if (statuses.some((status) => status === 'failed' || status === 'error' || status === 'blocked')) return 'error';
-		if (statuses.some((status) => ['waiting_for_input', 'waiting_for_subtasks'].includes(status))) return 'waiting';
+		if (statuses.some((status) => ['waiting_for_input', 'waiting_for_subtasks', 'waiting_for_dependencies'].includes(status))) return 'waiting';
 		if (statuses.some((status) => ['running', 'in_progress', 'preparing'].includes(status))) return 'working';
 		if (statuses.some((status) => ['queued', 'pending'].includes(status))) return 'queued';
 		return 'ready';
