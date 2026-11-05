@@ -88,12 +88,34 @@ Task priority orders eligible responses. Backlog holds, earliest-start dates,
 explicit `depends_on` prerequisites, and an Agent's active response still
 control when a queued response may run. Parent completion waits for accepted
 required results; it does not prevent the parent from coordinating them.
+An unfinished prerequisite also holds queued replies. Task details show
+“Waiting for dependencies” with links to the prerequisites and confirm that
+the message is saved. Sending another message does not waive those prerequisites.
 
 Use `update_task_planning` with the latest `expected_revision` to change
 future work. Its actions are `schedule`, `backlog`, `queue`, `assign`, and
 `priority`. `queue` releases a Backlog hold while preserving its date and
 dependencies. `schedule` can also release it with `activate: true`.
 An active turn retains its existing task lifecycle.
+
+## Temporary provider failures and queued guidance
+
+When a provider reports a capacity or rate-limit failure before the Agent has
+produced output or started work, XpressClaw retries the same prompt and session.
+The task timeline shows the next retry. Delays increase from 15 to 30, 60, and
+120 seconds, with jitter to spread requests from different Agents. There are
+at most five retries within ten minutes; supported provider retry-delay hints
+are respected. Longer waits and exhausted retries return the error for review.
+Authentication and billing failures do not enter this retry loop.
+Codex's typed `systemError` status is treated as failure even when its adapter
+ends the prompt with `end_turn`; ordinary assistant text alone is not a failure signal.
+These waits release shared worker capacity so other Agents can run, while
+preserving task ordering for the retrying Agent.
+
+New guidance interrupts a retry wait. For a running prompt, normal message
+delivery first lets the current tool finish. If the harness then ignores the
+interruption for 30 seconds, XpressClaw uses the existing worker-interruption
+path and preserves the queued message for the next response.
 
 ## Schedule workflows
 

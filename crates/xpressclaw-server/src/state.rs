@@ -210,6 +210,60 @@ impl AppState {
         *self.setup_complete.write().unwrap() = true;
     }
 
+    /// Recover a harness that ignores cooperative cancellation after its tools
+    /// finish. Reuse explicit interruption so the queued guidance is preserved.
+    pub fn monitor_guidance_interrupt(&self, attempt_id: String) {
+        let state = self.clone();
+        tokio::spawn(async move {
+            if !state
+                .turn_controls
+                .interruption_timed_out(&attempt_id, std::time::Duration::from_secs(30))
+                .await
+            {
+                return;
+            }
+            let sessions = xpressclaw_core::sessions::SessionManager::new(state.db.clone());
+            let Ok(attempt) = sessions.get_attempt(&attempt_id) else {
+                return;
+            };
+            if !matches!(
+                attempt.status.as_str(),
+                "preparing" | "running" | "waiting_for_input" | "review"
+            ) {
+                return;
+            }
+            let Some(task_id) = attempt.task_id.as_deref() else {
+                return;
+            };
+            if !xpressclaw_core::tasks::queue::TaskQueue::new(state.db.clone())
+                .has_queued_for_task(task_id)
+                .unwrap_or(false)
+            {
+                return;
+            }
+            tracing::warn!(
+                attempt_id,
+                task_id,
+                "harness did not acknowledge cancellation; interrupting for queued user guidance"
+            );
+            let _ = sessions.append_event(
+                &attempt.session_id,
+                xpressclaw_core::sessions::NewEvent {
+                    attempt_id: Some(&attempt_id),
+                    task_id: Some(task_id),
+                    source_type: "acp",
+                    source_id: Some(&attempt.runner),
+                    event_type: "interruption_timeout",
+                    summary: "Agent did not acknowledge interruption; recovering queued guidance",
+                    payload: serde_json::json!({"grace_seconds":30}),
+                },
+            );
+            if let Err(error) = state.interrupt_attempt(&attempt_id).await {
+                tracing::warn!(attempt_id, %error, "failed to interrupt unresponsive harness");
+            }
+        });
+    }
+
     /// Stop one worker attempt without cancelling its task. Any queued user
     /// messages remain runnable; otherwise the task returns to pending.
     pub async fn interrupt_attempt(

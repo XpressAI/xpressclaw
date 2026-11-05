@@ -1227,6 +1227,15 @@ impl TaskBoard {
             if input_pending {
                 return Ok("waiting_for_input".to_string());
             }
+            let dependencies_pending: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM task_dependencies d
+                 JOIN tasks prerequisite ON prerequisite.id=d.depends_on_id
+                 WHERE d.task_id=?1 AND prerequisite.status!='completed')",
+                [&task.id], |row| row.get(0),
+            )?;
+            if dependencies_pending {
+                return Ok("waiting_for_dependencies".into());
+            }
             let awaiting_review: bool = conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM task_pull_requests WHERE task_id=?1 AND status IN ('waiting','attention'))
                  OR EXISTS(SELECT 1 FROM work_attempts WHERE task_id=?1 AND status='review')",
@@ -3234,6 +3243,63 @@ mod tests {
         assert_eq!(
             board.list_subtasks(&parent.id).unwrap()[0].status,
             TaskStatus::Cancelled
+        );
+    }
+
+    #[test]
+    fn activity_status_explains_unmet_dependencies_without_releasing_queued_guidance() {
+        let (db, board) = setup();
+        add_test_agents(&db, &["developer"]);
+        let prerequisite = board
+            .create(&CreateTask {
+                title: "Approve prerequisite".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let task = board
+            .create(&CreateTask {
+                title: "Dependent work".into(),
+                agent_id: Some("developer".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        board.add_dependency(&task.id, &prerequisite.id).unwrap();
+        crate::tasks::conversation::TaskConversation::new(db.clone())
+            .add_user_message_with_attachments_and_enqueue(
+                &task.id,
+                Some("developer"),
+                "Please continue",
+                &[],
+            )
+            .unwrap();
+        let queue = crate::tasks::queue::TaskQueue::new(db.clone());
+        for status in ["pending", "in_progress"] {
+            board.update_status(&task.id, status, None).unwrap();
+            assert_eq!(
+                board
+                    .activity_status(&board.get(&task.id).unwrap())
+                    .unwrap(),
+                "waiting_for_dependencies"
+            );
+            assert!(queue.claim("developer").unwrap().is_none());
+        }
+        assert_eq!(
+            board.get_blockers(&task.id).unwrap(),
+            vec![prerequisite.id.clone()]
+        );
+        board
+            .update_status(&prerequisite.id, "completed", None)
+            .unwrap();
+        assert_eq!(queue.claim("developer").unwrap().unwrap().task_id, task.id);
+        board
+            .update_status(&prerequisite.id, "pending", None)
+            .unwrap();
+        assert_eq!(
+            board
+                .activity_status(&board.get(&task.id).unwrap())
+                .unwrap(),
+            "in_progress",
+            "an active dispatch remains visible as active"
         );
     }
 
