@@ -20,6 +20,11 @@ export default defineConfig({
 	},
 	projects: [
 		{
+			name: 'mermaid-webkit',
+			use: { ...devices['Desktop Safari'] },
+			testMatch: /mermaid\.spec\.ts/,
+		},
+		{
 			name: 'downloads-webkit',
 			use: { ...devices['Desktop Safari'] },
 			testMatch: /file-downloads\.spec\.ts/,

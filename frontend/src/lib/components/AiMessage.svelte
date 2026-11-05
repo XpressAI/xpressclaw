@@ -2,6 +2,7 @@
 	import type { Snippet } from 'svelte';
 	import type { MessageVisualization } from '$lib/api';
 	import { renderContent } from '$lib/formatMessage';
+	import { mermaidDiagrams } from '$lib/mermaidDiagrams';
 	import { splitMessageVisualizations } from '$lib/messageVisualizations';
 	import VisualizationArtifact from '$lib/components/VisualizationArtifact.svelte';
 	import ReadAloud from '$lib/components/ReadAloud.svelte';
@@ -149,8 +150,9 @@
 		>
 			{#each contentBlocks as block, index (`${block.kind}:${index}`)}
 				{#if block.kind === 'text'}
-					<div class="prose-chat max-w-none break-words {fromUser ? 'prose-chat-user' : ''}">
-						{@html renderContent(block.content, { openLinksInNewWindow, renderStructuredAgentMarkup: role === 'assistant', downloadAgentId: role === 'assistant' ? downloadAgentId : undefined })}
+					{@const html = renderContent(block.content, { openLinksInNewWindow, renderStructuredAgentMarkup: role === 'assistant', downloadAgentId: role === 'assistant' ? downloadAgentId : undefined })}
+					<div use:mermaidDiagrams={html} class="prose-chat max-w-none break-words {fromUser ? 'prose-chat-user' : ''}">
+						{@html html}
 					</div>
 				{:else}
 					<VisualizationArtifact
