@@ -1,6 +1,7 @@
 <script lang="ts">
 	import type { SessionEvent } from '$lib/api';
 	import { renderContent } from '$lib/formatMessage';
+	import { mermaidDiagrams } from '$lib/mermaidDiagrams';
 	import { timeAgo } from '$lib/utils';
 
 	let { event }: { event: SessionEvent } = $props();
@@ -15,6 +16,7 @@
 	let itemType = $derived(String(event.payload?.item_type ?? ''));
 	let isAgentUpdate = $derived(event.event_type === 'runner_progress' && itemType === 'agent_message');
 	let richText = $derived(event.event_type === 'agent_thought');
+	let richHtml = $derived((isAgentUpdate || richText) ? renderContent(event.summary, { openLinksInNewWindow: true, renderStructuredAgentMarkup: true, downloadAgentId: event.session_id }) : '');
 	let isTool = $derived(event.event_type === 'tool_call');
 	let toolDiffs = $derived(extractToolDiffs(event));
 	let toolContent = $derived(toolContentText(event));
@@ -142,8 +144,8 @@
 				<span class="text-xs text-muted-foreground">{timeAgo(event.created_at)}</span>
 			</div>
 			<div class="rounded-lg rounded-tl-[4px] bg-accent/55 px-3.5 py-2.5 text-sm text-foreground shadow-[var(--shadow-hairline)]" data-agent-update-content>
-				<div class="prose-chat max-w-none break-words">
-					{@html renderContent(event.summary, { openLinksInNewWindow: true, renderStructuredAgentMarkup: true, downloadAgentId: event.session_id })}
+				<div use:mermaidDiagrams={richHtml} class="prose-chat max-w-none break-words">
+					{@html richHtml}
 				</div>
 			</div>
 		</div>
@@ -177,8 +179,8 @@
 		{#if expanded}
 			<div class="mb-1 mr-2 border-l border-border/60 py-2 pl-3 text-xs {isTool || richText ? 'ml-4' : 'ml-[5.25rem] sm:ml-[6rem]'}">
 				{#if richText}
-					<div data-activity-rich-content class="prose prose-invert prose-sm max-w-none text-xs text-foreground/80">
-						{@html renderContent(event.summary, { openLinksInNewWindow: true, renderStructuredAgentMarkup: true, downloadAgentId: event.session_id })}
+					<div use:mermaidDiagrams={richHtml} data-activity-rich-content class="prose prose-invert prose-sm max-w-none text-xs text-foreground/80">
+						{@html richHtml}
 					</div>
 				{:else if !isTool}
 					<div class="whitespace-pre-wrap text-foreground/75">{event.summary}</div>

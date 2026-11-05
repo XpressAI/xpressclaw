@@ -222,6 +222,69 @@
 	font-size: 0.85em;
 	line-height: 1.65;
 }
+.mermaid-diagram {
+	min-width: 0;
+	margin: 0.75em 0;
+	border: 1px solid hsl(var(--border));
+	border-radius: 0.625rem;
+	background: hsl(var(--card));
+	color: hsl(var(--card-foreground));
+	overflow: hidden;
+}
+.mermaid-diagram-viewport {
+	max-width: 100%;
+	overflow-x: auto;
+	padding: 1rem;
+}
+.mermaid-diagram-viewport:focus-visible {
+	outline: 2px solid hsl(var(--ring));
+	outline-offset: -2px;
+}
+.mermaid-diagram .mermaid-diagram-viewport img {
+	display: block;
+	max-width: 100%;
+	height: auto;
+	margin: 0 auto;
+	border-radius: 0;
+}
+.mermaid-diagram .mermaid-diagram-viewport[data-actual-size="true"] img {
+	max-width: none;
+}
+.mermaid-diagram-controls {
+	display: flex;
+	justify-content: flex-end;
+	padding: 0.25rem 0.5rem 0;
+}
+.mermaid-diagram-controls button {
+	padding: 0.25rem 0.5rem;
+	border-radius: 0.25rem;
+	color: hsl(var(--muted-foreground));
+	font-size: 0.75rem;
+}
+.mermaid-diagram-controls button:hover {
+	background: hsl(var(--muted));
+	color: hsl(var(--foreground));
+}
+.mermaid-diagram-controls button:focus-visible {
+	outline: 2px solid hsl(var(--ring));
+}
+.mermaid-diagram summary {
+	cursor: pointer;
+	padding: 0.5rem 0.75rem;
+	border-top: 1px solid hsl(var(--border));
+	color: hsl(var(--muted-foreground));
+	font-size: 0.75rem;
+}
+.mermaid-diagram pre {
+	margin: 0;
+	padding: 0.875rem 1rem;
+	border: 0;
+	border-top: 1px solid hsl(var(--border));
+	border-radius: 0;
+	background: hsl(var(--code-background));
+	color: hsl(var(--code-foreground));
+	overflow-x: auto;
+}
 .prose-chat blockquote {
 	border-left: 3px solid hsl(var(--border));
 	padding-left: 0.75em;

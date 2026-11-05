@@ -14,6 +14,7 @@
 	import { timeAgo } from '$lib/utils';
 	import { serverTimestampMs } from '$lib/serverTime';
 	import { renderContent } from '$lib/formatMessage';
+	import { mermaidDiagrams } from '$lib/mermaidDiagrams';
 	import ActivityEventRow from '$lib/components/ActivityEventRow.svelte';
 	import AgentLoading from '$lib/components/AgentLoading.svelte';
 	import DelegatedWorkPanel from '$lib/components/DelegatedWorkPanel.svelte';
@@ -1823,13 +1824,14 @@
 					{/if}
 
 					{#if latestResult}
+						{@const resultHtml = renderContent(latestResult, { openLinksInNewWindow: true, renderStructuredAgentMarkup: true, downloadAgentId: latestResultAttempt?.session_id })}
 						<section class="rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-4">
 							<div class="mb-2 flex items-center gap-2 text-xs font-medium uppercase tracking-wide text-emerald-400">
 								<span class="h-2 w-2 rounded-full bg-emerald-400"></span>
 								Result
 								<ReadAloud content={latestResult} />
 							</div>
-							<div data-task-result-content class="prose prose-invert prose-sm max-w-none">{@html renderContent(latestResult, { openLinksInNewWindow: true, renderStructuredAgentMarkup: true, downloadAgentId: latestResultAttempt?.session_id })}</div>
+							<div use:mermaidDiagrams={resultHtml} data-task-result-content class="prose prose-invert prose-sm max-w-none">{@html resultHtml}</div>
 						</section>
 					{:else if latestError}
 						<section role="alert" data-attempt-error class="rounded-lg border border-red-500/30 bg-red-500/5 p-4">
