@@ -484,6 +484,7 @@ export interface NativeRunnerConfig {
 	subscription_auth: boolean;
 	ssh_agent_forwarding: boolean;
 	container_engine: 'none' | 'host';
+	proxy?: 'inherit' | 'direct';
 }
 
 export interface LogicalSession {
@@ -1395,7 +1396,31 @@ export interface SpeechSettings {
 	voice: string;
 }
 
+export interface ProxyHeaderRule {
+ header: string;
+ matcher: 'any' | 'exact' | 'contains' | 'regex' | 'email';
+ value: string;
+ action: 'remove' | 'replace' | 'block';
+ replacement: string;
+ domains: string[];
+}
+export interface ProxyConfig {
+ enabled: boolean;
+ domain_policy: 'allow_except_blocked' | 'allow_listed_only';
+ allowed_domains: string[];
+ blocked_domains: string[];
+ inspection_bypass: string[];
+ header_rules: ProxyHeaderRule[];
+}
+export interface ProxySettings {
+ config: ProxyConfig;
+ status: { state: string; image: string; events: { time: number; action: string; host: string; rule: number | null; client: string | null }[] };
+ direct_agents: string[];
+ host_engine_agents: string[];
+}
 export const settings = {
+ getProxy: () => request<ProxySettings>('/api/settings/proxy/'),
+ putProxy: (config: ProxyConfig) => request<ProxySettings>('/api/settings/proxy/', { method: 'PUT', body: JSON.stringify(config) }),
 	getSpeech: () => request<SpeechSettings>('/api/settings/speech'),
 	putSpeech: (config: Omit<SpeechSettings, 'has_api_key'> & { api_key?: string }) =>
 		request<SpeechSettings>('/api/settings/speech', { method: 'PUT', body: JSON.stringify(config) }),

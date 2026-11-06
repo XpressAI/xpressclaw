@@ -2018,6 +2018,9 @@ fn listed_container_agent_id(
         _ => return None,
     }
 
+    if labels.get(LIFECYCLE_LABEL).map(String::as_str) == Some("service") {
+        return None;
+    }
     if labels.get(LIFECYCLE_LABEL).map(String::as_str) == Some(PROJECT_LIFECYCLE) {
         let installation_id = installation_id?;
         let agent_id = labels.get(AGENT_ID_LABEL)?;
@@ -2087,6 +2090,20 @@ pub(crate) mod tests {
             "Config": {"Image": spec.image, "Labels": project_container_labels(&container_spec_fingerprint(spec).unwrap(), "installation", "agent")},
             "State": {"Running": true}
         })).unwrap()
+    }
+
+    #[test]
+    fn managed_services_are_not_agent_containers() {
+        let labels = HashMap::from([
+            (INSTALLATION_LABEL.into(), "installation".into()),
+            (LIFECYCLE_LABEL.into(), "service".into()),
+        ]);
+        assert!(listed_container_agent_id(
+            "xpressclaw-proxy-instance",
+            &labels,
+            Some("installation")
+        )
+        .is_none());
     }
 
     #[test]

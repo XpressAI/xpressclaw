@@ -252,9 +252,11 @@ pub async fn serve_on_with_bound_callback(
     let internal_listener = tokio::net::TcpListener::bind("0.0.0.0:0").await?;
     let internal_port = internal_listener.local_addr()?.port();
     let internal_token: Arc<str> = Arc::from(uuid::Uuid::new_v4().simple().to_string());
-    on_bound()?;
-
     let config = state.config();
+    // Refresh generated policy from durable configuration after owning both
+    // listeners, including YAML edits made while this instance was stopped.
+    xpressclaw_core::proxy::service::write_policy(&config.system.data_dir, &config.proxy)?;
+    on_bound()?;
 
     // Shutdown token: cancels all background tasks on Ctrl+C.
     let shutdown = tokio_util::sync::CancellationToken::new();

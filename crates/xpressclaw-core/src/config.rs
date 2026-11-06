@@ -287,6 +287,7 @@ pub struct NativeRunnerConfig {
     /// Optional access to the same Docker-compatible engine used by the
     /// control plane. Built-in agents select a separate CLI-enabled image.
     pub container_engine: ContainerEngineAccess,
+    pub proxy: crate::proxy::AgentProxyMode,
 }
 
 impl Default for NativeRunnerConfig {
@@ -305,6 +306,7 @@ impl Default for NativeRunnerConfig {
             subscription_auth: true,
             ssh_agent_forwarding: false,
             container_engine: ContainerEngineAccess::None,
+            proxy: crate::proxy::AgentProxyMode::Inherit,
         }
     }
 }
@@ -645,6 +647,8 @@ pub struct Config {
     /// Optional instance-local GitBucket/Jenkins services. Disabled by
     /// default and never started as a side effect of loading configuration.
     pub collaboration: crate::collaboration::CollaborationConfig,
+    #[serde(default = "crate::proxy::ProxyConfig::legacy_default")]
+    pub proxy: crate::proxy::ProxyConfig,
     #[serde(default)]
     pub agents: Vec<AgentConfig>,
     #[serde(default)]
@@ -803,6 +807,7 @@ impl Config {
             )));
         }
 
+        self.proxy.validate().map_err(Error::ConfigValidation)?;
         self.collaboration
             .validate()
             .map_err(Error::ConfigValidation)?;

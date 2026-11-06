@@ -152,6 +152,7 @@ agents:
 | `model` | Optional model value ID applied through ACP session configuration |
 | `subscription_auth` | Reuse the built-in product's host login directory |
 | `ssh_agent_forwarding` | Share host `~/.ssh` and forward a detected SSH agent when available (default `false`) |
+| `proxy` | `inherit` (default) uses the instance proxy; `direct` skips its domain and header rules |
 | `container_engine` | `none` (default) or trusted `host` Docker/Podman socket access |
 | `command` | ACP server argument list; required for custom harnesses and supports `{workspace}` |
 
@@ -175,6 +176,14 @@ For another harness, set `kind: custom`, provide an image, and enter the command
 that starts its ACP server over stdin/stdout. Authentication and credential
 mounts for custom harnesses are explicit volumes because Xpressclaw does not know
 their host directory conventions.
+
+## Agent network proxy
+
+**Settings → Proxy** configures domain allow/block lists, hosts that skip HTTPS
+inspection, and request-header rules. Agents inherit the instance setting;
+**Connect directly** in an Agent's runner settings bypasses the proxy for that
+Agent. Existing installations enable the new service explicitly in Settings.
+See [Agent network proxy](proxy.md) for matching rules, runtime behavior, and tests.
 
 ## Built-in images
 

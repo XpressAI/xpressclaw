@@ -626,6 +626,7 @@ async fn update_agent_config(
         agents: new_agents,
         instance: old_config.instance.clone(),
         collaboration: old_config.collaboration.clone(),
+        proxy: old_config.proxy.clone(),
         llm: old_config.llm.clone(),
         mcp_servers: old_config.mcp_servers.clone(),
         system: old_config.system.clone(),
