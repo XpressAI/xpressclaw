@@ -22,6 +22,7 @@
 	let subscriptionAuth = $state(true);
 	let sshAgentForwarding = $state(false);
 	let sshAgentForwardingUnsupportedReason = $state<string | null>(null);
+	let proxyMode = $state<'inherit' | 'direct'>('inherit');
 	let containerEngine = $state<'none' | 'host'>('none');
 	let commandText = $state('');
 	let configOptions = $state<AcpConfigOption[]>([]);
@@ -271,6 +272,7 @@
 			? inferHarnessKindFromBackend(config.backend)
 			: canonicalHarnessKind(configuredKind);
 		containerEngine = config.runner.container_engine ?? 'none';
+		proxyMode = config.runner.proxy ?? 'inherit';
 		savedKind = kind;
 		savedContainerEngine = containerEngine;
 		image = isManagedDefaultImage(config.runner.image) ? defaultImage() : config.runner.image;
@@ -310,7 +312,8 @@
 					command: commandText.split('\n').map((line) => line.trim()).filter(Boolean),
 					subscription_auth: subscriptionAuth,
 					ssh_agent_forwarding: sshAgentForwarding,
-					container_engine: containerEngine
+					container_engine: containerEngine,
+					proxy: proxyMode
 				},
 				volumes: volumesText.split('\n').map((line) => line.trim()).filter(Boolean)
 			});
@@ -669,7 +672,15 @@
 		<p class="mt-1 text-[11px] text-muted-foreground">One idempotent shell command per line. Commands run in the workspace before every short-lived ACP task.</p>
 	</div>
 
-	<div class="ai-card p-5">
+	<div class="ai-card space-y-5 p-5">
+		<div class="space-y-2">
+			<label for="agent-proxy" class="block text-sm font-medium">Network proxy</label>
+			<select id="agent-proxy" bind:value={proxyMode} class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm">
+				<option value="inherit">Use instance proxy (default)</option>
+				<option value="direct">Connect directly</option>
+			</select>
+			<p class="text-xs text-muted-foreground">Direct connections skip the instance domain and header rules. Changes apply on the next turn. <a href="/settings/proxy" class="underline">Proxy settings</a></p>
+		</div>
 		<HostSshAccess bind:enabled={sshAgentForwarding}
 			agentForwardingUnsupportedReason={sshAgentForwardingUnsupportedReason} />
 	</div>

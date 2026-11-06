@@ -5830,6 +5830,7 @@ test('automation and settings pages show context-specific sidebar lists', async 
 		'X Xpress AI Connect',
 		'↕ Project sync',
 		'C Local collaboration',
+		'N Proxy',
 		'M MCP servers',
 		'I Instance',
 	]);
@@ -5849,7 +5850,7 @@ test('automation and settings pages show context-specific sidebar lists', async 
 	await page.locator('aside:visible').getByRole('button', { name: 'Close', exact: true }).click();
 	await page.locator('nav a[href="/settings"]:visible').click();
 	await page.getByRole('button', { name: 'Open agent switcher' }).click();
-	await expect(page.locator('aside:visible [data-sidebar-mode="settings"] [data-sidebar-setting]')).toHaveCount(7);
+	await expect(page.locator('aside:visible [data-sidebar-mode="settings"] [data-sidebar-setting]')).toHaveCount(8);
 	await expect(page.getByRole('navigation', { name: 'Settings sections' })).toHaveCount(0);
 	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 });
@@ -7945,4 +7946,21 @@ test('choose-best workflow accepts rubric priorities and keeps memory writes opt
 		candidate_b: agentId,
 		worker: agentId,
 	});
+});
+
+
+test('Agent runner networking defaults to the instance proxy and saves a direct override', async ({ page }) => {
+    await mockApi(page);
+    let saved: { runner: { proxy: string } } | null = null;
+    await page.route(`**/api/agents/${agentId}/config`, async route => {
+        saved = route.request().postDataJSON();
+        await route.fulfill({ json: { agent: saved } });
+    });
+    await page.goto(`/agents/${agentId}?tab=runner`);
+    const mode = page.getByLabel('Network proxy', { exact: true });
+    await expect(mode).toHaveValue('inherit');
+    await mode.selectOption('direct');
+    await page.getByRole('button', { name: 'Save Changes' }).click();
+    await expect.poll(() => saved?.runner.proxy).toBe('direct');
+    await expect(mode).toHaveValue('direct');
 });

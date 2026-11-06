@@ -1,5 +1,6 @@
 <script lang="ts">
 	import type { WorkspaceTabKind } from '$lib/workspace';
+	import ProxySettingsPage from '../../../routes/settings/proxy/+page.svelte';
 	import SettingsPage from '../../../routes/settings/+page.svelte';
 	import McpSettingsPage from '../../../routes/settings/mcp/+page.svelte';
 	import CollaborationSettingsPage from '../../../routes/settings/collaboration/+page.svelte';
@@ -18,6 +19,8 @@
 		<ConnectSettingsPage />
 	{:else if kind === 'settings-collaboration'}
 		<CollaborationSettingsPage />
+	{:else if kind === 'settings-proxy'}
+		<ProxySettingsPage />
 	{:else if kind === 'settings-mcp'}
 		<McpSettingsPage />
 	{:else if kind === 'settings-sync'}

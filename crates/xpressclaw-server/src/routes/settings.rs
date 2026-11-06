@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::state::AppState;
 
-use super::{settings_collaboration, settings_instance, settings_sync, speech};
+use super::{settings_collaboration, settings_instance, settings_proxy, settings_sync, speech};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -18,6 +18,7 @@ pub fn routes() -> Router<AppState> {
         .nest("/collaboration", settings_collaboration::routes())
         .nest("/connect", crate::connect::routes())
         .nest("/sync", settings_sync::routes())
+        .nest("/proxy", settings_proxy::routes())
 }
 
 #[derive(Serialize, Deserialize)]

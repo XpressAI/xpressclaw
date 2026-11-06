@@ -47,6 +47,7 @@ base64 = "0.22"
 zip = { workspace = true }
 libc = "0.2"
 glob = "0.3"
+regex = "1"
 tempfile = "3"
 url = "2"
 cap-std = "4.0.2"

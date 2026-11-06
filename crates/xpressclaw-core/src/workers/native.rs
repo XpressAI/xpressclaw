@@ -883,6 +883,16 @@ async fn execute_conversation_turn_once(
     let mut spec = build_spec(&config, agent, &kind, &docker, &repository, github.as_ref())?;
     let collaboration_token =
         configure_local_collaboration_access(&db, &config, agent, &mut spec, &docker).await?;
+    crate::proxy::service::configure_runner(
+        &docker,
+        &config.system.data_dir,
+        &db.installation_id()?,
+        &config.proxy,
+        agent,
+        &mut spec,
+        control_plane_port,
+    )
+    .await?;
     let container_workspace = spec
         .working_dir
         .clone()
@@ -961,13 +971,18 @@ async fn execute_conversation_turn_once(
                 port: control_plane_port,
                 token: control_plane_token.as_ref(),
                 container_runtime: docker.runtime(),
+                proxied: config.proxy.applies_to(agent.runner.proxy),
                 collaboration_token: collaboration_token.as_deref(),
             },
         ));
     }
     if github_mcp_attached {
         mcp_servers.push(github::mcp_server(&github::GithubMcpContext {
-            control_plane_url: control_plane_url(control_plane_port, docker.runtime()),
+            control_plane_url: control_plane_url(
+                control_plane_port,
+                docker.runtime(),
+                config.proxy.applies_to(agent.runner.proxy),
+            ),
             control_plane_token: if connected {
                 crate::connect::callback_capability(control_plane_token.as_ref(), &agent.name)
             } else {
@@ -1597,6 +1612,16 @@ async fn execute_item_once(runtime: NativeAttemptRuntime, item: QueueItem) -> Re
     let mut spec = build_spec(&config, agent, &kind, &docker, &repository, github.as_ref())?;
     let collaboration_token =
         configure_local_collaboration_access(&db, &config, agent, &mut spec, &docker).await?;
+    crate::proxy::service::configure_runner(
+        &docker,
+        &config.system.data_dir,
+        &db.installation_id()?,
+        &config.proxy,
+        agent,
+        &mut spec,
+        control_plane_port,
+    )
+    .await?;
     let container_workspace = spec
         .working_dir
         .clone()
@@ -1691,13 +1716,18 @@ async fn execute_item_once(runtime: NativeAttemptRuntime, item: QueueItem) -> Re
                 port: control_plane_port,
                 token: control_plane_token.as_ref(),
                 container_runtime: docker.runtime(),
+                proxied: config.proxy.applies_to(agent.runner.proxy),
                 collaboration_token: collaboration_token.as_deref(),
             },
         ));
     }
     if github_mcp_attached {
         mcp_servers.push(github::mcp_server(&github::GithubMcpContext {
-            control_plane_url: control_plane_url(control_plane_port, docker.runtime()),
+            control_plane_url: control_plane_url(
+                control_plane_port,
+                docker.runtime(),
+                config.proxy.applies_to(agent.runner.proxy),
+            ),
             control_plane_token: if connected {
                 crate::connect::callback_capability(control_plane_token.as_ref(), &agent.name)
             } else {
@@ -3120,7 +3150,10 @@ fn github_review_lifecycle_enabled(task: &Task) -> bool {
         != Some("workflow")
 }
 
-fn control_plane_url(control_plane_port: u16, container_runtime: &str) -> String {
+fn control_plane_url(control_plane_port: u16, container_runtime: &str, proxied: bool) -> String {
+    if proxied {
+        return "http://xpressclaw-proxy:9080".into();
+    }
     let host = if container_runtime == "podman" {
         "host.containers.internal"
     } else {
@@ -3136,6 +3169,7 @@ struct RunnerCallback<'a> {
     port: u16,
     token: &'a str,
     container_runtime: &'a str,
+    proxied: bool,
     collaboration_token: Option<&'a str>,
 }
 
@@ -3159,6 +3193,7 @@ fn xpressclaw_control_mcp_server(
             port: control_plane_port,
             token: "test-control-token",
             container_runtime,
+            proxied: false,
             collaboration_token: None,
         },
     )
@@ -3176,7 +3211,7 @@ fn xpressclaw_control_mcp_server_for_context(
     let mut env = vec![
         EnvVariable::new(
             "XPRESSCLAW_URL",
-            control_plane_url(callback.port, callback.container_runtime),
+            control_plane_url(callback.port, callback.container_runtime, callback.proxied),
         ),
         EnvVariable::new("XPRESSCLAW_AGENT_ID", agent_id),
         EnvVariable::new("XPRESSCLAW_WORKSPACE", workspace),
@@ -5055,6 +5090,7 @@ mod tests {
                 port: 8935,
                 token: "control",
                 container_runtime: "docker",
+                proxied: false,
                 collaboration_token: None,
             },
         );
@@ -7118,6 +7154,7 @@ flows:
                 port: 1234,
                 token: "root-secret",
                 container_runtime: "docker",
+                proxied: false,
                 collaboration_token: None,
             },
         ) else {

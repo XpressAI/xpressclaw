@@ -28,3 +28,5 @@ pub mod tools;
 pub mod visualizations;
 pub mod workers;
 pub mod workflows;
+
+pub mod proxy;

@@ -884,6 +884,7 @@ fn runner_from_setup(setup: &AgentSetup) -> NativeRunnerConfig {
         subscription_auth: setup.subscription_auth.unwrap_or(true),
         ssh_agent_forwarding: setup.ssh_agent_forwarding.unwrap_or(false),
         container_engine,
+        proxy: Default::default(),
     }
 }
 
@@ -1317,6 +1318,7 @@ async fn upsert_mcp_server(
         agents: old_config.agents.clone(),
         instance: old_config.instance.clone(),
         collaboration: old_config.collaboration.clone(),
+        proxy: old_config.proxy.clone(),
         llm: old_config.llm.clone(),
         system: old_config.system.clone(),
         tools: old_config.tools.clone(),
@@ -2101,6 +2103,7 @@ async fn delete_mcp_server(
         agents,
         instance: old_config.instance.clone(),
         collaboration: old_config.collaboration.clone(),
+        proxy: old_config.proxy.clone(),
         llm: old_config.llm.clone(),
         system: old_config.system.clone(),
         tools: old_config.tools.clone(),

@@ -8265,6 +8265,7 @@ dependencies = [
  "libc",
  "notify",
  "ready-agent-cog",
+ "regex",
  "reqwest 0.12.28",
  "ring",
  "rusqlite",

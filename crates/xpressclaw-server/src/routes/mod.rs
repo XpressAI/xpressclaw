@@ -18,6 +18,7 @@ mod sessions;
 mod settings;
 mod settings_collaboration;
 mod settings_instance;
+mod settings_proxy;
 mod settings_sync;
 mod setup;
 mod speech;
