@@ -1091,10 +1091,11 @@ mod tests {
         let app = create_router(state())
             .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 43104))));
 
-        // The exact paths the Connect and Instance settings pages request.
+        // The exact paths the settings pages request.
         for (path, field) in [
             ("/api/settings/connect", "paired"),
             ("/api/settings/instance", "instance_id"),
+            ("/api/settings/proxy", "config"),
         ] {
             let response = app
                 .clone()
@@ -1105,11 +1106,40 @@ mod tests {
             assert!(json_body(response).await.get(field).is_some(), "{path}");
         }
 
+        // Saving uses the same canonical endpoint. An invalid policy should
+        // reach validation without starting the gateway or changing settings.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::put("/api/settings/proxy")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "enabled": false,
+                            "blocked_domains": ["https://example.com"]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(json_body(response).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("Invalid domain"));
+
         // A nested router's "/" does not match a trailing slash. That must
         // fail as a JSON 404 rather than fall back to the SPA's index.html,
         // on every listener that shares the frontend fallback.
         for router in [app, create_unprotected_router(state())] {
-            for path in ["/api/settings/connect/", "/api/does-not-exist", "/api"] {
+            for path in [
+                "/api/settings/connect/",
+                "/api/settings/proxy/",
+                "/api/does-not-exist",
+                "/api",
+            ] {
                 let response = router
                     .clone()
                     .oneshot(Request::get(path).body(Body::empty()).unwrap())
