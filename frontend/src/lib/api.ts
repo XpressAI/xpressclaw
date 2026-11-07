@@ -1419,8 +1419,8 @@ export interface ProxySettings {
  host_engine_agents: string[];
 }
 export const settings = {
- getProxy: () => request<ProxySettings>('/api/settings/proxy/'),
- putProxy: (config: ProxyConfig) => request<ProxySettings>('/api/settings/proxy/', { method: 'PUT', body: JSON.stringify(config) }),
+	getProxy: () => request<ProxySettings>('/api/settings/proxy'),
+	putProxy: (config: ProxyConfig) => request<ProxySettings>('/api/settings/proxy', { method: 'PUT', body: JSON.stringify(config) }),
 	getSpeech: () => request<SpeechSettings>('/api/settings/speech'),
 	putSpeech: (config: Omit<SpeechSettings, 'has_api_key'> & { api_key?: string }) =>
 		request<SpeechSettings>('/api/settings/speech', { method: 'PUT', body: JSON.stringify(config) }),

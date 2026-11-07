@@ -15,13 +15,16 @@ function fixture(): ProxySettings {
 async function mock(page: Page, fail = false) {
 	const data = fixture();
 	await page.route('**/api/**', async route => {
-		const path = new URL(route.request().url()).pathname.replace(/\/$/, '');
+		const path = new URL(route.request().url()).pathname;
 		if (path === '/api/settings/proxy') {
 			if (route.request().method() === 'PUT') {
 				if (fail) return route.fulfill({ status: 400, json: { error: 'Invalid domain: https://example.com' } });
 				data.config = route.request().postDataJSON();
 			}
 			return route.fulfill({ json: data });
+		}
+		if (path.startsWith('/api/settings/proxy')) {
+			return route.fulfill({ status: 404, json: { error: 'API route not found' } });
 		}
 		const responses: Record<string, unknown> = {
 			'/api/auth/bootstrap': { authentication_enabled: false, authenticated: true },
