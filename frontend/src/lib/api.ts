@@ -789,8 +789,8 @@ export const workspaces = {
 				}),
 			}
 		),
-	gitStatus: (agentId: string) =>
-		request<WorkspaceGitStatus>(`/api/workspaces/${encodeURIComponent(agentId)}/git/status`),
+	gitStatus: (agentId: string, signal?: AbortSignal) =>
+		request<WorkspaceGitStatus>(`/api/workspaces/${encodeURIComponent(agentId)}/git/status`, { signal }),
 	gitDiff: (agentId: string, path: string) =>
 		request<WorkspaceGitDiff>(`/api/workspaces/${encodeURIComponent(agentId)}/git/diff?path=${encodeURIComponent(path)}`),
 	repository: (agentId: string) =>

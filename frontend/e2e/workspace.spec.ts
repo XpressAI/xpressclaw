@@ -7964,3 +7964,65 @@ test('Agent runner networking defaults to the instance proxy and saves a direct 
     await expect.poll(() => saved?.runner.proxy).toBe('direct');
     await expect(mode).toHaveValue('direct');
 });
+
+test('task messages and completion keep updating while Git status is stalled', async ({ page }) => {
+    await page.clock.install();
+    const messages: Record<string, unknown>[] = [
+        { id: 1, task_id: taskId, role: 'assistant', content: 'Reply already saved in the database.', attachments: [], timestamp: timestamp(20) }
+    ];
+    const attempts: Record<string, unknown>[] = [attempt('running')];
+    await mockApi(page, { taskStatus: 'in_progress', taskMessages: messages, taskAttempts: attempts });
+    let releaseGit!: () => void;
+    const gitGate = new Promise<void>(resolve => { releaseGit = resolve; });
+    let gitRequests = 0;
+    await page.route(`**/api/workspaces/${agentId}/git/status`, async route => {
+        gitRequests++;
+        await gitGate;
+        await route.fulfill({ json: { repository: true, branch: 'main', files: [] } }).catch(() => {});
+    });
+    try {
+        await page.goto(`/tasks/${taskId}`);
+        await expect(page.getByText('Reply already saved in the database.', { exact: true })).toBeVisible();
+        await expect(page.locator('[data-agent-phase="loading"]')).toHaveCount(0);
+        await page.clock.runFor(6_000);
+        expect(gitRequests).toBe(1);
+        const task = await page.evaluate(async id => (await fetch(`/api/tasks/${id}`)).json(), taskId);
+        await page.route(`**/api/tasks/${taskId}`, route => route.fulfill({ json: { ...task, status: 'waiting_for_input', activity_status: 'waiting_for_input' } }));
+        messages.push({ id: 2, task_id: taskId, role: 'assistant', content: 'Completed while Git is still checking.', attachments: [], timestamp: timestamp(65) });
+        attempts.splice(0, 1, attempt('completed'));
+        await page.clock.runFor(3_000);
+        await expect(page.getByText('Completed while Git is still checking.', { exact: true })).toBeVisible();
+        await expect(page.locator('[data-task-activity-status="waiting_for_input"]')).toBeVisible();
+        expect(gitRequests).toBe(1);
+    } finally {
+        releaseGit();
+    }
+});
+
+test('stalled Git refresh times out and a later refresh recovers', async ({ page }) => {
+    await page.clock.install();
+    await page.setViewportSize({ width: 1600, height: 1000 });
+    await mockApi(page, { taskStatus: 'in_progress' });
+    let releaseGit!: () => void;
+    const gitGate = new Promise<void>(resolve => { releaseGit = resolve; });
+    let requests = 0;
+    const failedRequests: string[] = [];
+    page.on('requestfailed', request => {
+        if (new URL(request.url()).pathname.endsWith('/git/status')) failedRequests.push(request.url());
+    });
+    await page.route(`**/api/workspaces/${agentId}/git/status`, async route => {
+        if (++requests === 1) await gitGate;
+        await route.fulfill({ json: { repository: true, branch: 'git-recovered', files: [] } }).catch(() => {});
+    });
+    try {
+        await page.goto(`/tasks/${taskId}`);
+        await expect(page.locator('[data-task-transcript]')).toBeVisible();
+        await expect.poll(() => requests).toBe(1);
+        await page.clock.runFor(13_000);
+        await expect.poll(() => failedRequests.length).toBe(1);
+        await expect.poll(() => requests).toBe(2);
+        await expect(page.locator('[data-task-changed-files]')).toContainText('Working tree clean');
+    } finally {
+        releaseGit();
+    }
+});

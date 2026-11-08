@@ -836,7 +836,9 @@ impl TaskQueue {
         })?
     }
 
-    /// Claim the next queued item for an agent (atomically set to 'running').
+    /// Claim the next queued item and publish its preparation checkpoint atomically.
+    /// The worker owns started_at because prompt recovery uses it to track which
+    /// commands entered execution.
     pub fn claim(&self, agent_id: &str) -> Result<Option<QueueItem>> {
         self.claim_at(Some(agent_id), chrono::Utc::now())
     }
@@ -928,6 +930,31 @@ impl TaskQueue {
                         [id],
                     )?;
                     if changed == 1 {
+                        // Claim, preparation state, and its first event share
+                        // one commit, before workspace or container I/O begins.
+                        tx.execute(
+                            "UPDATE work_attempts SET status = 'preparing'
+                             WHERE id = (SELECT attempt_id FROM task_queue WHERE id = ?1)",
+                            [id],
+                        )?;
+                        tx.execute(
+                            "UPDATE logical_sessions SET status = 'running',
+                                latest_summary = 'Checking workspace before runner startup',
+                                updated_at = CURRENT_TIMESTAMP
+                             WHERE id = (SELECT session_id FROM work_attempts
+                                WHERE id = (SELECT attempt_id FROM task_queue WHERE id = ?1))",
+                            [id],
+                        )?;
+                        tx.execute(
+                            "INSERT INTO session_events
+                             (session_id, attempt_id, task_id, source_type, source_id,
+                              event_type, summary, payload)
+                             SELECT session_id, id, task_id, 'runner', runner,
+                                 'attempt_preparing', 'Checking workspace before runner startup',
+                                 '{\"status\":\"preparing\",\"phase\":\"workspace\"}'
+                             FROM work_attempts WHERE id = (SELECT attempt_id FROM task_queue WHERE id = ?1)",
+                            [id],
+                        )?;
                         tx.execute(
                             "UPDATE tasks SET parent_review_required=1 WHERE id=(SELECT task_id FROM task_queue WHERE id=?1)
                              AND blocks_parent=1 AND hidden=0 AND provenance!='native_plan'
@@ -1222,6 +1249,88 @@ mod tests {
         .unwrap();
         let queue = TaskQueue::new(db.clone());
         (db, queue)
+    }
+
+    #[test]
+    fn claim_records_preparation_before_any_async_startup() {
+        let (db, queue) = setup();
+        let board = TaskBoard::new(db.clone());
+        let task = board
+            .create(&CreateTask {
+                backlog: false,
+                start_after: None,
+                title: "Cold runner".into(),
+                description: None,
+                agent_id: Some("atlas".into()),
+                parent_task_id: None,
+                sop_id: None,
+                conversation_id: None,
+                priority: None,
+                context: None,
+            })
+            .unwrap();
+        let queued = queue.enqueue(&task.id, "atlas").unwrap();
+        let claimed = queue.claim_next().unwrap().unwrap();
+        let sessions = SessionManager::new(db.clone());
+        let attempt = sessions
+            .get_attempt(queued.attempt_id.as_deref().unwrap())
+            .unwrap();
+        assert_eq!(claimed.status, "running");
+        assert_eq!(attempt.status, "preparing");
+        // Claiming does not mean the worker has started: connected-task
+        // prompt recovery uses this timestamp to exclude unstarted commands.
+        assert!(attempt.started_at.is_none());
+        assert!(attempt.response_started_at.is_none());
+        assert!(attempt.container_id.is_none());
+        assert_eq!(sessions.get("atlas").unwrap().status, "running");
+        let events = sessions.list_events("atlas", None, 100).unwrap();
+        let event = events
+            .iter()
+            .find(|event| event.event_type == "attempt_preparing")
+            .unwrap();
+        assert_eq!(event.attempt_id, queued.attempt_id);
+        assert_eq!(event.summary, "Checking workspace before runner startup");
+        assert!(queue.claim_next().unwrap().is_none());
+    }
+
+    #[test]
+    fn failed_preparation_event_rolls_back_the_queue_claim() {
+        let (db, queue) = setup();
+        let board = TaskBoard::new(db.clone());
+        let task = board
+            .create(&CreateTask {
+                backlog: false,
+                start_after: None,
+                title: "Cold runner".into(),
+                description: None,
+                agent_id: Some("atlas".into()),
+                parent_task_id: None,
+                sop_id: None,
+                conversation_id: None,
+                priority: None,
+                context: None,
+            })
+            .unwrap();
+        let item = queue.enqueue(&task.id, "atlas").unwrap();
+        db.conn().execute_batch("CREATE TRIGGER reject_preparing BEFORE INSERT ON session_events
+            WHEN NEW.event_type = 'attempt_preparing' BEGIN SELECT RAISE(FAIL, 'event unavailable'); END;").unwrap();
+        assert!(queue.claim_next().is_err());
+        let unclaimed = queue.get(item.id).unwrap();
+        assert_eq!(unclaimed.status, "queued");
+        assert!(unclaimed.started_at.is_none());
+        let sessions = SessionManager::new(db.clone());
+        assert_eq!(
+            sessions
+                .get_attempt(item.attempt_id.as_deref().unwrap())
+                .unwrap()
+                .status,
+            "queued"
+        );
+        assert_eq!(sessions.get("atlas").unwrap().status, "queued");
+        db.conn()
+            .execute_batch("DROP TRIGGER reject_preparing")
+            .unwrap();
+        assert_eq!(queue.claim_next().unwrap().unwrap().id, item.id);
     }
 
     #[test]

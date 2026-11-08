@@ -854,7 +854,7 @@ mod tests {
                 .get_attempt(attempt)
                 .unwrap()
                 .status,
-            "queued"
+            "preparing"
         );
         assert!(prompt(&db, &parent.id, attempt)
             .unwrap()
