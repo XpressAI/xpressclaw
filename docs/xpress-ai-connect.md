@@ -47,6 +47,37 @@ normal completion checks. Local wake-up scheduling, local delegation, local
 memory-editing tools, cloud voice/desktop controls, and custom replacements for
 the bundled control MCP are outside this first version.
 
+## Troubleshooting synchronization
+
+`Xpress AI Connect synchronization deferred` means a sync pass failed. The
+connector waits five seconds after each pass before trying again. Each HTTP
+request has a five-second connection timeout and a fifteen-second total deadline.
+Pending receipts are kept for retry; active work stops if its execution lease
+expires without renewal.
+
+Warnings include the platform origin, request method and path, elapsed time,
+failure kind, and upstream HTTP status when a response was received:
+
+- `failure_kind=http_status upstream_status=502` means the platform or its
+  gateway returned HTTP 502.
+- `failure_kind=http_status upstream_status=401` means the platform rejected the
+  saved Connect credential. Check the installation in platform Connect settings.
+- `failure_kind=timeout` means the local request deadline expired. A status of
+  `200` can accompany this if the response headers arrived but the body stalled.
+- `failure_kind=connection` covers connection setup failures, including DNS and
+  TLS. Check reachability from the machine running XpressClaw.
+- `failure_kind=decode upstream_status=200` means the response did not match the
+  Connect protocol. Check that the configured origin serves the platform API.
+
+`local_status` is the status XpressClaw uses for its own API response. Older
+builds log only `status=502 Bad Gateway`, which also covers timeouts, connection
+failures, rejected credentials, and invalid responses. That line alone does not
+identify an upstream HTTP 502.
+
+`Xpress AI Connect receipt deferred` identifies a failed result delivery or
+lease heartbeat; other receipts and command polling continue. Diagnostics omit
+credentials and request/response bodies.
+
 ## Disconnect
 
 Use **Disconnect Agent** to retire one binding, or **Disconnect instance** to

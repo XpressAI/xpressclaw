@@ -1,6 +1,6 @@
 use std::io::Write;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::extract::{Path as RoutePath, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -133,53 +133,92 @@ impl Settings {
         body: Option<Value>,
     ) -> Result<T, ConnectError> {
         let base = validate_origin(&self.base_url)?;
+        let started = Instant::now();
+        let request_error = |kind, upstream_status, mut error: ConnectError| {
+            error.request = Some(Box::new(RequestFailure {
+                method: method.clone(),
+                origin: base.clone(),
+                path: format!("/api/connect/v1{path}"),
+                elapsed_ms: started.elapsed().as_millis() as u64,
+                kind,
+                upstream_status,
+            }));
+            error
+        };
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(15))
             .build()
             .map_err(|_| internal("Could not initialize Connect client"))?;
-        let mut request = client.request(method, format!("{base}/api/connect/v1{path}"));
+        let mut request = client.request(method.clone(), format!("{base}/api/connect/v1{path}"));
         if !self.credential.is_empty() {
             request = request.header(AUTH_HEADER, format!("Bearer {}", self.credential));
         }
         if let Some(body) = body {
             request = request.json(&body);
         }
-        let mut response = request
-            .send()
-            .await
-            .map_err(|_| unavailable("Cannot reach Xpress AI"))?;
-        if !response.status().is_success() {
-            return Err(ConnectError(
-                if response.status() == StatusCode::UNAUTHORIZED {
-                    StatusCode::BAD_GATEWAY
-                } else {
-                    response.status()
-                },
-                match response.status().as_u16() {
-                    401 | 403 => "Xpress AI denied this connection or project access",
-                    404 => "This platform does not support Connect, or the resource is unavailable",
-                    409 => "Xpress AI rejected a conflicting binding or command",
-                    429 => "Xpress AI is busy; try again shortly",
-                    _ => "Xpress AI could not process the Connect request",
-                }
-                .into(),
+        let mut response = request.send().await.map_err(|error| {
+            let (kind, message) = if error.is_timeout() {
+                ("timeout", "Xpress AI Connect request timed out")
+            } else if error.is_connect() {
+                ("connection", "Cannot connect to Xpress AI")
+            } else {
+                ("transport", "Cannot send Xpress AI Connect request")
+            };
+            request_error(kind, None, unavailable(message))
+        })?;
+        let upstream_status = response.status();
+        if !upstream_status.is_success() {
+            return Err(request_error(
+                "http_status",
+                Some(upstream_status),
+                ConnectError::new(
+                    if upstream_status == StatusCode::UNAUTHORIZED {
+                        StatusCode::BAD_GATEWAY
+                    } else {
+                        upstream_status
+                    },
+                    match upstream_status.as_u16() {
+                        401 | 403 => "Xpress AI denied this connection or project access",
+                        404 => {
+                            "This platform does not support Connect, or the resource is unavailable"
+                        }
+                        409 => "Xpress AI rejected a conflicting binding or command",
+                        429 => "Xpress AI is busy; try again shortly",
+                        _ => "Xpress AI could not process the Connect request",
+                    },
+                ),
             ));
         }
         let mut bytes = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| unavailable("Could not read Xpress AI response"))?
-        {
+        while let Some(chunk) = response.chunk().await.map_err(|error| {
+            request_error(
+                if error.is_timeout() {
+                    "timeout"
+                } else {
+                    "response_body"
+                },
+                Some(upstream_status),
+                unavailable("Could not read Xpress AI response"),
+            )
+        })? {
             if bytes.len() + chunk.len() > 32 * 1024 * 1024 {
-                return Err(unavailable("Xpress AI response exceeded the size limit"));
+                return Err(request_error(
+                    "response_size",
+                    Some(upstream_status),
+                    unavailable("Xpress AI response exceeded the size limit"),
+                ));
             }
             bytes.extend_from_slice(&chunk);
         }
-        serde_json::from_slice(&bytes)
-            .map_err(|_| unavailable("Xpress AI returned an incompatible response"))
+        serde_json::from_slice(&bytes).map_err(|_| {
+            request_error(
+                "decode",
+                Some(upstream_status),
+                unavailable("Xpress AI returned an incompatible response"),
+            )
+        })
     }
 }
 
@@ -476,7 +515,7 @@ async fn disconnect(State(state): State<AppState>) -> Result<Json<Value>, Connec
 pub async fn run(state: AppState) {
     loop {
         if let Err(error) = sync(&state).await {
-            tracing::warn!(status = %error.0, "Xpress AI Connect synchronization deferred");
+            error.warn("Xpress AI Connect synchronization deferred");
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
@@ -513,7 +552,10 @@ async fn sync(state: &AppState) -> Result<(), ConnectError> {
         let (execution, response) = result?;
         let receipt = match response {
             Ok(receipt) => receipt,
-            Err(_) => continue,
+            Err(error) => {
+                error.warn("Xpress AI Connect receipt deferred");
+                continue;
+            }
         };
         if matches!(
             receipt.status.as_str(),
@@ -693,20 +735,63 @@ fn lease_time(lease: &Lease) -> Result<i64, ConnectError> {
 }
 
 #[derive(Debug)]
-pub struct ConnectError(StatusCode, String);
+pub struct ConnectError {
+    status: StatusCode,
+    message: String,
+    request: Option<Box<RequestFailure>>,
+}
+
+#[derive(Debug)]
+struct RequestFailure {
+    method: reqwest::Method,
+    origin: String,
+    path: String,
+    elapsed_ms: u64,
+    kind: &'static str,
+    upstream_status: Option<StatusCode>,
+}
+
+impl ConnectError {
+    fn new(status: StatusCode, message: &str) -> Self {
+        Self {
+            status,
+            message: message.into(),
+            request: None,
+        }
+    }
+
+    fn warn(&self, message: &str) {
+        let request = self.request.as_deref();
+        tracing::warn!(
+            local_status = %self.status,
+            error = %self.message,
+            failure_kind = request.map(|r| r.kind),
+            method = request.map(|r| r.method.as_str()),
+            origin = request.map(|r| r.origin.as_str()),
+            path = request.map(|r| r.path.as_str()),
+            elapsed_ms = request.map(|r| r.elapsed_ms),
+            upstream_status = request.and_then(|r| r.upstream_status.map(|s| s.as_u16())),
+            "{message}"
+        );
+    }
+}
+
 impl IntoResponse for ConnectError {
     fn into_response(self) -> Response {
-        (self.0, Json(json!({"error": self.1}))).into_response()
+        if self.request.is_some() {
+            self.warn("Xpress AI Connect request failed");
+        }
+        (self.status, Json(json!({"error": self.message}))).into_response()
     }
 }
 fn bad(message: &str) -> ConnectError {
-    ConnectError(StatusCode::BAD_REQUEST, message.into())
+    ConnectError::new(StatusCode::BAD_REQUEST, message)
 }
 fn internal(message: &str) -> ConnectError {
-    ConnectError(StatusCode::INTERNAL_SERVER_ERROR, message.into())
+    ConnectError::new(StatusCode::INTERNAL_SERVER_ERROR, message)
 }
 fn unavailable(message: &str) -> ConnectError {
-    ConnectError(StatusCode::BAD_GATEWAY, message.into())
+    ConnectError::new(StatusCode::BAD_GATEWAY, message)
 }
 fn core_error(error: xpressclaw_core::error::Error) -> ConnectError {
     bad(&error.to_string())
@@ -717,6 +802,165 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
     use xpressclaw_core::{agents::registry::AgentRegistry, config::Config, db::Database};
+
+    #[derive(Clone, Default)]
+    struct LogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn warning(error: &ConnectError) -> Value {
+        let output = LogWriter::default();
+        let writer = output.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            error.warn("Xpress AI Connect synchronization deferred");
+        });
+        let bytes = output.0.lock().unwrap();
+        serde_json::from_slice::<Value>(&bytes).unwrap()["fields"].clone()
+    }
+
+    #[tokio::test]
+    async fn request_diagnostics_distinguish_upstream_status_and_keep_payloads_private() {
+        for (upstream, kind) in [
+            (StatusCode::UNAUTHORIZED, "http_status"),
+            (StatusCode::BAD_GATEWAY, "http_status"),
+            (StatusCode::OK, "decode"),
+        ] {
+            let platform = Router::new().fallback(
+                move |headers: HeaderMap, body: axum::body::Bytes| async move {
+                    assert_eq!(
+                        headers.get(AUTH_HEADER).unwrap(),
+                        "Bearer private-credential"
+                    );
+                    assert!(String::from_utf8_lossy(&body).contains("private-task-text"));
+                    (upstream, "private-response-body private-credential")
+                },
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let server =
+                tokio::spawn(async move { axum::serve(listener, platform).await.unwrap() });
+            let config = Settings {
+                base_url: origin.clone(),
+                credential: "private-credential".into(),
+                ..Settings::default()
+            };
+            let error = config
+                .request::<Value>(
+                    reqwest::Method::POST,
+                    "/instance/commands/command-id/receipt",
+                    Some(json!({"text": "private-task-text"})),
+                )
+                .await
+                .unwrap_err();
+            let fields = warning(&error);
+            assert_eq!(fields["local_status"], "502 Bad Gateway");
+            assert_eq!(fields["upstream_status"], upstream.as_u16());
+            assert_eq!(fields["failure_kind"], kind);
+            assert_eq!(fields["method"], "POST");
+            assert_eq!(fields["origin"], origin);
+            assert_eq!(
+                fields["path"],
+                "/api/connect/v1/instance/commands/command-id/receipt"
+            );
+            assert!(fields["elapsed_ms"].is_u64());
+            assert!(fields["error"].as_str().unwrap().contains(
+                if upstream == StatusCode::UNAUTHORIZED {
+                    "denied"
+                } else if upstream == StatusCode::OK {
+                    "incompatible"
+                } else {
+                    "could not process"
+                }
+            ));
+            assert!(!fields.to_string().contains("private-"));
+            let response = error.into_response();
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body, json!({"error": fields["error"]}));
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_failure_does_not_claim_an_upstream_http_response() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = Settings {
+            base_url: format!("http://{}", listener.local_addr().unwrap()),
+            ..Settings::default()
+        };
+        drop(listener);
+        let error = config
+            .request::<Value>(reqwest::Method::GET, "/instance/commands", None)
+            .await
+            .unwrap_err();
+        let fields = warning(&error);
+        assert_eq!(fields["local_status"], "502 Bad Gateway");
+        assert_eq!(fields["failure_kind"], "connection");
+        assert!(fields.get("upstream_status").is_none());
+    }
+
+    #[tokio::test]
+    async fn stalled_request_reports_the_request_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = Settings {
+            base_url: format!("http://{}", listener.local_addr().unwrap()),
+            ..Settings::default()
+        };
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let error = config
+            .request::<Value>(reqwest::Method::GET, "/instance/commands", None)
+            .await
+            .unwrap_err();
+        server.abort();
+        let fields = warning(&error);
+        assert_eq!(fields["failure_kind"], "timeout");
+        assert!(fields.get("upstream_status").is_none());
+        assert!(fields["elapsed_ms"].as_u64().unwrap() >= 14_000);
+    }
+
+    #[tokio::test]
+    async fn stalled_response_body_retains_the_successful_upstream_status() {
+        let platform = Router::new().fallback(|| async {
+            axum::body::Body::from_stream(stream::pending::<
+                Result<axum::body::Bytes, std::io::Error>,
+            >())
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = Settings {
+            base_url: format!("http://{}", listener.local_addr().unwrap()),
+            ..Settings::default()
+        };
+        let server = tokio::spawn(async move { axum::serve(listener, platform).await.unwrap() });
+        let error = config
+            .request::<Value>(reqwest::Method::GET, "/instance/commands", None)
+            .await
+            .unwrap_err();
+        server.abort();
+        let fields = warning(&error);
+        assert_eq!(fields["failure_kind"], "timeout");
+        assert_eq!(fields["upstream_status"], 200);
+        assert!(fields["elapsed_ms"].as_u64().unwrap() >= 14_000);
+    }
 
     #[test]
     fn origins_cannot_include_credentials_paths_or_insecure_remote_hosts() {
@@ -790,9 +1034,9 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
         assert!(error
-            .1
+            .message
             .contains("already bound to another platform project"));
         assert_eq!(journal.bindings("instance").unwrap(), vec![binding]);
     }
