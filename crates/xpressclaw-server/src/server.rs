@@ -1,7 +1,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use axum::extract::{DefaultBodyLimit, Request, State};
+use axum::extract::{DefaultBodyLimit, MatchedPath, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::Response;
@@ -14,6 +14,17 @@ use crate::frontend;
 use crate::routes;
 use crate::state::AppState;
 
+// Keep failure logs attributable at the default INFO filter. Route patterns
+// identify the handler without recording query tokens or concrete file paths.
+fn http_request_span(request: &Request) -> tracing::Span {
+    let route = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(MatchedPath::as_str)
+        .unwrap_or("unmatched");
+    tracing::info_span!("http_request", method = %request.method(), route)
+}
+
 /// Create the main Axum router with all routes.
 pub fn create_router(state: AppState) -> Router {
     let api = routes::public_api_routes(&state);
@@ -24,7 +35,7 @@ pub fn create_router(state: AppState) -> Router {
         // Base64 encoding expands image messages beyond Axum's 2 MiB JSON default.
         // Message handlers enforce tighter decoded per-image and aggregate limits.
         .layer(DefaultBodyLimit::max(30 * 1024 * 1024))
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new_for_http().make_span_with(http_request_span))
         .with_state(state)
 }
 
@@ -33,7 +44,7 @@ fn create_unprotected_router(state: AppState) -> Router {
         .nest("/api", routes::api_routes())
         .fallback(frontend::serve_frontend)
         .layer(DefaultBodyLimit::max(30 * 1024 * 1024))
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new_for_http().make_span_with(http_request_span))
         .with_state(state)
 }
 

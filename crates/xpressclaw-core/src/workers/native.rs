@@ -673,7 +673,12 @@ pub async fn start_dispatcher(
                             error = %error,
                             "native work attempt failed"
                         );
-                        let _ = fail_item(&db, &item, &error.to_string(), &event_bus);
+                        if let Err(persistence_error) =
+                            fail_item(&db, &item, &error.to_string(), &event_bus)
+                        {
+                            error!(queue_id = item.id, task_id = item.task_id, error = %persistence_error,
+                                "could not persist native work attempt failure");
+                        }
                     }
                 });
             }

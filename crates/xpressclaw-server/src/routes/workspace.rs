@@ -1180,6 +1180,7 @@ async fn git_output(root: &FsPath, arguments: &[&str]) -> ApiResult<Output> {
     let mut command = Command::new("git");
     command
         .current_dir(root)
+        .kill_on_drop(true)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .args(arguments);
     tokio::time::timeout(Duration::from_secs(10), command.output())

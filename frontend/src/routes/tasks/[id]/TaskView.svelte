@@ -214,6 +214,9 @@
 	let showJumpToLatest = $state(false);
 	let lastTranscriptScrollTop = 0;
 	let lastWorkspaceGitRefresh = 0;
+	let workspaceGitRequest: AbortController | null = null;
+	let pollInFlight = false;
+	let disposed = false;
 
 	$effect(() => {
 		if (messageDraftReady) saveComposerDraft(messageDraftScope(), messageInput);
@@ -818,6 +821,10 @@
 		controlSnapshot = null;
 		configRefreshVersion = null;
 		controlsInitializedFor = controlsScope;
+		workspaceGitRequest?.abort();
+		workspaceGitRequest = null;
+		workspaceGit = null;
+		lastWorkspaceGitRefresh = 0;
 		sessionEvents = [];
 		configOptions = [];
 		selectedConfig = {};
@@ -912,6 +919,7 @@
 		messageInput = loadComposerDraft(messageDraftScope());
 		messageDraftReady = true;
 		await load();
+		if (disposed) return;
 		loading = false;
 		// Auto-poll while task is in progress
 		pollTimer = setInterval(async () => {
@@ -926,6 +934,8 @@
 	});
 
 	onDestroy(() => {
+		disposed = true;
+		workspaceGitRequest?.abort();
 		++configRequestVersion;
 		if (pollTimer) clearInterval(pollTimer);
 		taskViewResizeObserver?.disconnect();
@@ -941,6 +951,7 @@
 				tasks.messages(id),
 				tasks.activity(id),
 			]);
+			if (disposed || taskId !== id) return;
 			task = loadedTask;
 			resetHarnessControls(loadedTask.agent_id);
 			void refreshModelMenu(true);
@@ -953,14 +964,10 @@
 			prevMessageCount = messages.length;
 			lastActivityEventId = activityEvents.at(-1)?.id ?? 0;
 			if (loadedTask.agent_id) {
-				const [events, git] = await Promise.all([
-					sessions.events(loadedTask.agent_id).catch(() => []),
-					workspaces.gitStatus(loadedTask.agent_id).catch(() => null),
-				]);
+				void refreshWorkspaceGit(loadedTask.agent_id);
+				const events = await sessions.events(loadedTask.agent_id).catch(() => []);
 				if (task?.id !== id || task.agent_id !== loadedTask.agent_id) return;
 				sessionEvents = events;
-				workspaceGit = git;
-				lastWorkspaceGitRefresh = Date.now();
 				refreshHarnessControls(sessionEvents, loadedTask.agent_id);
 			} else {
 				sessionEvents = []; configOptions = []; availableCommands = []; workspaceGit = null;
@@ -1008,8 +1015,29 @@
 		requestAnimationFrame(() => messagesEl?.focus({ preventScroll: true }));
 	}
 
+	// Git is auxiliary metadata. A slow repository must not delay the task,
+	// its saved messages, or terminal attempt state, or accumulate requests.
+	async function refreshWorkspaceGit(agentId: string) {
+		if (disposed || workspaceGitRequest || Date.now() - lastWorkspaceGitRefresh < 10_000) return;
+		const id = taskId;
+		const controller = new AbortController();
+		workspaceGitRequest = controller;
+		lastWorkspaceGitRefresh = Date.now();
+		const timeout = setTimeout(() => controller.abort(), 10_000);
+		try {
+			const git = await workspaces.gitStatus(agentId, controller.signal);
+			if (!disposed && workspaceGitRequest === controller && task?.id === id && task.agent_id === agentId) workspaceGit = git;
+		} catch { /* Preserve the last Git snapshot; task polling continues. */ }
+		finally {
+			clearTimeout(timeout);
+			if (workspaceGitRequest === controller) workspaceGitRequest = null;
+		}
+	}
+
 	/** Poll semantic task activity without exposing the runner's terminal. */
 	async function poll() {
+		if (pollInFlight || disposed) return;
+		pollInFlight = true;
 		try {
 			const id = taskId;
 			const [newTask, newMessages, newActivity] = await Promise.all([
@@ -1017,6 +1045,7 @@
 				tasks.messages(id),
 				tasks.activity(id, { after: lastActivityEventId || undefined }),
 			]);
+			if (disposed || taskId !== id) return;
 			// Update task status/details in-place
 			task = newTask;
 			resetHarnessControls(newTask.agent_id);
@@ -1045,17 +1074,15 @@
 					sessionEvents = latestSessionEvents;
 					refreshHarnessControls(sessionEvents, newTask.agent_id);
 				}
-				if (Date.now() - lastWorkspaceGitRefresh >= 10_000) {
-					workspaceGit = await workspaces.gitStatus(newTask.agent_id).catch(() => workspaceGit);
-					lastWorkspaceGitRefresh = Date.now();
-				}
+				void refreshWorkspaceGit(newTask.agent_id);
 			}
 			if (shouldScroll) scrollToBottom();
 			try {
 				const sub = await tasks.subtasks(id);
 				subtaskList = sub.tasks;
 			} catch { subtaskList = []; }
-		} catch { /* ignore poll errors */ }
+		} catch { /* Retry on the next polling interval. */ }
+		finally { pollInFlight = false; }
 	}
 
 	async function loadEarlierActivity() {
