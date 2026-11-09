@@ -8324,6 +8324,7 @@ dependencies = [
  "tower",
  "tower-http",
  "tracing",
+ "tracing-subscriber",
  "uuid",
  "xpressclaw-core",
  "zeroize",
