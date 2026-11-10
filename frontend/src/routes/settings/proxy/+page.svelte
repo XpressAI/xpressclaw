@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { settings, type ProxyConfig, type ProxySettings } from '$lib/api';
+	import { settings, type ProxyConfig, type ProxySettings, type ProxyNetworkRule } from '$lib/api';
 
 	let data = $state<ProxySettings | null>(null);
 	let form = $state<ProxyConfig | null>(null);
@@ -8,6 +8,7 @@
 	let blockedText = $state('');
 	let bypassText = $state('');
 	let ruleDomainText = $state<string[]>([]);
+	let webPortsText = $state('');
 	let busy = $state(false);
 	let error = $state('');
 	let notice = $state('');
@@ -17,6 +18,7 @@
 		try {
 			data = await settings.getProxy();
 			form = structuredClone($state.snapshot(data.config));
+			webPortsText = form.web_ports.join(', ');
             allowedText = form.allowed_domains.join('\n');
             blockedText = form.blocked_domains.join('\n');
             bypassText = form.inspection_bypass.join('\n');
@@ -30,17 +32,21 @@
 		error = '';
 		notice = '';
 		try {
+			const ports = webPortsText.split(',').map(value => value.trim());
+			if (ports.some(value => !/^\d+$/.test(value) || Number(value) < 1 || Number(value) > 65535)) throw new Error('Enter web proxy ports between 1 and 65535, separated by commas.');
+			form.web_ports = [...new Set(ports.map(Number))];
 			form.allowed_domains = lines(allowedText);
             form.blocked_domains = lines(blockedText);
             form.inspection_bypass = lines(bypassText);
             form.header_rules.forEach((rule, index) => { rule.domains = lines(ruleDomainText[index] ?? ''); });
             data = await settings.putProxy(form);
 			form = structuredClone($state.snapshot(data.config));
+			webPortsText = form.web_ports.join(', ');
             allowedText = form.allowed_domains.join('\n');
             blockedText = form.blocked_domains.join('\n');
             bypassText = form.inspection_bypass.join('\n');
             ruleDomainText = form.header_rules.map(rule => rule.domains.join('\n'));
-			notice = 'Proxy settings saved. Rules apply to new requests; Agent network changes apply on the next turn.';
+			notice = 'Proxy settings saved. Web rules apply to new requests. Network rules apply to new connections within a few seconds. Agent mode changes apply on the next turn.';
 		} catch (cause) { error = cause instanceof Error ? cause.message : String(cause); }
 		finally { busy = false; }
 	}
@@ -48,6 +54,15 @@
 	async function refresh() {
 		try { data = await settings.getProxy(); }
 		catch (cause) { error = String(cause); }
+	}
+
+	function addNetworkRule(preset: 'custom' | 'postgres' | 'redis' | 'dns' = 'custom') {
+		const presets: Record<string, Partial<ProxyNetworkRule>> = {
+			postgres: { name: 'PostgreSQL', ports: '5432' },
+			redis: { name: 'Redis', ports: '6379' },
+			dns: { name: 'DNS', ports: '53', protocol: 'udp' }
+		};
+		form?.network_rules.push({ name: '', enabled: true, protocol: 'tcp', destination: '', ports: '', ...presets[preset] });
 	}
 
 	function addRule() {
@@ -60,7 +75,7 @@
 	<div class="flex flex-wrap items-start justify-between gap-4">
 		<div>
 			<h1 class="text-2xl font-semibold">Proxy</h1>
-			<p class="mt-1 text-sm text-muted-foreground">Control the domains and request headers used by your Agents.</p>
+			<p class="mt-1 text-sm text-muted-foreground">Control web traffic, SSH, and other network access for your Agents.</p>
 		</div>
 		{#if data}
 			<span class="rounded-full border border-border px-3 py-1 text-xs" aria-label="Proxy status">{data.status.state.replaceAll('_', ' ')}</span>
@@ -83,7 +98,7 @@
 				</section>
 
 				<section class="space-y-4 rounded-xl border border-border p-5">
-					<h2 class="text-lg font-medium">Domain access</h2>
+					<h2 class="text-lg font-medium">Web domain access</h2>
 					<label class="block space-y-1 text-sm"><span>Default policy</span>
 						<select bind:value={form.domain_policy} class="w-full rounded-md border border-input bg-background px-3 py-2">
 							<option value="allow_except_blocked">Allow except blocked</option>
@@ -100,10 +115,41 @@
 							<textarea rows="5" bind:value={blockedText} class="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs" placeholder="*.blocked.example"></textarea>
 						</label>
 					</div>
+					<label class="block space-y-1 text-sm"><span>Web proxy ports</span>
+						<input aria-label="Web proxy ports" bind:value={webPortsText} placeholder="80,443,8443" class="w-full rounded-md border border-input bg-background px-3 py-2" />
+						<span class="block text-xs text-muted-foreground">HTTP requests and HTTPS CONNECT tunnels can only use these ports, including hosts exempt from inspection.</span>
+					</label>
 					<label class="block space-y-1 text-sm"><span>Skip HTTPS inspection</span>
 						<textarea aria-label="Skip HTTPS inspection" rows="3" bind:value={bypassText} class="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs" placeholder="pinned.example.com"></textarea>
 						<span class="block text-xs text-muted-foreground">These hosts still pass domain checks. Their headers are unchanged. Changes apply to new connections.</span>
 					</label>
+				</section>
+
+				<section class="space-y-4 rounded-xl border border-border p-5" data-testid="network-access-settings">
+					<h2 class="text-lg font-medium">Direct network access</h2>
+					<p class="text-sm text-muted-foreground">SSH uses TCP port 22 by default. Enable additional TCP or UDP services by destination and port. These connections use their normal addresses and bypass HTTP header filtering. All other direct outbound traffic is blocked.</p>
+					<p class="text-xs text-muted-foreground">The web proxy, control-plane callbacks, loopback, and the container engine’s DNS resolvers remain available. Web domain lists apply to traffic through the proxy.</p>
+					<div class="flex flex-wrap gap-2">
+						<button type="button" onclick={() => addNetworkRule()} class="rounded-md border border-border px-3 py-1.5 text-sm">Add network rule</button>
+						<button type="button" onclick={() => addNetworkRule('postgres')} class="rounded-md border border-border px-3 py-1.5 text-sm">Add PostgreSQL</button>
+						<button type="button" onclick={() => addNetworkRule('redis')} class="rounded-md border border-border px-3 py-1.5 text-sm">Add Redis</button>
+						<button type="button" onclick={() => addNetworkRule('dns')} class="rounded-md border border-border px-3 py-1.5 text-sm">Add DNS</button>
+					</div>
+					{#each form.network_rules as rule, index}
+						<div class="space-y-3 rounded-lg border border-border bg-muted/20 p-4" data-testid="network-rule">
+							<div class="flex items-center justify-between gap-3">
+								<label class="flex items-center gap-2 text-sm font-medium"><input type="checkbox" bind:checked={rule.enabled} /> Enable {rule.name || 'network rule'}</label>
+								<button type="button" aria-label={'Remove network rule ' + (index + 1)} onclick={() => { if (form) form.network_rules = form.network_rules.filter((_, i) => i !== index); }} class="text-xs text-muted-foreground hover:text-foreground">Remove</button>
+							</div>
+							<div class="grid gap-3 sm:grid-cols-2">
+								<label class="block space-y-1 text-sm"><span>Rule name</span><input bind:value={rule.name} maxlength="128" class="w-full rounded-md border border-input bg-background px-3 py-2" /></label>
+								<label class="block space-y-1 text-sm"><span>Protocol</span><select aria-label="Protocol" bind:value={rule.protocol} class="w-full rounded-md border border-input bg-background px-3 py-2"><option value="tcp">TCP</option><option value="udp">UDP</option></select></label>
+								<label class="block space-y-1 text-sm"><span>Destination</span><input required bind:value={rule.destination} placeholder="db.example.com, 10.0.0.0/8, or *" class="w-full rounded-md border border-input bg-background px-3 py-2" /></label>
+								<label class="block space-y-1 text-sm"><span>Ports</span><input required bind:value={rule.ports} placeholder="22,2222,5000-5010" class="w-full rounded-md border border-input bg-background px-3 py-2" /></label>
+							</div>
+						</div>
+					{/each}
+					{#if !form.network_rules.length}<p class="text-sm text-muted-foreground">No direct network exceptions. SSH is blocked until a TCP rule allows it.</p>{/if}
 				</section>
 
 				<section class="space-y-4 rounded-xl border border-border p-5">

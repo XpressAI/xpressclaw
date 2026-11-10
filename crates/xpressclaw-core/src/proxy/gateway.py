@@ -72,9 +72,10 @@ class Policy:
             self.config, self.stamp = config, stamp
             # Escaped, anchored hostname patterns; never user-supplied regex.
             patterns = []
+            ports = '|'.join(str(port) for port in config.get('web_ports', [80, 443]))
             for host in config['inspection_bypass']:
                 suffix = re.escape(host[2:] if host.startswith('*.') else host)
-                patterns.append('(?i)^' + (r'(?:[^.:]+\.)+' if host.startswith('*.') else '') + suffix + r'\.?\:\d+$')
+                patterns.append('(?i)^' + (r'(?:[^.:]+\.)+' if host.startswith('*.') else '') + suffix + r'\.?\:(?:' + ports + ')$')
             ctx.options.update(ignore_hosts=patterns)
         return self.config
 
@@ -96,6 +97,9 @@ class Policy:
             self.reject(flow, 'policy_unavailable')
             return None
         host = flow.request.host
+        if flow.request.port not in config.get('web_ports', [80, 443]):
+            self.reject(flow, 'blocked_proxy_port')
+            return None
         if listed(host, config['blocked_domains']):
             self.reject(flow, 'blocked_domain')
             return None

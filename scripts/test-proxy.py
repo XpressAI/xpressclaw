@@ -26,7 +26,7 @@ spec.loader.exec_module(gateway)
 
 def configuration():
     return dict(enabled=True, domain_policy='allow_except_blocked', allowed_domains=[],
-                blocked_domains=[], inspection_bypass=[], header_rules=[dict(
+                blocked_domains=[], inspection_bypass=[], web_ports=[80, 443], header_rules=[dict(
                     header='User-Agent', matcher='email', value='', action='replace',
                     replacement='XpressCLAW/1.0', domains=[]), dict(
                     header='From', matcher='any', value='', action='remove', replacement='', domains=[])])
@@ -56,6 +56,8 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         tls.load_cert_chain(self.cert, keyfile)
         self.origin = await asyncio.start_server(self.echo, '127.0.0.1', 0, ssl=tls)
         self.origin_port = self.origin.sockets[0].getsockname()[1]
+        self.config['web_ports'].append(self.origin_port)
+        self.save()
         with socket.socket() as probe:
             probe.bind(('127.0.0.1', 0))
             self.proxy_port = probe.getsockname()[1]
@@ -135,6 +137,13 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_blocklist_wins_over_allow_and_inspection_exemption(self):
         self.config.update(allowed_domains=['localhost'], blocked_domains=['localhost'], inspection_bypass=['localhost'])
+        self.save()
+        with self.assertRaisesRegex(OSError, '403'):
+            await self.request(passthrough=True)
+
+    async def test_inspection_exemption_cannot_open_unlisted_connect_ports(self):
+        self.config['inspection_bypass'] = ['localhost']
+        self.config['web_ports'] = [443]
         self.save()
         with self.assertRaisesRegex(OSError, '403'):
             await self.request(passthrough=True)

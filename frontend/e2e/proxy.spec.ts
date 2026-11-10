@@ -3,7 +3,7 @@ import type { ProxySettings } from '../src/lib/api';
 
 function fixture(): ProxySettings {
 	return {
-		config: { enabled: true, domain_policy: 'allow_except_blocked', allowed_domains: [], blocked_domains: [], inspection_bypass: [], header_rules: [
+		config: { enabled: true, web_ports: [80, 443], network_rules: [{ name: 'SSH', enabled: true, protocol: 'tcp', destination: '*', ports: '22' }], domain_policy: 'allow_except_blocked', allowed_domains: [], blocked_domains: [], inspection_bypass: [], header_rules: [
 			{ header: 'User-Agent', matcher: 'email', value: '', action: 'replace', replacement: 'XpressCLAW/1.0', domains: [] },
 			{ header: 'From', matcher: 'any', value: '', action: 'remove', replacement: '', domains: [] }
 		] },
@@ -86,4 +86,34 @@ test('proxy settings fit a narrow viewport', async ({ page }, info) => {
 	await expect(page.getByTestId('header-rule')).toHaveCount(2);
 	expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
 	await page.screenshot({ path: info.outputPath('proxy-mobile.png'), fullPage: true });
+});
+
+test('network permissions toggle SSH and save TCP, UDP, and web port controls', async ({ page }, info) => {
+	const data = await mock(page);
+	await page.goto('/settings/proxy');
+	const ssh = page.getByTestId('network-rule').first();
+	await expect(ssh.getByLabel('Enable SSH', { exact: true })).toBeChecked();
+	await expect(ssh.getByLabel('Ports', { exact: true })).toHaveValue('22');
+	await page.getByTestId('network-access-settings').screenshot({ path: info.outputPath('network-access.png') });
+	await ssh.getByLabel('Enable SSH', { exact: true }).uncheck();
+	await page.getByRole('button', { name: 'Add PostgreSQL' }).click();
+	const database = page.getByTestId('network-rule').nth(1);
+	await database.getByLabel('Destination', { exact: true }).fill('db.example.com');
+	await expect(database.getByLabel('Ports', { exact: true })).toHaveValue('5432');
+	await page.getByRole('button', { name: 'Add DNS' }).click();
+	const dns = page.getByTestId('network-rule').nth(2);
+	await dns.getByLabel('Destination', { exact: true }).fill('192.0.2.53/32');
+	await expect(dns.getByLabel('Protocol', { exact: true })).toHaveValue('udp');
+	await page.getByLabel('Web proxy ports', { exact: true }).fill('80,443,8443');
+	await page.getByRole('button', { name: 'Save proxy settings' }).click();
+	await expect(page.getByTestId('proxy-settings').getByRole('status')).toContainText('Proxy settings saved');
+	expect(data.config.network_rules).toEqual([
+		{ name: 'SSH', enabled: false, protocol: 'tcp', destination: '*', ports: '22' },
+		{ name: 'PostgreSQL', enabled: true, protocol: 'tcp', destination: 'db.example.com', ports: '5432' },
+		{ name: 'DNS', enabled: true, protocol: 'udp', destination: '192.0.2.53/32', ports: '53' }
+	]);
+	expect(data.config.web_ports).toEqual([80, 443, 8443]);
+	await page.reload();
+	await expect(page.getByLabel('Enable SSH', { exact: true })).not.toBeChecked();
+	await expect(page.getByTestId('network-rule')).toHaveCount(3);
 });

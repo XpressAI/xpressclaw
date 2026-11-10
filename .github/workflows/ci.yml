@@ -116,14 +116,16 @@ jobs:
       - name: Test native control-plane MCP servers
         run: node --test harnesses/native/common/*.test.mjs crates/xpressclaw-core/src/docker/workflow-command.test.mjs
 
-      - name: Test HTTPS proxy policies
+      - name: Build environment test image
+        run: docker build -f crates/xpressclaw-core/tests/fixtures/environment.Dockerfile -t xpressclaw-environment-test:local crates/xpressclaw-core/tests/fixtures
+
+      - name: Test HTTPS proxy and network permissions
         run: |
           docker run --rm --entrypoint python -v "$PWD:/work:ro" docker.io/mitmproxy/mitmproxy:12.2.1@sha256:743b6cdc817211d64bc269f5defacca8d14e76e647fc474e5c7244dbcb645141 /work/scripts/test-proxy.py
-          XPRESSCLAW_PROXY_TEST_ROOT="$PWD/target/proxy-tests" cargo test -p xpressclaw-core --lib proxy::service::tests::isolated_gateway_roundtrip -- --ignored --exact --nocapture
+          XPRESSCLAW_PROXY_TEST_ROOT="$PWD/target/proxy-tests" XPRESSCLAW_NETWORK_TEST_IMAGE=xpressclaw-environment-test:local cargo test -p xpressclaw-core --lib proxy:: -- --ignored --nocapture
 
       - name: Test retained container access
         run: |
-          docker build -f crates/xpressclaw-core/tests/fixtures/environment.Dockerfile -t xpressclaw-environment-test:local crates/xpressclaw-core/tests/fixtures
           test_name=docker::environment::tests::retained_environment_roundtrip
           cargo test -p xpressclaw-core --lib "$test_name" -- --ignored --exact --list | grep -Fx "$test_name: test"
           XPRESSCLAW_ENVIRONMENT_TEST_IMAGE=xpressclaw-environment-test:local cargo test -p xpressclaw-core --lib "$test_name" -- --ignored --exact --nocapture
