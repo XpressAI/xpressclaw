@@ -441,13 +441,16 @@ PY"#;
             docker.client().start_container::<String>(container, None).await.unwrap();
             }
             let server_ip = docker.client().inspect_container(&origin, None).await.unwrap().network_settings.unwrap().networks.unwrap()[&outside].ip_address.clone().unwrap();
-            let mut spec = ContainerSpec { image: image.clone(), expose_port: None, cmd: Some(vec!["sleep".into(), "infinity".into()]), run_as_host_user: true, ..Default::default() };
+            // The fixture has its own node account and no writable host mounts.
+            // An arbitrary host UID (1001 in CI) has no passwd entry for OpenSSH.
+            let mut spec = ContainerSpec { image: image.clone(), expose_port: None, cmd: Some(vec!["sleep".into(), "infinity".into()]), run_as_host_user: false, ..Default::default() };
             configure_runner(&docker, directory.path(), &installation, &config, &agent, &mut spec, 12345).await.unwrap();
             let guard = spec.network_mode.as_deref().unwrap().strip_prefix("container:").unwrap().to_string();
             assert_eq!(ensure(&docker, directory.path(), &installation, &agent.name).await.unwrap(), guard);
             let guest = docker.launch_project_attached(&agent.name, &spec).await.unwrap();
             guest_id = Some(guest.info.container_id.clone());
             let guest = guest.info.container_id;
+            assert_eq!(success(&docker, &guest, "id -un").await.trim(), "node");
             success(&docker, &guest, "cp /test-key /tmp/ssh-key && chmod 600 /tmp/ssh-key").await;
             let ssh = "ssh -i /tmp/ssh-key -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=2 root@network-target printf ssh-ok";
             assert!(success(&docker, &guest, ssh).await.contains("ssh-ok"));
@@ -476,7 +479,8 @@ PY"#;
             assert!(success(&docker, &guest, ssh).await.contains("ssh-ok"));
             // Even container root cannot remove the firewall or use raw sockets.
             assert_ne!(command(&docker, &guest, "iptables -F OUTPUT", true).await.0, 0);
-            success(&docker, &guest, "python3 -c 'import socket\ntry: socket.socket(socket.AF_PACKET,socket.SOCK_RAW)\nexcept PermissionError: pass\nelse: raise AssertionError(\"raw sockets available\")'").await;
+            let (status, output) = command(&docker, &guest, "python3 -c 'import os,socket\nassert os.getuid()==0\ntry: socket.socket(socket.AF_PACKET,socket.SOCK_RAW)\nexcept PermissionError: pass\nelse: raise AssertionError(\"raw sockets available\")'", true).await;
+            assert_eq!(status, 0, "{output}");
             config.network_rules.extend([
                 NetworkRule { name: "Database".into(), destination: "network-target".into(), ports: "5432-5433".into(), ..Default::default() },
                 NetworkRule { name: "UDP".into(), protocol: NetworkProtocol::Udp, destination: format!("{server_ip}/32"), ports: "5353".into(), ..Default::default() },
