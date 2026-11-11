@@ -18,6 +18,7 @@ const dockerBakeUrl = new URL('../harnesses/docker-bake.hcl', import.meta.url);
 const expectedAcpCommands = {
   codex: ['codex-acp'],
   claude: ['claude-agent-acp'],
+  antigravity: ['agy', 'acp', '--process-per-session'],
   'deepseek-harness': ['dsh-acp'],
   'github-copilot': ['copilot', '--acp'],
   junie: ['junie', '--acp=true'],
@@ -39,6 +40,17 @@ async function manifest() {
 
 function packageName(spec) {
   return spec.slice(0, spec.lastIndexOf('@'));
+}
+
+function antigravityRelease() {
+  return {
+    tag_name: '1.6.0', draft: false, prerelease: false,
+    assets: ['x64', 'arm64'].map((architecture, index) => ({
+      name: `agy_cli_linux_${architecture}.tar.gz`,
+      browser_download_url: `https://github.com/google-antigravity/antigravity-cli/releases/download/1.6.0/agy_cli_linux_${architecture}.tar.gz`,
+      digest: `sha256:${(index ? 'b' : 'a').repeat(64)}`,
+    })),
+  };
 }
 
 test('the checked-in runner manifest is complete and produces exact build arguments', async () => {
@@ -160,6 +172,7 @@ test('updates tracked registry and npm sources while leaving a pinned runner unc
   const updated = await updateRunnerVersions(input, {
     registry: { agents },
     npmVersion: async () => '8.8.8',
+    githubRelease: async () => antigravityRelease(),
   });
 
   assert.equal(updated.runners.codex.version, '9.9.9');
@@ -178,6 +191,28 @@ test('updates tracked registry and npm sources while leaving a pinned runner unc
     'https://example.test/cursor-amd64.tgz',
   );
   assert.equal(updated.runners.cursor.build_args.AGENT_SHA256_ARM64, 'b'.repeat(64));
+  assert.equal(updated.runners.antigravity.version, '1.6.0');
+  assert.equal(updated.runners.antigravity.build_args.AGENT_SHA256_ARM64, 'b'.repeat(64));
+  assert.match(updated.runners.antigravity.build_args.AGENT_ARCHIVE_AMD64, /\/1\.6\.0\/agy_cli_linux_x64.tar.gz$/);
+});
+
+test('official release updates require both architecture assets and verified digests', async () => {
+  const input = await manifest();
+  for (const [id, runner] of Object.entries(input.runners)) {
+    if (id === 'antigravity') continue;
+    runner.auto_update = false;
+    runner.pin_reason = 'test pin';
+  }
+  for (const mutate of [
+    (release) => release.assets.pop(),
+    (release) => { release.assets[0].digest = null; },
+    (release) => { release.assets[0].browser_download_url = 'https://example.invalid/replacement.tar.gz'; },
+    (release) => { release.prerelease = true; },
+  ]) {
+    const release = antigravityRelease();
+    mutate(release);
+    await assert.rejects(updateRunnerVersions(input, { githubRelease: async () => release }), /release requires|stable versioned release/);
+  }
 });
 
 test('rejects an unexpected binary layout instead of publishing a broken image', async () => {

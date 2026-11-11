@@ -4,6 +4,7 @@
 	import { canonicalHarnessKind, harnessName, inferHarnessKindFromBackend, openExternal } from '$lib/utils';
 	import DirectoryPicker from '$lib/components/DirectoryPicker.svelte';
 	import HostSshAccess from '$lib/components/HostSshAccess.svelte';
+	import AntigravityAuth from '$lib/components/AntigravityAuth.svelte';
 	import type { AcpAgentCatalogEntry, AcpConfigOption, AcpModeState, LiveConfig, McpServerDefinition, McpVerificationResult, NativeRunnerConfig, PreservedEnvironment, RunnerReadiness } from '$lib/api';
 
 	interface Props {
@@ -67,6 +68,7 @@
 		cline: 'https://docs.cline.bot/customization/skills'
 	};
 	const fallbackAgents = [
+		{ kind: 'antigravity', name: 'Google Antigravity', install_url: 'https://antigravity.google/docs/cli/acp/', image: 'ghcr.io/xpressai/xpressclaw-runner-antigravity:latest', host_image: 'ghcr.io/xpressai/xpressclaw-runner-antigravity-docker:latest' },
 		{ kind: 'codex', name: 'Codex', install_url: 'https://developers.openai.com/codex/cli/', image: 'ghcr.io/xpressai/xpressclaw-runner-codex:latest', host_image: 'ghcr.io/xpressai/xpressclaw-runner-codex-docker:latest' },
 		{ kind: 'claude', name: 'Claude Agent', install_url: 'https://docs.anthropic.com/en/docs/claude-code/setup', image: 'ghcr.io/xpressai/xpressclaw-runner-claude:latest', host_image: 'ghcr.io/xpressai/xpressclaw-runner-claude-docker:latest' },
 		{ kind: 'opencode', name: 'OpenCode', install_url: 'https://opencode.ai/docs/', image: 'ghcr.io/xpressai/xpressclaw-runner-opencode:latest', host_image: 'ghcr.io/xpressai/xpressclaw-runner-opencode-docker:latest' },
@@ -713,6 +715,7 @@
 			<input id="subscription-auth" type="checkbox" bind:checked={subscriptionAuth} disabled={kind === 'custom'} class="mt-0.5 h-4 w-4 rounded border-input disabled:opacity-50" />
 			<div>
 				<label for="subscription-auth" class="text-sm font-medium">Use host login and harness configuration</label>
+				{#if kind === 'antigravity'}<AntigravityAuth />{/if}
 				<p class="mt-1 text-xs leading-relaxed text-muted-foreground">
 					{kind === 'custom'
 						? 'Custom harnesses manage their own authentication; add any required directories in the mounts above.'

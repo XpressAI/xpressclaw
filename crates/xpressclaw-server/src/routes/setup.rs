@@ -2630,6 +2630,15 @@ mod tests {
         assert_eq!(agents.len(), ACP_AGENTS.len());
         assert!(agents.iter().any(|agent| agent["kind"] == "cursor"));
         assert!(agents.iter().any(|agent| agent["kind"] == "mistral-vibe"));
+        let antigravity = agents
+            .iter()
+            .find(|agent| agent["kind"] == "antigravity")
+            .unwrap();
+        assert_eq!(
+            antigravity["command"],
+            json!(["agy", "acp", "--process-per-session"])
+        );
+        assert_eq!(antigravity["login_command"], "agy acp --login");
         let dsh = agents
             .iter()
             .find(|agent| agent["kind"] == "deepseek-harness")

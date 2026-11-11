@@ -7521,6 +7521,10 @@ flows:
     fn starts_the_builtin_acp_servers() {
         let config = NativeRunnerConfig::default();
         assert_eq!(
+            acp_command_for(&config, "antigravity", "/workspace").unwrap(),
+            vec!["agy", "acp", "--process-per-session"]
+        );
+        assert_eq!(
             acp_command_for(&config, "codex", "/workspace").unwrap(),
             vec!["codex-acp"]
         );

@@ -46,6 +46,19 @@ const CODEX_AUTH: &[AcpAuthMount] = &[AcpAuthMount {
     read_only: false,
 }];
 
+const ANTIGRAVITY_AUTH: &[AcpAuthMount] = &[
+    AcpAuthMount {
+        source: ".gemini",
+        target: "/home/node/.gemini",
+        read_only: false,
+    },
+    AcpAuthMount {
+        source: ".config/antigravity",
+        target: "/home/node/.config/antigravity",
+        read_only: false,
+    },
+];
+
 const CLAUDE_AUTH: &[AcpAuthMount] = &[
     AcpAuthMount {
         source: ".claude",
@@ -186,6 +199,17 @@ macro_rules! agent {
 }
 
 pub const ACP_AGENTS: &[AcpAgentDefinition] = &[
+    agent!(
+        "antigravity",
+        "Google Antigravity",
+        "AG",
+        "Google's Antigravity CLI with its native ACP server.",
+        &["agy", "acp", "--process-per-session"],
+        &["agy", "antigravity"],
+        "agy acp --login",
+        "https://antigravity.google/docs/cli/acp/",
+        ANTIGRAVITY_AUTH
+    ),
     agent!(
         "claude",
         "Claude Agent",
@@ -367,6 +391,7 @@ pub fn canonical_agent_kind(value: &str) -> Option<&'static str> {
         return Some(agent.kind);
     }
     match normalized.as_str() {
+        "agy" => Some("antigravity"),
         "copilot" => Some("github-copilot"),
         "deepseek"
         | "dsh"
@@ -585,6 +610,20 @@ mod tests {
             "ghcr.io/xpressai/xpressclaw-runner-codex:manually-pinned",
             "codex"
         ));
+    }
+
+    #[test]
+    fn antigravity_alias_mounts_its_login_and_session_state() {
+        assert_eq!(canonical_agent_kind("agy"), Some("antigravity"));
+        assert_eq!(canonical_agent_kind("my-antigravity-server"), None);
+        let agent = agent_definition("antigravity").unwrap();
+        assert_eq!(agent.login_command, "agy acp --login");
+        assert_eq!(agent.auth_mounts, ANTIGRAVITY_AUTH);
+        assert!(agent.auth_mounts.iter().all(|mount| !mount.read_only));
+        assert_eq!(
+            default_runner_image("antigravity", ContainerEngineAccess::Host),
+            Some(agent.host_image)
+        );
     }
 
     #[test]

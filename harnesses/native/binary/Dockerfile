@@ -45,6 +45,7 @@ RUN test -n "${AGENT_KIND}" \
 COPY --chmod=0755 common/mcp-github.mjs /opt/xpressclaw/mcp-github.mjs
 COPY --chmod=0755 common/mcp-xpressclaw.mjs /opt/xpressclaw/mcp-xpressclaw.mjs
 COPY --chmod=0755 common/verify-acp-initialize.mjs /opt/xpressclaw/verify-acp-initialize.mjs
+COPY --chmod=0755 common/verify-antigravity.mjs /opt/xpressclaw/verify-antigravity.mjs
 COPY --chmod=0755 common/git-credential-xpressclaw /usr/local/bin/git-credential-xpressclaw
 
 RUN /opt/xpressclaw/libexec/gh --version \
@@ -57,6 +58,7 @@ ENV HOME=/home/node \
     CI=1 \
     NO_COLOR=1
 RUN node /opt/xpressclaw/verify-acp-initialize.mjs "${ACP_SMOKE_COMMAND_B64}"
+RUN if [ "${AGENT_KIND}" = "antigravity" ]; then node /opt/xpressclaw/verify-antigravity.mjs; fi
 WORKDIR /workspace
 ENTRYPOINT []
 

@@ -44,6 +44,7 @@ export async function openExternal(url: string): Promise<void> {
 /** Compact product mark for an ACP-backed agent. */
 export function harnessMark(backend: string): string {
 	const normalized = canonicalHarnessKind(backend);
+	if (normalized === 'antigravity') return 'AG';
 	if (normalized.includes('claude')) return 'A';
 	if (normalized.includes('opencode')) return 'O';
 	if (normalized.includes('codex')) return 'C';
@@ -66,6 +67,7 @@ export function harnessMark(backend: string): string {
 /** Normalize exact supported aliases to a stable built-in harness kind. */
 export function canonicalHarnessKind(backend: string): string {
 	const normalized = backend.trim().toLowerCase();
+	if (normalized === 'agy') return 'antigravity';
 	if (['deepseek', 'dsh', 'dsh-acp', 'deepseek-harness-acp', '@openma/deepseek-harness-acp'].includes(normalized)) return 'deepseek-harness';
 	if (normalized === 'copilot') return 'github-copilot';
 	if (normalized === 'pi-acp') return 'pi';
@@ -87,6 +89,7 @@ export function inferHarnessKindFromBackend(backend: string): string {
 export function harnessName(backend: string): string {
 	const normalized = canonicalHarnessKind(backend);
 	const names: Record<string, string> = {
+		antigravity: 'Google Antigravity',
 		claude: 'Claude Agent',
 		'claude-code': 'Claude Agent',
 		'claude-sdk': 'Claude Agent',
