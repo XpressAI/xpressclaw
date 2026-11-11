@@ -1404,6 +1404,13 @@ export interface ProxyHeaderRule {
  replacement: string;
  domains: string[];
 }
+export interface ProxyNetworkRule {
+ name: string;
+ enabled: boolean;
+ protocol: 'tcp' | 'udp';
+ destination: string;
+ ports: string;
+}
 export interface ProxyConfig {
  enabled: boolean;
  domain_policy: 'allow_except_blocked' | 'allow_listed_only';
@@ -1411,6 +1418,8 @@ export interface ProxyConfig {
  blocked_domains: string[];
  inspection_bypass: string[];
  header_rules: ProxyHeaderRule[];
+ web_ports: number[];
+ network_rules: ProxyNetworkRule[];
 }
 export interface ProxySettings {
  config: ProxyConfig;

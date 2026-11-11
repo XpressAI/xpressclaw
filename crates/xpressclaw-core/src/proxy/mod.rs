@@ -1,4 +1,6 @@
 //! Instance-owned HTTP(S) egress policy for native runners.
+pub mod network;
+pub mod network_guard;
 pub mod service;
 
 use serde::{Deserialize, Serialize};
@@ -72,6 +74,8 @@ pub struct ProxyConfig {
     pub blocked_domains: Vec<String>,
     pub inspection_bypass: Vec<String>,
     pub header_rules: Vec<HeaderRule>,
+    pub web_ports: Vec<u16>,
+    pub network_rules: Vec<network::NetworkRule>,
 }
 
 impl Default for ProxyConfig {
@@ -82,6 +86,8 @@ impl Default for ProxyConfig {
             allowed_domains: vec![],
             blocked_domains: vec![],
             inspection_bypass: vec![],
+            web_ports: vec![80, 443],
+            network_rules: vec![network::NetworkRule::default()],
             header_rules: vec![
                 HeaderRule::default(),
                 HeaderRule {
@@ -110,6 +116,10 @@ impl ProxyConfig {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        if self.web_ports.is_empty() || self.web_ports.len() > 64 || self.web_ports.contains(&0) {
+            return Err("Web proxy ports must contain 1–64 ports between 1 and 65535".into());
+        }
+        network::validate_rules(&self.network_rules)?;
         for domains in [
             &self.allowed_domains,
             &self.blocked_domains,

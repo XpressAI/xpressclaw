@@ -628,11 +628,19 @@ impl DockerManager {
             );
         }
 
+        let network_guard = spec
+            .environment
+            .iter()
+            .any(|value| value == "XPRESSCLAW_NETWORK_GUARD=1");
+        let shared_network = spec
+            .network_mode
+            .as_deref()
+            .is_some_and(|network| network.starts_with("container:"));
         let host_config = HostConfig {
             memory: spec.memory_limit,
             nano_cpus: spec.cpu_limit,
             group_add: socket_mount_groups(spec),
-            extra_hosts: (self.runtime == "docker")
+            extra_hosts: (self.runtime == "docker" && !shared_network)
                 .then(|| vec!["host.docker.internal:host-gateway".to_string()]),
             binds: if runtime_mounts.binds.is_empty() {
                 None
@@ -645,6 +653,7 @@ impl DockerManager {
                 Some(runtime_mounts.mounts)
             },
             network_mode: spec.network_mode.clone(),
+            cap_drop: network_guard.then(|| vec!["NET_ADMIN".into(), "NET_RAW".into()]),
             port_bindings: if port_bindings.is_empty() {
                 None
             } else {
@@ -790,10 +799,22 @@ impl DockerManager {
         // Validate the whole set before deleting any writable layer. Upgraded
         // installations can own both a retained environment and a legacy one.
         let candidates = self.removable_owned_workload(agent_id).await?;
+        if let Some(installation) = self.installation_id.as_deref() {
+            crate::proxy::network_guard::preflight_removal(
+                self,
+                installation,
+                agent_id,
+                &candidates,
+            )
+            .await?;
+        }
         for container_name in candidates {
             self.remove_container_reference(&container_name, agent_id)
                 .await?;
             self.stop_agent_forwards(agent_id).await;
+        }
+        if let Some(installation) = self.installation_id.as_deref() {
+            crate::proxy::network_guard::remove_for_agent(self, installation, agent_id).await?;
         }
         Ok(())
     }
@@ -934,7 +955,7 @@ impl DockerManager {
         Ok(())
     }
 
-    async fn ensure_no_container_dependents(&self, reference: &str) -> Result<()> {
+    pub(crate) async fn ensure_no_container_dependents(&self, reference: &str) -> Result<()> {
         let dependents = self.container_dependents(reference).await?;
         if dependents.is_empty() {
             return Ok(());
@@ -945,7 +966,10 @@ impl DockerManager {
         )))
     }
 
-    async fn container_dependents(&self, reference: &str) -> Result<Vec<ContainerInspectResponse>> {
+    pub(crate) async fn container_dependents(
+        &self,
+        reference: &str,
+    ) -> Result<Vec<ContainerInspectResponse>> {
         let Some(parent) = self.inspect_optional(reference).await? else {
             return Ok(Vec::new());
         };

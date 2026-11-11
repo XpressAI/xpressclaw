@@ -179,8 +179,9 @@ their host directory conventions.
 
 ## Agent network proxy
 
-**Settings → Proxy** configures domain allow/block lists, hosts that skip HTTPS
-inspection, and request-header rules. Agents inherit the instance setting;
+**Settings → Proxy** configures web domain allow/block lists, inspection
+exemptions, header rules, and direct TCP/UDP destination and port permissions.
+SSH on port 22 is permitted by default. Agents inherit the instance setting;
 **Connect directly** in an Agent's runner settings bypasses the proxy for that
 Agent. Existing installations enable the new service explicitly in Settings.
 See [Agent network proxy](proxy.md) for matching rules, runtime behavior, and tests.

@@ -21,19 +21,19 @@ use crate::error::{Error, Result};
 
 // Multi-architecture upstream release, shared by Docker and Podman installations.
 pub const IMAGE: &str = "docker.io/mitmproxy/mitmproxy:12.2.1@sha256:743b6cdc817211d64bc269f5defacca8d14e76e647fc474e5c7244dbcb645141";
-const OWNER: &str = "io.xpressclaw.installation";
+pub(super) const OWNER: &str = "io.xpressclaw.installation";
 const REVISION: &str = "io.xpressclaw.proxy-revision";
 const GATEWAY: &str = include_str!("gateway.py");
 const CA_PATH: &str = "/opt/xpressclaw/proxy/ca.pem";
 const BUNDLE: &str = "/tmp/xpressclaw-proxy-ca.pem";
 const PROXY_URL: &str = "http://xpressclaw-proxy:8080";
-static LIFECYCLE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub(super) static LIFECYCLE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-fn failure(error: impl std::fmt::Display) -> Error {
+pub(super) fn failure(error: impl std::fmt::Display) -> Error {
     Error::Container(format!("Proxy: {error}"))
 }
 
-fn prefix(installation: &str) -> String {
+pub(super) fn prefix(installation: &str) -> String {
     format!(
         "xpressclaw-proxy-{}",
         &format!("{:x}", Sha256::digest(installation.as_bytes()))[..16]
@@ -55,7 +55,7 @@ fn owned(labels: Option<&HashMap<String, String>>, installation: &str) -> Result
     Ok(())
 }
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(super) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| failure("missing parent directory"))?;
@@ -81,7 +81,8 @@ pub fn write_policy(data_dir: &Path, config: &ProxyConfig) -> Result<()> {
         &directory.join("policy.json"),
         &serde_json::to_vec(config).map_err(failure)?,
     )?;
-    atomic_write(&directory.join("gateway.py"), GATEWAY.as_bytes())
+    atomic_write(&directory.join("gateway.py"), GATEWAY.as_bytes())?;
+    super::network_guard::write_policy(data_dir, config)
 }
 
 pub struct ProxyService<'a> {
@@ -326,7 +327,13 @@ impl ProxyService<'_> {
                         }),
                         networking_config: Some(NetworkingConfig {
                             endpoints_config: HashMap::from([
-                                (outside, EndpointSettings::default()),
+                                (
+                                    outside,
+                                    EndpointSettings {
+                                        aliases: Some(vec!["xpressclaw-proxy".into()]),
+                                        ..Default::default()
+                                    },
+                                ),
                                 (
                                     network,
                                     EndpointSettings {
@@ -372,6 +379,32 @@ impl ProxyService<'_> {
         {
             atomic_write(&certificate_path, certificate.as_bytes())?;
         }
+        let inspected = self
+            .docker
+            .client()
+            .inspect_container(&name, None)
+            .await
+            .map_err(failure)?;
+        let outside = format!("{name}-outside");
+        let address = inspected
+            .network_settings
+            .and_then(|settings| settings.networks)
+            .and_then(|networks| {
+                networks
+                    .get(&outside)
+                    .and_then(|network| network.ip_address.clone())
+            })
+            .filter(|address| address.parse::<std::net::IpAddr>().is_ok())
+            .ok_or_else(|| failure("gateway has no address on its outbound network"))?;
+        atomic_write(
+            &self.data_dir.join("proxy/policy/gateway.address"),
+            address.as_bytes(),
+        )?;
+        let active: ProxyConfig = serde_json::from_slice(
+            &std::fs::read(self.data_dir.join("proxy/policy/policy.json")).map_err(failure)?,
+        )
+        .map_err(failure)?;
+        super::network_guard::write_policy(self.data_dir, &active)?;
         Ok(certificate_path)
     }
 
@@ -454,7 +487,10 @@ pub async fn configure_runner(
     }
     .ensure(config)
     .await?;
+    let guard = super::network_guard::ensure(docker, data_dir, installation, &agent.name).await?;
     apply_runner(spec, installation, certificate);
+    spec.network_mode = Some(format!("container:{guard}"));
+    spec.environment.push("XPRESSCLAW_NETWORK_GUARD=1".into());
     Ok(())
 }
 
@@ -568,7 +604,8 @@ mod tests {
         let origin = format!("{name}-origin");
         let guest = format!("{name}-guest");
         let result = std::panic::AssertUnwindSafe(async {
-            let certificate = service.ensure(&ProxyConfig::default()).await.unwrap();
+            let initial = ProxyConfig { web_ports: vec![80, 443, 8000], ..Default::default() };
+            let certificate = service.ensure(&initial).await.unwrap();
             let original_ca = std::fs::read(&certificate).unwrap();
             assert!(!String::from_utf8_lossy(&original_ca).contains("PRIVATE KEY"));
             docker.client().create_container(Some(CreateContainerOptions { name: origin.clone(), platform: None }), ContainerConfig {
@@ -604,7 +641,7 @@ mod tests {
                 }
             };
             run_guest(format!("import http.client,socket,time\ntime.sleep(.5)\nc=http.client.HTTPConnection('xpressclaw-proxy',8080,timeout=5)\nc.request('GET','http://proxy-origin:8000/')\nassert c.getresponse().status==200\nc.close()\nc=http.client.HTTPConnection('xpressclaw-proxy',9080,timeout=5)\nc.request('GET','/')\nassert c.getresponse().status==200\nc.close()\ntry:\n socket.create_connection(('{origin_ip}',8000),timeout=1)\nexcept OSError:\n pass\nelse:\n raise AssertionError('direct egress succeeded')")).await;
-            let config = ProxyConfig { blocked_domains: vec!["proxy-origin".into()], ..Default::default() };
+            let config = ProxyConfig { blocked_domains: vec!["proxy-origin".into()], ..initial };
             service.apply(&config).await.unwrap();
             run_guest("import http.client\nc=http.client.HTTPConnection('xpressclaw-proxy',8080,timeout=5)\nc.request('GET','http://proxy-origin:8000/')\nassert c.getresponse().status==403".into()).await;
             assert!(service.status().await.unwrap().events.iter().any(|event| event["action"] == "blocked_domain"));
