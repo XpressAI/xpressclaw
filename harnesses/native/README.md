@@ -6,6 +6,7 @@ XpressClaw publishes one product-specific image for each supported ACP agent:
 | --- | --- |
 | `claude` | Claude Agent |
 | `codex` | Codex |
+| `antigravity` | [Google Antigravity CLI](../../docs/antigravity.md) |
 | `deepseek-harness` | DeepSeek Harness via the maintained openma-ai ACP adapter |
 | `github-copilot` | GitHub Copilot CLI |
 | `junie` | Junie |
@@ -71,7 +72,7 @@ only when a project explicitly enables host-engine access.
 The control plane launches the image's ACP server and attaches over
 bidirectional stdio. Tasks are sent with `session/prompt`, while fresh and
 continued work use ACP session lifecycle methods. Agent commands and versions
-follow the official ACP Registry.
+follow the pinned manifest's ACP Registry, npm, or official release source.
 
 Every image build checks ACP initialization without making a model request.
 The probe allows 60 seconds for a response and logs initialization and shutdown

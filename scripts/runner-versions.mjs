@@ -10,6 +10,7 @@ const manifestPath = fileURLToPath(
 export const expectedRunnerIds = [
   'codex',
   'claude',
+  'antigravity',
   'deepseek-harness',
   'github-copilot',
   'junie',
@@ -120,7 +121,7 @@ export function validateRunnerVersions(manifest) {
     if (primarySources.length !== 1) fail(`${id} must have exactly one primary version source`);
 
     for (const source of runner.sources) {
-      if (!isRecord(source) || !['acp-registry', 'npm'].includes(source.kind)) {
+      if (!isRecord(source) || !['acp-registry', 'npm', 'github-release'].includes(source.kind)) {
         fail(`${id} has an unsupported source`);
       }
       if ('primary' in source && typeof source.primary !== 'boolean') {
@@ -134,6 +135,16 @@ export function validateRunnerVersions(manifest) {
       }
       if (source.kind === 'npm' && typeof source.package !== 'string') {
         fail(`${id} npm source requires package`);
+      }
+      if (source.kind === 'github-release') {
+        if (source.target !== 'binary' || !/^[\w.-]+\/[\w.-]+$/.test(source.repo ?? '')) {
+          fail(`${id} GitHub release source requires a repository and binary target`);
+        }
+        for (const platform of ['linux-x86_64', 'linux-aarch64']) {
+          if (typeof source.assets?.[platform] !== 'string' || !source.assets[platform]) {
+            fail(`${id} GitHub release source requires a ${platform} asset name`);
+          }
+        }
       }
       if (source.target !== 'binary') {
         if (typeof source.arg !== 'string' || !(source.arg in runner.build_args)) {
@@ -206,6 +217,17 @@ function binaryTarget(agent, platform) {
   return target;
 }
 
+function releaseBinary(release, source, platform) {
+  const name = source.assets[platform];
+  const asset = release.assets?.find((candidate) => candidate.name === name);
+  const digest = asset?.digest?.match(/^sha256:([0-9a-f]{64})$/)?.[1];
+  const prefix = `https://github.com/${source.repo}/releases/download/${release.tag_name}/`;
+  if (!digest || asset.browser_download_url !== `${prefix}${name}`) {
+    fail(`${source.repo} release requires ${name} with its download URL and SHA-256 digest`);
+  }
+  return { archive: asset.browser_download_url, sha256: digest };
+}
+
 function packageFor(agent) {
   const spec = agent.distribution?.npx?.package;
   if (typeof spec !== 'string' || !exactPackageVersion(spec)) {
@@ -219,6 +241,7 @@ export async function updateRunnerVersions(
   {
     registry,
     npmVersion,
+    githubRelease,
   },
 ) {
   const manifest = structuredClone(input);
@@ -231,9 +254,16 @@ export async function updateRunnerVersions(
     for (const source of runner.sources) {
       let version;
       let agent;
+      let release;
       if (source.kind === 'acp-registry') {
         agent = registryAgent(registry, source.id);
         version = agent.version;
+      } else if (source.kind === 'github-release') {
+        release = await githubRelease(source.repo);
+        if (release.draft || release.prerelease || !isExactVersion(release.tag_name?.replace(/^v/, ''))) {
+          fail(`${source.repo} returned no stable versioned release`);
+        }
+        version = release.tag_name.replace(/^v/, '');
       } else {
         version = await npmVersion(source.package);
         if (typeof version !== 'string' || !version) {
@@ -253,21 +283,28 @@ export async function updateRunnerVersions(
         }
         runner.build_args[source.arg] = nextPackage;
       } else {
-        if (source.kind !== 'acp-registry') fail(`${id} binary source must use the ACP Registry`);
-        const amd64 = binaryTarget(agent, 'linux-x86_64');
-        const arm64 = binaryTarget(agent, 'linux-aarch64');
+        if (!['acp-registry', 'github-release'].includes(source.kind)) {
+          fail(`${id} binary source must use the ACP Registry or an official GitHub release`);
+        }
+        const target = (platform) => source.kind === 'github-release'
+          ? releaseBinary(release, source, platform)
+          : binaryTarget(agent, platform);
+        const amd64 = target('linux-x86_64');
+        const arm64 = target('linux-aarch64');
         runner.build_args.AGENT_ARCHIVE_AMD64 = amd64.archive;
         runner.build_args.AGENT_ARCHIVE_ARM64 = arm64.archive;
         runner.build_args.AGENT_SHA256_AMD64 = amd64.sha256 ?? '';
         runner.build_args.AGENT_SHA256_ARM64 = arm64.sha256 ?? '';
 
-        const expectedPath = runner.build_args.AGENT_PATH;
-        const amd64Path = amd64.cmd.replace(/^\.\//, '');
-        const arm64Path = arm64.cmd.replace(/^\.\//, '');
-        if (amd64Path !== expectedPath || arm64Path !== expectedPath) {
-          fail(
-            `${id} registry command changed (expected ${expectedPath}; got ${amd64.cmd} and ${arm64.cmd})`,
-          );
+        if (source.kind === 'acp-registry') {
+          const expectedPath = runner.build_args.AGENT_PATH;
+          const amd64Path = amd64.cmd.replace(/^\.\//, '');
+          const arm64Path = arm64.cmd.replace(/^\.\//, '');
+          if (amd64Path !== expectedPath || arm64Path !== expectedPath) {
+            fail(
+              `${id} registry command changed (expected ${expectedPath}; got ${amd64.cmd} and ${arm64.cmd})`,
+            );
+          }
         }
       }
     }
@@ -351,6 +388,7 @@ async function main() {
     const updated = await updateRunnerVersions(manifest, {
       registry,
       npmVersion: fetchNpmVersion,
+      githubRelease: (repo) => fetchJson(`https://api.github.com/repos/${repo}/releases/latest`, repo),
     });
     await writeFile(manifestPath, `${JSON.stringify(updated, null, 2)}\n`);
     console.log('Resolved current exact runner versions.');

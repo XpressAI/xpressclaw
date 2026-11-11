@@ -1351,7 +1351,8 @@ async function callTool(name, argumentsValue) {
 
 async function handle(message) {
   const { id, method, params } = message;
-  if (method === 'notifications/initialized' || method === 'notifications/cancelled') return;
+  // JSON-RPC notifications, including roots changes, never receive responses.
+  if (id === undefined) return;
   if (method === 'initialize') {
     let memoryIndex = null;
     try {

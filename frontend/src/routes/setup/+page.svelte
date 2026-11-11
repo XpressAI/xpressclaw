@@ -1,4 +1,5 @@
 <script lang="ts">
+	import AntigravityAuth from '$lib/components/AntigravityAuth.svelte';
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/stores';
@@ -444,6 +445,7 @@
 					<span class="mt-0.5 block text-xs leading-relaxed text-muted-foreground">Mount the harness's standard login directory so its subscription and native sessions can continue across tasks. Only enable this for images you trust.</span>
 				</span>
 			</label>
+			{#if runnerKind === 'antigravity'}<AntigravityAuth />{/if}
 			{/if}
 		</section>
 

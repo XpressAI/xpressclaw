@@ -40,6 +40,36 @@
         "CLAUDE_ACP_VERSION": "0.95.0"
       }
     },
+    "antigravity": {
+      "auto_update": true,
+      "version": "1.5.5",
+      "acp_command": [
+        "agy",
+        "acp",
+        "--process-per-session"
+      ],
+      "dockerfile": "binary",
+      "sources": [
+        {
+          "kind": "github-release",
+          "repo": "google-antigravity/antigravity-cli",
+          "target": "binary",
+          "assets": {
+            "linux-x86_64": "agy_cli_linux_x64.tar.gz",
+            "linux-aarch64": "agy_cli_linux_arm64.tar.gz"
+          }
+        }
+      ],
+      "build_args": {
+        "AGENT_KIND": "antigravity",
+        "AGENT_BINARY": "agy",
+        "AGENT_PATH": "antigravity",
+        "AGENT_ARCHIVE_AMD64": "https://github.com/google-antigravity/antigravity-cli/releases/download/1.5.5/agy_cli_linux_x64.tar.gz",
+        "AGENT_ARCHIVE_ARM64": "https://github.com/google-antigravity/antigravity-cli/releases/download/1.5.5/agy_cli_linux_arm64.tar.gz",
+        "AGENT_SHA256_AMD64": "bfe2c25edeadd98c2942417c9972ee0e1faa3f0afdc90711e84d5f3a633b5078",
+        "AGENT_SHA256_ARM64": "f6faff7b47ad2d9a60ebca9d774239a1cd23e53a8ca6d812c1e9583909dca655"
+      }
+    },
     "deepseek-harness": {
       "auto_update": false,
       "pin_reason": "0.4.28 fails the runner's ACP protocol smoke test with an internal error",
