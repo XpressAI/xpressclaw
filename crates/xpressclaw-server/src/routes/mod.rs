@@ -4,6 +4,7 @@ use axum::Router;
 
 use crate::state::AppState;
 
+mod agent_auth;
 mod agents;
 pub(crate) mod auth;
 mod conversations;

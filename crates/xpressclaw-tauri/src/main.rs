@@ -12,6 +12,7 @@ use serde::Deserialize;
 use tauri::Manager;
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 use tracing::{info, warn};
+use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 
 const DEFAULT_PORT: u16 = 8935;
@@ -98,10 +99,12 @@ fn listener_client_url(bind: IpAddr, port: u16) -> String {
 struct SidecarState(Mutex<Option<std::process::Child>>);
 
 fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::filter::filter_fn(
+            xpressclaw_core::workers::acp::allow_log_metadata,
+        ))
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with(tracing_subscriber::fmt::layer())
         .init();
 
     let local_connection = local_instance_connection();

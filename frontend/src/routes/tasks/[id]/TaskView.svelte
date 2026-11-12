@@ -11,12 +11,13 @@
 	import { tasks, agents, sessions, workspaces, ApiError } from '$lib/api';
 	import { selectChoices, isModelOption, isReasoningOption, isAdditionalModelOption, reconcileConfig, duplicatesReasoningMode } from '$lib/acpConfig';
 	import type { TaskControlSnapshot, AcpCommand, AcpConfigOption, AcpModeState, DelegatedWork, Task, TaskMessage, Agent, WorkAttempt, SessionEvent, ImageAttachmentUpload, GitChange, WorkspaceGitStatus, MessageVisualization } from '$lib/api';
-	import { timeAgo } from '$lib/utils';
+	import { timeAgo, openExternal } from '$lib/utils';
 	import { serverTimestampMs } from '$lib/serverTime';
 	import { renderContent } from '$lib/formatMessage';
 	import { mermaidDiagrams } from '$lib/mermaidDiagrams';
 	import ActivityEventRow from '$lib/components/ActivityEventRow.svelte';
 	import AgentLoading from '$lib/components/AgentLoading.svelte';
+	import AgentSignIn from '$lib/components/AgentSignIn.svelte';
 	import DelegatedWorkPanel from '$lib/components/DelegatedWorkPanel.svelte';
 	import AiMessage from '$lib/components/AiMessage.svelte';
 	import ImageAttachmentPreviews from '$lib/components/ImageAttachmentPreviews.svelte';
@@ -37,6 +38,8 @@
 	let editError = $state('');
 	let statusUpdating = $state(false);
 	let actionError = $state('');
+	let signInAgentId = $state<string | null>(null);
+	let authenticatedAttemptId = $state<string | null>(null);
 	async function openPlanning() {
 		if (platformManaged) return;
 		planningError = '';
@@ -104,6 +107,10 @@
 	interface PendingUnsupportedElicitation extends PendingElicitationBase {
 		kind: 'unsupported';
 	}
+	interface PendingUrlElicitation extends PendingElicitationBase {
+		kind: 'url';
+		url: string;
+	}
 
 	interface PendingToolInstallElicitation extends PendingElicitationBase {
 		kind: 'tool_install';
@@ -112,7 +119,7 @@
 		toolType: 'plugin' | 'connector';
 	}
 
-	type PendingElicitation = PendingFormElicitation | PendingToolInstallElicitation | PendingUnsupportedElicitation;
+	type PendingElicitation = PendingFormElicitation | PendingToolInstallElicitation | PendingUnsupportedElicitation | PendingUrlElicitation;
 
 	interface ContextUsage {
 		used: number;
@@ -319,7 +326,7 @@
 	})());
 	let pendingElicitation = $derived(pendingElicitations.at(-1) ?? null);
 	let composerBlockedByElicitation = $derived(
-		pendingElicitation?.kind === 'form' || pendingElicitation?.kind === 'tool_install'
+		pendingElicitation?.kind === 'form' || pendingElicitation?.kind === 'tool_install' || pendingElicitation?.kind === 'url'
 	);
 	let runningAttempt = $derived(
 		attempts.find(attempt => ['preparing', 'running', 'waiting_for_input', 'review'].includes(attempt.status)) ?? null
@@ -341,6 +348,10 @@
 			: null
 	);
 	let latestErrorAttempt = $derived(attempts.find(attempt => attempt.error_message) ?? null);
+	let authenticationRequired = $derived(Boolean(latestErrorAttempt && latestErrorAttempt.id === attempts[0]?.id && (
+		activityEvents.some(event => event.attempt_id === latestErrorAttempt.id && event.event_type === 'authentication_required')
+		|| latestErrorAttempt.error_message?.startsWith('backend error: ACP turn failed: Authentication required')
+	)));
 	let latestErrorKey = $derived(
 		latestErrorAttempt?.error_message
 			? `${latestErrorAttempt.id}:${latestErrorAttempt.error_message}`
@@ -666,6 +677,13 @@
 		};
 		const toolInstall = parseToolInstallElicitation(event, id, message, properties);
 		if (toolInstall) return toolInstall;
+		if (event.payload.mode === 'url' && typeof event.payload.url === 'string') {
+			try {
+				const url = new URL(event.payload.url);
+				if (url.protocol === 'https:' || url.protocol === 'http:') return { kind: 'url', id, eventId: event.id, attemptId: event.attempt_id, message, url: url.href };
+			} catch { /* Unsupported URLs use the existing decline/cancel flow. */ }
+			return fallback;
+		}
 		if (event.payload.mode !== 'form' || !properties) return fallback;
 
 		const rawEntries = Object.entries(properties);
@@ -1426,6 +1444,12 @@
 
 </script>
 
+{#if signInAgentId}
+	<AgentSignIn agentId={signInAgentId} onclose={() => signInAgentId = null}
+		onauthenticated={() => authenticatedAttemptId = latestErrorAttempt?.id ?? null}
+		onretry={platformManaged ? undefined : async () => { await updateStatus('in_progress'); if (actionError) throw new Error(actionError); }} />
+{/if}
+
 {#snippet taskDetails(current: Task)}
 				<!-- Details -->
 				<div class="space-y-2">
@@ -1863,7 +1887,7 @@
 					{:else if latestError}
 						<section role="alert" data-attempt-error class="rounded-lg border border-red-500/30 bg-red-500/5 p-4">
 							<div class="mb-2 flex items-start justify-between gap-3">
-								<div class="text-xs font-medium uppercase tracking-wide text-red-400">Attempt failed</div>
+								<div class="text-xs font-medium uppercase tracking-wide {authenticationRequired && authenticatedAttemptId === latestErrorAttempt?.id ? 'text-emerald-600 dark:text-emerald-400' : 'text-red-400'}">{authenticationRequired ? authenticatedAttemptId === latestErrorAttempt?.id ? 'Signed in' : 'Sign-in required' : 'Attempt failed'}</div>
 								<button
 									type="button"
 									onclick={dismissAttemptError}
@@ -1871,7 +1895,19 @@
 									class="flex h-6 w-6 shrink-0 items-center justify-center rounded text-lg leading-none text-red-300/70 hover:bg-red-500/10 hover:text-red-200"
 								>&times;</button>
 							</div>
-							<div class="whitespace-pre-wrap text-sm text-red-200">{latestError}</div>
+							{#if authenticationRequired && authenticatedAttemptId === latestErrorAttempt?.id}
+								<p class="text-sm text-foreground">Retry this task to continue.</p>
+							{:else}<div class="whitespace-pre-wrap text-sm text-red-200">{latestError}</div>{/if}
+							{#if authenticationRequired && task?.agent_id}
+								<div class="mt-3 flex items-center gap-3">
+									{#if authenticatedAttemptId === latestErrorAttempt?.id}
+										<span class="text-sm text-emerald-600 dark:text-emerald-400">Signed in.</span>
+										{#if !platformManaged}<button type="button" onclick={() => updateStatus('in_progress')} disabled={statusUpdating} class="rounded bg-primary px-3 py-1.5 text-sm text-primary-foreground">Retry task</button>{/if}
+									{:else}
+										<button type="button" onclick={() => signInAgentId = task?.agent_id ?? null} class="rounded bg-primary px-3 py-1.5 text-sm text-primary-foreground">Sign in</button>
+									{/if}
+								</div>
+							{/if}
 						</section>
 					{/if}
 
@@ -1911,6 +1947,17 @@
 						</section>
 					{/if}
 
+					{#if pendingElicitation?.kind === 'url'}
+						{@const question = pendingElicitation}
+						<section class="ai-card mx-auto w-full max-w-lg space-y-3 p-4" data-url-elicitation>
+							<p class="whitespace-pre-wrap text-sm">{question.message}</p>
+							<div class="flex flex-wrap gap-2">
+								<button type="button" onclick={() => void openExternal(question.url).catch(cause => actionError = String(cause))} class="rounded bg-primary px-3 py-2 text-sm text-primary-foreground">Open sign-in page</button>
+								<button type="button" onclick={() => respondToElicitation(question, 'accept')} disabled={elicitationSending} class="rounded border border-border px-3 py-2 text-sm">I've completed sign-in</button>
+								<button type="button" onclick={() => respondToElicitation(question, 'cancel')} disabled={elicitationSending} class="rounded border border-border px-3 py-2 text-sm">Cancel request</button>
+							</div>
+						</section>
+					{/if}
 					{#if pendingElicitation?.kind === 'unsupported'}
 						{@const question = pendingElicitation}
 						<section class="ai-card mx-auto w-full max-w-lg overflow-hidden" data-unsupported-elicitation aria-live="polite">
