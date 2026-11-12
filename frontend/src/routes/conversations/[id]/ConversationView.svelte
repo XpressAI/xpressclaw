@@ -8,6 +8,7 @@
 	import { PROJECT_MUTATION_EVENT, type ProjectMutation } from '$lib/projectEvents';
 	import { harnessMark, timeAgo } from '$lib/utils';
 	import AgentLoading from '$lib/components/AgentLoading.svelte';
+	import AgentSignIn from '$lib/components/AgentSignIn.svelte';
 	import AiMessage from '$lib/components/AiMessage.svelte';
 	import ImageAttachmentPreviews from '$lib/components/ImageAttachmentPreviews.svelte';
 
@@ -34,6 +35,8 @@
 	let content = $state('');
 	let attachments = $state<ConversationMessageUpload[]>([]);
 	let error = $state('');
+	let signInTurn = $state<ConversationTurn | null>(null);
+	let signedInTurns = $state<string[]>([]);
 	let attachmentError = $state('');
 	let viewMode = $state<'conversation' | 'files'>('conversation');
 	let showPeople = $state(false);
@@ -514,6 +517,11 @@
 	}
 </script>
 
+{#if signInTurn}
+	<AgentSignIn agentId={signInTurn.agent_id} onclose={() => signInTurn = null}
+		onauthenticated={() => { if (signInTurn) signedInTurns = [...signedInTurns, signInTurn.id]; }} />
+{/if}
+
 <div class="flex h-full min-h-0 flex-col bg-background">
 	{#if loading}
 		<div class="flex flex-1 items-center justify-center"><AgentLoading label="Loading conversation" phase="loading" /></div>
@@ -582,7 +590,10 @@
 								{#each failedTurns as turn (turn.id)}
 									<div role="status" class="flex items-start gap-3 rounded-lg border border-destructive/25 bg-destructive/5 px-3 py-2 text-xs">
 										<span class="mt-1 h-2 w-2 shrink-0 rounded-full bg-destructive"></span>
-										<span class="min-w-0 flex-1"><span class="font-medium">{turnAgentName(turn)} could not respond.</span>{#if turn.error_message}<span class="mt-0.5 block break-words text-muted-foreground">{turn.error_message}</span>{/if}</span>
+										<span class="min-w-0 flex-1"><span class="font-medium">{turnAgentName(turn)} could not respond.</span>{#if signedInTurns.includes(turn.id)}<span class="mt-0.5 block text-emerald-600 dark:text-emerald-400">Signed in. Send another message to continue.</span>{:else if turn.error_message}<span class="mt-0.5 block break-words text-muted-foreground">{turn.error_message}</span>{/if}</span>
+										{#if !signedInTurns.includes(turn.id) && turn.error_message?.startsWith('backend error: ACP turn failed: Authentication required')}
+											<button type="button" onclick={() => signInTurn = turn} class="shrink-0 rounded bg-primary px-2 py-1 text-[11px] text-primary-foreground">Sign in</button>
+										{/if}
 										<button type="button" onclick={() => void cancelConversationTurn(turn)} disabled={cancellingTurnId !== null} class="shrink-0 rounded-md border border-border bg-card px-2 py-1 text-[11px] font-medium hover:bg-accent disabled:opacity-50">{cancellingTurnId === turn.id ? 'Clearing…' : 'Dismiss'}</button>
 									</div>
 								{/each}

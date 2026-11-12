@@ -262,6 +262,9 @@ pub async fn serve_on_with_bound_callback(
     let public_listener = tokio::net::TcpListener::bind(public_addr).await?;
     let internal_listener = tokio::net::TcpListener::bind("0.0.0.0:0").await?;
     let internal_port = internal_listener.local_addr()?.port();
+    state
+        .runner_callback_port
+        .store(internal_port, std::sync::atomic::Ordering::Relaxed);
     let internal_token: Arc<str> = Arc::from(uuid::Uuid::new_v4().simple().to_string());
     let config = state.config();
     // Refresh generated policy from durable configuration after owning both

@@ -5,6 +5,7 @@
 	import DirectoryPicker from '$lib/components/DirectoryPicker.svelte';
 	import HostSshAccess from '$lib/components/HostSshAccess.svelte';
 	import AntigravityAuth from '$lib/components/AntigravityAuth.svelte';
+	import AgentSignIn from '$lib/components/AgentSignIn.svelte';
 	import type { AcpAgentCatalogEntry, AcpConfigOption, AcpModeState, LiveConfig, McpServerDefinition, McpVerificationResult, NativeRunnerConfig, PreservedEnvironment, RunnerReadiness } from '$lib/api';
 
 	interface Props {
@@ -21,6 +22,7 @@
 	let projectName = $state('');
 	let model = $state('');
 	let subscriptionAuth = $state(true);
+	let showSignIn = $state(false);
 	let sshAgentForwarding = $state(false);
 	let sshAgentForwardingUnsupportedReason = $state<string | null>(null);
 	let proxyMode = $state<'inherit' | 'direct'>('inherit');
@@ -442,6 +444,10 @@
 	}
 </script>
 
+{#if showSignIn}
+	<AgentSignIn {agentId} onclose={() => showSignIn = false} onauthenticated={() => void refreshRunnerReadiness(agentId)} />
+{/if}
+
 <div class="mx-auto max-w-3xl space-y-6">
 	<div class="ai-card p-5">
 		<h2 class="text-sm font-semibold">ACP harness</h2>
@@ -711,11 +717,16 @@
 	</div>
 
 	<div class="ai-card p-5">
-		<div class="flex items-start gap-3">
+		<h2 class="text-sm font-semibold">Provider sign-in</h2>
+		<div class="mt-3 flex items-center gap-3">
+			<button type="button" onclick={() => showSignIn = true} disabled={kind !== savedKind} class="rounded bg-primary px-3 py-1.5 text-sm text-primary-foreground disabled:opacity-50">Sign in</button>
+			<span class="text-xs text-muted-foreground">{kind !== savedKind ? 'Save the harness selection before signing in.' : runnerReadiness?.authentication_status === 'authenticated' ? 'Signed in' : 'Connect this Agent to its provider in XpressClaw.'}</span>
+		</div>
+		{#if kind === 'antigravity'}<AntigravityAuth />{/if}
+		<div class="mt-4 flex items-start gap-3 border-t border-border pt-4">
 			<input id="subscription-auth" type="checkbox" bind:checked={subscriptionAuth} disabled={kind === 'custom'} class="mt-0.5 h-4 w-4 rounded border-input disabled:opacity-50" />
 			<div>
 				<label for="subscription-auth" class="text-sm font-medium">Use host login and harness configuration</label>
-				{#if kind === 'antigravity'}<AntigravityAuth />{/if}
 				<p class="mt-1 text-xs leading-relaxed text-muted-foreground">
 					{kind === 'custom'
 						? 'Custom harnesses manage their own authentication; add any required directories in the mounts above.'

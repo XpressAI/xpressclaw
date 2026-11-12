@@ -8026,3 +8026,139 @@ test('stalled Git refresh times out and a later refresh recovers', async ({ page
         releaseGit();
     }
 });
+
+test('Agent sign-in opens from an authentication failure and retries only after success', async ({ page }) => {
+	const taskStatusRequests: string[] = [];
+	const postedMessages: Record<string, unknown>[] = [];
+	await mockApi(page, { taskStatus: 'blocked', attemptError: 'backend error: ACP turn failed: Authentication required', taskStatusRequests, postedMessages });
+	await page.route('**/api/sessions/**/authentication', route => route.fulfill({ json: {
+		kind: 'antigravity', status: 'required', methods: [{ id: 'terminal-login', name: 'Google account', description: null, kind: 'terminal', api_key: false }],
+	} }));
+	let input = '';
+	await page.routeWebSocket('**/api/sessions/**/authentication/terminal?**', websocket => {
+		expect(new URL(websocket.url()).searchParams.get('method_id')).toBe('terminal-login');
+		websocket.send(JSON.stringify({ type: 'ready' }));
+		websocket.send(Buffer.from('Enter the sign-in code:\r\n'));
+		websocket.onMessage(message => {
+			if (typeof message !== 'string') {
+				input += message.toString();
+				if (input.includes('1234\r')) websocket.send(JSON.stringify({ type: 'authenticated' }));
+			}
+		});
+	});
+	await page.goto(`/tasks/${taskId}`);
+	await page.locator('[data-attempt-error]').getByRole('button', { name: 'Sign in', exact: true }).click();
+	const dialog = page.getByRole('dialog', { name: 'Sign in to Agent' });
+	await expect(dialog.getByText('Enter the sign-in code:')).toBeVisible();
+	await expect(dialog.getByLabel('tmux session name')).toHaveCount(0);
+	await page.screenshot({ path: test.info().outputPath('agent-sign-in-terminal.png') });
+	await page.keyboard.type('1234');
+	await page.keyboard.press('Enter');
+	await expect(dialog.getByText('Signed in successfully.')).toBeVisible();
+	expect(taskStatusRequests).toEqual([]);
+	expect(postedMessages).toEqual([]);
+	await dialog.getByRole('button', { name: 'Retry task', exact: true }).click();
+	await expect.poll(() => taskStatusRequests).toEqual(['in_progress']);
+	await expect(dialog).not.toBeVisible();
+});
+
+test('Agent sign-in supports provider URLs and forms without writing them to task chat', async ({ page }) => {
+	const opened = await mockDesktopExternalLinks(page);
+	const postedMessages: Record<string, unknown>[] = [];
+	await mockApi(page, { postedMessages });
+	await page.route('**/api/sessions/**/authentication', route => route.fulfill({ json: {
+		kind: 'codex', status: 'required', methods: [{ id: 'device', name: 'Provider account', description: null, kind: 'agent', api_key: false }],
+	} }));
+	const responses: Record<string, unknown>[] = [];
+	await page.routeWebSocket('**/api/sessions/**/authentication/agent?**', websocket => {
+		websocket.onMessage(message => {
+			const data = JSON.parse(message.toString());
+			if (data.type === 'start') websocket.send(JSON.stringify({ type: 'prompt', id: 'url', request: { mode: 'url', message: 'Enter code ABCD on the provider page.', url: 'https://example.com/sign-in' } }));
+			else if (data.type === 'response') {
+				responses.push(data);
+				if (data.id === 'url') websocket.send(JSON.stringify({ type: 'prompt', id: 'form', request: { mode: 'form', message: 'Choose your account.', requestedSchema: { type: 'object', properties: { account: { type: 'string', title: 'Account', enum: ['Personal', 'Work'] } }, required: ['account'] } } }));
+				else websocket.send(JSON.stringify({ type: 'authenticated' }));
+			}
+		});
+	});
+	await page.goto(`/agents/${agentId}?tab=runner`);
+	await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+	const dialog = page.getByRole('dialog', { name: 'Sign in to Agent' });
+	await expect(dialog.getByText('Enter code ABCD on the provider page.')).toBeVisible();
+	await page.screenshot({ path: test.info().outputPath('agent-sign-in-provider.png') });
+	await dialog.getByRole('button', { name: 'Open provider sign-in' }).click();
+	await expect.poll(() => opened).toEqual(['https://example.com/sign-in']);
+	await dialog.getByRole('button', { name: "I've completed sign-in" }).click();
+	await dialog.getByRole('combobox', { name: 'Account', exact: true }).selectOption('Work');
+	await dialog.getByRole('button', { name: 'Continue', exact: true }).click();
+	await expect(dialog.getByText('Signed in successfully.')).toBeVisible();
+	expect(responses).toEqual([
+		{ type: 'response', id: 'url', response: { action: 'accept' } },
+		{ type: 'response', id: 'form', response: { action: 'accept', content: { account: 'Work' } } },
+	]);
+	expect(postedMessages).toEqual([]);
+});
+
+test('Agent sign-in cancels its connection and does not report failed login as success', async ({ page }) => {
+	await mockApi(page);
+	await page.route('**/api/sessions/**/authentication', route => route.fulfill({ json: {
+		kind: 'antigravity', status: 'required', methods: [{ id: 'terminal-login', name: 'Google account', description: null, kind: 'terminal', api_key: false }],
+	} }));
+	let closed = false;
+	await page.routeWebSocket('**/api/sessions/**/authentication/terminal?**', websocket => {
+		websocket.send(JSON.stringify({ type: 'ready' }));
+		websocket.send(JSON.stringify({ type: 'error', message: 'Sign-in did not complete (exit status 1). Try again.' }));
+		websocket.onClose(() => { closed = true; });
+	});
+	await page.goto(`/agents/${agentId}?tab=runner`);
+	await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+	const dialog = page.getByRole('dialog', { name: 'Sign in to Agent' });
+	await expect(dialog.getByText('Sign-in did not complete (exit status 1). Try again.').first()).toBeVisible();
+	await expect(dialog.getByText('Signed in successfully.')).toHaveCount(0);
+	await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
+	await expect(dialog).not.toBeVisible();
+	await expect.poll(() => closed).toBe(true);
+});
+
+test('Agent sign-in sends an API key only through the authentication connection', async ({ page }) => {
+	const postedMessages: Record<string, unknown>[] = [];
+	await mockApi(page, { postedMessages });
+	await page.route('**/api/sessions/**/authentication', route => route.fulfill({ json: {
+		kind: 'codex', status: 'required', methods: [{ id: 'api-key', name: 'API key', description: null, kind: 'agent', api_key: true }],
+	} }));
+	let received: unknown;
+	await page.routeWebSocket('**/api/sessions/**/authentication/agent?**', websocket => {
+		expect(websocket.url()).not.toContain('fixture-key');
+		websocket.onMessage(message => { received = JSON.parse(message.toString()); websocket.send(JSON.stringify({ type: 'authenticated' })); });
+	});
+	await page.goto(`/agents/${agentId}?tab=runner`);
+	await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+	const dialog = page.getByRole('dialog', { name: 'Sign in to Agent' });
+	const key = dialog.getByLabel('API key', { exact: true });
+	await expect(key).toHaveAttribute('type', 'password');
+	await key.fill('fixture-key');
+	await dialog.getByRole('button', { name: 'Sign in', exact: true }).click();
+	await expect(dialog.getByText('Signed in successfully.')).toBeVisible();
+	expect(received).toEqual({ type: 'start', api_key: 'fixture-key' });
+	expect(postedMessages).toEqual([]);
+});
+
+test('Agent sign-in URL requests during a task use the browser and require confirmation', async ({ page }) => {
+	const opened = await mockDesktopExternalLinks(page);
+	const elicitationResponses: { elicitationId: string; payload: Record<string, unknown> }[] = [];
+	const postedMessages: Record<string, unknown>[] = [];
+	await mockApi(page, {
+		pendingElicitation: { mode: 'url', message: 'Authorize the provider to continue.', url: 'https://example.com/authorize' },
+		elicitationResponses, postedMessages,
+	});
+	await page.goto(`/tasks/${taskId}`);
+	const prompt = page.locator('[data-url-elicitation]');
+	await expect(page.locator(`#task-message-input-${taskId}`)).toBeDisabled();
+	await prompt.getByRole('button', { name: 'Open sign-in page' }).click();
+	await expect.poll(() => opened).toEqual(['https://example.com/authorize']);
+	expect(elicitationResponses).toEqual([]);
+	await prompt.getByRole('button', { name: "I've completed sign-in" }).click();
+	await expect.poll(() => elicitationResponses).toEqual([{ elicitationId: 'elicitation-browser-test', payload: { action: 'accept' } }]);
+	await expect(prompt).toHaveCount(0);
+	expect(postedMessages).toEqual([]);
+});

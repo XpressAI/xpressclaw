@@ -5,19 +5,20 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-pub use agent_client_protocol::schema::v1::CreateElicitationResponse;
 use agent_client_protocol::schema::v1::{
-    BooleanConfigOptionCapabilities, CancelNotification, ClientCapabilities,
-    ClientSessionCapabilities, ContentBlock, CreateElicitationRequest, ElicitationAction,
-    ElicitationCapabilities, ElicitationFormCapabilities, ForkSessionRequest, ImageContent,
-    InitializeRequest, InitializeResponse, LoadSessionRequest, McpServer, NewSessionRequest,
-    PermissionOptionKind, PlanEntryStatus, PromptRequest, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, ResumeSessionRequest,
-    SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigOptionValue, SessionConfigOptionsCapabilities, SessionConfigSelectOptions,
-    SessionMode, SessionModeState, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionModeRequest, TextContent, ToolCallStatus, ToolKind,
+    AuthCapabilities, AuthenticateRequest, BooleanConfigOptionCapabilities, CancelNotification,
+    ClientCapabilities, ClientSessionCapabilities, ContentBlock, CreateElicitationRequest,
+    ElicitationAction, ElicitationCapabilities, ElicitationFormCapabilities,
+    ElicitationUrlCapabilities, ForkSessionRequest, ImageContent, InitializeRequest,
+    InitializeResponse, LoadSessionRequest, McpServer, NewSessionRequest, PermissionOptionKind,
+    PlanEntryStatus, PromptRequest, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, ResumeSessionRequest, SelectedPermissionOutcome, SessionConfigKind,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
+    SessionConfigOptionsCapabilities, SessionConfigSelectOptions, SessionMode, SessionModeState,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest,
+    TextContent, ToolCallStatus, ToolKind,
 };
+pub use agent_client_protocol::schema::v1::{AuthMethod, CreateElicitationResponse};
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo};
 use base64::engine::general_purpose::STANDARD;
@@ -45,6 +46,18 @@ const MAX_TRANSCRIPT_UPDATES: usize = 500;
 #[path = "acp_retry.rs"]
 mod provider_retry;
 pub(crate) use provider_retry::{DispatchPermit, RetryCapacity};
+
+#[path = "acp_auth.rs"]
+pub mod authentication;
+use authentication::AuthenticationBroker;
+
+/// These libraries log complete protocol payloads at debug/trace levels,
+/// including authentication keys, codes, and form responses.
+pub fn allow_log_metadata(metadata: &tracing::Metadata<'_>) -> bool {
+    !["agent_client_protocol", "tungstenite", "tokio_tungstenite"]
+        .iter()
+        .any(|target| metadata.target().starts_with(target))
+}
 
 const MAX_DIAGNOSTIC_BYTES: usize = 200_000;
 const CONFIG_UPDATE_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
@@ -438,9 +451,32 @@ pub struct AcpProcess {
     shutdown: watch::Sender<bool>,
     alive: Arc<AtomicBool>,
     stopped: Arc<Notify>,
+    authentication: Arc<Mutex<AcpAuthentication>>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcpAuthenticationStatus {
+    #[default]
+    Unknown,
+    Required,
+    Authenticated,
+}
+
+#[derive(Clone, Default)]
+pub struct AcpAuthentication {
+    pub status: AcpAuthenticationStatus,
+    pub methods: Vec<AuthMethod>,
+    sensitive: bool,
+    broker: Option<Arc<AuthenticationBroker>>,
 }
 
 enum AcpProcessCommand {
+    Authenticate {
+        request: AuthenticateRequest,
+        broker: Arc<AuthenticationBroker>,
+        response: oneshot::Sender<Result<()>>,
+    },
     Turn(Box<AcpProcessTurn>),
     Configure {
         session_id: String,
@@ -1237,6 +1273,7 @@ impl AcpProcess {
         let (ready_sender, ready_receiver) = oneshot::channel();
         let alive = Arc::new(AtomicBool::new(true));
         let stopped = Arc::new(Notify::new());
+        let authentication = Arc::new(Mutex::new(AcpAuthentication::default()));
         tokio::spawn(serve_process(
             attached,
             receiver,
@@ -1244,6 +1281,7 @@ impl AcpProcess {
             ready_sender,
             alive.clone(),
             stopped.clone(),
+            authentication.clone(),
         ));
 
         ready_receiver.await.map_err(|_| {
@@ -1256,7 +1294,48 @@ impl AcpProcess {
             shutdown,
             alive,
             stopped,
+            authentication,
         })
+    }
+
+    pub fn authentication(&self) -> AcpAuthentication {
+        self.authentication.lock().unwrap().clone()
+    }
+
+    pub async fn authenticate(
+        &self,
+        method_id: &str,
+        meta: Option<serde_json::Map<String, Value>>,
+        broker: Arc<AuthenticationBroker>,
+    ) -> Result<()> {
+        let _operation = self
+            .operation
+            .try_lock()
+            .map_err(|_| Error::Agent("The Agent is busy".into()))?;
+        if !self.authentication().methods.iter().any(|method| {
+            matches!(method, AuthMethod::Agent(_)) && method.id().to_string() == method_id
+        }) {
+            return Err(Error::Agent(
+                "The Agent does not advertise that authentication method".into(),
+            ));
+        }
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(AcpProcessCommand::Authenticate {
+                request: AuthenticateRequest::new(method_id.to_owned()).meta(meta),
+                broker,
+                response,
+            })
+            .await
+            .map_err(|_| Error::Agent("The Agent disconnected during sign-in".into()))?;
+        receiver
+            .await
+            .map_err(|_| Error::Agent("The Agent disconnected during sign-in".into()))?
+    }
+
+    /// Record success reported by the runner's authentication flow.
+    pub fn authenticated(&self) {
+        self.authentication.lock().unwrap().status = AcpAuthenticationStatus::Authenticated;
     }
 
     /// Whether the underlying protocol connection is still available.
@@ -1365,6 +1444,7 @@ async fn serve_process(
     ready_sender: oneshot::Sender<Result<()>>,
     alive: Arc<AtomicBool>,
     stopped: Arc<Notify>,
+    authentication: Arc<Mutex<AcpAuthentication>>,
 ) {
     let AttachedContainer {
         input, mut output, ..
@@ -1405,9 +1485,11 @@ async fn serve_process(
     let notification_turn = active_turn.clone();
     let permission_turn = active_turn.clone();
     let elicitation_turn = active_turn.clone();
+    let elicitation_authentication = authentication.clone();
     let ready = Arc::new(Mutex::new(Some(ready_sender)));
     let ready_for_connection = ready.clone();
     let stderr_for_connection = stderr.clone();
+    let authentication_log_state = authentication.clone();
 
     let protocol_result = Client
         .builder()
@@ -1508,6 +1590,10 @@ async fn serve_process(
         )
         .on_receive_request(
             async move |request: CreateElicitationRequest, responder, _connection| {
+                let broker = elicitation_authentication.lock().unwrap().broker.clone();
+                if let Some(broker) = broker {
+                    return responder.respond(broker.prompt(request).await);
+                }
                 let active = elicitation_turn.lock().unwrap().clone();
                 let Some(active) = active else {
                     return responder
@@ -1547,6 +1633,7 @@ async fn serve_process(
                 .send_request(
                     InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
                         ClientCapabilities::new()
+                            .auth(AuthCapabilities::new().terminal(true))
                             .session(
                                 ClientSessionCapabilities::new().config_options(
                                     SessionConfigOptionsCapabilities::new()
@@ -1555,12 +1642,15 @@ async fn serve_process(
                             )
                             .elicitation(
                                 ElicitationCapabilities::new()
-                                    .form(ElicitationFormCapabilities::new()),
+                                    .form(ElicitationFormCapabilities::new())
+                                    .url(ElicitationUrlCapabilities::new()),
                             ),
                     ),
                 )
                 .block_task()
                 .await?;
+
+            authentication.lock().unwrap().methods = initialized.auth_methods.clone();
 
             if let Some(sender) = ready_for_connection.lock().unwrap().take() {
                 let _ = sender.send(Ok(()));
@@ -1587,6 +1677,25 @@ async fn serve_process(
                     }
                 };
                 let turn = match turn {
+                    AcpProcessCommand::Authenticate { request, broker, response } => {
+                        authentication.lock().unwrap().broker = Some(broker.clone());
+                        authentication.lock().unwrap().sensitive = true;
+                        let (result, disconnected) = tokio::select! {
+                            result = connection.send_request(request).block_task() => (result.map(|_| ()).map_err(|error| Error::Backend(format!("Sign-in failed: {error}"))), false),
+                            _ = broker.cancelled() => (Err(Error::Agent("Sign-in cancelled".into())), false),
+                            _ = shutdown.changed() => (Err(Error::Agent("The Agent disconnected during sign-in".into())), true),
+                            _ = &mut output_closed_receiver => (Err(Error::Agent("The Agent disconnected during sign-in".into())), true),
+                        };
+                        authentication.lock().unwrap().broker = None;
+                        if result.is_ok() {
+                            authentication.lock().unwrap().status = AcpAuthenticationStatus::Authenticated;
+                            sessions.lock().unwrap().clear();
+                        }
+                        broker.cancel();
+                        let _ = response.send(result);
+                        if disconnected { break; }
+                        continue;
+                    }
                     AcpProcessCommand::Configure {
                         session_id,
                         change,
@@ -1668,6 +1777,7 @@ async fn serve_process(
 
                 match result {
                     Ok((session_id, stop_reason, interrupted)) => {
+                        authentication.lock().unwrap().status = AcpAuthenticationStatus::Authenticated;
                         let result = recorder.finish().map(|(summary, transcript)| {
                             let summary = if summary.is_empty() {
                                 format!("ACP turn finished ({stop_reason})")
@@ -1693,6 +1803,14 @@ async fn serve_process(
                         let _ = response.send(result);
                     }
                     Err(error) => {
+                        if error.code == agent_client_protocol::ErrorCode::AuthRequired {
+                            authentication.lock().unwrap().status = AcpAuthenticationStatus::Required;
+                            let _ = recorder.append_event(
+                                "authentication_required",
+                                "Sign in to the Agent to continue",
+                                json!({ "runner": recorder.runner }),
+                            );
+                        }
                         let detail = if turn_stderr.trim().is_empty() {
                             error.to_string()
                         } else {
@@ -1727,7 +1845,11 @@ async fn serve_process(
         let _ = sender.send(Err(Error::Backend(detail)));
     }
     if let Err(error) = protocol_result {
-        warn!(%error, "persistent ACP process connection stopped");
+        if authentication_log_state.lock().unwrap().sensitive {
+            warn!("ACP authentication connection stopped");
+        } else {
+            warn!(%error, "persistent ACP process connection stopped");
+        }
     }
 }
 
@@ -2794,6 +2916,72 @@ mod tests {
     use crate::docker::manager::ContainerInfo;
 
     const OAUTH_REFRESH_CONFLICT: &str = "Failed to refresh OAuth token: another Claude Code process is refreshing it or exited mid-refresh. This is usually transient; retry in a minute, and if it persists close other Claude Code processes or sign in again";
+
+    #[tokio::test]
+    async fn authentication_required_exposes_sign_in_without_sending_the_task_prompt() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let (recorder, _) = test_recorder(db.clone());
+        let session = recorder.logical_session_id.clone();
+        let (client_input, server_input) = tokio::io::duplex(4096);
+        let (output, input) = mpsc::channel(8);
+        let mock = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_input).lines();
+            while let Some(line) = lines.next_line().await.unwrap() {
+                let request: Value = serde_json::from_str(&line).unwrap();
+                if request["method"] == "initialize" {
+                    assert_eq!(
+                        request["params"]["clientCapabilities"]["auth"]["terminal"],
+                        true
+                    );
+                    assert!(
+                        request["params"]["clientCapabilities"]["elicitation"]["url"].is_object()
+                    );
+                    send_json(&output,json!({"jsonrpc":"2.0","id":request["id"],"result":InitializeResponse::new(ProtocolVersion::V1)})).await;
+                } else if request["method"] == "session/new" {
+                    send_json(&output,json!({"jsonrpc":"2.0","id":request["id"],"error":agent_client_protocol::Error::auth_required()})).await;
+                } else {
+                    assert_ne!(request["method"], "session/prompt");
+                }
+            }
+        });
+        let process = AcpProcess::start(AttachedContainer {
+            info: ContainerInfo {
+                container_id: "auth-test".into(),
+                agent_id: "test-agent".into(),
+                status: "running".into(),
+                host_port: None,
+            },
+            input: Box::pin(client_input),
+            output: Box::pin(ReceiverStream::new(input)),
+        })
+        .await
+        .unwrap();
+        let result = process
+            .run_turn(
+                AcpTurnRuntime::new(
+                    recorder,
+                    Arc::new(AcpElicitationBroker::new()),
+                    Arc::new(AcpTurnControlBroker::new()),
+                ),
+                AcpSessionStart::New,
+                Path::new("/workspace"),
+                "Do the task",
+                AcpTurnOptions::default(),
+            )
+            .await;
+        assert!(result.is_err());
+        assert_eq!(
+            process.authentication().status,
+            AcpAuthenticationStatus::Required
+        );
+        assert!(SessionManager::new(db)
+            .list_events(&session, None, 100)
+            .unwrap()
+            .iter()
+            .any(|event| event.event_type == "authentication_required"));
+        process.shutdown();
+        mock.await.unwrap();
+    }
 
     #[tokio::test(start_paused = true)]
     async fn codex_system_error_metadata_prevents_false_success_and_retries_only_before_work() {

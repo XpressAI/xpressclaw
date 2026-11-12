@@ -19,7 +19,7 @@ use xpressclaw_core::tasks::queue::TaskQueue;
 use xpressclaw_core::workers::native::{
     compatible_retained_runner_image, host_ssh_agent_socket, local_runner_image_alias,
     presentation_runtime_available, resolve_runner_kind, resolved_runner_image,
-    runner_image_compatible, subscription_auth_available,
+    runner_image_compatible,
 };
 
 use crate::state::AppState;
@@ -50,6 +50,7 @@ struct MessageInput {
 
 pub fn routes() -> Router<AppState> {
     Router::new()
+        .merge(super::agent_auth::routes())
         .route("/{id}", get(get_session))
         .route("/{id}/events", get(get_events))
         .route("/{id}/attempts", get(get_attempts))
@@ -162,9 +163,14 @@ async fn readiness(
     let workspace = session_workspace(state, agent);
     let workspace_present = workspace.is_dir();
     let command_present = kind != "custom" || !agent.runner.command.is_empty();
-    let auth_required =
-        agent.runner.subscription_auth && xpressclaw_core::acp::agent_definition(&kind).is_some();
-    let auth_present = !auth_required || subscription_auth_available(&kind);
+    let authentication = state
+        .project_processes
+        .connected_process(&agent.name, &kind)
+        .await
+        .map(|process| process.authentication())
+        .unwrap_or_default();
+    let auth_present =
+        authentication.status != xpressclaw_core::workers::acp::AcpAuthenticationStatus::Required;
     let docker = state.docker().await;
     let docker_available = docker.is_some();
     let container_engine_available = agent.runner.container_engine != ContainerEngineAccess::Host
@@ -242,9 +248,7 @@ async fn readiness(
         );
     }
     if !auth_present {
-        issues.push(format!(
-            "No host {kind} login was found; authenticate with {kind} on the host first"
-        ));
+        issues.push("Sign in to this Agent in XpressClaw to continue".into());
     }
     Ok(json!({
         "protocol": "acp",
@@ -271,6 +275,7 @@ async fn readiness(
         "command_present": command_present,
         "subscription_auth": agent.runner.subscription_auth,
         "auth_present": auth_present,
+        "authentication_status": authentication.status,
         "presentation_artifacts": {
             "supported": presentation_supported,
             "available": presentation_available,
