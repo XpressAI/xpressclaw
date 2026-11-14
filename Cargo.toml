@@ -23,14 +23,14 @@ tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["ws", "multipart"] }
 axum-extra = { version = "0.10", features = ["typed-header"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
+tower-http = { version = "0.6", features = ["cors", "fs", "trace", "compression-gzip", "compression-br"] }
 
 # HTTP client
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
 serde_urlencoded = "0.7"
 
 # Database
-rusqlite = { version = "0.32", features = ["bundled", "functions"] }
+rusqlite = { version = "0.32", features = ["bundled", "functions", "hooks"] }
 sqlite-vec = "0.1"
 zerocopy = { version = "0.8", features = ["derive"] }
 unicode-casefold = "0.2"

@@ -1,11 +1,25 @@
 const BASE = '';
 let csrfToken: string | null = null;
 
+type ApiRevisionObserver = (headerValue: string, path: string) => void;
+let apiRevisionObserver: ApiRevisionObserver | null = null;
+const earlyRevisionHeaders: Array<{ headerValue: string; path: string }> = [];
+
+export function setApiRevisionObserver(observer: ApiRevisionObserver | null): void {
+	apiRevisionObserver = observer;
+	if (observer && earlyRevisionHeaders.length > 0) {
+		const queued = earlyRevisionHeaders.splice(0);
+		for (const item of queued) {
+			observer(item.headerValue, item.path);
+		}
+	}
+}
+
 function mutation(method: string | undefined): boolean {
 	return !['GET', 'HEAD', 'OPTIONS'].includes((method ?? 'GET').toUpperCase());
 }
 
-function sendToLogin(): void {
+export function sendToLogin(): void {
 	if (typeof window === 'undefined' || window.location.pathname === '/login') return;
 	const returnTo = `${window.location.pathname}${window.location.search}${window.location.hash}`;
 	window.location.assign(`/login?return_to=${encodeURIComponent(returnTo)}`);
@@ -20,21 +34,33 @@ export class ApiError extends Error {
 
 export async function requestResponse(path: string, init?: RequestInit, retryCsrf = true): Promise<Response> {
 	const headers = new Headers(init?.headers);
+	const isMutation = mutation(init?.method);
 	if (init?.body && !(init.body instanceof FormData) && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
-	if (mutation(init?.method) && csrfToken) headers.set('X-XpressClaw-CSRF', csrfToken);
+	if (isMutation && csrfToken) headers.set('X-XpressClaw-CSRF', csrfToken);
 	const res = await fetch(`${BASE}${path}`, {
 		credentials: 'same-origin',
+		cache: isMutation ? init?.cache : (init?.cache ?? 'no-store'),
 		...init,
 		headers
 	});
 	if (!res.ok) {
 		const body = await res.json().catch(() => ({ error: res.statusText }));
-		if (res.status === 403 && retryCsrf && mutation(init?.method) && String(body.error).includes('CSRF')) {
+		if (res.status === 403 && retryCsrf && isMutation && String(body.error).includes('CSRF')) {
 			const session = await auth.bootstrap();
 			if (session.authenticated) return requestResponse(path, init, false);
 		}
 		if (res.status === 401 && !path.startsWith('/api/auth/')) sendToLogin();
 		throw new ApiError(body.error || res.statusText, res.status);
+	}
+	if (!isMutation) {
+		const revHeader = res.headers.get('x-ui-revisions');
+		if (revHeader) {
+			if (apiRevisionObserver) {
+				apiRevisionObserver(revHeader, path);
+			} else {
+				earlyRevisionHeaders.push({ headerValue: revHeader, path });
+			}
+		}
 	}
 	return res;
 }
@@ -605,6 +631,7 @@ export interface AttemptArtifact {
 
 export interface SessionOverview {
 	session: LogicalSession;
+	active_task_count?: number;
 	active_attempts: WorkAttempt[];
 	queued_attempts: WorkAttempt[];
 	recent_attempts: WorkAttempt[];
@@ -654,14 +681,23 @@ export interface ImageAttachmentUpload {
 }
 
 export const sessions = {
-	get: (id: string) => request<SessionOverview>(`/api/sessions/${id}`),
+	get: (id: string, includeDetails = false) =>
+		request<SessionOverview>(`/api/sessions/${id}${includeDetails ? '?include_details=true' : ''}`),
 	readiness: (id: string) => request<RunnerReadiness>(`/api/sessions/${id}/readiness`),
 	prepare: (id: string) => request<RunnerReadiness>(`/api/sessions/${id}/readiness`, {
 		method: 'POST',
 		body: '{}'
 	}),
-	events: (id: string, after?: number) => {
-		const query = after ? `?after=${after}` : '';
+	events: (id: string, afterOrOptions?: number | { after?: number; limit?: number; eventType?: string }) => {
+		if (typeof afterOrOptions === 'number') {
+			const query = afterOrOptions ? `?after=${afterOrOptions}` : '';
+			return request<SessionEvent[]>(`/api/sessions/${id}/events${query}`);
+		}
+		const params = new URLSearchParams();
+		if (afterOrOptions?.after) params.set('after', String(afterOrOptions.after));
+		if (afterOrOptions?.limit !== undefined) params.set('limit', String(afterOrOptions.limit));
+		if (afterOrOptions?.eventType) params.set('event_type', afterOrOptions.eventType);
+		const query = params.size ? `?${params}` : '';
 		return request<SessionEvent[]>(`/api/sessions/${id}/events${query}`);
 	},
 	attempts: (id: string, status?: string) => {
@@ -905,8 +941,10 @@ export const tasks = {
 		const qs = params.toString();
 		return request<{ tasks: Task[]; counts: TaskCounts }>(`/api/tasks${qs ? `?${qs}` : ''}`);
 	},
-	recentByAgent: (limit = 5) =>
-		request<{ tasks: Task[] }>(`/api/tasks/recent-by-agent?limit=${encodeURIComponent(limit)}`),
+	recentByAgent: (limit = 5, includeDetails = false) =>
+		request<{ tasks: Task[] }>(
+			`/api/tasks/recent-by-agent?limit=${encodeURIComponent(limit)}${includeDetails ? '&include_details=true' : ''}`
+		),
 	get: (id: string) => request<Task>(`/api/tasks/${id}`),
 	create: (data: { backlog?: boolean; start_after?: string; title: string; description?: string; agent_id?: string; priority?: number; context?: Record<string, unknown> }) =>
 		request<Task>('/api/tasks', { method: 'POST', body: JSON.stringify(data) }),
@@ -921,7 +959,10 @@ export const tasks = {
 			body: JSON.stringify({ status })
 		}),
 	delete: (id: string) => request<void>(`/api/tasks/${id}`, { method: 'DELETE' }),
-	messages: (id: string) => request<TaskMessage[]>(`/api/tasks/${id}/messages`),
+	messages: (id: string, afterId?: number) =>
+		request<TaskMessage[]>(
+			`/api/tasks/${id}/messages${afterId !== undefined ? `?after_id=${encodeURIComponent(afterId)}` : ''}`
+		),
 	visualizationUrl: (taskId: string, messageId: number, artifactId: string) =>
 		`/api/tasks/${encodeURIComponent(taskId)}/messages/${messageId}/visualizations/${encodeURIComponent(artifactId)}`,
 	activity: (id: string, options: { after?: number; before?: number; limit?: number } = {}) => {
@@ -1024,9 +1065,13 @@ export interface Schedule {
 }
 
 export const schedules = {
-	list: (agentId?: string) => {
-		const params = agentId ? `?agent_id=${agentId}` : '';
-		return request<Schedule[]>(`/api/schedules${params}`);
+	list: (agentId?: string, options?: { enabled?: boolean; includeCompletedOnce?: boolean }) => {
+		const params = new URLSearchParams();
+		if (agentId) params.set('agent_id', agentId);
+		if (options?.enabled !== undefined) params.set('enabled', String(options.enabled));
+		if (options?.includeCompletedOnce) params.set('include_completed_once', 'true');
+		const qs = params.toString();
+		return request<Schedule[]>(`/api/schedules${qs ? `?${qs}` : ''}`);
 	},
 	get: (id: string) => request<Schedule>(`/api/schedules/${id}`),
 	create: (data: {
@@ -1052,7 +1097,22 @@ export const schedules = {
 	trigger: (id: string) => request<Task | { conversation_id: string; agent_id: string; message: ConversationMessage }>(`/api/schedules/${id}/trigger`, { method: 'POST' })
 };
 
-// -- Health --
+// -- Health & Live UI Revisions --
+
+export interface UiRevisions {
+	seq: number;
+	projects: number;
+	agents: number;
+	conversations: number;
+	tasks: number;
+	sessions: number;
+	schedules: number;
+	workflows: number;
+}
+
+export const ui = {
+	revisions: (signal?: AbortSignal) => request<UiRevisions>('/api/ui/revisions', { signal })
+};
 
 export const health = {
 	check: () =>

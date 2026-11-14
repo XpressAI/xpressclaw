@@ -208,6 +208,12 @@ impl AppState {
         *self.llm_router.write().unwrap() = llm_router;
         *self.rate_limiter.write().unwrap() = rate_limiter;
         *self.setup_complete.write().unwrap() = true;
+        self.db.bump_ui_domains(
+            xpressclaw_core::db::ui_domains::AGENTS
+                | xpressclaw_core::db::ui_domains::PROJECTS
+                | xpressclaw_core::db::ui_domains::SESSIONS
+                | xpressclaw_core::db::ui_domains::WORKFLOWS,
+        );
     }
 
     /// Recover a harness that ignores cooperative cancellation after its tools

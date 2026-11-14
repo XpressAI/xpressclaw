@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use crate::conversations::event_bus::{ConversationEvent, ConversationEventBus};
 use crate::conversations::{ConversationManager, ConversationMessage, SendMessage};
 use crate::db::Database;
 use crate::error::{Error, Result};
@@ -222,6 +223,16 @@ impl ScheduleManager {
 
     /// List all schedules, optionally filtered by agent_id or enabled status.
     pub fn list(&self, agent_id: Option<&str>, enabled_only: bool) -> Result<Vec<Schedule>> {
+        self.list_filtered(agent_id, enabled_only, true)
+    }
+
+    /// List schedules with optional exclusion of already-fired disabled one-shot wake-ups.
+    pub fn list_filtered(
+        &self,
+        agent_id: Option<&str>,
+        enabled_only: bool,
+        include_completed_once: bool,
+    ) -> Result<Vec<Schedule>> {
         self.db.with_conn(|conn| {
             let mut sql = "SELECT * FROM schedules WHERE 1=1".to_string();
             let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -232,6 +243,8 @@ impl ScheduleManager {
             }
             if enabled_only {
                 sql.push_str(" AND enabled = 1");
+            } else if !include_completed_once {
+                sql.push_str(" AND NOT (schedule_type = 'once' AND enabled = 0 AND run_count > 0)");
             }
 
             sql.push_str(" ORDER BY created_at DESC");
@@ -589,17 +602,24 @@ fn ensure_agent_project_accepts_work(conn: &rusqlite::Connection, agent_id: &str
 /// Checks all enabled schedules every 60 seconds and triggers due one-shot
 /// deadlines or cron expressions that match the current time.
 pub async fn start_schedule_runner(db: Arc<Database>) {
+    start_schedule_runner_with_events(db, None).await;
+}
+
+pub async fn start_schedule_runner_with_events(
+    db: Arc<Database>,
+    event_bus: Option<Arc<ConversationEventBus>>,
+) {
     info!("schedule runner started");
 
     loop {
-        if let Err(e) = check_schedules(&db) {
+        if let Err(e) = check_schedules(&db, event_bus.as_deref()) {
             error!(error = %e, "schedule check error");
         }
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
     }
 }
 
-fn check_schedules(db: &Arc<Database>) -> Result<()> {
+fn check_schedules(db: &Arc<Database>, event_bus: Option<&ConversationEventBus>) -> Result<()> {
     let mgr = ScheduleManager::new(db.clone());
     let board = TaskBoard::new(db.clone());
 
@@ -628,13 +648,23 @@ fn check_schedules(db: &Arc<Database>) -> Result<()> {
                     conversation_id,
                     agent_id,
                     message,
-                }) => info!(
-                    schedule_id = schedule.id.as_str(),
-                    conversation_id,
-                    agent_id,
-                    message_id = message.id,
-                    "scheduled Conversation turn created"
-                ),
+                }) => {
+                    if let Some(bus) = event_bus {
+                        if let Ok(value) = serde_json::to_value(&message) {
+                            bus.send(
+                                &conversation_id,
+                                ConversationEvent::Message { message: value },
+                            );
+                        }
+                    }
+                    info!(
+                        schedule_id = schedule.id.as_str(),
+                        conversation_id,
+                        agent_id,
+                        message_id = message.id,
+                        "scheduled Conversation turn created"
+                    );
+                }
                 Err(e) => {
                     error!(
                         schedule_id = schedule.id.as_str(),
@@ -1226,8 +1256,8 @@ mod tests {
             })
             .unwrap();
 
-        check_schedules(&db).unwrap();
-        check_schedules(&db).unwrap();
+        check_schedules(&db, None).unwrap();
+        check_schedules(&db, None).unwrap();
 
         let updated = mgr.get(&schedule.id).unwrap();
         assert!(!updated.enabled);
@@ -1351,5 +1381,60 @@ mod tests {
         let pending = queue.pending_count("atlas").unwrap();
         assert_eq!(pending, 1);
         assert_eq!(task.agent_id.as_deref(), Some("atlas"));
+    }
+
+    #[test]
+    fn continuation_wakeup_on_completed_task_bumps_ui_revisions_and_hides_fired_wakeup() {
+        let (db, mgr, board) = setup();
+        let task = board
+            .create(&CreateTask {
+                backlog: false,
+                start_after: None,
+                title: "Train monitor".to_string(),
+                description: None,
+                agent_id: Some("atlas".to_string()),
+                parent_task_id: None,
+                sop_id: None,
+                conversation_id: None,
+                priority: None,
+                context: None,
+            })
+            .unwrap();
+        board
+            .update_status(&task.id, "completed", Some("atlas"))
+            .unwrap();
+
+        let wakeup = mgr
+            .create_one_shot(&CreateOneShotSchedule {
+                name: "Check later".to_string(),
+                run_at: None,
+                delay_seconds: Some(60),
+                agent_id: "atlas".to_string(),
+                title: "Check status".to_string(),
+                description: Some("Verify job status".to_string()),
+                continuation_task_id: Some(task.id.clone()),
+                conversation_id: None,
+            })
+            .unwrap();
+
+        assert_eq!(mgr.list_filtered(None, false, false).unwrap().len(), 1);
+
+        let before = db.ui_revisions();
+        mgr.trigger(&wakeup.id, &board).unwrap();
+        let after = db.ui_revisions();
+
+        assert!(after.tasks > before.tasks);
+        assert!(after.sessions > before.sessions);
+        assert!(after.schedules > before.schedules);
+        assert_eq!(board.get(&task.id).unwrap().status, TaskStatus::Pending);
+
+        // Fired one-shot wakeups are excluded when include_completed_once is false,
+        // while disabled cron schedules remain visible.
+        let cron = create_schedule(&mgr);
+        mgr.disable(&cron.id).unwrap();
+        let filtered = mgr.list_filtered(None, false, false).unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, cron.id);
+        assert_eq!(mgr.list_filtered(None, false, true).unwrap().len(), 2);
     }
 }

@@ -88,6 +88,8 @@ pub struct SessionOverview {
     pub recent_attempts: Vec<WorkAttempt>,
     pub recent_events: Vec<SessionEvent>,
     pub artifacts: Vec<AttemptArtifact>,
+    #[serde(default)]
+    pub active_task_count: usize,
 }
 
 /// Native work history scoped to one task. This is the task page's semantic
@@ -125,6 +127,32 @@ impl SessionManager {
     /// valid, but titles are always refreshed from the current project path.
     pub fn ensure(&self, session_id: &str, title: Option<&str>) -> Result<LogicalSession> {
         self.db.with_conn(|conn| {
+            let project_id = conn
+                .query_row(
+                    "SELECT project_id FROM agents WHERE id = ?1",
+                    [session_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .ok_or_else(|| Error::AgentNotFound {
+                    name: session_id.to_string(),
+                })?;
+            if let Some(project_id) = project_id.as_deref() {
+                ensure_project_accepts_work(conn, project_id)?;
+            }
+            let existing_title = conn
+                .query_row(
+                    "SELECT title FROM logical_sessions WHERE id = ?1",
+                    [session_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?;
+            if let Some(existing_title) = existing_title {
+                if title.is_none() || existing_title.as_deref() == title {
+                    return Ok(());
+                }
+            }
+
             let transaction = rusqlite::Transaction::new_unchecked(
                 conn,
                 rusqlite::TransactionBehavior::Immediate,
@@ -148,7 +176,7 @@ impl SessionManager {
             )?;
             if title.is_some() {
                 transaction.execute(
-                    "UPDATE logical_sessions SET title = ?1 WHERE id = ?2",
+                    "UPDATE logical_sessions SET title = ?1 WHERE id = ?2 AND title IS NOT ?1",
                     rusqlite::params![title, session_id],
                 )?;
             }
@@ -177,6 +205,32 @@ impl SessionManager {
         })
     }
 
+    pub fn active_task_count(&self, session_id: &str) -> Result<usize> {
+        self.db.with_conn(|conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM tasks
+                 WHERE agent_id = ?1 AND hidden = 0 AND backlog = 0
+                   AND status IN ('pending', 'in_progress')",
+                [session_id],
+                |row| row.get(0),
+            )?;
+            Ok(count.max(0) as usize)
+        })
+    }
+
+    pub fn overview_summary(&self, session_id: &str) -> Result<SessionOverview> {
+        let session = self.get(session_id)?;
+        Ok(SessionOverview {
+            active_attempts: self.list_attempts(session_id, Some("running"), 20)?,
+            queued_attempts: self.list_attempts(session_id, Some("queued"), 20)?,
+            recent_attempts: Vec::new(),
+            recent_events: Vec::new(),
+            artifacts: Vec::new(),
+            active_task_count: self.active_task_count(session_id)?,
+            session,
+        })
+    }
+
     pub fn overview(&self, session_id: &str) -> Result<SessionOverview> {
         let session = self.get(session_id)?;
         Ok(SessionOverview {
@@ -185,6 +239,7 @@ impl SessionManager {
             recent_attempts: self.list_attempts(session_id, None, 30)?,
             recent_events: self.list_events(session_id, None, 100)?,
             artifacts: self.list_artifacts(session_id, 50)?,
+            active_task_count: self.active_task_count(session_id)?,
             session,
         })
     }
@@ -236,29 +291,61 @@ impl SessionManager {
         after: Option<i64>,
         limit: i64,
     ) -> Result<Vec<SessionEvent>> {
+        self.list_events_filtered(session_id, after, None, limit)
+    }
+
+    pub fn list_events_filtered(
+        &self,
+        session_id: &str,
+        after: Option<i64>,
+        event_type: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<SessionEvent>> {
+        let event_type = event_type.map(str::trim).filter(|value| !value.is_empty());
         self.db.with_conn(|conn| {
-            let (sql, pivot) = if let Some(after_id) = after {
-                (
+            let (sql, pivot) = match (after, event_type.is_some()) {
+                (Some(after_id), false) => (
                     "SELECT id, session_id, attempt_id, task_id, source_type, source_id,
                             event_type, summary, payload, created_at
                      FROM session_events WHERE session_id = ?1 AND id > ?2
                      ORDER BY id ASC LIMIT ?3",
                     after_id,
-                )
-            } else {
-                (
+                ),
+                (None, false) => (
                     "SELECT id, session_id, attempt_id, task_id, source_type, source_id,
                             event_type, summary, payload, created_at
                      FROM session_events WHERE session_id = ?1 AND id > ?2
                      ORDER BY id DESC LIMIT ?3",
                     -1,
-                )
+                ),
+                (Some(after_id), true) => (
+                    "SELECT id, session_id, attempt_id, task_id, source_type, source_id,
+                            event_type, summary, payload, created_at
+                     FROM session_events WHERE session_id = ?1 AND id > ?2 AND event_type = ?4
+                     ORDER BY id ASC LIMIT ?3",
+                    after_id,
+                ),
+                (None, true) => (
+                    "SELECT id, session_id, attempt_id, task_id, source_type, source_id,
+                            event_type, summary, payload, created_at
+                     FROM session_events WHERE session_id = ?1 AND id > ?2 AND event_type = ?4
+                     ORDER BY id DESC LIMIT ?3",
+                    -1,
+                ),
             };
             let mut stmt = conn.prepare(sql)?;
-            let mut events: Vec<_> = stmt
-                .query_map(rusqlite::params![session_id, pivot, limit], row_to_event)?
+            let mut events: Vec<_> = if let Some(kind) = event_type {
+                stmt.query_map(
+                    rusqlite::params![session_id, pivot, limit, kind],
+                    row_to_event,
+                )?
                 .filter_map(|row| row.ok())
-                .collect();
+                .collect()
+            } else {
+                stmt.query_map(rusqlite::params![session_id, pivot, limit], row_to_event)?
+                    .filter_map(|row| row.ok())
+                    .collect()
+            };
             if after.is_none() {
                 events.reverse();
             }
@@ -1817,5 +1904,34 @@ mod tests {
         assert!(!events
             .iter()
             .any(|event| event.event_type == "attempt_running"));
+    }
+
+    #[test]
+    fn ensuring_existing_session_with_unchanged_title_does_not_bump_ui_revisions() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        insert_agent(&db, "builder");
+        let manager = SessionManager::new(db.clone());
+        let before_create = db.ui_revisions();
+
+        let created = manager.ensure("builder", Some("Builder")).unwrap();
+        assert_eq!(created.title.as_deref(), Some("Builder"));
+        let after_create = db.ui_revisions();
+        assert_eq!(after_create.seq, before_create.seq + 1);
+        assert_eq!(after_create.sessions, before_create.sessions + 1);
+
+        // Repeated ensures with the same title or None must be pure reads so
+        // GET /api/sessions/* and GET /api/agents* never retrigger SSE loops.
+        manager.ensure("builder", Some("Builder")).unwrap();
+        manager.ensure("builder", None).unwrap();
+        assert_eq!(db.ui_revisions(), after_create);
+
+        let renamed = manager.ensure("builder", Some("Builder v2")).unwrap();
+        assert_eq!(renamed.title.as_deref(), Some("Builder v2"));
+        let after_rename = db.ui_revisions();
+        assert_eq!(after_rename.seq, after_create.seq + 1);
+        assert_eq!(after_rename.sessions, after_create.sessions + 1);
+
+        manager.ensure("builder", Some("Builder v2")).unwrap();
+        assert_eq!(db.ui_revisions(), after_rename);
     }
 }

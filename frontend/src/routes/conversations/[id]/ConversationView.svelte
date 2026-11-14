@@ -3,6 +3,7 @@
 	import { onDestroy, onMount } from 'svelte';
 	import yaml from 'js-yaml';
 	import { agents, conversations, projects, workflows, type Agent, type Conversation, type ConversationMessage, type ConversationMessageUpload, type ConversationTurn, type Project, type Task, type Workflow } from '$lib/api';
+	import { isTransientRefreshError, subscribeLiveUpdates, usePaneActive } from '$lib/liveUpdates';
 	import { clearComposerDraft, loadComposerDraft, saveComposerDraft } from '$lib/composerDrafts';
 	import { clipboardFiles, imageDataUrl, pastedImageFiles, shouldHandleImagePaste } from '$lib/imageAttachments';
 	import { PROJECT_MUTATION_EVENT, type ProjectMutation } from '$lib/projectEvents';
@@ -46,7 +47,8 @@
 	let fileInput = $state<HTMLInputElement>();
 	let composerInput = $state<HTMLTextAreaElement>();
 	let messagePane = $state<HTMLDivElement>();
-	let pollTimer: ReturnType<typeof setInterval> | null = null;
+	const paneActive = usePaneActive();
+	let unsubscribeLiveUpdates: (() => void) | null = null;
 	let eventSource: EventSource | null = null;
 	let stopInitialScrollPin: (() => void) | null = null;
 	let projectMutationVersion = 0;
@@ -85,18 +87,33 @@
 
 	$effect(() => { if (draftReady) saveComposerDraft(draftScope, content); });
 
+	let initialLoadPromise: Promise<void> | null = null;
+	let activityGeneration = 0;
+	let appliedActivityGeneration = 0;
+
 	onMount(() => {
 		window.addEventListener(PROJECT_MUTATION_EVENT, handleProjectMutation);
 		content = loadComposerDraft(draftScope);
 		draftReady = true;
-		void loadAll(true);
+		const initial = loadAll(true).finally(() => {
+			if (initialLoadPromise === initial) initialLoadPromise = null;
+		});
+		initialLoadPromise = initial;
 		connectEvents();
-		pollTimer = setInterval(() => void refreshActivity(), 2500);
+		unsubscribeLiveUpdates = subscribeLiveUpdates(
+			['conversations', 'tasks', 'agents'],
+			async () => {
+				if (initialLoadPromise) await initialLoadPromise.catch(() => {});
+				await refreshActivity(true);
+			},
+			{ active: paneActive, fallbackIntervalMs: 2500 }
+		);
 		return () => window.removeEventListener(PROJECT_MUTATION_EVENT, handleProjectMutation);
 	});
 
 	onDestroy(() => {
-		if (pollTimer) clearInterval(pollTimer);
+		unsubscribeLiveUpdates?.();
+		unsubscribeLiveUpdates = null;
 		eventSource?.close();
 		stopInitialScrollPin?.();
 	});
@@ -184,7 +201,8 @@
 		return currentProject;
 	}
 
-	async function refreshActivity() {
+	async function refreshActivity(rethrowTransient = false) {
+		const gen = ++activityGeneration;
 		const latestMessageIdAtRequest = messages.at(-1)?.id ?? 0;
 		const reconcileLoadedHistory = olderMessagesLoaded;
 		try {
@@ -194,6 +212,8 @@
 				conversations.tasks(conversationId),
 				reconcileLoadedHistory ? conversations.messageDeletions(conversationId) : Promise.resolve([]),
 			]);
+			if (gen < appliedActivityGeneration) return;
+			appliedActivityGeneration = gen;
 			if (reconcileLoadedHistory) {
 				messages = reconcileRecentMessages(messages, nextMessages, latestMessageIdAtRequest, deletedMessageIds);
 			}
@@ -203,7 +223,9 @@
 			}
 			turns = nextTurns;
 			taskList = nextTasks;
-		} catch {}
+		} catch (err) {
+			if (rethrowTransient && isTransientRefreshError(err)) throw err;
+		}
 	}
 
 	function mergeMessages(existing: ConversationMessage[], incoming: ConversationMessage[]): ConversationMessage[] {

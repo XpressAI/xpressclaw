@@ -24,15 +24,16 @@ mod setup;
 mod speech;
 mod task_controls;
 mod tasks;
+mod ui;
 mod visualizations;
 mod workflows;
 mod workspace;
 
-pub fn api_routes() -> Router<AppState> {
+pub fn api_routes(state: &AppState) -> Router<AppState> {
     Router::new()
         .route("/health", get(health::health_check))
         .nest("/auth", auth::routes())
-        .merge(protected_api_routes())
+        .merge(protected_api_routes(state))
 }
 
 /// Runner-only callbacks. These routes are mounted exclusively on the
@@ -51,14 +52,14 @@ pub fn public_api_routes(state: &AppState) -> Router<AppState> {
         .route("/health", get(health::health_check))
         .nest("/auth", auth::routes())
         .merge(
-            protected_api_routes().route_layer(middleware::from_fn_with_state(
+            protected_api_routes(state).route_layer(middleware::from_fn_with_state(
                 state.auth.clone(),
                 crate::server::require_user_session,
             )),
         )
 }
 
-fn protected_api_routes() -> Router<AppState> {
+fn protected_api_routes(state: &AppState) -> Router<AppState> {
     Router::new()
         .route("/open-url", post(open_url::open_url))
         .nest("/agents", agents::routes())
@@ -73,6 +74,11 @@ fn protected_api_routes() -> Router<AppState> {
         .nest("/settings", settings::routes())
         .nest("/speech", speech::routes())
         .nest("/setup", setup::routes())
+        .nest("/ui", ui::routes())
         .nest("/workflows", workflows::routes())
         .nest("/workspaces", workspace::routes())
+        .route_layer(middleware::from_fn_with_state(
+            state.db.clone(),
+            ui::attach_ui_revisions_header,
+        ))
 }

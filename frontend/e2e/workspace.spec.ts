@@ -979,8 +979,26 @@ async function mockApi(
 			response = createdWorkflow ?? options.workflows?.find((workflow) => workflow.id === id) ?? {
 				error: `Unknown workflow: ${id}`,
 			};
+		} else if (path === '/api/ui/stream' || path === '/api/ui/revisions') {
+			await route.fulfill({ status: 204, body: '' });
+			return;
 		} else if (path === '/api/schedules') {
-			response = options.schedules ?? [];
+			const agentFilter = url.searchParams.get('agent_id');
+			const enabledOnly = url.searchParams.get('enabled') === 'true';
+			const includeCompletedOnce = url.searchParams.get('include_completed_once') === 'true';
+			response = (options.schedules ?? []).filter((schedule: Record<string, unknown>) => {
+				if (agentFilter && schedule.agent_id !== agentFilter) return false;
+				if (enabledOnly && !schedule.enabled) return false;
+				if (
+					!includeCompletedOnce
+					&& schedule.schedule_type === 'once'
+					&& !schedule.enabled
+					&& Number(schedule.run_count ?? 0) > 0
+				) {
+					return false;
+				}
+				return true;
+			});
 		} else if (path === '/api/setup/config') {
 			const configuredKind = options.agentKind?.value ?? agentRunnerKind;
 			response = {
@@ -1235,11 +1253,15 @@ async function mockApi(
 					delivery: payload.delivery === 'immediate' ? 'immediate' : (options.live ? 'after_tool' : 'queued'),
 				};
 			} else {
-				response = options.taskMessages ?? [
+				const allMessages = options.taskMessages ?? [
 					{ id: 1, task_id: taskId, role: 'assistant', content: firstAnswer, attachments: [], timestamp: timestamp(25) },
 					{ id: 2, task_id: taskId, role: 'user', content: userFollowUp, attachments: [], timestamp: timestamp(40) },
 					{ id: 3, task_id: taskId, role: 'assistant', content: secondAnswer, attachments: [], timestamp: timestamp(55) },
 				];
+				const afterId = url.searchParams.has('after_id') ? Number(url.searchParams.get('after_id')) : null;
+				response = afterId !== null && Number.isFinite(afterId)
+					? allMessages.filter((message) => Number(message.id) > afterId)
+					: allMessages;
 			}
 		} else if (path.startsWith(`/api/tasks/${taskId}/elicitations/`) && path.endsWith('/response')) {
 			const elicitationId = decodeURIComponent(path.split('/')[5]);
@@ -1328,6 +1350,9 @@ async function mockApi(
 		} else if (path === `/api/sessions/${agentId}`) {
 			response = {
 				session: { id: agentId, status: options.live ? 'running' : 'idle' },
+				active_task_count: listedTasks.filter(
+					(listedTask) => listedTask.agent_id === agentId && ['pending', 'in_progress'].includes(listedTask.status),
+				).length,
 				active_attempts: [],
 				queued_attempts: [],
 				recent_attempts: [],
@@ -1359,7 +1384,7 @@ async function mockApi(
 				], modes: null, notice: 'Last observed controls; changes will apply on the next turn.',
 			};
 		} else if (path === `/api/sessions/${agentId}/events`) {
-			response = [
+			const allEvents = [
 				{
 					...activityEvent(70),
 					event_type: 'session_config_options',
@@ -1379,6 +1404,18 @@ async function mockApi(
 					] },
 				},
 			];
+			const eventType = url.searchParams.get('event_type');
+			const after = url.searchParams.has('after') ? Number(url.searchParams.get('after')) : null;
+			const limit = url.searchParams.has('limit') ? Number(url.searchParams.get('limit')) : null;
+			let filteredEvents = allEvents.filter((event) => {
+				if (eventType && event.event_type !== eventType) return false;
+				if (after !== null && Number.isFinite(after) && event.id <= after) return false;
+				return true;
+			});
+			if (limit !== null && Number.isFinite(limit) && limit > 0) {
+				filteredEvents = after !== null ? filteredEvents.slice(0, limit) : filteredEvents.slice(-limit);
+			}
+			response = filteredEvents;
 		} else {
 			await route.fulfill({ status: 404, contentType: 'application/json', body: JSON.stringify({ error: `Unmocked API route: ${path}` }) });
 			return;
@@ -1405,7 +1442,7 @@ for (const history of ['evicted', 'sibling', 'abandoned']) {
 	test(`canonical picker ignores ${history} history and does not submit observed defaults`, async ({ page }) => {
 		const postedMessages: Record<string, unknown>[] = [];
 		await mockApi(page, { taskStatus: 'completed', postedMessages });
-		await page.route(`**/api/sessions/${agentId}/events`, route => route.fulfill({ json: history === 'evicted' ? [] : [{
+		await page.route(`**/api/sessions/${agentId}/events*`, route => route.fulfill({ json: history === 'evicted' ? [] : [{
 			...activityEvent(500), task_id: history === 'sibling' ? 'another-task' : taskId,
 			event_type: 'session_config_options', payload: pickerSnapshot('qwen'),
 		}] }));
@@ -8026,3 +8063,984 @@ test('stalled Git refresh times out and a later refresh recovers', async ({ page
         releaseGit();
     }
 });
+
+async function installMockUiStream(page: Page) {
+	await page.addInitScript(() => {
+		const originalFetch = window.fetch.bind(window);
+		const encoder = new TextEncoder();
+		const controllers = new Set<ReadableStreamDefaultController<Uint8Array>>();
+		let state = {
+			seq: 1,
+			projects: 1,
+			agents: 1,
+			conversations: 1,
+			tasks: 1,
+			sessions: 1,
+			schedules: 1,
+			workflows: 1,
+		};
+		const w = window as unknown as {
+			__mockUiStreamEmit?: (patch: Record<string, number>) => void;
+			__mockUiStreamSubscriberCount?: () => number;
+		};
+		w.__mockUiStreamSubscriberCount = () => controllers.size;
+		w.__mockUiStreamEmit = (patch: Record<string, number>) => {
+			state = { ...state, ...patch, seq: (patch.seq ?? state.seq + 1) };
+			const frame = encoder.encode(`event: revisions\ndata: ${JSON.stringify(state)}\n\n`);
+			for (const controller of controllers) {
+				try {
+					controller.enqueue(frame);
+				} catch {
+					controllers.delete(controller);
+				}
+			}
+		};
+		window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+			const rawUrl = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+			const parsed = new URL(rawUrl, window.location.origin);
+			if (parsed.pathname === '/api/ui/stream') {
+				let activeController: ReadableStreamDefaultController<Uint8Array> | null = null;
+				const stream = new ReadableStream<Uint8Array>({
+					start(controller) {
+						activeController = controller;
+						controllers.add(controller);
+						controller.enqueue(
+							encoder.encode(`event: revisions\ndata: ${JSON.stringify(state)}\n\n`),
+						);
+						init?.signal?.addEventListener('abort', () => {
+							controllers.delete(controller);
+							try { controller.close(); } catch {}
+						});
+					},
+					cancel() {
+						if (activeController) controllers.delete(activeController);
+					},
+				});
+				return new Response(stream, {
+					status: 200,
+					headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' },
+				});
+			}
+			return originalFetch(input, init);
+		};
+	});
+}
+
+test('scheduled wake-up updates a completed task via SSE without idle background polling', async ({ page }) => {
+	await installMockUiStream(page);
+	const messages: Record<string, unknown>[] = [
+		{ id: 1, task_id: taskId, role: 'user', content: 'Check status in 5 minutes.', attachments: [], timestamp: timestamp(10) },
+		{ id: 2, task_id: taskId, role: 'assistant', content: 'Scheduled a follow-up wake-up.', attachments: [], timestamp: timestamp(20) },
+	];
+	const attempts = [attempt('completed', 64_000, null, 'Scheduled a follow-up wake-up.')];
+	await mockApi(page, {
+		taskStatus: 'completed',
+		taskMessages: messages,
+		taskAttempts: attempts,
+		taskActivityEvents: [],
+	});
+
+	const seenRequests: string[] = [];
+	page.on('request', (req) => {
+		const url = new URL(req.url());
+		if (url.pathname.startsWith('/api/')) {
+			seenRequests.push(`${url.pathname}${url.search}`);
+		}
+	});
+
+	await page.goto(`/tasks/${taskId}`);
+	await expect(page.getByText('Scheduled a follow-up wake-up.', { exact: true })).toBeVisible();
+	await expect.poll(() =>
+		page.evaluate(() => (window as unknown as { __mockUiStreamSubscriberCount?: () => number }).__mockUiStreamSubscriberCount?.() ?? 0),
+	).toBeGreaterThan(0);
+
+	// Let initial load settle, then verify zero idle background polls while SSE is connected.
+	await page.waitForTimeout(200);
+	seenRequests.length = 0;
+	await page.waitForTimeout(3600);
+	expect(seenRequests).toEqual([]);
+
+	// Simulate a scheduled wake-up firing on the completed task in the backend.
+	const currentTask = await page.evaluate(async (id) => (await fetch(`/api/tasks/${id}`)).json(), taskId);
+	seenRequests.length = 0;
+	await page.route(`**/api/tasks/${taskId}`, (route) =>
+		route.fulfill({ json: { ...currentTask, status: 'in_progress', activity_status: 'in_progress', completed_at: null } }),
+	);
+	messages.push(
+		{ id: 3, task_id: taskId, role: 'user', content: 'Scheduled wake-up: Check deployment health', attachments: [], timestamp: timestamp(70) },
+		{ id: 4, task_id: taskId, role: 'assistant', content: 'Deployment is healthy after the scheduled check.', attachments: [], timestamp: timestamp(72) },
+	);
+
+	await page.evaluate(() => {
+		(window as unknown as { __mockUiStreamEmit?: (patch: Record<string, number>) => void }).__mockUiStreamEmit?.({
+			tasks: 2,
+			sessions: 2,
+		});
+	});
+
+	await expect(page.getByText('Scheduled wake-up: Check deployment health', { exact: true })).toBeVisible();
+	await expect(page.getByText('Deployment is healthy after the scheduled check.', { exact: true })).toBeVisible();
+	expect(seenRequests.some((entry) => entry.startsWith(`/api/tasks/${taskId}/messages?after_id=1`))).toBe(true);
+});
+
+test('completed one-shot wake-ups are hidden by default and revealed on demand', async ({ page }) => {
+	const scheduleRequests: string[] = [];
+	page.on('request', (req) => {
+		const url = new URL(req.url());
+		if (url.pathname === '/api/schedules') {
+			scheduleRequests.push(url.search);
+		}
+	});
+
+	await mockApi(page, {
+		schedules: [
+			{
+				id: 'schedule-recurring',
+				name: 'Morning digest',
+				cron: '0 8 * * *',
+				agent_id: agentId,
+				title: 'Send morning digest',
+				description: null,
+				enabled: true,
+				last_run: null,
+				run_count: 3,
+				created_at: timestamp(10),
+				schedule_type: 'cron',
+				run_at: null,
+				continuation_task_id: null,
+				conversation_id: null,
+			},
+			{
+				id: 'schedule-fired-wakeup',
+				name: 'Follow-up wake-up #1229',
+				cron: '',
+				agent_id: agentId,
+				title: 'Resume deployment check',
+				description: 'Historical fired one-shot continuation payload',
+				enabled: false,
+				last_run: timestamp(50),
+				run_count: 1,
+				created_at: timestamp(40),
+				schedule_type: 'once',
+				run_at: timestamp(50),
+				continuation_task_id: taskId,
+				conversation_id: null,
+			},
+		],
+	});
+
+	// Opening an Agent page must not fetch /api/schedules while Automations is not open.
+	await page.goto(`/agents/${agentId}`);
+	await expect(page.getByPlaceholder('Send work or ask a question…')).toBeVisible();
+	expect(scheduleRequests).toEqual([]);
+
+	// Opening Automations fetches only active/unfired schedules by default.
+	await page.goto('/automations');
+	await expect(page.getByText('Morning digest').first()).toBeVisible();
+	await expect(page.getByText('Follow-up wake-up #1229')).toHaveCount(0);
+
+	// Opting into completed wake-ups fetches with include_completed_once=true.
+	await page.locator('[data-include-completed-wakeups]').check();
+	await expect(page.getByText('Follow-up wake-up #1229')).toBeVisible();
+	expect(scheduleRequests.some((search) => search.includes('include_completed_once=true'))).toBe(true);
+});
+
+test('task view retries transient refresh errors while SSE stays connected and reads latest command snapshot', async ({ page }) => {
+	await installMockUiStream(page);
+	const messages: Record<string, unknown>[] = [
+		{ id: 1, task_id: taskId, role: 'user', content: 'Run full check.', attachments: [], timestamp: timestamp(10) },
+	];
+	const attempts = [attempt('running', 64_000, null, null)];
+	await mockApi(page, {
+		taskStatus: 'in_progress',
+		taskMessages: messages,
+		taskAttempts: attempts,
+		taskActivityEvents: [],
+	});
+
+	const commandSnapshots = [
+		{
+			...activityEvent(71),
+			event_type: 'available_commands',
+			payload: {
+				available_commands: [{ name: 'initial-cmd', description: 'Initial command' }],
+			},
+		},
+	];
+	await page.route(`**/api/sessions/${agentId}/events*`, (route) => {
+		const url = new URL(route.request().url());
+		const eventType = url.searchParams.get('event_type');
+		const after = url.searchParams.has('after') ? Number(url.searchParams.get('after')) : null;
+		const limit = url.searchParams.has('limit') ? Number(url.searchParams.get('limit')) : null;
+		let filtered = commandSnapshots.filter((event) => {
+			if (eventType && event.event_type !== eventType) return false;
+			if (after !== null && Number.isFinite(after) && event.id <= after) return false;
+			return true;
+		});
+		if (limit !== null && Number.isFinite(limit) && limit > 0) {
+			// Match SQLite list_events_filtered: ASC when after is set, DESC (latest) when omitted.
+			filtered = after !== null ? filtered.slice(0, limit) : filtered.slice(-limit);
+		}
+		return route.fulfill({ json: filtered });
+	});
+
+	await page.goto(`/tasks/${taskId}`);
+	await expect(page.getByText('Run full check.', { exact: true })).toBeVisible();
+	await expect.poll(() =>
+		page.evaluate(() => (window as unknown as { __mockUiStreamSubscriberCount?: () => number }).__mockUiStreamSubscriberCount?.() ?? 0),
+	).toBeGreaterThan(0);
+
+	// Queue TWO new available_commands snapshots and a task completion, while
+	// failing the first messages fetch transiently with 503 and emitting ONLY ONE SSE revision!
+	commandSnapshots.push(
+		{
+			...activityEvent(72),
+			event_type: 'available_commands',
+			payload: {
+				available_commands: [{ name: 'stale-middle-cmd', description: 'Superseded command' }],
+			},
+		},
+		{
+			...activityEvent(73),
+			event_type: 'available_commands',
+			payload: {
+				available_commands: [{ name: 'latest-deploy-cmd', description: 'Newest command snapshot' }],
+			},
+		},
+	);
+
+	const currentTask = await page.evaluate(async (id) => (await fetch(`/api/tasks/${id}`)).json(), taskId);
+	await page.route(`**/api/tasks/${taskId}`, (route) =>
+		route.fulfill({ json: { ...currentTask, status: 'completed', activity_status: 'completed', completed_at: timestamp(45) } }),
+	);
+	messages.push({
+		id: 2,
+		task_id: taskId,
+		role: 'assistant',
+		content: 'Final response delivered after transient 503 recovery.',
+		attachments: [],
+		timestamp: timestamp(45),
+	});
+
+	let failNextMessagesFetch = true;
+	await page.route(`**/api/tasks/${taskId}/messages*`, (route) => {
+		if (failNextMessagesFetch) {
+			failNextMessagesFetch = false;
+			return route.fulfill({
+				status: 503,
+				contentType: 'application/json',
+				body: JSON.stringify({ error: 'Temporary upstream timeout' }),
+			});
+		}
+		return route.fulfill({ json: messages });
+	});
+
+	await page.evaluate(() => {
+		(window as unknown as { __mockUiStreamEmit?: (patch: Record<string, number>) => void }).__mockUiStreamEmit?.({
+			tasks: 2,
+			sessions: 2,
+		});
+	});
+
+	// Without any further SSE events, bounded retry recovers the failed refresh.
+	await expect(page.getByText('Final response delivered after transient 503 recovery.', { exact: true })).toBeVisible({ timeout: 5000 });
+
+	// Typing `/` shows the newest command snapshot (#73), not the superseded #72 delta.
+	const composer = page.locator(`#task-message-input-${taskId}`);
+	await composer.fill('/');
+	await composer.focus();
+	await expect(page.getByText('/latest-deploy-cmd')).toBeVisible();
+	await expect(page.getByText('/stale-middle-cmd')).toHaveCount(0);
+});
+
+test('task view reconciles SSE completion that arrives while initial task load is still in flight', async ({ page }) => {
+	await installMockUiStream(page);
+	const messages: Record<string, unknown>[] = [
+		{ id: 1, task_id: taskId, role: 'user', content: 'Finish while loading.', attachments: [], timestamp: timestamp(10) },
+	];
+	let currentAttempts = [attempt('running', 64_000, null, null)];
+	await mockApi(page, {
+		taskStatus: 'in_progress',
+		taskMessages: messages,
+		taskAttempts: currentAttempts,
+		taskActivityEvents: [],
+	});
+
+	let taskGetServed = false;
+	let messagesServed = false;
+	let initialActivityGateHeld = false;
+	let releaseInitialActivity: (() => void) | null = null;
+	let taskCompleted = false;
+
+	await page.route(`**/api/tasks/${taskId}`, async (route) => {
+		taskGetServed = true;
+		await route.fulfill({
+			json: {
+				id: taskId,
+				title: 'Browser-tested workspace slice',
+				description: 'Verify task completion during initial load.',
+				status: taskCompleted ? 'completed' : 'in_progress',
+				activity_status: taskCompleted ? 'completed' : 'in_progress',
+				priority: 1,
+				agent_id: agentId,
+				project_id: projectId,
+				parent_task_id: null,
+				sop_id: null,
+				conversation_id: null,
+				created_at: timestamp(0),
+				updated_at: timestamp(taskCompleted ? 40 : 10),
+				completed_at: taskCompleted ? timestamp(40) : null,
+				context: null,
+			},
+		});
+	});
+	await page.route(`**/api/tasks/${taskId}/messages*`, async (route) => {
+		messagesServed = true;
+		const url = new URL(route.request().url());
+		const afterId = url.searchParams.has('after_id') ? Number(url.searchParams.get('after_id')) : null;
+		const body = afterId !== null
+			? messages.filter((m) => Number(m.id) > afterId)
+			: messages;
+		await route.fulfill({ json: body });
+	});
+	await page.route(`**/api/tasks/${taskId}/activity*`, async (route) => {
+		if (!initialActivityGateHeld) {
+			initialActivityGateHeld = true;
+			await new Promise<void>((resolve) => {
+				releaseInitialActivity = resolve;
+			});
+		}
+		await route.fulfill({
+			json: {
+				attempts: currentAttempts,
+				delegated_work: [],
+				events: [],
+				has_more_before: false,
+				has_more_after: false,
+			},
+		});
+	});
+
+	// Open the task directly with domcontentloaded so we can observe initial load mid-flight.
+	await page.goto(`/tasks/${taskId}`, { waitUntil: 'domcontentloaded' });
+	await expect.poll(() => taskGetServed && messagesServed && initialActivityGateHeld).toBe(true);
+	await expect.poll(() =>
+		page.evaluate(() => (window as unknown as { __mockUiStreamSubscriberCount?: () => number }).__mockUiStreamSubscriberCount?.() ?? 0),
+	).toBeGreaterThan(0);
+
+	// Transition the task to completed and emit the SSE revision BEFORE initial /activity resolves.
+	taskCompleted = true;
+	currentAttempts = [attempt('completed', 64_000, null, 'Completed while initial load was still awaiting activity.')];
+	messages.push({
+		id: 2,
+		task_id: taskId,
+		role: 'assistant',
+		content: 'Completed while initial load was still awaiting activity.',
+		attachments: [],
+		timestamp: timestamp(40),
+	});
+	await page.evaluate(() => {
+		(window as unknown as { __mockUiStreamEmit?: (patch: Record<string, number>) => void }).__mockUiStreamEmit?.({
+			tasks: 2,
+			sessions: 2,
+		});
+	});
+
+	// Now let initial /activity resolve; TaskView must immediately reconcile without another SSE event.
+	(releaseInitialActivity as (() => void) | null)?.();
+	await expect(
+		page.getByText('Completed while initial load was still awaiting activity.', { exact: true }),
+	).toBeVisible();
+});
+
+test('fresh page load reconciles completion occurring before the first SSE revision arrives', async ({ page }) => {
+	// Hold /api/ui/stream until after the initial task/messages load has returned pre-completion state,
+	// then complete the task BEFORE the very first SSE revisions event is delivered.
+	await page.addInitScript(() => {
+		const originalFetch = window.fetch.bind(window);
+		const encoder = new TextEncoder();
+		let releaseStream: ((initialRevisions: Record<string, number>) => void) | null = null;
+		let streamRequested = false;
+		const w = window as unknown as {
+			__streamRequested?: () => boolean;
+			__deliverFirstStreamRevision?: (revisions: Record<string, number>) => void;
+		};
+		w.__streamRequested = () => streamRequested;
+		w.__deliverFirstStreamRevision = (revisions) => {
+			releaseStream?.(revisions);
+		};
+		window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+			const rawUrl = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+			const parsed = new URL(rawUrl, window.location.origin);
+			if (parsed.pathname === '/api/ui/stream') {
+				streamRequested = true;
+				const initial = await new Promise<Record<string, number>>((resolve) => {
+					releaseStream = resolve;
+				});
+				const stream = new ReadableStream<Uint8Array>({
+					start(controller) {
+						controller.enqueue(
+							encoder.encode(`event: revisions\ndata: ${JSON.stringify(initial)}\n\n`),
+						);
+						init?.signal?.addEventListener('abort', () => {
+							try { controller.close(); } catch {}
+						});
+					},
+				});
+				return new Response(stream, {
+					status: 200,
+					headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' },
+				});
+			}
+			return originalFetch(input, init);
+		};
+	});
+
+	const messages: Record<string, unknown>[] = [
+		{ id: 1, task_id: taskId, role: 'user', content: 'Check before SSE connects.', attachments: [], timestamp: timestamp(10) },
+	];
+	let taskCompleted = false;
+	await mockApi(page, {
+		taskStatus: 'in_progress',
+		taskMessages: messages,
+		taskAttempts: [attempt('running', 64_000, null, null)],
+		taskActivityEvents: [],
+	});
+	await page.route(`**/api/tasks/${taskId}`, (route) =>
+		route.fulfill({
+			json: {
+				id: taskId,
+				title: 'Browser-tested workspace slice',
+				description: 'Verify pre-first-SSE completion.',
+				status: taskCompleted ? 'completed' : 'in_progress',
+				activity_status: taskCompleted ? 'completed' : 'in_progress',
+				priority: 1,
+				agent_id: agentId,
+				project_id: projectId,
+				parent_task_id: null,
+				sop_id: null,
+				conversation_id: null,
+				created_at: timestamp(0),
+				updated_at: timestamp(taskCompleted ? 40 : 10),
+				completed_at: taskCompleted ? timestamp(40) : null,
+				context: null,
+			},
+		}),
+	);
+	await page.route(`**/api/tasks/${taskId}/messages*`, (route) => {
+		const url = new URL(route.request().url());
+		const afterId = url.searchParams.has('after_id') ? Number(url.searchParams.get('after_id')) : null;
+		const body = afterId !== null ? messages.filter((m) => Number(m.id) > afterId) : messages;
+		return route.fulfill({ json: body });
+	});
+
+	await page.goto(`/tasks/${taskId}`, { waitUntil: 'domcontentloaded' });
+	await expect(page.getByText('Check before SSE connects.', { exact: true })).toBeVisible();
+	await expect.poll(() =>
+		page.evaluate(() => (window as unknown as { __streamRequested?: () => boolean }).__streamRequested?.() ?? false),
+	).toBe(true);
+
+	// Complete the task BEFORE the first SSE snapshot is delivered; emit NO subsequent SSE events.
+	taskCompleted = true;
+	messages.push({
+		id: 2,
+		task_id: taskId,
+		role: 'assistant',
+		content: 'Finished before first SSE snapshot arrived.',
+		attachments: [],
+		timestamp: timestamp(40),
+	});
+	await page.evaluate(() => {
+		(window as unknown as { __deliverFirstStreamRevision?: (rev: Record<string, number>) => void })
+			.__deliverFirstStreamRevision?.({
+				seq: 2,
+				projects: 1,
+				agents: 1,
+				conversations: 1,
+				tasks: 2,
+				sessions: 2,
+				schedules: 1,
+				workflows: 1,
+			});
+	});
+
+	await expect(
+		page.getByText('Finished before first SSE snapshot arrived.', { exact: true }),
+	).toBeVisible();
+});
+
+test('x-ui-revisions baseline avoids duplicate idle fetches while reconciling races before first SSE event', async ({ page }) => {
+	await page.addInitScript(() => {
+		const originalFetch = window.fetch.bind(window);
+		const encoder = new TextEncoder();
+		let releaseStream: ((initialRevisions: Record<string, number>) => void) | null = null;
+		const toHeader = (r: Record<string, number>) =>
+			`${r.seq},${r.projects},${r.agents},${r.conversations},${r.tasks},${r.sessions},${r.schedules},${r.workflows}`;
+		const w = window as unknown as {
+			__deliverFirstHeaderStreamRevision?: (revisions: Record<string, number>) => void;
+		};
+		w.__deliverFirstHeaderStreamRevision = (revisions) => {
+			releaseStream?.(revisions);
+		};
+		window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+			const rawUrl = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+			const parsed = new URL(rawUrl, window.location.origin);
+			if (parsed.pathname === '/api/ui/stream') {
+				const initial = await new Promise<Record<string, number>>((resolve) => {
+					releaseStream = resolve;
+				});
+				const stream = new ReadableStream<Uint8Array>({
+					start(controller) {
+						controller.enqueue(
+							encoder.encode(`event: revisions\ndata: ${JSON.stringify(initial)}\n\n`),
+						);
+						init?.signal?.addEventListener('abort', () => {
+							try { controller.close(); } catch {}
+						});
+					},
+				});
+				return new Response(stream, {
+					status: 200,
+					headers: {
+						'Content-Type': 'text/event-stream',
+						'Cache-Control': 'no-cache',
+						'x-ui-revisions': toHeader(initial),
+					},
+				});
+			}
+			return originalFetch(input, init);
+		};
+	});
+
+	let currentHeader = '1,1,1,1,1,1,1,1';
+	let taskGetCount = 0;
+	let taskCompleted = false;
+	const messages: Record<string, unknown>[] = [
+		{ id: 1, task_id: taskId, role: 'user', content: 'Verify header baseline.', attachments: [], timestamp: timestamp(10) },
+	];
+
+	await mockApi(page, {
+		taskStatus: 'in_progress',
+		taskMessages: messages,
+		taskAttempts: [attempt('running', 64_000, null, null)],
+		taskActivityEvents: [],
+	});
+	await page.route(`**/api/tasks/${taskId}`, (route) => {
+		taskGetCount += 1;
+		return route.fulfill({
+			headers: { 'x-ui-revisions': currentHeader },
+			json: {
+				id: taskId,
+				title: 'Browser-tested workspace slice',
+				description: 'Verify x-ui-revisions baseline.',
+				status: taskCompleted ? 'completed' : 'in_progress',
+				activity_status: taskCompleted ? 'completed' : 'in_progress',
+				priority: 1,
+				agent_id: agentId,
+				project_id: projectId,
+				parent_task_id: null,
+				sop_id: null,
+				conversation_id: null,
+				created_at: timestamp(0),
+				updated_at: timestamp(taskCompleted ? 40 : 10),
+				completed_at: taskCompleted ? timestamp(40) : null,
+				context: null,
+			},
+		});
+	});
+	await page.route(`**/api/tasks/${taskId}/messages*`, (route) => {
+		const url = new URL(route.request().url());
+		const afterId = url.searchParams.has('after_id') ? Number(url.searchParams.get('after_id')) : null;
+		const body = afterId !== null ? messages.filter((m) => Number(m.id) > afterId) : messages;
+		return route.fulfill({
+			headers: { 'x-ui-revisions': currentHeader },
+			json: body,
+		});
+	});
+
+	// 1. Idle load where GET x-ui-revisions matches first SSE revisions: zero extra task GETs.
+	await page.goto(`/tasks/${taskId}`, { waitUntil: 'domcontentloaded' });
+	await expect(page.getByText('Verify header baseline.', { exact: true })).toBeVisible();
+	expect(taskGetCount).toBe(1);
+
+	await page.evaluate(() => {
+		(window as unknown as { __deliverFirstHeaderStreamRevision?: (rev: Record<string, number>) => void })
+			.__deliverFirstHeaderStreamRevision?.({
+				seq: 1,
+				projects: 1,
+				agents: 1,
+				conversations: 1,
+				tasks: 1,
+				sessions: 1,
+				schedules: 1,
+				workflows: 1,
+			});
+	});
+	await page.waitForTimeout(250);
+	expect(taskGetCount).toBe(1);
+
+	// 2. Reload where GET returns revision 1, then task completes at revision 2 before first SSE frame.
+	taskGetCount = 0;
+	await page.reload({ waitUntil: 'domcontentloaded' });
+	await expect(page.getByText('Verify header baseline.', { exact: true })).toBeVisible();
+	expect(taskGetCount).toBe(1);
+
+	taskCompleted = true;
+	currentHeader = '2,1,1,1,2,2,1,1';
+	messages.push({
+		id: 2,
+		task_id: taskId,
+		role: 'assistant',
+		content: 'Reconciled via x-ui-revisions mismatch on first SSE frame.',
+		attachments: [],
+		timestamp: timestamp(40),
+	});
+	await page.evaluate(() => {
+		(window as unknown as { __deliverFirstHeaderStreamRevision?: (rev: Record<string, number>) => void })
+			.__deliverFirstHeaderStreamRevision?.({
+				seq: 2,
+				projects: 1,
+				agents: 1,
+				conversations: 1,
+				tasks: 2,
+				sessions: 2,
+				schedules: 1,
+				workflows: 1,
+			});
+	});
+
+	await expect(
+		page.getByText('Reconciled via x-ui-revisions mismatch on first SSE frame.', { exact: true }),
+	).toBeVisible();
+	expect(taskGetCount).toBe(2);
+});
+
+test('lazy-loaded workspace views and agent tabs evict failed chunk promises and recover on retry', async ({ page }) => {
+	await mockApi(page);
+
+	let failTaskView = true;
+	let taskViewRequests = 0;
+	await page.route('**/src/routes/tasks/\\[id\\]/TaskView.svelte*', async (route) => {
+		if (!route.request().url().includes('svelte&type=style')) {
+			taskViewRequests += 1;
+			if (failTaskView) {
+				failTaskView = false;
+				await route.abort('failed');
+				return;
+			}
+		}
+		await route.continue();
+	});
+
+	let failSchedulesTab = true;
+	let schedulesTabRequests = 0;
+	await page.route('**/src/routes/agents/\\[id\\]/SchedulesTab.svelte*', async (route) => {
+		if (!route.request().url().includes('svelte&type=style')) {
+			schedulesTabRequests += 1;
+			if (failSchedulesTab) {
+				failSchedulesTab = false;
+				await route.abort('failed');
+				return;
+			}
+		}
+		await route.continue();
+	});
+
+	let failServerSettings = true;
+	let serverSettingsRequests = 0;
+	await page.route('**/src/routes/settings/server/+page.svelte*', async (route) => {
+		if (!route.request().url().includes('svelte&type=style')) {
+			serverSettingsRequests += 1;
+			if (failServerSettings) {
+				failServerSettings = false;
+				await route.abort('failed');
+				return;
+			}
+		}
+		await route.continue();
+	});
+
+	let failProjectOverview = true;
+	let projectOverviewRequests = 0;
+	await page.route('**/src/routes/projects/\\[id\\]/ProjectOverview.svelte*', async (route) => {
+		if (!route.request().url().includes('svelte&type=style')) {
+			projectOverviewRequests += 1;
+			if (failProjectOverview) {
+				failProjectOverview = false;
+				await route.abort('failed');
+				return;
+			}
+		}
+		await route.continue();
+	});
+
+	// 1. WorkspaceContent lazy view recovery via Retry button (TaskView)
+	await page.goto(`/tasks/${taskId}`, { waitUntil: 'domcontentloaded' });
+	const viewAlert = page.locator('[data-view-load-error]');
+	await expect(viewAlert).toBeVisible();
+	expect(taskViewRequests).toBe(1);
+
+	await viewAlert.getByRole('button', { name: 'Retry' }).click();
+	await expect(viewAlert).toBeHidden();
+	await expect(page.getByRole('heading', { name: 'Browser-tested workspace' })).toBeVisible();
+	expect(taskViewRequests).toBe(2);
+
+	// 2. WorkspaceContent recovery when closing and reopening a failed tab after connectivity returns
+	await page.getByRole('link', { name: 'Browser collaboration project' }).click();
+	await expect(viewAlert).toBeVisible();
+	expect(projectOverviewRequests).toBe(1);
+
+	await page.getByRole('button', { name: 'Close Browser collaboration project', exact: true }).click();
+	await expect(viewAlert).toBeHidden();
+	await page.getByRole('link', { name: 'Browser collaboration project' }).click();
+	await expect(viewAlert).toBeHidden();
+	await expect(page.getByRole('heading', { level: 1, name: 'Browser collaboration project' })).toBeVisible();
+	expect(projectOverviewRequests).toBe(2);
+
+	// 3. ProjectView lazy sub-tab recovery (SchedulesTab)
+	await page.goto(`/agents/${agentId}?tab=schedules`, { waitUntil: 'domcontentloaded' });
+	const tabAlert = page.locator('[data-tab-load-error]');
+	await expect(tabAlert).toBeVisible();
+	expect(schedulesTabRequests).toBe(1);
+
+	await tabAlert.getByRole('button', { name: 'Retry' }).click();
+	await expect(tabAlert).toBeHidden();
+	await expect(page.getByText('Show completed wake-ups')).toBeVisible();
+	expect(schedulesTabRequests).toBe(2);
+
+	// 4. SettingsView lazy page recovery (/settings/server)
+	await page.goto('/settings/server', { waitUntil: 'domcontentloaded' });
+	const settingsAlert = page.locator('[data-settings-load-error]');
+	await expect(settingsAlert).toBeVisible();
+	expect(serverSettingsRequests).toBe(1);
+
+	await settingsAlert.getByRole('button', { name: 'Retry' }).click();
+	await expect(settingsAlert).toBeHidden();
+	await expect(page.getByRole('heading', { level: 1, name: 'Instance' })).toBeVisible();
+	expect(serverSettingsRequests).toBe(2);
+});
+
+test('opening an older completed task outside recent-by-agent resolves tab title and agent context while SSE is idle', async ({ page }) => {
+	await page.addInitScript(() => {
+		const originalFetch = window.fetch.bind(window);
+		const encoder = new TextEncoder();
+		window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+			const rawUrl = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+			const parsed = new URL(rawUrl, window.location.origin);
+			if (parsed.pathname === '/api/ui/stream') {
+				const initial = {
+					seq: 1,
+					projects: 1,
+					agents: 1,
+					conversations: 1,
+					tasks: 1,
+					sessions: 1,
+					schedules: 1,
+					workflows: 1,
+				};
+				const stream = new ReadableStream<Uint8Array>({
+					start(controller) {
+						controller.enqueue(
+							encoder.encode(`event: revisions\ndata: ${JSON.stringify(initial)}\n\n`),
+						);
+						init?.signal?.addEventListener('abort', () => {
+							try { controller.close(); } catch {}
+						});
+					},
+				});
+				return new Response(stream, {
+					status: 200,
+					headers: {
+						'Content-Type': 'text/event-stream',
+						'Cache-Control': 'no-cache',
+						'x-ui-revisions': '1,1,1,1,1,1,1,1',
+					},
+				});
+			}
+			return originalFetch(input, init);
+		};
+	});
+
+	await mockApi(page, { completedTaskCount: 7 });
+
+	const archivedTaskId = 'completed-task-1';
+	const archivedTask = {
+		id: archivedTaskId,
+		title: 'Completed task 1',
+		description: 'Older completed work outside the five most recent tasks.',
+		status: 'completed',
+		activity_status: 'completed',
+		priority: 0,
+		revision: 1,
+		agent_id: agentId,
+		project_id: projectId,
+		parent_task_id: null,
+		sop_id: null,
+		conversation_id: null,
+		created_at: timestamp(0),
+		updated_at: timestamp(0),
+		completed_at: timestamp(0),
+		context: null,
+	};
+	let archivedTaskGets = 0;
+	await page.route(`**/api/tasks/${archivedTaskId}`, (route) => {
+		archivedTaskGets += 1;
+		return route.fulfill({
+			headers: { 'x-ui-revisions': '1,1,1,1,1,1,1,1' },
+			json: archivedTask,
+		});
+	});
+	await page.route(`**/api/tasks/${archivedTaskId}/messages*`, (route) =>
+		route.fulfill({ headers: { 'x-ui-revisions': '1,1,1,1,1,1,1,1' }, json: [] }),
+	);
+	await page.route(`**/api/tasks/${archivedTaskId}/activity*`, (route) =>
+		route.fulfill({
+			headers: { 'x-ui-revisions': '1,1,1,1,1,1,1,1' },
+			json: { attempts: [], events: [], has_more_before: false, has_more_after: false },
+		}),
+	);
+	await page.route(`**/api/tasks/${archivedTaskId}/config*`, (route) =>
+		route.fulfill({
+			headers: { 'x-ui-revisions': '1,1,1,1,1,1,1,1' },
+			json: {
+				context: { agent_id: agentId, runner_kind: 'codex', native_session_id: null },
+				availability: 'cached',
+				revision: null,
+				event_id: null,
+				pending: {},
+				model_pending: false,
+				config_options: [],
+				modes: null,
+				notice: null,
+			},
+		}),
+	);
+
+	await page.goto('/tasks?view=list', { waitUntil: 'domcontentloaded' });
+	await page.getByRole('button', { name: /^Done\b/ }).click();
+	const archivedLink = page.getByRole('link', { name: /Completed task 1/ }).first();
+	await expect(archivedLink).toBeVisible();
+	expect(archivedTaskGets).toBe(0);
+
+	await archivedLink.click();
+	await expect(page.getByRole('heading', { level: 1, name: 'Completed task 1' })).toBeVisible();
+	await expect(
+		page
+			.getByRole('group', { name: 'Pane tabs' })
+			.locator('[data-workspace-tab-active="true"][data-workspace-tab-title="Completed task 1"]'),
+	).toBeVisible();
+	expect(archivedTaskGets).toBeGreaterThanOrEqual(1);
+});
+
+test('sessions SSE invalidations refresh shell agent tab busy indicator when agents domain stays unchanged', async ({ page }) => {
+	await page.addInitScript(() => {
+		const originalFetch = window.fetch.bind(window);
+		const encoder = new TextEncoder();
+		let pushStreamRevision: ((revisions: Record<string, number>) => void) | null = null;
+		(window as unknown as { __pushSessionRevision?: (rev: Record<string, number>) => void }).__pushSessionRevision = (
+			revisions,
+		) => {
+			pushStreamRevision?.(revisions);
+		};
+		window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+			const rawUrl = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+			const parsed = new URL(rawUrl, window.location.origin);
+			if (parsed.pathname === '/api/ui/stream') {
+				const initial = {
+					seq: 1,
+					projects: 1,
+					agents: 1,
+					conversations: 1,
+					tasks: 1,
+					sessions: 1,
+					schedules: 1,
+					workflows: 1,
+				};
+				const stream = new ReadableStream<Uint8Array>({
+					start(controller) {
+						controller.enqueue(
+							encoder.encode(`event: revisions\ndata: ${JSON.stringify(initial)}\n\n`),
+						);
+						pushStreamRevision = (next) => {
+							controller.enqueue(
+								encoder.encode(`event: revisions\ndata: ${JSON.stringify(next)}\n\n`),
+							);
+						};
+						init?.signal?.addEventListener('abort', () => {
+							try { controller.close(); } catch {}
+						});
+					},
+				});
+				return new Response(stream, {
+					status: 200,
+					headers: {
+						'Content-Type': 'text/event-stream',
+						'Cache-Control': 'no-cache',
+						'x-ui-revisions': '1,1,1,1,1,1,1,1',
+					},
+				});
+			}
+			return originalFetch(input, init);
+		};
+	});
+
+	await mockApi(page, { live: true, taskStatus: 'completed' });
+
+	let agentBusy = true;
+	await page.route('**/api/agents', async (route) => {
+		if (route.request().method() !== 'GET') {
+			await route.fallback();
+			return;
+		}
+		await route.fulfill({
+			headers: { 'x-ui-revisions': agentBusy ? '1,1,1,1,1,1,1,1' : '2,1,1,1,1,2,1,1' },
+			json: [
+				{
+					id: agentId,
+					name: 'browser-workspace',
+					title: 'Browser workspace',
+					project_id: projectId,
+					role: 'Implement browser-verified UX',
+					backend: 'codex',
+					model: 'codex-test',
+					workspace: '/workspace/browser',
+					tools: [],
+					max_turns: 25,
+					auto_approve: true,
+					status: agentBusy ? 'running' : 'idle',
+					current_task_id: null,
+					pid: null,
+					started_at: null,
+					restart_count: 0,
+				},
+			],
+		});
+	});
+
+	await page.goto(`/agents/${agentId}`, { waitUntil: 'domcontentloaded' });
+	const activeTabDot = page
+		.getByRole('group', { name: 'Pane tabs' })
+		.locator('[data-workspace-tab-active="true"] span.rounded-full')
+		.first();
+	await expect(activeTabDot).toHaveClass(/animate-pulse/);
+
+	agentBusy = false;
+	await page.evaluate(() => {
+		(window as unknown as { __pushSessionRevision?: (rev: Record<string, number>) => void })
+			.__pushSessionRevision?.({
+				seq: 2,
+				projects: 1,
+				agents: 1,
+				conversations: 1,
+				tasks: 1,
+				sessions: 2,
+				schedules: 1,
+				workflows: 1,
+			});
+	});
+
+	await expect(activeTabDot).not.toHaveClass(/animate-pulse/);
+});
+
+
+

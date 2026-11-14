@@ -2,12 +2,14 @@
 	import { goto } from '$app/navigation';
 	import { onMount } from 'svelte';
 	import { agents, conversations, projects, tasks, type Agent, type Conversation, type Project, type Task } from '$lib/api';
+	import { isTransientRefreshError, subscribeLiveUpdates, usePaneActive } from '$lib/liveUpdates';
 	import { PROJECT_MUTATION_EVENT, publishProjectMutation, type ProjectMutation } from '$lib/projectEvents';
 	import { agentRuntimeSummary, harnessMark, timeAgo } from '$lib/utils';
 	import AgentLoading from '$lib/components/AgentLoading.svelte';
 	import ProjectSettingsDialog from '$lib/components/ProjectSettingsDialog.svelte';
 
 	let { projectId }: { projectId: string } = $props();
+	const paneActive = usePaneActive();
 	let project = $state<Project | null>(null);
 	let projectConversations = $state<Conversation[]>([]);
 	let agentList = $state<Agent[]>([]);
@@ -23,6 +25,8 @@
 	let showingProjectSettings = $state(false);
 	let error = $state('');
 	let projectMutationVersion = 0;
+	let loadGeneration = 0;
+	let appliedGeneration = 0;
 
 	let projectAgents = $derived(agentList.filter((agent) => agent.project_id === projectId));
 	let availableAgents = $derived(agentList.filter((agent) => agent.project_id !== projectId));
@@ -38,14 +42,19 @@
 		};
 		window.addEventListener(PROJECT_MUTATION_EVENT, handleProjectMutation);
 		void load();
-		const poll = setInterval(() => void load(), 5000);
+		const unsubscribeLiveUpdates = subscribeLiveUpdates(
+			['projects', 'conversations', 'agents', 'sessions', 'tasks'],
+			() => load(true),
+			{ active: paneActive, fallbackIntervalMs: 5000 }
+		);
 		return () => {
-			clearInterval(poll);
+			unsubscribeLiveUpdates();
 			window.removeEventListener(PROJECT_MUTATION_EVENT, handleProjectMutation);
 		};
 	});
 
-	async function load() {
+	async function load(rethrowTransient = false) {
+		const gen = ++loadGeneration;
 		const mutationVersionAtStart = projectMutationVersion;
 		try {
 			const [loadedProject, loadedConversations, loadedAgents, loadedTasks, attention] = await Promise.all([
@@ -55,6 +64,8 @@
 				projects.tasks(projectId),
 				tasks.attention(),
 			]);
+			if (gen < appliedGeneration) return;
+			appliedGeneration = gen;
 			if (projectMutationVersion === mutationVersionAtStart) project = loadedProject;
 			projectConversations = loadedConversations;
 			agentList = loadedAgents;
@@ -63,9 +74,12 @@
 			error = '';
 			if (loading && selectedAgents.length === 0) selectedAgents = project?.agent_ids.slice() ?? [];
 		} catch (cause) {
-			error = cause instanceof Error ? cause.message : 'Could not load this project.';
+			if (gen >= appliedGeneration) {
+				error = cause instanceof Error ? cause.message : 'Could not load this project.';
+			}
+			if (rethrowTransient && isTransientRefreshError(cause)) throw cause;
 		} finally {
-			loading = false;
+			if (appliedGeneration > 0 || gen === loadGeneration) loading = false;
 		}
 	}
 

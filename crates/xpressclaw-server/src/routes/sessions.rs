@@ -24,9 +24,16 @@ use xpressclaw_core::workers::native::{
 
 use crate::state::AppState;
 
+#[derive(Debug, Default, Deserialize)]
+struct SessionQuery {
+    #[serde(default)]
+    include_details: bool,
+}
+
 #[derive(Debug, Deserialize)]
 struct EventsQuery {
     after: Option<i64>,
+    event_type: Option<String>,
     limit: Option<i64>,
 }
 
@@ -65,11 +72,16 @@ pub fn routes() -> Router<AppState> {
 async fn get_session(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(query): Query<SessionQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     ensure_session(&state, &id)?;
-    let overview = SessionManager::new(state.db.clone())
-        .overview(&id)
-        .map_err(internal_error)?;
+    let sessions = SessionManager::new(state.db.clone());
+    let overview = if query.include_details {
+        sessions.overview(&id)
+    } else {
+        sessions.overview_summary(&id)
+    }
+    .map_err(internal_error)?;
     Ok(Json(json!(overview)))
 }
 
@@ -80,7 +92,12 @@ async fn get_events(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     ensure_session(&state, &id)?;
     let events = SessionManager::new(state.db.clone())
-        .list_events(&id, query.after, query.limit.unwrap_or(100).clamp(1, 500))
+        .list_events_filtered(
+            &id,
+            query.after,
+            query.event_type.as_deref(),
+            query.limit.unwrap_or(100).clamp(1, 500),
+        )
         .map_err(internal_error)?;
     Ok(Json(json!(events)))
 }
@@ -1041,5 +1058,145 @@ mod tests {
             .unwrap()
             .contains("does not include the pinned XpressClaw presentation runtime"));
         assert!(value["issues"].is_array());
+    }
+
+    #[tokio::test]
+    async fn session_overview_defaults_to_summary_and_events_support_type_filter() {
+        let (app, db) = test_app_with_db();
+        let sessions = SessionManager::new(db.clone());
+        sessions.ensure("builder", Some("Builder")).unwrap();
+        sessions
+            .append_event(
+                "builder",
+                xpressclaw_core::sessions::NewEvent {
+                    attempt_id: None,
+                    task_id: None,
+                    source_type: "acp",
+                    source_id: Some("codex"),
+                    event_type: "tool_call",
+                    summary: "Ran rg",
+                    payload: json!({ "output": "x".repeat(2048) }),
+                },
+            )
+            .unwrap();
+        sessions
+            .append_event(
+                "builder",
+                xpressclaw_core::sessions::NewEvent {
+                    attempt_id: None,
+                    task_id: None,
+                    source_type: "acp",
+                    source_id: Some("codex"),
+                    event_type: "available_commands",
+                    summary: "Commands updated",
+                    payload: json!({ "available_commands": [{ "name": "review" }] }),
+                },
+            )
+            .unwrap();
+        TaskBoard::new(db)
+            .create(&CreateTask {
+                backlog: false,
+                start_after: None,
+                title: "Active work".to_string(),
+                description: None,
+                agent_id: Some("builder".to_string()),
+                parent_task_id: None,
+                sop_id: None,
+                conversation_id: None,
+                priority: None,
+                context: None,
+            })
+            .unwrap();
+
+        let summary_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/sessions/builder")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(summary_resp.status(), StatusCode::OK);
+        let summary_bytes = summary_resp.into_body().collect().await.unwrap().to_bytes();
+        let summary: Value = serde_json::from_slice(&summary_bytes).unwrap();
+        assert_eq!(summary["active_task_count"], 1);
+        assert_eq!(summary["recent_events"].as_array().unwrap().len(), 0);
+
+        let detail_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/sessions/builder?include_details=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(detail_resp.status(), StatusCode::OK);
+        let detail_bytes = detail_resp.into_body().collect().await.unwrap().to_bytes();
+        let detail: Value = serde_json::from_slice(&detail_bytes).unwrap();
+        assert_eq!(detail["recent_events"].as_array().unwrap().len(), 2);
+
+        let filtered_events = app
+            .oneshot(
+                Request::builder()
+                    .uri("/sessions/builder/events?event_type=available_commands&limit=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(filtered_events.status(), StatusCode::OK);
+        let events_bytes = filtered_events
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let events: Value = serde_json::from_slice(&events_bytes).unwrap();
+        let events_arr = events.as_array().unwrap();
+        assert_eq!(events_arr.len(), 1);
+        assert_eq!(events_arr[0]["event_type"], "available_commands");
+    }
+
+    #[tokio::test]
+    async fn session_get_endpoints_do_not_retrigger_ui_revisions_once_ensured() {
+        let (app, db) = test_app_with_db();
+
+        // First read ensures the logical session row once.
+        let initial = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/sessions/builder")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(initial.status(), StatusCode::OK);
+        let baseline = db.ui_revisions();
+
+        for uri in [
+            "/sessions/builder",
+            "/sessions/builder?include_details=true",
+            "/sessions/builder/events",
+            "/sessions/builder/attempts",
+            "/sessions/builder/readiness",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "failed GET {uri}");
+            assert_eq!(
+                db.ui_revisions(),
+                baseline,
+                "GET {uri} must not bump UI revisions"
+            );
+        }
     }
 }
