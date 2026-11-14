@@ -1,0 +1,7 @@
+adr: ADR-049
+branch: feat/low-bandwidth-live-updates
+summary: Retry transient live-refresh failures while SSE remains connected, drain activity pages, and fetch latest command/config snapshots
+validation:
+  - npm --prefix frontend run check && npm --prefix frontend run build
+  - TZ=UTC npx playwright test --project=chromium (301 passed, 1 skipped)
+  - TZ=UTC npx playwright test --project=touch-chromium (1 passed)
