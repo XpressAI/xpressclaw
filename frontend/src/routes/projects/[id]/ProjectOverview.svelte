@@ -43,7 +43,7 @@
 		window.addEventListener(PROJECT_MUTATION_EVENT, handleProjectMutation);
 		void load();
 		const unsubscribeLiveUpdates = subscribeLiveUpdates(
-			['projects', 'conversations', 'agents', 'tasks'],
+			['projects', 'conversations', 'agents', 'sessions', 'tasks'],
 			() => load(true),
 			{ active: paneActive, fallbackIntervalMs: 5000 }
 		);

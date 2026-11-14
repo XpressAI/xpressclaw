@@ -1039,7 +1039,8 @@
 		const fetchAll = !domains;
 		const wantProjects = fetchAll || domains.has('projects');
 		const wantConversations = fetchAll || domains.has('conversations');
-		const wantAgents = fetchAll || domains.has('agents');
+		// /api/agents derives agent.status from logical_sessions, which bumps the sessions domain.
+		const wantAgents = fetchAll || domains.has('agents') || domains.has('sessions');
 		const wantTasks = fetchAll || domains.has('tasks');
 		const automationsVisible = sidebarCategory === 'automations';
 		const workflowsVisible = automationsVisible || hasWorkflowTab;
@@ -1337,7 +1338,7 @@
 		window.addEventListener(PROJECT_MUTATION_EVENT, handleProjectMutation);
 		window.addEventListener(WORKSPACE_OPEN_SPLIT_EVENT, handleOpenSplit);
 		const unsubscribeLiveUpdates = subscribeLiveUpdates(
-			['projects', 'conversations', 'agents', 'tasks', 'workflows', 'schedules'],
+			['projects', 'conversations', 'agents', 'sessions', 'tasks', 'workflows', 'schedules'],
 			(_revisions, ctx) => loadWorkspaceSummary(ctx.changedDomains, true),
 			{ fallbackIntervalMs: 3000 }
 		);

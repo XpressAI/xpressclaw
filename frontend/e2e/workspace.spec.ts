@@ -8932,4 +8932,115 @@ test('opening an older completed task outside recent-by-agent resolves tab title
 	expect(archivedTaskGets).toBeGreaterThanOrEqual(1);
 });
 
+test('sessions SSE invalidations refresh shell agent tab busy indicator when agents domain stays unchanged', async ({ page }) => {
+	await page.addInitScript(() => {
+		const originalFetch = window.fetch.bind(window);
+		const encoder = new TextEncoder();
+		let pushStreamRevision: ((revisions: Record<string, number>) => void) | null = null;
+		(window as unknown as { __pushSessionRevision?: (rev: Record<string, number>) => void }).__pushSessionRevision = (
+			revisions,
+		) => {
+			pushStreamRevision?.(revisions);
+		};
+		window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+			const rawUrl = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+			const parsed = new URL(rawUrl, window.location.origin);
+			if (parsed.pathname === '/api/ui/stream') {
+				const initial = {
+					seq: 1,
+					projects: 1,
+					agents: 1,
+					conversations: 1,
+					tasks: 1,
+					sessions: 1,
+					schedules: 1,
+					workflows: 1,
+				};
+				const stream = new ReadableStream<Uint8Array>({
+					start(controller) {
+						controller.enqueue(
+							encoder.encode(`event: revisions\ndata: ${JSON.stringify(initial)}\n\n`),
+						);
+						pushStreamRevision = (next) => {
+							controller.enqueue(
+								encoder.encode(`event: revisions\ndata: ${JSON.stringify(next)}\n\n`),
+							);
+						};
+						init?.signal?.addEventListener('abort', () => {
+							try { controller.close(); } catch {}
+						});
+					},
+				});
+				return new Response(stream, {
+					status: 200,
+					headers: {
+						'Content-Type': 'text/event-stream',
+						'Cache-Control': 'no-cache',
+						'x-ui-revisions': '1,1,1,1,1,1,1,1',
+					},
+				});
+			}
+			return originalFetch(input, init);
+		};
+	});
+
+	await mockApi(page, { live: true, taskStatus: 'completed' });
+
+	let agentBusy = true;
+	await page.route('**/api/agents', async (route) => {
+		if (route.request().method() !== 'GET') {
+			await route.fallback();
+			return;
+		}
+		await route.fulfill({
+			headers: { 'x-ui-revisions': agentBusy ? '1,1,1,1,1,1,1,1' : '2,1,1,1,1,2,1,1' },
+			json: [
+				{
+					id: agentId,
+					name: 'browser-workspace',
+					title: 'Browser workspace',
+					project_id: projectId,
+					role: 'Implement browser-verified UX',
+					backend: 'codex',
+					model: 'codex-test',
+					workspace: '/workspace/browser',
+					tools: [],
+					max_turns: 25,
+					auto_approve: true,
+					status: agentBusy ? 'running' : 'idle',
+					current_task_id: null,
+					pid: null,
+					started_at: null,
+					restart_count: 0,
+				},
+			],
+		});
+	});
+
+	await page.goto(`/agents/${agentId}`, { waitUntil: 'domcontentloaded' });
+	const activeTabDot = page
+		.getByRole('group', { name: 'Pane tabs' })
+		.locator('[data-workspace-tab-active="true"] span.rounded-full')
+		.first();
+	await expect(activeTabDot).toHaveClass(/animate-pulse/);
+
+	agentBusy = false;
+	await page.evaluate(() => {
+		(window as unknown as { __pushSessionRevision?: (rev: Record<string, number>) => void })
+			.__pushSessionRevision?.({
+				seq: 2,
+				projects: 1,
+				agents: 1,
+				conversations: 1,
+				tasks: 1,
+				sessions: 2,
+				schedules: 1,
+				workflows: 1,
+			});
+	});
+
+	await expect(activeTabDot).not.toHaveClass(/animate-pulse/);
+});
+
+
 
