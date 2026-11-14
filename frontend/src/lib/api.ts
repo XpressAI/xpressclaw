@@ -1,6 +1,20 @@
 const BASE = '';
 let csrfToken: string | null = null;
 
+type ApiRevisionObserver = (headerValue: string, path: string) => void;
+let apiRevisionObserver: ApiRevisionObserver | null = null;
+const earlyRevisionHeaders: Array<{ headerValue: string; path: string }> = [];
+
+export function setApiRevisionObserver(observer: ApiRevisionObserver | null): void {
+	apiRevisionObserver = observer;
+	if (observer && earlyRevisionHeaders.length > 0) {
+		const queued = earlyRevisionHeaders.splice(0);
+		for (const item of queued) {
+			observer(item.headerValue, item.path);
+		}
+	}
+}
+
 function mutation(method: string | undefined): boolean {
 	return !['GET', 'HEAD', 'OPTIONS'].includes((method ?? 'GET').toUpperCase());
 }
@@ -20,21 +34,33 @@ export class ApiError extends Error {
 
 export async function requestResponse(path: string, init?: RequestInit, retryCsrf = true): Promise<Response> {
 	const headers = new Headers(init?.headers);
+	const isMutation = mutation(init?.method);
 	if (init?.body && !(init.body instanceof FormData) && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
-	if (mutation(init?.method) && csrfToken) headers.set('X-XpressClaw-CSRF', csrfToken);
+	if (isMutation && csrfToken) headers.set('X-XpressClaw-CSRF', csrfToken);
 	const res = await fetch(`${BASE}${path}`, {
 		credentials: 'same-origin',
+		cache: isMutation ? init?.cache : (init?.cache ?? 'no-store'),
 		...init,
 		headers
 	});
 	if (!res.ok) {
 		const body = await res.json().catch(() => ({ error: res.statusText }));
-		if (res.status === 403 && retryCsrf && mutation(init?.method) && String(body.error).includes('CSRF')) {
+		if (res.status === 403 && retryCsrf && isMutation && String(body.error).includes('CSRF')) {
 			const session = await auth.bootstrap();
 			if (session.authenticated) return requestResponse(path, init, false);
 		}
 		if (res.status === 401 && !path.startsWith('/api/auth/')) sendToLogin();
 		throw new ApiError(body.error || res.statusText, res.status);
+	}
+	if (!isMutation) {
+		const revHeader = res.headers.get('x-ui-revisions');
+		if (revHeader) {
+			if (apiRevisionObserver) {
+				apiRevisionObserver(revHeader, path);
+			} else {
+				earlyRevisionHeaders.push({ headerValue: revHeader, path });
+			}
+		}
 	}
 	return res;
 }

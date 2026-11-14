@@ -112,6 +112,40 @@ impl UiRevisions {
             self.workflows = self.workflows.wrapping_add(1);
         }
     }
+
+    /// Compact comma-separated representation for the `x-ui-revisions` HTTP header.
+    pub fn to_header_value(&self) -> String {
+        format!(
+            "{},{},{},{},{},{},{},{}",
+            self.seq,
+            self.projects,
+            self.agents,
+            self.conversations,
+            self.tasks,
+            self.sessions,
+            self.schedules,
+            self.workflows,
+        )
+    }
+
+    /// Parse a compact `x-ui-revisions` header value.
+    pub fn from_header_value(raw: &str) -> Option<Self> {
+        let mut parts = raw.trim().split(',');
+        let parsed = Self {
+            seq: parts.next()?.parse().ok()?,
+            projects: parts.next()?.parse().ok()?,
+            agents: parts.next()?.parse().ok()?,
+            conversations: parts.next()?.parse().ok()?,
+            tasks: parts.next()?.parse().ok()?,
+            sessions: parts.next()?.parse().ok()?,
+            schedules: parts.next()?.parse().ok()?,
+            workflows: parts.next()?.parse().ok()?,
+        };
+        if parts.next().is_some() {
+            return None;
+        }
+        Some(parsed)
+    }
 }
 
 fn ui_domain_mask_for_table(table: &str) -> u32 {

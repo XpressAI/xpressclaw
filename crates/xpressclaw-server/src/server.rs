@@ -52,8 +52,9 @@ pub fn create_router(state: AppState) -> Router {
 }
 
 fn create_unprotected_router(state: AppState) -> Router {
+    let api = routes::api_routes(&state);
     Router::new()
-        .nest("/api", routes::api_routes())
+        .nest("/api", api)
         .fallback(frontend::serve_frontend)
         .layer(DefaultBodyLimit::max(30 * 1024 * 1024))
         .layer(http_compression_layer())

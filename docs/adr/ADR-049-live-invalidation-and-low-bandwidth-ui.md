@@ -37,6 +37,12 @@ seconds.
    - `GET /api/ui/stream` streams coalesced `UiRevisions` snapshots over SSE
      behind the standard user session boundary, and `GET /api/ui/revisions`
      provides a tiny snapshot for fallback checks.
+   - Protected `GET`/`HEAD` API responses include a compact `x-ui-revisions`
+     header stamped from the pre-read `UiRevisions` snapshot before the handler
+     runs. On fresh page loads, this establishes an exact revision baseline
+     with zero extra requests when idle while reconciling any mutation that
+     completes between an initial `GET` read and the first SSE frame (falling
+     back to a one-time baseline reconciliation when headers are absent).
    - A single shared browser client maintains one stream per tab, triggers
      domain-scoped single-flight refreshes when revisions advance (including
      when a completed task or conversation receives a scheduled wake-up),

@@ -8452,3 +8452,265 @@ test('task view reconciles SSE completion that arrives while initial task load i
 		page.getByText('Completed while initial load was still awaiting activity.', { exact: true }),
 	).toBeVisible();
 });
+
+test('fresh page load reconciles completion occurring before the first SSE revision arrives', async ({ page }) => {
+	// Hold /api/ui/stream until after the initial task/messages load has returned pre-completion state,
+	// then complete the task BEFORE the very first SSE revisions event is delivered.
+	await page.addInitScript(() => {
+		const originalFetch = window.fetch.bind(window);
+		const encoder = new TextEncoder();
+		let releaseStream: ((initialRevisions: Record<string, number>) => void) | null = null;
+		let streamRequested = false;
+		const w = window as unknown as {
+			__streamRequested?: () => boolean;
+			__deliverFirstStreamRevision?: (revisions: Record<string, number>) => void;
+		};
+		w.__streamRequested = () => streamRequested;
+		w.__deliverFirstStreamRevision = (revisions) => {
+			releaseStream?.(revisions);
+		};
+		window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+			const rawUrl = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+			const parsed = new URL(rawUrl, window.location.origin);
+			if (parsed.pathname === '/api/ui/stream') {
+				streamRequested = true;
+				const initial = await new Promise<Record<string, number>>((resolve) => {
+					releaseStream = resolve;
+				});
+				const stream = new ReadableStream<Uint8Array>({
+					start(controller) {
+						controller.enqueue(
+							encoder.encode(`event: revisions\ndata: ${JSON.stringify(initial)}\n\n`),
+						);
+						init?.signal?.addEventListener('abort', () => {
+							try { controller.close(); } catch {}
+						});
+					},
+				});
+				return new Response(stream, {
+					status: 200,
+					headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' },
+				});
+			}
+			return originalFetch(input, init);
+		};
+	});
+
+	const messages: Record<string, unknown>[] = [
+		{ id: 1, task_id: taskId, role: 'user', content: 'Check before SSE connects.', attachments: [], timestamp: timestamp(10) },
+	];
+	let taskCompleted = false;
+	await mockApi(page, {
+		taskStatus: 'in_progress',
+		taskMessages: messages,
+		taskAttempts: [attempt('running', 64_000, null, null)],
+		taskActivityEvents: [],
+	});
+	await page.route(`**/api/tasks/${taskId}`, (route) =>
+		route.fulfill({
+			json: {
+				id: taskId,
+				title: 'Browser-tested workspace slice',
+				description: 'Verify pre-first-SSE completion.',
+				status: taskCompleted ? 'completed' : 'in_progress',
+				activity_status: taskCompleted ? 'completed' : 'in_progress',
+				priority: 1,
+				agent_id: agentId,
+				project_id: projectId,
+				parent_task_id: null,
+				sop_id: null,
+				conversation_id: null,
+				created_at: timestamp(0),
+				updated_at: timestamp(taskCompleted ? 40 : 10),
+				completed_at: taskCompleted ? timestamp(40) : null,
+				context: null,
+			},
+		}),
+	);
+	await page.route(`**/api/tasks/${taskId}/messages*`, (route) => {
+		const url = new URL(route.request().url());
+		const afterId = url.searchParams.has('after_id') ? Number(url.searchParams.get('after_id')) : null;
+		const body = afterId !== null ? messages.filter((m) => Number(m.id) > afterId) : messages;
+		return route.fulfill({ json: body });
+	});
+
+	await page.goto(`/tasks/${taskId}`, { waitUntil: 'domcontentloaded' });
+	await expect(page.getByText('Check before SSE connects.', { exact: true })).toBeVisible();
+	await expect.poll(() =>
+		page.evaluate(() => (window as unknown as { __streamRequested?: () => boolean }).__streamRequested?.() ?? false),
+	).toBe(true);
+
+	// Complete the task BEFORE the first SSE snapshot is delivered; emit NO subsequent SSE events.
+	taskCompleted = true;
+	messages.push({
+		id: 2,
+		task_id: taskId,
+		role: 'assistant',
+		content: 'Finished before first SSE snapshot arrived.',
+		attachments: [],
+		timestamp: timestamp(40),
+	});
+	await page.evaluate(() => {
+		(window as unknown as { __deliverFirstStreamRevision?: (rev: Record<string, number>) => void })
+			.__deliverFirstStreamRevision?.({
+				seq: 2,
+				projects: 1,
+				agents: 1,
+				conversations: 1,
+				tasks: 2,
+				sessions: 2,
+				schedules: 1,
+				workflows: 1,
+			});
+	});
+
+	await expect(
+		page.getByText('Finished before first SSE snapshot arrived.', { exact: true }),
+	).toBeVisible();
+});
+
+test('x-ui-revisions baseline avoids duplicate idle fetches while reconciling races before first SSE event', async ({ page }) => {
+	await page.addInitScript(() => {
+		const originalFetch = window.fetch.bind(window);
+		const encoder = new TextEncoder();
+		let releaseStream: ((initialRevisions: Record<string, number>) => void) | null = null;
+		const toHeader = (r: Record<string, number>) =>
+			`${r.seq},${r.projects},${r.agents},${r.conversations},${r.tasks},${r.sessions},${r.schedules},${r.workflows}`;
+		const w = window as unknown as {
+			__deliverFirstHeaderStreamRevision?: (revisions: Record<string, number>) => void;
+		};
+		w.__deliverFirstHeaderStreamRevision = (revisions) => {
+			releaseStream?.(revisions);
+		};
+		window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+			const rawUrl = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+			const parsed = new URL(rawUrl, window.location.origin);
+			if (parsed.pathname === '/api/ui/stream') {
+				const initial = await new Promise<Record<string, number>>((resolve) => {
+					releaseStream = resolve;
+				});
+				const stream = new ReadableStream<Uint8Array>({
+					start(controller) {
+						controller.enqueue(
+							encoder.encode(`event: revisions\ndata: ${JSON.stringify(initial)}\n\n`),
+						);
+						init?.signal?.addEventListener('abort', () => {
+							try { controller.close(); } catch {}
+						});
+					},
+				});
+				return new Response(stream, {
+					status: 200,
+					headers: {
+						'Content-Type': 'text/event-stream',
+						'Cache-Control': 'no-cache',
+						'x-ui-revisions': toHeader(initial),
+					},
+				});
+			}
+			return originalFetch(input, init);
+		};
+	});
+
+	let currentHeader = '1,1,1,1,1,1,1,1';
+	let taskGetCount = 0;
+	let taskCompleted = false;
+	const messages: Record<string, unknown>[] = [
+		{ id: 1, task_id: taskId, role: 'user', content: 'Verify header baseline.', attachments: [], timestamp: timestamp(10) },
+	];
+
+	await mockApi(page, {
+		taskStatus: 'in_progress',
+		taskMessages: messages,
+		taskAttempts: [attempt('running', 64_000, null, null)],
+		taskActivityEvents: [],
+	});
+	await page.route(`**/api/tasks/${taskId}`, (route) => {
+		taskGetCount += 1;
+		return route.fulfill({
+			headers: { 'x-ui-revisions': currentHeader },
+			json: {
+				id: taskId,
+				title: 'Browser-tested workspace slice',
+				description: 'Verify x-ui-revisions baseline.',
+				status: taskCompleted ? 'completed' : 'in_progress',
+				activity_status: taskCompleted ? 'completed' : 'in_progress',
+				priority: 1,
+				agent_id: agentId,
+				project_id: projectId,
+				parent_task_id: null,
+				sop_id: null,
+				conversation_id: null,
+				created_at: timestamp(0),
+				updated_at: timestamp(taskCompleted ? 40 : 10),
+				completed_at: taskCompleted ? timestamp(40) : null,
+				context: null,
+			},
+		});
+	});
+	await page.route(`**/api/tasks/${taskId}/messages*`, (route) => {
+		const url = new URL(route.request().url());
+		const afterId = url.searchParams.has('after_id') ? Number(url.searchParams.get('after_id')) : null;
+		const body = afterId !== null ? messages.filter((m) => Number(m.id) > afterId) : messages;
+		return route.fulfill({
+			headers: { 'x-ui-revisions': currentHeader },
+			json: body,
+		});
+	});
+
+	// 1. Idle load where GET x-ui-revisions matches first SSE revisions: zero extra task GETs.
+	await page.goto(`/tasks/${taskId}`, { waitUntil: 'domcontentloaded' });
+	await expect(page.getByText('Verify header baseline.', { exact: true })).toBeVisible();
+	expect(taskGetCount).toBe(1);
+
+	await page.evaluate(() => {
+		(window as unknown as { __deliverFirstHeaderStreamRevision?: (rev: Record<string, number>) => void })
+			.__deliverFirstHeaderStreamRevision?.({
+				seq: 1,
+				projects: 1,
+				agents: 1,
+				conversations: 1,
+				tasks: 1,
+				sessions: 1,
+				schedules: 1,
+				workflows: 1,
+			});
+	});
+	await page.waitForTimeout(250);
+	expect(taskGetCount).toBe(1);
+
+	// 2. Reload where GET returns revision 1, then task completes at revision 2 before first SSE frame.
+	taskGetCount = 0;
+	await page.reload({ waitUntil: 'domcontentloaded' });
+	await expect(page.getByText('Verify header baseline.', { exact: true })).toBeVisible();
+	expect(taskGetCount).toBe(1);
+
+	taskCompleted = true;
+	currentHeader = '2,1,1,1,2,2,1,1';
+	messages.push({
+		id: 2,
+		task_id: taskId,
+		role: 'assistant',
+		content: 'Reconciled via x-ui-revisions mismatch on first SSE frame.',
+		attachments: [],
+		timestamp: timestamp(40),
+	});
+	await page.evaluate(() => {
+		(window as unknown as { __deliverFirstHeaderStreamRevision?: (rev: Record<string, number>) => void })
+			.__deliverFirstHeaderStreamRevision?.({
+				seq: 2,
+				projects: 1,
+				agents: 1,
+				conversations: 1,
+				tasks: 2,
+				sessions: 2,
+				schedules: 1,
+				workflows: 1,
+			});
+	});
+
+	await expect(
+		page.getByText('Reconciled via x-ui-revisions mismatch on first SSE frame.', { exact: true }),
+	).toBeVisible();
+	expect(taskGetCount).toBe(2);
+});

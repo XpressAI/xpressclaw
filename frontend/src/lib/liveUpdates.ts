@@ -1,5 +1,5 @@
 import { getContext, hasContext, setContext } from 'svelte';
-import { ApiError, sendToLogin, ui, type UiRevisions } from './api';
+import { ApiError, sendToLogin, setApiRevisionObserver, ui, type UiRevisions } from './api';
 
 export function isTransientRefreshError(err: unknown): boolean {
 	if (err instanceof ApiError) {
@@ -76,6 +76,7 @@ interface Subscriber {
 	retryAttempt: number;
 	retryDomains: Set<UiDomain>;
 	retrySource: LiveUpdateSource | null;
+	coveredRevisions: Record<UiDomain, number>;
 }
 
 let nextSubscriberId = 1;
@@ -83,6 +84,7 @@ const subscribers = new Map<number, Subscriber>();
 const streamStatusListeners = new Set<(connected: boolean) => void>();
 
 let currentRevisions: UiRevisions | null = null;
+let serverProvidesRevisionHeaders = false;
 let streamAbort: AbortController | null = null;
 let streamConnected = false;
 let streamUnsupported = false;
@@ -95,8 +97,7 @@ let fallbackTickInFlight = false;
 let adaptiveFallbackMs = 3000;
 let listenersInstalled = false;
 
-const EMPTY_REVISIONS: UiRevisions = {
-	seq: 0,
+const EMPTY_DOMAIN_REVISIONS: Record<UiDomain, number> = {
 	projects: 0,
 	agents: 0,
 	conversations: 0,
@@ -105,6 +106,29 @@ const EMPTY_REVISIONS: UiRevisions = {
 	schedules: 0,
 	workflows: 0
 };
+
+const EMPTY_REVISIONS: UiRevisions = {
+	seq: 0,
+	...EMPTY_DOMAIN_REVISIONS
+};
+
+export function parseUiRevisionsHeader(raw: string | null): UiRevisions | null {
+	if (!raw) return null;
+	const parts = raw.trim().split(',');
+	if (parts.length !== 8) return null;
+	const nums = parts.map((part) => Number(part));
+	if (nums.some((n) => !Number.isInteger(n) || n < 0)) return null;
+	return {
+		seq: nums[0],
+		projects: nums[1],
+		agents: nums[2],
+		conversations: nums[3],
+		tasks: nums[4],
+		sessions: nums[5],
+		schedules: nums[6],
+		workflows: nums[7]
+	};
+}
 
 function isValidUiRevisions(value: unknown): value is UiRevisions {
 	if (typeof value !== 'object' || value === null) return false;
@@ -217,6 +241,9 @@ function triggerSubscriber(
 
 	const mergedDomains = new Set<UiDomain>(sub.retryDomains);
 	for (const domain of changedDomains) mergedDomains.add(domain);
+	for (const domain of mergedDomains) {
+		sub.coveredRevisions[domain] = Math.max(sub.coveredRevisions[domain], revisions[domain]);
+	}
 	clearSubscriberRetryTimer(sub);
 
 	if (isDocumentHidden() || !sub.isActive()) {
@@ -287,16 +314,78 @@ function triggerSubscriber(
 		});
 }
 
+function observeApiRevisionsHeader(raw: string, path: string): void {
+	const parsed = parseUiRevisionsHeader(raw);
+	if (!parsed) return;
+	serverProvidesRevisionHeaders = true;
+	if (path.startsWith('/api/ui/')) return;
+
+	if (currentRevisions === null) {
+		currentRevisions = parsed;
+		return;
+	}
+
+	const advanced = new Set<UiDomain>();
+	const stale = new Set<UiDomain>();
+	const updated: UiRevisions = {
+		...currentRevisions,
+		seq: Math.max(currentRevisions.seq, parsed.seq)
+	};
+
+	for (const domain of ALL_DOMAINS) {
+		if (parsed[domain] > currentRevisions[domain]) {
+			updated[domain] = parsed[domain];
+			advanced.add(domain);
+		} else if (parsed[domain] < currentRevisions[domain]) {
+			stale.add(domain);
+		}
+	}
+	currentRevisions = updated;
+
+	if (advanced.size === 0 && stale.size === 0) return;
+
+	for (const sub of subscribers.values()) {
+		const toTrigger = new Set<UiDomain>();
+		for (const domain of sub.domains) {
+			if (advanced.has(domain)) {
+				toTrigger.add(domain);
+			} else if (stale.has(domain) && sub.coveredRevisions[domain] < updated[domain]) {
+				toTrigger.add(domain);
+			}
+		}
+		if (toTrigger.size > 0) {
+			triggerSubscriber(sub, updated, 'revisions', toTrigger);
+		}
+	}
+}
+
+setApiRevisionObserver(observeApiRevisionsHeader);
+
 function applyIncomingRevisions(next: UiRevisions, source: 'sse' | 'revisions'): void {
 	const previous = currentRevisions;
 	currentRevisions = next;
 
 	if (previous === null) {
-		// Establish baseline on first observation; views perform their own initial load.
+		if (!serverProvidesRevisionHeaders) {
+			// When GET responses do not carry X-Ui-Revisions headers (e.g. mocked streams
+			// or proxies stripping custom headers), an initial view fetch may have returned
+			// pre-mutation state before this first snapshot arrived. Reconcile registered
+			// subscribers once so initial snapshots cannot remain stale.
+			for (const sub of subscribers.values()) {
+				if (sub.domains.length > 0) {
+					triggerSubscriber(sub, next, source, sub.domains);
+				}
+			}
+		}
 		return;
 	}
 
 	const serverRestarted = next.seq < previous.seq;
+	if (serverRestarted) {
+		for (const sub of subscribers.values()) {
+			sub.coveredRevisions = { ...EMPTY_DOMAIN_REVISIONS };
+		}
+	}
 	const changed = new Set<UiDomain>();
 	for (const domain of ALL_DOMAINS) {
 		if (serverRestarted || next[domain] !== previous[domain]) {
@@ -379,6 +468,9 @@ async function connectStream(): Promise<void> {
 			throw new Error(`Unexpected stream status ${response.status}`);
 		}
 
+		if (response.headers.has('x-ui-revisions')) {
+			serverProvidesRevisionHeaders = true;
+		}
 		reconnectAttempt = 0;
 		revisionsSupported = true;
 		setStreamConnected(true);
@@ -598,7 +690,18 @@ export function subscribeLiveUpdates(
 		retryTimer: null,
 		retryAttempt: 0,
 		retryDomains: new Set(),
-		retrySource: null
+		retrySource: null,
+		coveredRevisions: currentRevisions
+			? {
+				projects: currentRevisions.projects,
+				agents: currentRevisions.agents,
+				conversations: currentRevisions.conversations,
+				tasks: currentRevisions.tasks,
+				sessions: currentRevisions.sessions,
+				schedules: currentRevisions.schedules,
+				workflows: currentRevisions.workflows
+			}
+			: { ...EMPTY_DOMAIN_REVISIONS }
 	};
 	subscribers.set(id, subscriber);
 	ensureTransport();
@@ -610,6 +713,7 @@ export function subscribeLiveUpdates(
 			stopStream();
 			stopFallbackLoop();
 			currentRevisions = null;
+			serverProvidesRevisionHeaders = false;
 			streamUnsupported = false;
 			revisionsSupported = null;
 			reconnectAttempt = 0;
