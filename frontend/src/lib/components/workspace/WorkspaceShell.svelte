@@ -99,6 +99,24 @@
 	let workflowsDirty = false;
 	let schedulesLoaded = false;
 	let schedulesDirty = false;
+	const nextDomainGen: Record<UiDomain, number> = {
+		projects: 0,
+		agents: 0,
+		conversations: 0,
+		tasks: 0,
+		sessions: 0,
+		schedules: 0,
+		workflows: 0,
+	};
+	const appliedDomainGen: Record<UiDomain, number> = {
+		projects: 0,
+		agents: 0,
+		conversations: 0,
+		tasks: 0,
+		sessions: 0,
+		schedules: 0,
+		workflows: 0,
+	};
 	let contextMenu = $state<WorkspaceContextMenu | null>(null);
 	let projectMutationVersion = 0;
 	const projectMutations = new Map<string, { version: number; mutation: ProjectMutation }>();
@@ -968,7 +986,18 @@
 		if ((fetchAll || domains.has('workflows')) && !workflowsVisible) workflowsDirty = true;
 		if ((fetchAll || domains.has('schedules')) && !automationsVisible) schedulesDirty = true;
 
+		const projectsGen = wantProjects ? ++nextDomainGen.projects : 0;
+		const conversationsGen = wantConversations ? ++nextDomainGen.conversations : 0;
+		const agentsGen = wantAgents ? ++nextDomainGen.agents : 0;
+		const tasksGen = wantTasks ? ++nextDomainGen.tasks : 0;
+		const workflowsGen = wantWorkflows ? ++nextDomainGen.workflows : 0;
+		const schedulesGen = wantSchedules ? ++nextDomainGen.schedules : 0;
+
 		let transientError: unknown = null;
+		let projectsSucceeded = true;
+		let conversationsSucceeded = true;
+		let agentsSucceeded = true;
+		let tasksSucceeded = true;
 		let workflowsSucceeded = true;
 		let schedulesSucceeded = true;
 		const guard = <T, F>(promise: Promise<T>, fallback: F, onError?: () => void): Promise<T | F> =>
@@ -989,11 +1018,21 @@
 				nextSchedules,
 				attentionResult,
 			] = await Promise.all([
-				wantProjects ? guard(projectsApi.list(), projectList) : Promise.resolve(projectList),
-				wantConversations ? guard(conversationsApi.list(undefined, 200), conversationList) : Promise.resolve(conversationList),
-				wantAgents ? guard(agents.list(), agentList) : Promise.resolve(agentList),
+				wantProjects
+					? guard(projectsApi.list(), projectList, () => { projectsSucceeded = false; })
+					: Promise.resolve(projectList),
+				wantConversations
+					? guard(conversationsApi.list(undefined, 200), conversationList, () => { conversationsSucceeded = false; })
+					: Promise.resolve(conversationList),
+				wantAgents
+					? guard(agents.list(), agentList, () => { agentsSucceeded = false; })
+					: Promise.resolve(agentList),
 				wantTasks
-					? guard(tasksApi.list(undefined, undefined, { excludeStatuses: ['completed', 'cancelled'] }), { tasks: taskList })
+					? guard(
+						tasksApi.list(undefined, undefined, { excludeStatuses: ['completed', 'cancelled'] }),
+						{ tasks: taskList },
+						() => { tasksSucceeded = false; }
+					)
 					: Promise.resolve({ tasks: taskList }),
 				wantTasks ? guard(tasksApi.recentByAgent(), null) : Promise.resolve(null),
 				wantWorkflows
@@ -1004,14 +1043,22 @@
 					: Promise.resolve(scheduleList),
 				wantTasks ? guard(tasksApi.attention(), null) : Promise.resolve(null),
 			]);
-			if (wantProjects) {
+			if (wantProjects && projectsSucceeded && projectsGen >= appliedDomainGen.projects) {
+				appliedDomainGen.projects = projectsGen;
 				projectList = [...projectMutations.values()]
 					.filter(({ version }) => version > startingProjectMutationVersion)
 					.reduce((list, { mutation }) => applyProjectMutation(list, mutation), nextProjects);
 			}
-			if (wantConversations) conversationList = nextConversations;
-			if (wantAgents) agentList = nextAgents;
-			if (wantTasks) {
+			if (wantConversations && conversationsSucceeded && conversationsGen >= appliedDomainGen.conversations) {
+				appliedDomainGen.conversations = conversationsGen;
+				conversationList = nextConversations;
+			}
+			if (wantAgents && agentsSucceeded && agentsGen >= appliedDomainGen.agents) {
+				appliedDomainGen.agents = agentsGen;
+				agentList = nextAgents;
+			}
+			if (wantTasks && tasksSucceeded && tasksGen >= appliedDomainGen.tasks) {
+				appliedDomainGen.tasks = tasksGen;
 				taskList = taskResult.tasks;
 				if (attentionResult?.tasks) attentionSnapshot = attentionResult.tasks;
 				sidebarTaskList = [...new Map([...(sidebarTaskResult?.tasks ?? taskResult.tasks), ...attentionSnapshot].map(task => [task.id, task])).values()];
@@ -1024,19 +1071,23 @@
 				)];
 				if (openTaskIds.length > 0) {
 					const resolved = await Promise.all(openTaskIds.map((id) => guard(tasksApi.get(id), null)));
-					const nextLookup: Record<string, Task> = { ...tabTaskLookup };
-					for (const item of resolved) {
-						if (item) nextLookup[item.id] = item;
+					if (tasksGen === appliedDomainGen.tasks) {
+						const nextLookup: Record<string, Task> = { ...tabTaskLookup };
+						for (const item of resolved) {
+							if (item) nextLookup[item.id] = item;
+						}
+						tabTaskLookup = nextLookup;
 					}
-					tabTaskLookup = nextLookup;
 				}
 			}
-			if (wantWorkflows && workflowsSucceeded) {
+			if (wantWorkflows && workflowsSucceeded && workflowsGen >= appliedDomainGen.workflows) {
+				appliedDomainGen.workflows = workflowsGen;
 				workflowList = nextWorkflows;
 				workflowsLoaded = true;
 				workflowsDirty = false;
 			}
-			if (wantSchedules && schedulesSucceeded) {
+			if (wantSchedules && schedulesSucceeded && schedulesGen >= appliedDomainGen.schedules) {
+				appliedDomainGen.schedules = schedulesGen;
 				scheduleList = nextSchedules;
 				schedulesLoaded = true;
 				schedulesDirty = false;

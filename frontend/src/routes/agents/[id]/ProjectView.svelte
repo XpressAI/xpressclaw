@@ -65,6 +65,8 @@
 
 	const paneActive = usePaneActive();
 	let unsubscribeLiveUpdates: (() => void) | null = null;
+	let agentFetchGen = 0;
+	let appliedAgentGen = 0;
 
 	const tabs: { id: ProjectSection; label: string }[] = [
 		{ id: 'session', label: 'Work' },
@@ -134,8 +136,11 @@
 	}
 
 	async function refreshAgentStatus(id: string, rethrowTransient = false) {
+		const gen = ++agentFetchGen;
 		try {
 			const fresh = await agents.get(id);
+			if (gen < appliedAgentGen) return;
+			appliedAgentGen = gen;
 			if (agent && agent.id === id) {
 				agent.status = fresh.status;
 				agent.desired_status = fresh.desired_status;
@@ -148,12 +153,14 @@
 			} else if (agentId === id) {
 				agent = fresh;
 			}
+			error = null;
 		} catch (err) {
 			if (rethrowTransient && isTransientRefreshError(err)) throw err;
 		}
 	}
 
 	async function loadAgent(id: string) {
+		const gen = ++agentFetchGen;
 		error = null;
 		configLoadedForAgent = '';
 		agentConfig = null;
@@ -169,9 +176,12 @@
 				agentConfig = loadedConfig.agents.find((a) => a.name === loadedAgent.name) ?? null;
 				configLoadedForAgent = loadedAgent.id;
 			}
-			agent = loadedAgent;
+			if (gen >= appliedAgentGen) {
+				appliedAgentGen = gen;
+				agent = loadedAgent;
+			}
 		} catch (e) {
-			error = String(e);
+			if (gen >= appliedAgentGen) error = String(e);
 		} finally {
 			if (needConfig) configLoading = false;
 		}

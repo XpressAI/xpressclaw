@@ -25,6 +25,8 @@
 	let showingProjectSettings = $state(false);
 	let error = $state('');
 	let projectMutationVersion = 0;
+	let loadGeneration = 0;
+	let appliedGeneration = 0;
 
 	let projectAgents = $derived(agentList.filter((agent) => agent.project_id === projectId));
 	let availableAgents = $derived(agentList.filter((agent) => agent.project_id !== projectId));
@@ -52,6 +54,7 @@
 	});
 
 	async function load(rethrowTransient = false) {
+		const gen = ++loadGeneration;
 		const mutationVersionAtStart = projectMutationVersion;
 		try {
 			const [loadedProject, loadedConversations, loadedAgents, loadedTasks, attention] = await Promise.all([
@@ -61,6 +64,8 @@
 				projects.tasks(projectId),
 				tasks.attention(),
 			]);
+			if (gen < appliedGeneration) return;
+			appliedGeneration = gen;
 			if (projectMutationVersion === mutationVersionAtStart) project = loadedProject;
 			projectConversations = loadedConversations;
 			agentList = loadedAgents;
@@ -69,10 +74,12 @@
 			error = '';
 			if (loading && selectedAgents.length === 0) selectedAgents = project?.agent_ids.slice() ?? [];
 		} catch (cause) {
-			error = cause instanceof Error ? cause.message : 'Could not load this project.';
+			if (gen >= appliedGeneration) {
+				error = cause instanceof Error ? cause.message : 'Could not load this project.';
+			}
 			if (rethrowTransient && isTransientRefreshError(cause)) throw cause;
 		} finally {
-			loading = false;
+			if (appliedGeneration > 0 || gen === loadGeneration) loading = false;
 		}
 	}
 

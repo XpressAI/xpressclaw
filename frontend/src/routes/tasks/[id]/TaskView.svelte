@@ -186,6 +186,8 @@
 	let controlSnapshot = $state<TaskControlSnapshot | null>(null);
 	let configRequestVersion = 0;
 	let configRefreshVersion: number | null = null;
+	let configRefreshPromise: Promise<void> | null = null;
+	let configRefreshPendingAfterUpdate = false;
 	let messageInputFocused = $state(false);
 	let slashMenuDismissed = $state(false);
 	let selectedCommandIndex = $state(0);
@@ -551,7 +553,33 @@
 	}
 
 	async function refreshModelMenu(showErrors = false, rethrowTransient = false) {
-		if (!task?.agent_id || configUpdating || configRefreshVersion === configRequestVersion) return;
+		if (!task?.agent_id || disposed) return;
+		if (configUpdating) {
+			configRefreshPendingAfterUpdate = true;
+			return;
+		}
+		while (configRefreshPromise) {
+			const inflight = configRefreshPromise;
+			try {
+				await inflight;
+			} catch {
+				// Run a fresh config snapshot below regardless of the prior caller's outcome.
+			}
+			if (!task?.agent_id || configUpdating || disposed) {
+				if (configUpdating) configRefreshPendingAfterUpdate = true;
+				return;
+			}
+		}
+		let run: Promise<void>;
+		run = runRefreshModelMenuOnce(showErrors, rethrowTransient).finally(() => {
+			if (configRefreshPromise === run) configRefreshPromise = null;
+		});
+		configRefreshPromise = run;
+		await run;
+	}
+
+	async function runRefreshModelMenuOnce(showErrors: boolean, rethrowTransient: boolean) {
+		if (!task?.agent_id) return;
 		const version = configRequestVersion;
 		configRefreshVersion = version;
 		const id = task.id;
@@ -592,7 +620,9 @@
 			if (version === configRequestVersion) configUpdating = false;
 		}
 		if (version !== configRequestVersion || task?.id !== id) return;
-		if (conflict) await refreshModelMenu();
+		const pendingRefresh = configRefreshPendingAfterUpdate;
+		configRefreshPendingAfterUpdate = false;
+		if (conflict || pendingRefresh) await refreshModelMenu();
 		if (failure) configNotice = failure;
 	}
 
@@ -828,6 +858,8 @@
 		++configRequestVersion;
 		controlSnapshot = null;
 		configRefreshVersion = null;
+		configRefreshPromise = null;
+		configRefreshPendingAfterUpdate = false;
 		controlsInitializedFor = controlsScope;
 		workspaceGitRequest?.abort();
 		workspaceGitRequest = null;
@@ -1001,7 +1033,7 @@
 		}
 	}
 
-	onMount(async () => {
+	onMount(() => {
 		try { detailsCollapsed = localStorage.getItem(detailsPreferenceKey) === 'true'; } catch { /* Use the default when storage is unavailable. */ }
 		document.addEventListener('pointerdown', handleComposerPointerDown);
 		taskViewResizeObserver = new ResizeObserver(updateDetailsSidebarVisibility);
@@ -1009,13 +1041,19 @@
 		updateDetailsSidebarVisibility();
 		messageInput = loadComposerDraft(messageDraftScope());
 		messageDraftReady = true;
-		await load();
-		if (disposed) return;
-		loading = false;
+
+		const initialLoadPromise = load().finally(() => {
+			if (pollPromise === initialLoadPromise) pollPromise = null;
+			if (!disposed) loading = false;
+		});
+		pollPromise = initialLoadPromise;
+
 		unsubscribeLiveUpdates = subscribeLiveUpdates(
 			['tasks', 'sessions', 'agents'],
 			async (_revisions, ctx) => {
 				if (ctx.source === 'fallback') {
+					await initialLoadPromise.catch(() => {});
+					if (disposed) return;
 					if (isTaskOrDelegatesActive()) {
 						await poll(true);
 					}
@@ -1024,9 +1062,15 @@
 					}
 					return;
 				}
-				// Live SSE / revision push (including scheduled wake-ups on completed tasks!):
+				// Live SSE / revision push (including updates arriving during initial load or scheduled wake-ups!):
 				await poll(true);
-				if (modelMenuOpen || hasPendingControls() || ctx.changedDomains.has('sessions') || ctx.changedDomains.has('agents')) {
+				if (
+					!controlSnapshot
+					|| modelMenuOpen
+					|| hasPendingControls()
+					|| ctx.changedDomains.has('sessions')
+					|| ctx.changedDomains.has('agents')
+				) {
 					await refreshModelMenu(false, true);
 				}
 			},
@@ -1107,8 +1151,21 @@
 		retryingLoad = true;
 		loading = true;
 		error = null;
+		while (pollPromise) {
+			const inflight = pollPromise;
+			try {
+				await inflight;
+			} catch {
+				// Proceed with explicit retry below.
+			}
+		}
+		let retryPromise: Promise<void>;
+		retryPromise = load().finally(() => {
+			if (pollPromise === retryPromise) pollPromise = null;
+		});
+		pollPromise = retryPromise;
 		try {
-			await load();
+			await retryPromise;
 		} finally {
 			loading = false;
 			retryingLoad = false;
@@ -1150,26 +1207,27 @@
 	/** Poll semantic task activity without exposing the runner's terminal. */
 	async function poll(rethrowTransient = false) {
 		if (disposed) return;
-		if (pollPromise) {
+		while (pollPromise) {
+			const inflight = pollPromise;
 			try {
-				await pollPromise;
+				await inflight;
 			} catch {
 				// Run a fresh snapshot below regardless of the prior caller's outcome.
 			}
 			if (disposed) return;
 		}
-		const currentRun = runPollOnce(rethrowTransient);
-		pollPromise = currentRun;
-		try {
-			await currentRun;
-		} finally {
+		let currentRun: Promise<void>;
+		currentRun = runPollOnce(rethrowTransient).finally(() => {
 			if (pollPromise === currentRun) pollPromise = null;
-		}
+		});
+		pollPromise = currentRun;
+		await currentRun;
 	}
 
 	async function runPollOnce(rethrowTransient: boolean) {
 		try {
 			const id = taskId;
+			const hadActivityCursor = Boolean(lastActivityEventId);
 			const afterMessageId = incrementalMessagePivot(messages);
 			const [newTask, incomingMessages, newActivity, subResult] = await Promise.all([
 				tasks.get(id),
@@ -1183,11 +1241,17 @@
 			if (disposed || taskId !== id) return;
 			// Update task status/details in-place
 			task = newTask;
+			error = null;
+			if (!hadActivityCursor) hasEarlierActivity = newActivity.has_more_before;
 			resetHarnessControls(newTask.agent_id);
 			attempts = newActivity.attempts;
 			delegatedWork = newActivity.delegated_work ?? [];
 			subtaskList = subResult.tasks;
 			let shouldScroll = false;
+			if (initialLoad) {
+				initialLoad = false;
+				shouldScroll = true;
+			}
 			const mergedResult = mergeTaskMessages(messages, incomingMessages, afterMessageId);
 			if (mergedResult.changed) {
 				messages = mergedResult.merged;

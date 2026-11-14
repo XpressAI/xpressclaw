@@ -39,6 +39,8 @@
 	let readinessRequest = 0;
 	let loadingReadiness = false;
 	let lastReadinessCheck = 0;
+	let loadGeneration = 0;
+	let appliedGeneration = 0;
 
 	const RECENT_WORK_LIMIT = 5;
 	const ATTENTION_STATUSES = ['waiting_for_input', 'blocked'];
@@ -91,6 +93,7 @@
 	});
 
 	async function load(rethrowTransient = false) {
+		const gen = ++loadGeneration;
 		try {
 			const [nextOverview, recentWork, attention] = await Promise.all([
 				sessions.get(agentId),
@@ -101,12 +104,14 @@
 				}),
 				tasks.attention(agentId),
 			]);
+			if (gen < appliedGeneration) return;
+			appliedGeneration = gen;
 			overview = nextOverview;
 			recentWorkTasks = recentWork.tasks.filter(task => !ATTENTION_STATUSES.includes(task.activity_status ?? task.status));
 			attentionTasks = attention.tasks ?? [];
 			error = null;
 		} catch (e) {
-			error = e instanceof Error ? e.message : String(e);
+			if (gen >= appliedGeneration) error = e instanceof Error ? e.message : String(e);
 			if (rethrowTransient && isTransientRefreshError(e)) throw e;
 		}
 	}

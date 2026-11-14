@@ -18,6 +18,7 @@
 	let includeCompletedOnce = $state(false);
 	const paneActive = usePaneActive();
 	let unsubscribeLiveUpdates: (() => void) | null = null;
+	let loadGeneration = 0;
 
 	// Create form
 	let showCreateForm = $state(false);
@@ -44,15 +45,17 @@
 	});
 
 	async function loadSchedules(initial = true, rethrowTransient = false) {
+		const gen = ++loadGeneration;
 		if (initial) loading = true;
 		error = null;
 		try {
-			scheduleList = await schedules.list(agentId, { includeCompletedOnce });
+			const result = await schedules.list(agentId, { includeCompletedOnce });
+			if (gen === loadGeneration) scheduleList = result;
 		} catch (e) {
-			error = `Failed to load schedules: ${e}`;
+			if (gen === loadGeneration) error = `Failed to load schedules: ${e}`;
 			if (rethrowTransient && isTransientRefreshError(e)) throw e;
 		} finally {
-			loading = false;
+			if (gen === loadGeneration) loading = false;
 		}
 	}
 

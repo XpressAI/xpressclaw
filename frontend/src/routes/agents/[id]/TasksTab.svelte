@@ -15,6 +15,8 @@
 	let loading = $state(true);
 	const paneActive = usePaneActive();
 	let unsubscribeLiveUpdates: (() => void) | null = null;
+	let loadGeneration = 0;
+	let appliedGeneration = 0;
 	let error = $state<string | null>(null);
 
 	// Create task form
@@ -37,16 +39,20 @@
 	});
 
 	async function loadTasks(initial = true, rethrowTransient = false) {
+		const gen = ++loadGeneration;
 		if (initial) loading = true;
 		error = null;
 		try {
 			const result = await tasksApi.list(undefined, agentId, { sort: 'recent' });
-			taskList = result.tasks;
+			if (gen >= appliedGeneration) {
+				appliedGeneration = gen;
+				taskList = result.tasks;
+			}
 		} catch (e) {
-			error = `Failed to load tasks: ${e}`;
+			if (gen >= appliedGeneration) error = `Failed to load tasks: ${e}`;
 			if (rethrowTransient && isTransientRefreshError(e)) throw e;
 		} finally {
-			loading = false;
+			if (appliedGeneration > 0 || gen === loadGeneration) loading = false;
 		}
 	}
 

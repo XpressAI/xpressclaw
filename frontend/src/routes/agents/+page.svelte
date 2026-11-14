@@ -3,7 +3,7 @@
 	import { goto } from '$app/navigation';
 	import { agents } from '$lib/api';
 	import type { Agent } from '$lib/api';
-	import { subscribeLiveUpdates, usePaneActive } from '$lib/liveUpdates';
+	import { isTransientRefreshError, subscribeLiveUpdates, usePaneActive } from '$lib/liveUpdates';
 	import ContextMenu from '$lib/components/ContextMenu.svelte';
 	import { PROJECT_CONTEXT_MENU_ITEMS } from '$lib/contextMenu';
 	import { openWorkspaceWindow } from '$lib/openWorkspaceWindow';
@@ -15,14 +15,31 @@
 	const paneActive = usePaneActive();
 	let unsubscribeLiveUpdates: (() => void) | null = null;
 	let projectMenu = $state<{ agent: Agent; x: number; y: number } | null>(null);
+	let loadGeneration = 0;
+	let appliedGeneration = 0;
 
-	onMount(async () => {
-		agentList = await agents.list().catch(() => []);
-		loading = false;
+	async function refreshAgents(rethrowTransient = false) {
+		const gen = ++loadGeneration;
+		try {
+			const next = await agents.list();
+			if (gen >= appliedGeneration) {
+				appliedGeneration = gen;
+				agentList = next;
+			}
+		} catch (err) {
+			if (rethrowTransient && isTransientRefreshError(err)) throw err;
+		} finally {
+			if (appliedGeneration > 0 || gen === loadGeneration) loading = false;
+		}
+	}
+
+	onMount(() => {
+		const initialLoad = refreshAgents(false);
 		unsubscribeLiveUpdates = subscribeLiveUpdates(
 			['agents', 'sessions', 'tasks'],
 			async () => {
-				agentList = await agents.list();
+				await initialLoad;
+				await refreshAgents(true);
 			},
 			{ active: paneActive, fallbackIntervalMs: 5000 }
 		);

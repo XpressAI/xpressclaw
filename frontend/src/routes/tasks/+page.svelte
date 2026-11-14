@@ -12,6 +12,7 @@
   } from "$lib/api";
   import {
     isTransientRefreshError,
+    notifyLiveUpdatesVisibilityChanged,
     subscribeLiveUpdates,
     usePaneActive,
   } from "$lib/liveUpdates";
@@ -113,6 +114,11 @@
     const index = lane.findIndex((t) => t.id === selected!.id);
     return { previous: lane[index - 1], next: lane[index + 1] };
   });
+  $effect(() => {
+    if (mounted && !dragging && !saving && paneActive()) {
+      notifyLiveUpdatesVisibilityChanged();
+    }
+  });
   onMount(() => {
     const url = new URL(route, location.origin);
     const saved =
@@ -151,7 +157,6 @@
     const unsubscribeLiveUpdates = subscribeLiveUpdates(
       ["tasks", "projects", "agents"],
       async (_revisions, ctx) => {
-        if (dragging || saving) return;
         const operations: Promise<unknown>[] = [load(true, true)];
         if (
           ctx.source !== "fallback" &&
@@ -167,7 +172,10 @@
         }
         await Promise.all(operations);
       },
-      { active: paneActive, fallbackIntervalMs: 5000 },
+      {
+        active: () => paneActive() && !dragging && !saving,
+        fallbackIntervalMs: 5000,
+      },
     );
     return () => {
       resize.disconnect();

@@ -57,11 +57,18 @@
 		if (!scheduleForm.agent_id) scheduleForm.agent_id = agentList[0].id;
 	});
 
-	onMount(async () => {
-		await loadAll();
+	let automationsGeneration = 0;
+	let appliedWorkflowsGeneration = 0;
+	let appliedSchedulesGeneration = 0;
+
+	onMount(() => {
+		const initialLoad = loadAll();
 		unsubscribeLiveUpdates = subscribeLiveUpdates(
 			['workflows', 'schedules'],
-			() => loadAutomations(true),
+			async () => {
+				await initialLoad;
+				await loadAutomations(true);
+			},
 			{ active: paneActive, fallbackIntervalMs: 10000 }
 		);
 	});
@@ -77,19 +84,31 @@
 	}
 
 	async function loadAutomations(rethrowTransient = false) {
+		const gen = ++automationsGeneration;
+		const requestedIncludeCompletedOnce = includeCompletedOnce;
 		let transientError: unknown = null;
+		let workflowsOk = true;
+		let schedulesOk = true;
 		const [nextWorkflows, nextSchedules] = await Promise.all([
 			workflows.list().catch((err) => {
+				workflowsOk = false;
 				if (isTransientRefreshError(err)) transientError ??= err;
 				return workflowList;
 			}),
-			schedules.list(undefined, { includeCompletedOnce }).catch((err) => {
+			schedules.list(undefined, { includeCompletedOnce: requestedIncludeCompletedOnce }).catch((err) => {
+				schedulesOk = false;
 				if (isTransientRefreshError(err)) transientError ??= err;
 				return scheduleList;
 			}),
 		]);
-		workflowList = nextWorkflows;
-		scheduleList = nextSchedules;
+		if (workflowsOk && gen >= appliedWorkflowsGeneration) {
+			appliedWorkflowsGeneration = gen;
+			workflowList = nextWorkflows;
+		}
+		if (schedulesOk && requestedIncludeCompletedOnce === includeCompletedOnce && gen >= appliedSchedulesGeneration) {
+			appliedSchedulesGeneration = gen;
+			scheduleList = nextSchedules;
+		}
 		if (rethrowTransient && transientError !== null) {
 			throw transientError;
 		}

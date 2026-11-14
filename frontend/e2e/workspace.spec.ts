@@ -8352,3 +8352,103 @@ test('task view retries transient refresh errors while SSE stays connected and r
 	await expect(page.getByText('/latest-deploy-cmd')).toBeVisible();
 	await expect(page.getByText('/stale-middle-cmd')).toHaveCount(0);
 });
+
+test('task view reconciles SSE completion that arrives while initial task load is still in flight', async ({ page }) => {
+	await installMockUiStream(page);
+	const messages: Record<string, unknown>[] = [
+		{ id: 1, task_id: taskId, role: 'user', content: 'Finish while loading.', attachments: [], timestamp: timestamp(10) },
+	];
+	let currentAttempts = [attempt('running', 64_000, null, null)];
+	await mockApi(page, {
+		taskStatus: 'in_progress',
+		taskMessages: messages,
+		taskAttempts: currentAttempts,
+		taskActivityEvents: [],
+	});
+
+	let taskGetServed = false;
+	let messagesServed = false;
+	let initialActivityGateHeld = false;
+	let releaseInitialActivity: (() => void) | null = null;
+	let taskCompleted = false;
+
+	await page.route(`**/api/tasks/${taskId}`, async (route) => {
+		taskGetServed = true;
+		await route.fulfill({
+			json: {
+				id: taskId,
+				title: 'Browser-tested workspace slice',
+				description: 'Verify task completion during initial load.',
+				status: taskCompleted ? 'completed' : 'in_progress',
+				activity_status: taskCompleted ? 'completed' : 'in_progress',
+				priority: 1,
+				agent_id: agentId,
+				project_id: projectId,
+				parent_task_id: null,
+				sop_id: null,
+				conversation_id: null,
+				created_at: timestamp(0),
+				updated_at: timestamp(taskCompleted ? 40 : 10),
+				completed_at: taskCompleted ? timestamp(40) : null,
+				context: null,
+			},
+		});
+	});
+	await page.route(`**/api/tasks/${taskId}/messages*`, async (route) => {
+		messagesServed = true;
+		const url = new URL(route.request().url());
+		const afterId = url.searchParams.has('after_id') ? Number(url.searchParams.get('after_id')) : null;
+		const body = afterId !== null
+			? messages.filter((m) => Number(m.id) > afterId)
+			: messages;
+		await route.fulfill({ json: body });
+	});
+	await page.route(`**/api/tasks/${taskId}/activity*`, async (route) => {
+		if (!initialActivityGateHeld) {
+			initialActivityGateHeld = true;
+			await new Promise<void>((resolve) => {
+				releaseInitialActivity = resolve;
+			});
+		}
+		await route.fulfill({
+			json: {
+				attempts: currentAttempts,
+				delegated_work: [],
+				events: [],
+				has_more_before: false,
+				has_more_after: false,
+			},
+		});
+	});
+
+	// Open the task directly with domcontentloaded so we can observe initial load mid-flight.
+	await page.goto(`/tasks/${taskId}`, { waitUntil: 'domcontentloaded' });
+	await expect.poll(() => taskGetServed && messagesServed && initialActivityGateHeld).toBe(true);
+	await expect.poll(() =>
+		page.evaluate(() => (window as unknown as { __mockUiStreamSubscriberCount?: () => number }).__mockUiStreamSubscriberCount?.() ?? 0),
+	).toBeGreaterThan(0);
+
+	// Transition the task to completed and emit the SSE revision BEFORE initial /activity resolves.
+	taskCompleted = true;
+	currentAttempts = [attempt('completed', 64_000, null, 'Completed while initial load was still awaiting activity.')];
+	messages.push({
+		id: 2,
+		task_id: taskId,
+		role: 'assistant',
+		content: 'Completed while initial load was still awaiting activity.',
+		attachments: [],
+		timestamp: timestamp(40),
+	});
+	await page.evaluate(() => {
+		(window as unknown as { __mockUiStreamEmit?: (patch: Record<string, number>) => void }).__mockUiStreamEmit?.({
+			tasks: 2,
+			sessions: 2,
+		});
+	});
+
+	// Now let initial /activity resolve; TaskView must immediately reconcile without another SSE event.
+	(releaseInitialActivity as (() => void) | null)?.();
+	await expect(
+		page.getByText('Completed while initial load was still awaiting activity.', { exact: true }),
+	).toBeVisible();
+});

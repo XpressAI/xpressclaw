@@ -87,15 +87,25 @@
 
 	$effect(() => { if (draftReady) saveComposerDraft(draftScope, content); });
 
+	let initialLoadPromise: Promise<void> | null = null;
+	let activityGeneration = 0;
+	let appliedActivityGeneration = 0;
+
 	onMount(() => {
 		window.addEventListener(PROJECT_MUTATION_EVENT, handleProjectMutation);
 		content = loadComposerDraft(draftScope);
 		draftReady = true;
-		void loadAll(true);
+		const initial = loadAll(true).finally(() => {
+			if (initialLoadPromise === initial) initialLoadPromise = null;
+		});
+		initialLoadPromise = initial;
 		connectEvents();
 		unsubscribeLiveUpdates = subscribeLiveUpdates(
 			['conversations', 'tasks', 'agents'],
-			() => refreshActivity(true),
+			async () => {
+				if (initialLoadPromise) await initialLoadPromise.catch(() => {});
+				await refreshActivity(true);
+			},
 			{ active: paneActive, fallbackIntervalMs: 2500 }
 		);
 		return () => window.removeEventListener(PROJECT_MUTATION_EVENT, handleProjectMutation);
@@ -192,6 +202,7 @@
 	}
 
 	async function refreshActivity(rethrowTransient = false) {
+		const gen = ++activityGeneration;
 		const latestMessageIdAtRequest = messages.at(-1)?.id ?? 0;
 		const reconcileLoadedHistory = olderMessagesLoaded;
 		try {
@@ -201,6 +212,8 @@
 				conversations.tasks(conversationId),
 				reconcileLoadedHistory ? conversations.messageDeletions(conversationId) : Promise.resolve([]),
 			]);
+			if (gen < appliedActivityGeneration) return;
+			appliedActivityGeneration = gen;
 			if (reconcileLoadedHistory) {
 				messages = reconcileRecentMessages(messages, nextMessages, latestMessageIdAtRequest, deletedMessageIds);
 			}
