@@ -1,0 +1,7 @@
+adr: ADR-049
+branch: feat/low-bandwidth-live-updates
+summary: Subscribe synchronously before initial loads settle, preserve mid-drag planner invalidations, and guard out-of-order refreshes
+validation:
+  - npm --prefix frontend run check && npm --prefix frontend run build
+  - TZ=UTC npx playwright test --workers=4 --project=chromium (303 passed, 1 skipped)
+  - TZ=UTC npx playwright test --project=touch-chromium (1 passed)
