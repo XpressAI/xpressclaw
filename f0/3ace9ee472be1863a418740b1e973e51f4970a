@@ -1,0 +1,9 @@
+adr: ADR-049
+branch: feat/low-bandwidth-live-updates
+summary: Stamp pre-read x-ui-revisions header on GET/HEAD responses and reconcile initial SSE snapshots without extra idle fetches
+validation:
+  - ./scripts/rustfmt.sh --check
+  - cargo clippy -p xpressclaw-core -p xpressclaw-server --all-targets -- -D warnings
+  - cargo test -p xpressclaw-core --lib ui_revisions && cargo test -p xpressclaw-server --lib (220 passed)
+  - npm --prefix frontend run check
+  - TZ=UTC npx playwright test --project=chromium e2e/task-planning.spec.ts e2e/workspace.spec.ts -g 'SSE|wake-ups' (14 passed)
