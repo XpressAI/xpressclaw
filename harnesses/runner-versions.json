@@ -4,7 +4,7 @@
   "runners": {
     "codex": {
       "auto_update": true,
-      "version": "2.2.2",
+      "version": "2.6.0",
       "acp_command": [
         "codex-acp"
       ],
@@ -18,12 +18,12 @@
         }
       ],
       "build_args": {
-        "CODEX_ACP_VERSION": "2.2.2"
+        "CODEX_ACP_VERSION": "2.6.0"
       }
     },
     "claude": {
       "auto_update": true,
-      "version": "0.95.0",
+      "version": "0.107.0",
       "acp_command": [
         "claude-agent-acp"
       ],
@@ -37,12 +37,12 @@
         }
       ],
       "build_args": {
-        "CLAUDE_ACP_VERSION": "0.95.0"
+        "CLAUDE_ACP_VERSION": "0.107.0"
       }
     },
     "antigravity": {
       "auto_update": true,
-      "version": "1.5.5",
+      "version": "1.5.9",
       "acp_command": [
         "agy",
         "acp",
@@ -64,10 +64,10 @@
         "AGENT_KIND": "antigravity",
         "AGENT_BINARY": "agy",
         "AGENT_PATH": "antigravity",
-        "AGENT_ARCHIVE_AMD64": "https://github.com/google-antigravity/antigravity-cli/releases/download/1.5.5/agy_cli_linux_x64.tar.gz",
-        "AGENT_ARCHIVE_ARM64": "https://github.com/google-antigravity/antigravity-cli/releases/download/1.5.5/agy_cli_linux_arm64.tar.gz",
-        "AGENT_SHA256_AMD64": "bfe2c25edeadd98c2942417c9972ee0e1faa3f0afdc90711e84d5f3a633b5078",
-        "AGENT_SHA256_ARM64": "f6faff7b47ad2d9a60ebca9d774239a1cd23e53a8ca6d812c1e9583909dca655"
+        "AGENT_ARCHIVE_AMD64": "https://github.com/google-antigravity/antigravity-cli/releases/download/1.5.9/agy_cli_linux_x64.tar.gz",
+        "AGENT_ARCHIVE_ARM64": "https://github.com/google-antigravity/antigravity-cli/releases/download/1.5.9/agy_cli_linux_arm64.tar.gz",
+        "AGENT_SHA256_AMD64": "8b1f5e56779f2434a0af36f1b715a8392a084de550f8c68bc79821f95fabf3fa",
+        "AGENT_SHA256_ARM64": "3a18c238c7ee6661e43df7e824a7d4c1bed78aeeda09430921a0f1dbfe825bca"
       }
     },
     "deepseek-harness": {
@@ -99,7 +99,7 @@
     },
     "github-copilot": {
       "auto_update": true,
-      "version": "1.0.103",
+      "version": "1.0.112",
       "acp_command": [
         "copilot",
         "--acp"
@@ -115,13 +115,13 @@
       ],
       "build_args": {
         "AGENT_KIND": "github-copilot",
-        "AGENT_PACKAGE": "@github/copilot@1.0.103",
+        "AGENT_PACKAGE": "@github/copilot@1.0.112",
         "AGENT_BINARY": "copilot"
       }
     },
     "junie": {
       "auto_update": true,
-      "version": "3813.9.0",
+      "version": "4020.10.0",
       "acp_command": [
         "junie",
         "--acp=true"
@@ -138,8 +138,8 @@
         "AGENT_KIND": "junie",
         "AGENT_BINARY": "junie",
         "AGENT_PATH": "junie-app/bin/junie",
-        "AGENT_ARCHIVE_AMD64": "https://github.com/JetBrains/junie-acp-release/releases/download/3813.9/junie-release-3813.9-linux-amd64.zip",
-        "AGENT_ARCHIVE_ARM64": "https://github.com/JetBrains/junie-acp-release/releases/download/3813.9/junie-release-3813.9-linux-aarch64.zip",
+        "AGENT_ARCHIVE_AMD64": "https://github.com/JetBrains/junie-acp-release/releases/download/4020.10/junie-release-4020.10-linux-amd64.zip",
+        "AGENT_ARCHIVE_ARM64": "https://github.com/JetBrains/junie-acp-release/releases/download/4020.10/junie-release-4020.10-linux-aarch64.zip",
         "AGENT_SHA256_AMD64": "",
         "AGENT_SHA256_ARM64": ""
       }
@@ -171,7 +171,7 @@
     },
     "opencode": {
       "auto_update": true,
-      "version": "1.19.4",
+      "version": "2.3.0",
       "acp_command": [
         "opencode",
         "acp"
@@ -186,7 +186,7 @@
         }
       ],
       "build_args": {
-        "OPENCODE_VERSION": "1.19.4"
+        "OPENCODE_VERSION": "2.3.0"
       }
     },
     "pi": {
@@ -222,9 +222,9 @@
         "AGENT_KIND": "pi",
         "AGENT_PACKAGE": "pi-acp@0.0.34",
         "AGENT_BINARY": "pi-acp",
-        "AGENT_EXTRA_PACKAGES": "@earendil-works/pi-coding-agent@1.4.0",
+        "AGENT_EXTRA_PACKAGES": "@earendil-works/pi-coding-agent@1.5.2",
         "AGENT_EXTRA_BINARY": "pi",
-        "PI_MCP_PACKAGE": "pi-mcp-adapter@6.0.0"
+        "PI_MCP_PACKAGE": "pi-mcp-adapter@7.0.1"
       }
     },
     "qwen": {
@@ -253,7 +253,7 @@
     },
     "cline": {
       "auto_update": true,
-      "version": "3.0.73",
+      "version": "3.0.74",
       "acp_command": [
         "cline",
         "--acp"
@@ -269,13 +269,13 @@
       ],
       "build_args": {
         "AGENT_KIND": "cline",
-        "AGENT_PACKAGE": "cline@3.0.73",
+        "AGENT_PACKAGE": "cline@3.0.74",
         "AGENT_BINARY": "cline"
       }
     },
     "cursor": {
       "auto_update": true,
-      "version": "2026.10.22",
+      "version": "2026.11.13",
       "acp_command": [
         "cursor-agent",
         "acp"
@@ -292,15 +292,15 @@
         "AGENT_KIND": "cursor",
         "AGENT_BINARY": "cursor-agent",
         "AGENT_PATH": "dist-package/cursor-agent",
-        "AGENT_ARCHIVE_AMD64": "https://downloads.cursor.com/lab/2026.10.22-27dcf5f/linux/x64/agent-cli-package.tar.gz",
-        "AGENT_ARCHIVE_ARM64": "https://downloads.cursor.com/lab/2026.10.22-27dcf5f/linux/arm64/agent-cli-package.tar.gz",
+        "AGENT_ARCHIVE_AMD64": "https://downloads.cursor.com/lab/2026.11.13-eacade1/linux/x64/agent-cli-package.tar.gz",
+        "AGENT_ARCHIVE_ARM64": "https://downloads.cursor.com/lab/2026.11.13-eacade1/linux/arm64/agent-cli-package.tar.gz",
         "AGENT_SHA256_AMD64": "",
         "AGENT_SHA256_ARM64": ""
       }
     },
     "glm": {
       "auto_update": true,
-      "version": "1.15.0",
+      "version": "1.17.1",
       "acp_command": [
         "glm-acp-agent"
       ],
@@ -315,13 +315,13 @@
       ],
       "build_args": {
         "AGENT_KIND": "glm",
-        "AGENT_PACKAGE": "glm-acp-agent@1.15.0",
+        "AGENT_PACKAGE": "glm-acp-agent@1.17.1",
         "AGENT_BINARY": "glm-acp-agent"
       }
     },
     "grok": {
       "auto_update": true,
-      "version": "1.0.70",
+      "version": "1.0.85",
       "acp_command": [
         "grok",
         "agent",
@@ -338,13 +338,13 @@
       ],
       "build_args": {
         "AGENT_KIND": "grok",
-        "AGENT_PACKAGE": "@xai-official/grok@1.0.70",
+        "AGENT_PACKAGE": "@xai-official/grok@1.0.85",
         "AGENT_BINARY": "grok"
       }
     },
     "kilo": {
       "auto_update": true,
-      "version": "7.8.17",
+      "version": "7.8.27",
       "acp_command": [
         "kilo",
         "acp"
@@ -360,13 +360,13 @@
       ],
       "build_args": {
         "AGENT_KIND": "kilo",
-        "AGENT_PACKAGE": "@kilocode/cli@7.8.17",
+        "AGENT_PACKAGE": "@kilocode/cli@7.8.27",
         "AGENT_BINARY": "kilo"
       }
     },
     "mistral-vibe": {
       "auto_update": true,
-      "version": "3.0.1",
+      "version": "3.1.1",
       "acp_command": [
         "vibe-acp"
       ],
@@ -382,10 +382,10 @@
         "AGENT_KIND": "mistral-vibe",
         "AGENT_BINARY": "vibe-acp",
         "AGENT_PATH": "vibe-acp",
-        "AGENT_ARCHIVE_AMD64": "https://github.com/mistralai/mistral-vibe/releases/download/v3.0.1/vibe-acp-linux-x86_64-3.0.1.tar.gz",
-        "AGENT_ARCHIVE_ARM64": "https://github.com/mistralai/mistral-vibe/releases/download/v3.0.1/vibe-acp-linux-aarch64-3.0.1.tar.gz",
-        "AGENT_SHA256_AMD64": "0771544f32f64132731e3d40ca1fdfa628c6076dae1ad4d273fdc31562a13062",
-        "AGENT_SHA256_ARM64": "7ef82101b23d286fb43eb911a6f2d75cf67cbb0ca3d026e7ff1db9d8ccaf32e0"
+        "AGENT_ARCHIVE_AMD64": "https://github.com/mistralai/mistral-vibe/releases/download/v3.1.1/vibe-acp-linux-x86_64-3.1.1.tar.gz",
+        "AGENT_ARCHIVE_ARM64": "https://github.com/mistralai/mistral-vibe/releases/download/v3.1.1/vibe-acp-linux-aarch64-3.1.1.tar.gz",
+        "AGENT_SHA256_AMD64": "ea3b33b2faebbd5cd2c4bc1c5226e865a8cafeb7486fb7fbd869418b4e4f6fec",
+        "AGENT_SHA256_ARM64": "c2dbf99928f80b368a795af5ae870c6ccf2137ac06ad5478d52c44856ea6a219"
       }
     }
   }
