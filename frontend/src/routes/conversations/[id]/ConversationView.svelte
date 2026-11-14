@@ -3,7 +3,7 @@
 	import { onDestroy, onMount } from 'svelte';
 	import yaml from 'js-yaml';
 	import { agents, conversations, projects, workflows, type Agent, type Conversation, type ConversationMessage, type ConversationMessageUpload, type ConversationTurn, type Project, type Task, type Workflow } from '$lib/api';
-	import { subscribeLiveUpdates, usePaneActive } from '$lib/liveUpdates';
+	import { isTransientRefreshError, subscribeLiveUpdates, usePaneActive } from '$lib/liveUpdates';
 	import { clearComposerDraft, loadComposerDraft, saveComposerDraft } from '$lib/composerDrafts';
 	import { clipboardFiles, imageDataUrl, pastedImageFiles, shouldHandleImagePaste } from '$lib/imageAttachments';
 	import { PROJECT_MUTATION_EVENT, type ProjectMutation } from '$lib/projectEvents';
@@ -95,7 +95,7 @@
 		connectEvents();
 		unsubscribeLiveUpdates = subscribeLiveUpdates(
 			['conversations', 'tasks', 'agents'],
-			() => refreshActivity(),
+			() => refreshActivity(true),
 			{ active: paneActive, fallbackIntervalMs: 2500 }
 		);
 		return () => window.removeEventListener(PROJECT_MUTATION_EVENT, handleProjectMutation);
@@ -191,7 +191,7 @@
 		return currentProject;
 	}
 
-	async function refreshActivity() {
+	async function refreshActivity(rethrowTransient = false) {
 		const latestMessageIdAtRequest = messages.at(-1)?.id ?? 0;
 		const reconcileLoadedHistory = olderMessagesLoaded;
 		try {
@@ -210,7 +210,9 @@
 			}
 			turns = nextTurns;
 			taskList = nextTasks;
-		} catch {}
+		} catch (err) {
+			if (rethrowTransient && isTransientRefreshError(err)) throw err;
+		}
 	}
 
 	function mergeMessages(existing: ConversationMessage[], incoming: ConversationMessage[]): ConversationMessage[] {

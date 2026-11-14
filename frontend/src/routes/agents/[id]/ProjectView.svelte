@@ -35,7 +35,7 @@
 	import { goto } from '$app/navigation';
 	import { agents, setup } from '$lib/api';
 	import type { Agent, LiveConfig } from '$lib/api';
-	import { subscribeLiveUpdates, usePaneActive } from '$lib/liveUpdates';
+	import { isTransientRefreshError, subscribeLiveUpdates, usePaneActive } from '$lib/liveUpdates';
 	import { agentRuntimeSummary, agentRuntimeTitle, harnessMark, statusColor } from '$lib/utils';
 	import { projectPath, type ProjectSection } from '$lib/workspace';
 
@@ -107,7 +107,7 @@
 		void loadAgent(agentId);
 		unsubscribeLiveUpdates = subscribeLiveUpdates(
 			['agents', 'sessions', 'tasks'],
-			() => refreshAgentStatus(agentId),
+			() => refreshAgentStatus(agentId, true),
 			{ active: paneActive, fallbackIntervalMs: 5000 }
 		);
 	});
@@ -133,7 +133,7 @@
 		}
 	}
 
-	async function refreshAgentStatus(id: string) {
+	async function refreshAgentStatus(id: string, rethrowTransient = false) {
 		try {
 			const fresh = await agents.get(id);
 			if (agent && agent.id === id) {
@@ -148,7 +148,9 @@
 			} else if (agentId === id) {
 				agent = fresh;
 			}
-		} catch {}
+		} catch (err) {
+			if (rethrowTransient && isTransientRefreshError(err)) throw err;
+		}
 	}
 
 	async function loadAgent(id: string) {

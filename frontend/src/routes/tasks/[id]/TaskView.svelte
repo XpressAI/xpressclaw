@@ -9,7 +9,7 @@
 	import { MIN_DETAILS_WIDTH } from '$lib/workspaceLayout';
 	import { goto } from '$app/navigation';
 	import { tasks, agents, sessions, workspaces, ApiError } from '$lib/api';
-	import { subscribeLiveUpdates, usePaneActive } from '$lib/liveUpdates';
+	import { isTransientRefreshError, subscribeLiveUpdates, usePaneActive } from '$lib/liveUpdates';
 	import { selectChoices, isModelOption, isReasoningOption, isAdditionalModelOption, reconcileConfig, duplicatesReasoningMode } from '$lib/acpConfig';
 	import type { TaskControlSnapshot, AcpCommand, AcpConfigOption, AcpModeState, DelegatedWork, Task, TaskMessage, Agent, WorkAttempt, SessionEvent, ImageAttachmentUpload, GitChange, WorkspaceGitStatus, MessageVisualization } from '$lib/api';
 	import { timeAgo } from '$lib/utils';
@@ -220,7 +220,7 @@
 	let lastTranscriptScrollTop = 0;
 	let lastWorkspaceGitRefresh = 0;
 	let workspaceGitRequest: AbortController | null = null;
-	let pollInFlight = false;
+	let pollPromise: Promise<void> | null = null;
 	let disposed = false;
 
 	$effect(() => {
@@ -550,7 +550,7 @@
 		await refreshModelMenu(true);
 	}
 
-	async function refreshModelMenu(showErrors = false) {
+	async function refreshModelMenu(showErrors = false, rethrowTransient = false) {
 		if (!task?.agent_id || configUpdating || configRefreshVersion === configRequestVersion) return;
 		const version = configRequestVersion;
 		configRefreshVersion = version;
@@ -563,6 +563,9 @@
 		} catch (e) {
 			if (showErrors && version === configRequestVersion && task?.id === id) {
 				configNotice = e instanceof Error ? e.message : String(e);
+			}
+			if (rethrowTransient && isTransientRefreshError(e)) {
+				throw e;
 			}
 		} finally {
 			if (configRefreshVersion === version) configRefreshVersion = null;
@@ -1014,17 +1017,17 @@
 			async (_revisions, ctx) => {
 				if (ctx.source === 'fallback') {
 					if (isTaskOrDelegatesActive()) {
-						await poll();
+						await poll(true);
 					}
 					if (modelMenuOpen || hasPendingControls() || isTaskOrDelegatesActive()) {
-						await refreshModelMenu();
+						await refreshModelMenu(false, true);
 					}
 					return;
 				}
 				// Live SSE / revision push (including scheduled wake-ups on completed tasks!):
-				await poll();
+				await poll(true);
 				if (modelMenuOpen || hasPendingControls() || ctx.changedDomains.has('sessions') || ctx.changedDomains.has('agents')) {
-					await refreshModelMenu();
+					await refreshModelMenu(false, true);
 				}
 			},
 			{
@@ -1145,9 +1148,26 @@
 	}
 
 	/** Poll semantic task activity without exposing the runner's terminal. */
-	async function poll() {
-		if (pollInFlight || disposed) return;
-		pollInFlight = true;
+	async function poll(rethrowTransient = false) {
+		if (disposed) return;
+		if (pollPromise) {
+			try {
+				await pollPromise;
+			} catch {
+				// Run a fresh snapshot below regardless of the prior caller's outcome.
+			}
+			if (disposed) return;
+		}
+		const currentRun = runPollOnce(rethrowTransient);
+		pollPromise = currentRun;
+		try {
+			await currentRun;
+		} finally {
+			if (pollPromise === currentRun) pollPromise = null;
+		}
+	}
+
+	async function runPollOnce(rethrowTransient: boolean) {
 		try {
 			const id = taskId;
 			const afterMessageId = incrementalMessagePivot(messages);
@@ -1155,7 +1175,10 @@
 				tasks.get(id),
 				tasks.messages(id, afterMessageId),
 				tasks.activity(id, { after: lastActivityEventId || undefined }),
-				tasks.subtasks(id).catch(() => ({ tasks: subtaskList })),
+				tasks.subtasks(id).catch((err) => {
+					if (isTransientRefreshError(err)) throw err;
+					return { tasks: subtaskList };
+				}),
 			]);
 			if (disposed || taskId !== id) return;
 			// Update task status/details in-place
@@ -1171,32 +1194,41 @@
 				prevMessageCount = messages.length;
 				if (mergedResult.shouldScroll) shouldScroll = true;
 			}
-			if (newActivity.events.length > 0) {
+			let activityPage = newActivity;
+			while (activityPage.events.length > 0) {
 				const known = new Set(activityEvents.map(event => event.id));
 				activityEvents = [
 					...activityEvents,
-					...newActivity.events.filter(event => !known.has(event.id)),
+					...activityPage.events.filter(event => !known.has(event.id)),
 				];
 				lastActivityEventId = activityEvents.at(-1)?.id ?? lastActivityEventId;
 				shouldScroll = true;
+				if (!activityPage.has_more_after || !lastActivityEventId || disposed || taskId !== id) break;
+				activityPage = await tasks.activity(id, { after: lastActivityEventId });
 			}
 			if (newTask.agent_id) {
 				void refreshWorkspaceGit(newTask.agent_id);
 				const latestCommandEvents = await sessions.events(newTask.agent_id, {
-					after: lastCommandsEventId || undefined,
 					eventType: 'available_commands',
 					limit: 1,
-				}).catch(() => []);
+				}).catch((err) => {
+					if (isTransientRefreshError(err)) throw err;
+					return [];
+				});
 				if (task?.id !== id || task.agent_id !== newTask.agent_id) return;
-				if (latestCommandEvents.length > 0) {
+				const newestCommandId = latestCommandEvents.at(-1)?.id ?? 0;
+				if (latestCommandEvents.length > 0 && newestCommandId !== lastCommandsEventId) {
 					sessionEvents = latestCommandEvents;
-					lastCommandsEventId = latestCommandEvents.at(-1)?.id ?? lastCommandsEventId;
+					lastCommandsEventId = newestCommandId;
 					refreshHarnessControls(sessionEvents, newTask.agent_id);
 				}
 			}
 			if (shouldScroll) scrollToBottom();
-		} catch { /* Retry on the next update or fallback interval. */ }
-		finally { pollInFlight = false; }
+		} catch (err) {
+			if (rethrowTransient && isTransientRefreshError(err)) {
+				throw err;
+			}
+		}
 	}
 
 	async function loadEarlierActivity() {

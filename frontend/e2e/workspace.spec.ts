@@ -1413,7 +1413,7 @@ async function mockApi(
 				return true;
 			});
 			if (limit !== null && Number.isFinite(limit) && limit > 0) {
-				filteredEvents = filteredEvents.slice(-limit);
+				filteredEvents = after !== null ? filteredEvents.slice(0, limit) : filteredEvents.slice(-limit);
 			}
 			response = filteredEvents;
 		} else {
@@ -8243,4 +8243,112 @@ test('completed one-shot wake-ups are hidden by default and revealed on demand',
 	await page.locator('[data-include-completed-wakeups]').check();
 	await expect(page.getByText('Follow-up wake-up #1229')).toBeVisible();
 	expect(scheduleRequests.some((search) => search.includes('include_completed_once=true'))).toBe(true);
+});
+
+test('task view retries transient refresh errors while SSE stays connected and reads latest command snapshot', async ({ page }) => {
+	await installMockUiStream(page);
+	const messages: Record<string, unknown>[] = [
+		{ id: 1, task_id: taskId, role: 'user', content: 'Run full check.', attachments: [], timestamp: timestamp(10) },
+	];
+	const attempts = [attempt('running', 64_000, null, null)];
+	await mockApi(page, {
+		taskStatus: 'in_progress',
+		taskMessages: messages,
+		taskAttempts: attempts,
+		taskActivityEvents: [],
+	});
+
+	const commandSnapshots = [
+		{
+			...activityEvent(71),
+			event_type: 'available_commands',
+			payload: {
+				available_commands: [{ name: 'initial-cmd', description: 'Initial command' }],
+			},
+		},
+	];
+	await page.route(`**/api/sessions/${agentId}/events*`, (route) => {
+		const url = new URL(route.request().url());
+		const eventType = url.searchParams.get('event_type');
+		const after = url.searchParams.has('after') ? Number(url.searchParams.get('after')) : null;
+		const limit = url.searchParams.has('limit') ? Number(url.searchParams.get('limit')) : null;
+		let filtered = commandSnapshots.filter((event) => {
+			if (eventType && event.event_type !== eventType) return false;
+			if (after !== null && Number.isFinite(after) && event.id <= after) return false;
+			return true;
+		});
+		if (limit !== null && Number.isFinite(limit) && limit > 0) {
+			// Match SQLite list_events_filtered: ASC when after is set, DESC (latest) when omitted.
+			filtered = after !== null ? filtered.slice(0, limit) : filtered.slice(-limit);
+		}
+		return route.fulfill({ json: filtered });
+	});
+
+	await page.goto(`/tasks/${taskId}`);
+	await expect(page.getByText('Run full check.', { exact: true })).toBeVisible();
+	await expect.poll(() =>
+		page.evaluate(() => (window as unknown as { __mockUiStreamSubscriberCount?: () => number }).__mockUiStreamSubscriberCount?.() ?? 0),
+	).toBeGreaterThan(0);
+
+	// Queue TWO new available_commands snapshots and a task completion, while
+	// failing the first messages fetch transiently with 503 and emitting ONLY ONE SSE revision!
+	commandSnapshots.push(
+		{
+			...activityEvent(72),
+			event_type: 'available_commands',
+			payload: {
+				available_commands: [{ name: 'stale-middle-cmd', description: 'Superseded command' }],
+			},
+		},
+		{
+			...activityEvent(73),
+			event_type: 'available_commands',
+			payload: {
+				available_commands: [{ name: 'latest-deploy-cmd', description: 'Newest command snapshot' }],
+			},
+		},
+	);
+
+	const currentTask = await page.evaluate(async (id) => (await fetch(`/api/tasks/${id}`)).json(), taskId);
+	await page.route(`**/api/tasks/${taskId}`, (route) =>
+		route.fulfill({ json: { ...currentTask, status: 'completed', activity_status: 'completed', completed_at: timestamp(45) } }),
+	);
+	messages.push({
+		id: 2,
+		task_id: taskId,
+		role: 'assistant',
+		content: 'Final response delivered after transient 503 recovery.',
+		attachments: [],
+		timestamp: timestamp(45),
+	});
+
+	let failNextMessagesFetch = true;
+	await page.route(`**/api/tasks/${taskId}/messages*`, (route) => {
+		if (failNextMessagesFetch) {
+			failNextMessagesFetch = false;
+			return route.fulfill({
+				status: 503,
+				contentType: 'application/json',
+				body: JSON.stringify({ error: 'Temporary upstream timeout' }),
+			});
+		}
+		return route.fulfill({ json: messages });
+	});
+
+	await page.evaluate(() => {
+		(window as unknown as { __mockUiStreamEmit?: (patch: Record<string, number>) => void }).__mockUiStreamEmit?.({
+			tasks: 2,
+			sessions: 2,
+		});
+	});
+
+	// Without any further SSE events, bounded retry recovers the failed refresh.
+	await expect(page.getByText('Final response delivered after transient 503 recovery.', { exact: true })).toBeVisible({ timeout: 5000 });
+
+	// Typing `/` shows the newest command snapshot (#73), not the superseded #72 delta.
+	const composer = page.locator(`#task-message-input-${taskId}`);
+	await composer.fill('/');
+	await composer.focus();
+	await expect(page.getByText('/latest-deploy-cmd')).toBeVisible();
+	await expect(page.getByText('/stale-middle-cmd')).toHaveCount(0);
 });

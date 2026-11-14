@@ -10,7 +10,11 @@
     type Task,
     type PlanningAction,
   } from "$lib/api";
-  import { subscribeLiveUpdates, usePaneActive } from "$lib/liveUpdates";
+  import {
+    isTransientRefreshError,
+    subscribeLiveUpdates,
+    usePaneActive,
+  } from "$lib/liveUpdates";
   import {
     lanes,
     taskLane,
@@ -146,21 +150,22 @@
     mounted = true;
     const unsubscribeLiveUpdates = subscribeLiveUpdates(
       ["tasks", "projects", "agents"],
-      (_revisions, ctx) => {
+      async (_revisions, ctx) => {
         if (dragging || saving) return;
-        void load(true);
+        const operations: Promise<unknown>[] = [load(true, true)];
         if (
           ctx.source !== "fallback" &&
           (ctx.changedDomains.has("agents") ||
             ctx.changedDomains.has("projects"))
         ) {
-          void Promise.all([agents.list(), projects.list()])
-            .then(([a, p]) => {
+          operations.push(
+            Promise.all([agents.list(), projects.list()]).then(([a, p]) => {
               agentList = a;
               projectList = p;
-            })
-            .catch(() => {});
+            }),
+          );
         }
+        await Promise.all(operations);
       },
       { active: paneActive, fallbackIntervalMs: 5000 },
     );
@@ -170,7 +175,7 @@
     };
   });
   onDestroy(() => clearTimeout(timer));
-  async function load(quiet = false) {
+  async function load(quiet = false, rethrowTransient = false) {
     const request = ++generation;
     if (!quiet) loading = true;
     try {
@@ -193,6 +198,7 @@
     } catch (e) {
       if (request === generation)
         error = e instanceof Error ? e.message : String(e);
+      if (rethrowTransient && isTransientRefreshError(e)) throw e;
     } finally {
       if (request === generation) loading = false;
     }

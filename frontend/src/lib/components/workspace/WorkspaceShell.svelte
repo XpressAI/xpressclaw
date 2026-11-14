@@ -5,7 +5,7 @@
 	import { page } from '$app/stores';
 	import { agents, conversations as conversationsApi, projects as projectsApi, request, schedules as schedulesApi, tasks as tasksApi, workflows as workflowsApi } from '$lib/api';
 	import type { Agent, Conversation, Project, Schedule, Task, Workflow } from '$lib/api';
-	import { isLiveStreamConnected, subscribeLiveStreamStatus, subscribeLiveUpdates, type UiDomain } from '$lib/liveUpdates';
+	import { isLiveStreamConnected, isTransientRefreshError, subscribeLiveStreamStatus, subscribeLiveUpdates, type UiDomain } from '$lib/liveUpdates';
 	import { PROJECT_CONTEXT_MENU_ITEMS, type ContextMenuItem } from '$lib/contextMenu';
 	import { openWorkspaceWindow, WORKSPACE_WINDOW_PARAM } from '$lib/openWorkspaceWindow';
 	import { PROJECT_MUTATION_EVENT, sortProjectsByRecency, type ProjectMutation } from '$lib/projectEvents';
@@ -953,7 +953,7 @@
 		void loadWorkspaceSummary(domains);
 	});
 
-	async function loadWorkspaceSummary(domains?: ReadonlySet<UiDomain>) {
+	async function loadWorkspaceSummary(domains?: ReadonlySet<UiDomain>, rethrowTransient = false) {
 		const startingProjectMutationVersion = projectMutationVersion;
 		const fetchAll = !domains;
 		const wantProjects = fetchAll || domains.has('projects');
@@ -968,6 +968,16 @@
 		if ((fetchAll || domains.has('workflows')) && !workflowsVisible) workflowsDirty = true;
 		if ((fetchAll || domains.has('schedules')) && !automationsVisible) schedulesDirty = true;
 
+		let transientError: unknown = null;
+		let workflowsSucceeded = true;
+		let schedulesSucceeded = true;
+		const guard = <T, F>(promise: Promise<T>, fallback: F, onError?: () => void): Promise<T | F> =>
+			promise.catch((err) => {
+				onError?.();
+				if (isTransientRefreshError(err)) transientError ??= err;
+				return fallback;
+			});
+
 		try {
 			const [
 				nextProjects,
@@ -979,16 +989,20 @@
 				nextSchedules,
 				attentionResult,
 			] = await Promise.all([
-				wantProjects ? projectsApi.list().catch(() => projectList) : Promise.resolve(projectList),
-				wantConversations ? conversationsApi.list(undefined, 200).catch(() => conversationList) : Promise.resolve(conversationList),
-				wantAgents ? agents.list().catch(() => agentList) : Promise.resolve(agentList),
+				wantProjects ? guard(projectsApi.list(), projectList) : Promise.resolve(projectList),
+				wantConversations ? guard(conversationsApi.list(undefined, 200), conversationList) : Promise.resolve(conversationList),
+				wantAgents ? guard(agents.list(), agentList) : Promise.resolve(agentList),
 				wantTasks
-					? tasksApi.list(undefined, undefined, { excludeStatuses: ['completed', 'cancelled'] }).catch(() => ({ tasks: taskList }))
+					? guard(tasksApi.list(undefined, undefined, { excludeStatuses: ['completed', 'cancelled'] }), { tasks: taskList })
 					: Promise.resolve({ tasks: taskList }),
-				wantTasks ? tasksApi.recentByAgent().catch(() => null) : Promise.resolve(null),
-				wantWorkflows ? workflowsApi.list().catch(() => workflowList) : Promise.resolve(workflowList),
-				wantSchedules ? schedulesApi.list().catch(() => scheduleList) : Promise.resolve(scheduleList),
-				wantTasks ? tasksApi.attention().catch(() => null) : Promise.resolve(null),
+				wantTasks ? guard(tasksApi.recentByAgent(), null) : Promise.resolve(null),
+				wantWorkflows
+					? guard(workflowsApi.list(), workflowList, () => { workflowsSucceeded = false; })
+					: Promise.resolve(workflowList),
+				wantSchedules
+					? guard(schedulesApi.list(), scheduleList, () => { schedulesSucceeded = false; })
+					: Promise.resolve(scheduleList),
+				wantTasks ? guard(tasksApi.attention(), null) : Promise.resolve(null),
 			]);
 			if (wantProjects) {
 				projectList = [...projectMutations.values()]
@@ -1009,7 +1023,7 @@
 						.map((tab) => tab.resourceId!)
 				)];
 				if (openTaskIds.length > 0) {
-					const resolved = await Promise.all(openTaskIds.map((id) => tasksApi.get(id).catch(() => null)));
+					const resolved = await Promise.all(openTaskIds.map((id) => guard(tasksApi.get(id), null)));
 					const nextLookup: Record<string, Task> = { ...tabTaskLookup };
 					for (const item of resolved) {
 						if (item) nextLookup[item.id] = item;
@@ -1017,18 +1031,23 @@
 					tabTaskLookup = nextLookup;
 				}
 			}
-			if (wantWorkflows) {
+			if (wantWorkflows && workflowsSucceeded) {
 				workflowList = nextWorkflows;
 				workflowsLoaded = true;
 				workflowsDirty = false;
 			}
-			if (wantSchedules) {
+			if (wantSchedules && schedulesSucceeded) {
 				scheduleList = nextSchedules;
 				schedulesLoaded = true;
 				schedulesDirty = false;
 			}
 			refreshTabMetadata();
-		} catch {}
+		} catch (err) {
+			if (isTransientRefreshError(err)) transientError ??= err;
+		}
+		if (rethrowTransient && transientError !== null) {
+			throw transientError;
+		}
 	}
 
 	function handleProjectMutation(event: Event) {
@@ -1183,7 +1202,7 @@
 		window.addEventListener(WORKSPACE_OPEN_SPLIT_EVENT, handleOpenSplit);
 		const unsubscribeLiveUpdates = subscribeLiveUpdates(
 			['projects', 'conversations', 'agents', 'tasks', 'workflows', 'schedules'],
-			(_revisions, ctx) => loadWorkspaceSummary(ctx.changedDomains),
+			(_revisions, ctx) => loadWorkspaceSummary(ctx.changedDomains, true),
 			{ fallbackIntervalMs: 3000 }
 		);
 		const unsubscribeStreamStatus = subscribeLiveStreamStatus((connected) => {

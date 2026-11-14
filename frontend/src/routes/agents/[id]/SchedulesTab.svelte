@@ -2,7 +2,7 @@
 	import { onMount, onDestroy } from 'svelte';
 	import { schedules } from '$lib/api';
 	import type { Schedule } from '$lib/api';
-	import { subscribeLiveUpdates, usePaneActive } from '$lib/liveUpdates';
+	import { isTransientRefreshError, subscribeLiveUpdates, usePaneActive } from '$lib/liveUpdates';
 	import { timeAgo } from '$lib/utils';
 	import { serverTimestampMs } from '$lib/serverTime';
 
@@ -33,7 +33,7 @@
 		void loadSchedules();
 		unsubscribeLiveUpdates = subscribeLiveUpdates(
 			['schedules'],
-			() => loadSchedules(false),
+			() => loadSchedules(false, true),
 			{ active: paneActive, fallbackIntervalMs: 10000 }
 		);
 	});
@@ -43,15 +43,17 @@
 		unsubscribeLiveUpdates = null;
 	});
 
-	async function loadSchedules(initial = true) {
+	async function loadSchedules(initial = true, rethrowTransient = false) {
 		if (initial) loading = true;
 		error = null;
 		try {
 			scheduleList = await schedules.list(agentId, { includeCompletedOnce });
 		} catch (e) {
 			error = `Failed to load schedules: ${e}`;
+			if (rethrowTransient && isTransientRefreshError(e)) throw e;
+		} finally {
+			loading = false;
 		}
-		loading = false;
 	}
 
 	async function toggleEnabled(schedule: Schedule) {

@@ -22,7 +22,7 @@
 		unsubscribeLiveUpdates = subscribeLiveUpdates(
 			['agents', 'sessions', 'tasks'],
 			async () => {
-				agentList = await agents.list().catch(() => agentList);
+				agentList = await agents.list();
 			},
 			{ active: paneActive, fallbackIntervalMs: 5000 }
 		);

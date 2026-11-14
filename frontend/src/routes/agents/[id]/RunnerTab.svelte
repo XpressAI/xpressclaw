@@ -228,7 +228,7 @@
 	onMount(async () => {
 		try {
 			const [events, catalog, agents, docker] = await Promise.all([
-				sessions.events(agentId).catch(() => []),
+				sessions.events(agentId, { eventType: 'session_config_options', limit: 1 }).catch(() => []),
 				mcpServers.list().catch(() => ({ servers: [] })),
 				setup.agentCatalog().catch(() => ({ agents: [] })),
 				setup.checkDocker().catch(() => null)

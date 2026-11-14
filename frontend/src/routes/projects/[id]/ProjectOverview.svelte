@@ -2,7 +2,7 @@
 	import { goto } from '$app/navigation';
 	import { onMount } from 'svelte';
 	import { agents, conversations, projects, tasks, type Agent, type Conversation, type Project, type Task } from '$lib/api';
-	import { subscribeLiveUpdates, usePaneActive } from '$lib/liveUpdates';
+	import { isTransientRefreshError, subscribeLiveUpdates, usePaneActive } from '$lib/liveUpdates';
 	import { PROJECT_MUTATION_EVENT, publishProjectMutation, type ProjectMutation } from '$lib/projectEvents';
 	import { agentRuntimeSummary, harnessMark, timeAgo } from '$lib/utils';
 	import AgentLoading from '$lib/components/AgentLoading.svelte';
@@ -42,7 +42,7 @@
 		void load();
 		const unsubscribeLiveUpdates = subscribeLiveUpdates(
 			['projects', 'conversations', 'agents', 'tasks'],
-			() => load(),
+			() => load(true),
 			{ active: paneActive, fallbackIntervalMs: 5000 }
 		);
 		return () => {
@@ -51,7 +51,7 @@
 		};
 	});
 
-	async function load() {
+	async function load(rethrowTransient = false) {
 		const mutationVersionAtStart = projectMutationVersion;
 		try {
 			const [loadedProject, loadedConversations, loadedAgents, loadedTasks, attention] = await Promise.all([
@@ -70,6 +70,7 @@
 			if (loading && selectedAgents.length === 0) selectedAgents = project?.agent_ids.slice() ?? [];
 		} catch (cause) {
 			error = cause instanceof Error ? cause.message : 'Could not load this project.';
+			if (rethrowTransient && isTransientRefreshError(cause)) throw cause;
 		} finally {
 			loading = false;
 		}

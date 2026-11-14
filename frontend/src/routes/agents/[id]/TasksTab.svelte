@@ -2,7 +2,7 @@
 	import { onMount, onDestroy } from 'svelte';
 	import { tasks as tasksApi } from '$lib/api';
 	import type { Task } from '$lib/api';
-	import { subscribeLiveUpdates, usePaneActive } from '$lib/liveUpdates';
+	import { isTransientRefreshError, subscribeLiveUpdates, usePaneActive } from '$lib/liveUpdates';
 	import { statusColor, timeAgo } from '$lib/utils';
 
 	interface Props {
@@ -27,7 +27,7 @@
 		void loadTasks();
 		unsubscribeLiveUpdates = subscribeLiveUpdates(
 			['tasks'],
-			() => loadTasks(false),
+			() => loadTasks(false, true),
 			{ active: paneActive, fallbackIntervalMs: 5000 }
 		);
 	});
@@ -36,7 +36,7 @@
 		unsubscribeLiveUpdates = null;
 	});
 
-	async function loadTasks(initial = true) {
+	async function loadTasks(initial = true, rethrowTransient = false) {
 		if (initial) loading = true;
 		error = null;
 		try {
@@ -44,8 +44,10 @@
 			taskList = result.tasks;
 		} catch (e) {
 			error = `Failed to load tasks: ${e}`;
+			if (rethrowTransient && isTransientRefreshError(e)) throw e;
+		} finally {
+			loading = false;
 		}
-		loading = false;
 	}
 
 	async function createTask() {

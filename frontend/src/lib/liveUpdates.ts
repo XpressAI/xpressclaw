@@ -1,5 +1,12 @@
 import { getContext, hasContext, setContext } from 'svelte';
-import { sendToLogin, ui, type UiRevisions } from './api';
+import { ApiError, sendToLogin, ui, type UiRevisions } from './api';
+
+export function isTransientRefreshError(err: unknown): boolean {
+	if (err instanceof ApiError) {
+		return err.status >= 500 || err.status === 408 || err.status === 429;
+	}
+	return true;
+}
 
 export type UiDomain =
 	| 'projects'
@@ -65,6 +72,10 @@ interface Subscriber {
 	pendingDomains: Set<UiDomain>;
 	dirty: boolean;
 	dirtyDomains: Set<UiDomain>;
+	retryTimer: ReturnType<typeof setTimeout> | null;
+	retryAttempt: number;
+	retryDomains: Set<UiDomain>;
+	retrySource: LiveUpdateSource | null;
 }
 
 let nextSubscriberId = 1;
@@ -131,12 +142,26 @@ export function subscribeLiveStreamStatus(listener: (connected: boolean) => void
 	};
 }
 
+function clearSubscriberRetryTimer(sub: Subscriber): void {
+	if (sub.retryTimer !== null) {
+		clearTimeout(sub.retryTimer);
+		sub.retryTimer = null;
+	}
+}
+
 function installGlobalListeners(): void {
 	if (listenersInstalled || typeof window === 'undefined') return;
 	listenersInstalled = true;
 
 	document.addEventListener('visibilitychange', () => {
 		if (isDocumentHidden()) {
+			for (const sub of subscribers.values()) {
+				if (sub.retryDomains.size > 0) {
+					sub.dirty = true;
+					for (const domain of sub.retryDomains) sub.dirtyDomains.add(domain);
+				}
+				clearSubscriberRetryTimer(sub);
+			}
 			stopStream();
 			stopFallbackLoop();
 			return;
@@ -149,6 +174,18 @@ function installGlobalListeners(): void {
 		streamUnsupported = false;
 		reconnectAttempt = 0;
 		if (!isDocumentHidden() && subscribers.size > 0) {
+			for (const sub of subscribers.values()) {
+				if (sub.retryDomains.size > 0 && sub.isActive()) {
+					sub.retryAttempt = 0;
+					clearSubscriberRetryTimer(sub);
+					triggerSubscriber(
+						sub,
+						currentRevisions ?? EMPTY_REVISIONS,
+						sub.retrySource ?? 'resume',
+						new Set(sub.retryDomains)
+					);
+				}
+			}
 			ensureTransport();
 		}
 	});
@@ -178,26 +215,44 @@ function triggerSubscriber(
 ): void {
 	if (!subscribers.has(sub.id)) return;
 
+	const mergedDomains = new Set<UiDomain>(sub.retryDomains);
+	for (const domain of changedDomains) mergedDomains.add(domain);
+	clearSubscriberRetryTimer(sub);
+
 	if (isDocumentHidden() || !sub.isActive()) {
 		sub.dirty = true;
-		for (const domain of changedDomains) sub.dirtyDomains.add(domain);
+		for (const domain of mergedDomains) sub.dirtyDomains.add(domain);
 		return;
 	}
 
 	if (sub.inFlight) {
 		sub.pendingSource = sub.pendingSource === 'sse' ? 'sse' : source;
-		for (const domain of changedDomains) sub.pendingDomains.add(domain);
+		for (const domain of mergedDomains) sub.pendingDomains.add(domain);
 		return;
 	}
 
 	sub.inFlight = true;
 	sub.lastRunAt = Date.now();
-	const domainSet = new Set(changedDomains);
+	const domainSet = mergedDomains;
+	let transientFailure = false;
 
 	Promise.resolve()
 		.then(() => sub.callback(revisions, { source, changedDomains: domainSet }))
-		.catch(() => {
-			// Individual view callbacks handle their own error states.
+		.then(() => {
+			sub.retryAttempt = 0;
+			sub.retryDomains.clear();
+			sub.retrySource = null;
+		})
+		.catch((err) => {
+			if (isTransientRefreshError(err)) {
+				transientFailure = true;
+				for (const domain of domainSet) sub.retryDomains.add(domain);
+				sub.retrySource = sub.retrySource === 'sse' ? 'sse' : source;
+			} else {
+				sub.retryAttempt = 0;
+				sub.retryDomains.clear();
+				sub.retrySource = null;
+			}
 		})
 		.finally(() => {
 			sub.inFlight = false;
@@ -208,6 +263,26 @@ function triggerSubscriber(
 				sub.pendingSource = null;
 				sub.pendingDomains.clear();
 				triggerSubscriber(sub, currentRevisions ?? revisions, nextSource, nextDomains);
+				return;
+			}
+			if (transientFailure && sub.retryDomains.size > 0) {
+				if (isDocumentHidden() || !sub.isActive()) {
+					sub.dirty = true;
+					for (const domain of sub.retryDomains) sub.dirtyDomains.add(domain);
+					return;
+				}
+				const delayMs = Math.min(15_000, 1000 * 2 ** Math.min(sub.retryAttempt, 4));
+				sub.retryAttempt += 1;
+				sub.retryTimer = setTimeout(() => {
+					sub.retryTimer = null;
+					if (!subscribers.has(sub.id)) return;
+					triggerSubscriber(
+						sub,
+						currentRevisions ?? revisions,
+						sub.retrySource ?? source,
+						new Set(sub.retryDomains)
+					);
+				}, delayMs);
 			}
 		});
 }
@@ -519,12 +594,17 @@ export function subscribeLiveUpdates(
 		pendingSource: null,
 		pendingDomains: new Set(),
 		dirty: false,
-		dirtyDomains: new Set()
+		dirtyDomains: new Set(),
+		retryTimer: null,
+		retryAttempt: 0,
+		retryDomains: new Set(),
+		retrySource: null
 	};
 	subscribers.set(id, subscriber);
 	ensureTransport();
 
 	return () => {
+		clearSubscriberRetryTimer(subscriber);
 		subscribers.delete(id);
 		if (subscribers.size === 0) {
 			stopStream();

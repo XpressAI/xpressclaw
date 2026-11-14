@@ -4,7 +4,7 @@
 	import { page } from '$app/stores';
 	import { agents, schedules, workflows } from '$lib/api';
 	import type { Agent, Schedule, Workflow } from '$lib/api';
-	import { subscribeLiveUpdates, usePaneActive } from '$lib/liveUpdates';
+	import { isTransientRefreshError, subscribeLiveUpdates, usePaneActive } from '$lib/liveUpdates';
 	import { timeAgo } from '$lib/utils';
 	import { serverTimestampMs } from '$lib/serverTime';
 	import { dateLabel } from '$lib/taskPlanning';
@@ -61,7 +61,7 @@
 		await loadAll();
 		unsubscribeLiveUpdates = subscribeLiveUpdates(
 			['workflows', 'schedules'],
-			() => loadAutomations(),
+			() => loadAutomations(true),
 			{ active: paneActive, fallbackIntervalMs: 10000 }
 		);
 	});
@@ -76,13 +76,23 @@
 		loading = false;
 	}
 
-	async function loadAutomations() {
+	async function loadAutomations(rethrowTransient = false) {
+		let transientError: unknown = null;
 		const [nextWorkflows, nextSchedules] = await Promise.all([
-			workflows.list().catch(() => workflowList),
-			schedules.list(undefined, { includeCompletedOnce }).catch(() => scheduleList),
+			workflows.list().catch((err) => {
+				if (isTransientRefreshError(err)) transientError ??= err;
+				return workflowList;
+			}),
+			schedules.list(undefined, { includeCompletedOnce }).catch((err) => {
+				if (isTransientRefreshError(err)) transientError ??= err;
+				return scheduleList;
+			}),
 		]);
 		workflowList = nextWorkflows;
 		scheduleList = nextSchedules;
+		if (rethrowTransient && transientError !== null) {
+			throw transientError;
+		}
 	}
 
 	async function loadAgents() {

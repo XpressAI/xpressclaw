@@ -3,7 +3,7 @@
 	import { goto } from '$app/navigation';
 	import { sessions, tasks } from '$lib/api';
 	import type { ImageAttachmentUpload, SessionOverview, RunnerReadiness, Task } from '$lib/api';
-	import { subscribeLiveUpdates, usePaneActive } from '$lib/liveUpdates';
+	import { isTransientRefreshError, subscribeLiveUpdates, usePaneActive } from '$lib/liveUpdates';
 	import ImageAttachmentPreviews from '$lib/components/ImageAttachmentPreviews.svelte';
 	import DictationButton from '$lib/components/DictationButton.svelte';
 	import { clearComposerDraft, loadComposerDraft, saveComposerDraft } from '$lib/composerDrafts';
@@ -71,7 +71,7 @@
 		void loadReadiness();
 		unsubscribeLiveUpdates = subscribeLiveUpdates(
 			['sessions', 'tasks', 'agents'],
-			() => load(),
+			() => load(true),
 			{ active: paneActive, fallbackIntervalMs: 2500 }
 		);
 		document.addEventListener('visibilitychange', handleVisibilityChange);
@@ -90,7 +90,7 @@
 		readinessRequest++;
 	});
 
-	async function load() {
+	async function load(rethrowTransient = false) {
 		try {
 			const [nextOverview, recentWork, attention] = await Promise.all([
 				sessions.get(agentId),
@@ -107,6 +107,7 @@
 			error = null;
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
+			if (rethrowTransient && isTransientRefreshError(e)) throw e;
 		}
 	}
 
