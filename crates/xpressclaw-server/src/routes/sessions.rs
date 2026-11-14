@@ -1160,4 +1160,43 @@ mod tests {
         assert_eq!(events_arr.len(), 1);
         assert_eq!(events_arr[0]["event_type"], "available_commands");
     }
+
+    #[tokio::test]
+    async fn session_get_endpoints_do_not_retrigger_ui_revisions_once_ensured() {
+        let (app, db) = test_app_with_db();
+
+        // First read ensures the logical session row once.
+        let initial = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/sessions/builder")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(initial.status(), StatusCode::OK);
+        let baseline = db.ui_revisions();
+
+        for uri in [
+            "/sessions/builder",
+            "/sessions/builder?include_details=true",
+            "/sessions/builder/events",
+            "/sessions/builder/attempts",
+            "/sessions/builder/readiness",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "failed GET {uri}");
+            assert_eq!(
+                db.ui_revisions(),
+                baseline,
+                "GET {uri} must not bump UI revisions"
+            );
+        }
+    }
 }

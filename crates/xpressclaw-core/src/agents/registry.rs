@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
@@ -81,6 +82,16 @@ impl AgentRegistry {
     /// Does NOT overwrite status if the agent already exists.
     pub fn ensure(&self, name: &str, backend: &str) -> Result<AgentRecord> {
         self.db.with_conn(|conn| {
+            let has_project = conn
+                .query_row(
+                    "SELECT project_id IS NOT NULL FROM agents WHERE id = ?1",
+                    [name],
+                    |row| row.get::<_, bool>(0),
+                )
+                .optional()?;
+            if has_project == Some(true) {
+                return Ok(());
+            }
             conn.execute(
                 "INSERT OR IGNORE INTO projects (id, name, description)
                  SELECT ?1, ?1, 'Created with this Agent'
@@ -95,9 +106,10 @@ impl AgentRegistry {
                 rusqlite::params![name, name, backend],
             )?;
             conn.execute(
-                "UPDATE agents SET project_id = COALESCE(project_id, ?1) WHERE id = ?1",
+                "UPDATE agents SET project_id = ?1 WHERE id = ?1 AND project_id IS NULL",
                 [name],
-            )
+            )?;
+            Ok::<_, rusqlite::Error>(())
         })?;
         self.get(name)
     }
@@ -388,7 +400,7 @@ impl AgentRegistry {
     pub fn clear_error(&self, agent_id: &str) -> Result<()> {
         self.db.with_conn(|conn| {
             conn.execute(
-                "UPDATE agents SET error_message = NULL WHERE id = ?1",
+                "UPDATE agents SET error_message = NULL WHERE id = ?1 AND error_message IS NOT NULL",
                 [agent_id],
             )
         })?;
@@ -636,5 +648,18 @@ mod tests {
         let agents = registry.list().unwrap();
         assert_eq!(agents.len(), 2);
         assert!(registry.get("old_agent").is_err());
+    }
+
+    #[test]
+    fn repeated_ensure_and_clear_error_do_not_bump_ui_revisions() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let registry = AgentRegistry::new(db.clone());
+
+        registry.ensure("atlas", "generic").unwrap();
+        let initialized = db.ui_revisions();
+
+        registry.ensure("atlas", "generic").unwrap();
+        registry.clear_error("atlas").unwrap();
+        assert_eq!(db.ui_revisions(), initialized);
     }
 }
