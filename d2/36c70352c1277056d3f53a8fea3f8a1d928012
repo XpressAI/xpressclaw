@@ -1,0 +1,8 @@
+adr: ADR-049
+branch: feat/low-bandwidth-live-updates
+summary: Evict rejected lazy-load chunk promises, bypass poisoned browser moduleMap entries on retry, and render retry alerts across lazy workspace views and agent tabs
+validation:
+  - npm --prefix frontend run check (0 errors, 0 warnings)
+  - npm --prefix frontend run build
+  - TZ=UTC npx playwright test --project=chromium e2e/workspace.spec.ts -g 'lazy-loaded workspace views|SSE|wake-ups' (8 passed)
+  - TZ=UTC npx playwright test --project=touch-chromium (1 passed)
