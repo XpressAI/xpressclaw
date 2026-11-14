@@ -1,0 +1,9 @@
+adr: ADR-049
+branch: feat/low-bandwidth-live-updates
+summary: Prevent read-time SessionManager::ensure and AgentRegistry::ensure calls from firing SQLite update_hook when state is unchanged
+validation:
+  - ./scripts/rustfmt.sh --check
+  - cargo clippy -p xpressclaw-core -p xpressclaw-server -p xpressclaw-cli -p xpressclaw-tauri --all-targets -- -D warnings
+  - cargo test -p xpressclaw-core --lib sessions
+  - cargo test -p xpressclaw-core --lib registry
+  - cargo test -p xpressclaw-server --lib
