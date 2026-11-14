@@ -4,6 +4,7 @@
 	import { page } from '$app/stores';
 	import { agents, schedules, workflows } from '$lib/api';
 	import type { Agent, Schedule, Workflow } from '$lib/api';
+	import { subscribeLiveUpdates, usePaneActive } from '$lib/liveUpdates';
 	import { timeAgo } from '$lib/utils';
 	import { serverTimestampMs } from '$lib/serverTime';
 	import { dateLabel } from '$lib/taskPlanning';
@@ -13,7 +14,9 @@
 	let scheduleList = $state<Schedule[]>([]);
 	let agentList = $state<Agent[]>([]);
 	let loading = $state(true);
-	let pollTimer: ReturnType<typeof setInterval> | null = null;
+	let includeCompletedOnce = $state(false);
+	const paneActive = usePaneActive();
+	let unsubscribeLiveUpdates: (() => void) | null = null;
 	let confirmDeleteId = $state<string | null>(null);
 	let showScheduleCreate = $state(false);
 	let scheduleForm = $state({
@@ -56,11 +59,16 @@
 
 	onMount(async () => {
 		await loadAll();
-		pollTimer = setInterval(loadAutomations, 10000);
+		unsubscribeLiveUpdates = subscribeLiveUpdates(
+			['workflows', 'schedules'],
+			() => loadAutomations(),
+			{ active: paneActive, fallbackIntervalMs: 10000 }
+		);
 	});
 
 	onDestroy(() => {
-		if (pollTimer) clearInterval(pollTimer);
+		unsubscribeLiveUpdates?.();
+		unsubscribeLiveUpdates = null;
 	});
 
 	async function loadAll() {
@@ -71,7 +79,7 @@
 	async function loadAutomations() {
 		const [nextWorkflows, nextSchedules] = await Promise.all([
 			workflows.list().catch(() => workflowList),
-			schedules.list().catch(() => scheduleList),
+			schedules.list(undefined, { includeCompletedOnce }).catch(() => scheduleList),
 		]);
 		workflowList = nextWorkflows;
 		scheduleList = nextSchedules;
@@ -299,7 +307,19 @@
 					<h2 class="text-lg font-semibold">Schedules</h2>
 					<p class="mt-1 text-sm text-muted-foreground">Start or resume agent work once or on a recurring schedule.</p>
 				</div>
-				<button type="button" onclick={openScheduleCreate} disabled={agentList.length === 0} class="self-start rounded-md border border-border bg-card px-3 py-1.5 text-xs font-medium transition-colors hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50">New Schedule</button>
+				<div class="flex flex-wrap items-center gap-3 self-start">
+					<label class="flex cursor-pointer items-center gap-2 text-xs text-muted-foreground">
+						<input
+							type="checkbox"
+							data-include-completed-wakeups
+							bind:checked={includeCompletedOnce}
+							onchange={() => void loadAutomations()}
+							class="h-3.5 w-3.5 rounded border-border accent-primary"
+						/>
+						Show completed wake-ups
+					</label>
+					<button type="button" onclick={openScheduleCreate} disabled={agentList.length === 0} class="rounded-md border border-border bg-card px-3 py-1.5 text-xs font-medium transition-colors hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50">New Schedule</button>
+				</div>
 			</div>
 
 			{#if agentList.length === 0}

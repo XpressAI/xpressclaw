@@ -40,6 +40,10 @@ pub fn log_frontend_status() {
 /// serve `index.html` so SvelteKit's client-side router handles it.
 pub async fn serve_frontend(req: Request<Body>) -> impl IntoResponse {
     let path = req.uri().path().trim_start_matches('/');
+    let if_none_match = req
+        .headers()
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok());
 
     // An unmatched API path is a client bug, not a page. Answering with the
     // SPA's index.html (200, text/html) surfaced only as a JSON parse error
@@ -50,7 +54,7 @@ pub async fn serve_frontend(req: Request<Body>) -> impl IntoResponse {
 
     // Try the exact path first
     if let Some(file) = FrontendAssets::get(path) {
-        return serve_file(path, &file.data);
+        return serve_embedded_file(path, &file, if_none_match);
     }
 
     // Try with index.html appended (for directory paths)
@@ -60,12 +64,12 @@ pub async fn serve_frontend(req: Request<Body>) -> impl IntoResponse {
         format!("{path}/index.html")
     };
     if let Some(file) = FrontendAssets::get(&index_path) {
-        return serve_file(&index_path, &file.data);
+        return serve_embedded_file(&index_path, &file, if_none_match);
     }
 
     // SPA fallback: serve index.html for client-side routing
     if let Some(file) = FrontendAssets::get("index.html") {
-        return serve_file("index.html", &file.data);
+        return serve_embedded_file("index.html", &file, if_none_match);
     }
 
     Response::builder()
@@ -74,21 +78,61 @@ pub async fn serve_frontend(req: Request<Body>) -> impl IntoResponse {
         .unwrap()
 }
 
-fn serve_file(path: &str, data: &[u8]) -> Response<Body> {
+fn serve_embedded_file(
+    path: &str,
+    file: &rust_embed::EmbeddedFile,
+    if_none_match: Option<&str>,
+) -> Response<Body> {
+    let etag = format_etag(&file.metadata.sha256_hash());
+    serve_bytes(path, &file.data, &etag, if_none_match)
+}
+
+fn serve_bytes(path: &str, data: &[u8], etag: &str, if_none_match: Option<&str>) -> Response<Body> {
+    let cache_control = if path.contains("immutable") {
+        "public, max-age=31536000, immutable"
+    } else {
+        "public, max-age=0, must-revalidate"
+    };
+    if if_none_match.is_some_and(|header_val| etag_matches(header_val, etag)) {
+        return Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header(header::ETAG, etag)
+            .header(header::CACHE_CONTROL, cache_control)
+            .body(Body::empty())
+            .unwrap();
+    }
+
     let mime = mime_type(path);
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, mime)
-        .header(
-            header::CACHE_CONTROL,
-            if path.contains("immutable") {
-                "public, max-age=31536000, immutable"
-            } else {
-                "public, max-age=0, must-revalidate"
-            },
-        )
+        .header(header::ETAG, etag)
+        .header(header::CACHE_CONTROL, cache_control)
         .body(Body::from(data.to_vec()))
         .unwrap()
+}
+
+fn format_etag(hash: &[u8; 32]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(66);
+    out.push('"');
+    for byte in hash {
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out.push('"');
+    out
+}
+
+fn etag_matches(if_none_match: &str, etag: &str) -> bool {
+    let trimmed = if_none_match.trim();
+    if trimmed == "*" {
+        return true;
+    }
+    trimmed.split(',').any(|candidate| {
+        let candidate = candidate.trim();
+        let normalized = candidate.strip_prefix("W/").unwrap_or(candidate).trim();
+        normalized == etag
+    })
 }
 
 fn mime_type(path: &str) -> &'static str {
@@ -103,5 +147,35 @@ fn mime_type(path: &str) -> &'static str {
         Some("woff2") => "font/woff2",
         Some("woff") => "font/woff",
         _ => "application/octet-stream",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serve_bytes_emits_etag_and_honors_if_none_match() {
+        let hash = [0xab_u8; 32];
+        let etag = format_etag(&hash);
+        let initial = serve_bytes("index.html", b"<!doctype html>", &etag, None);
+        assert_eq!(initial.status(), StatusCode::OK);
+        assert_eq!(initial.headers()[header::ETAG], etag);
+        assert_eq!(
+            initial.headers()[header::CACHE_CONTROL],
+            "public, max-age=0, must-revalidate"
+        );
+
+        let revalidated = serve_bytes("index.html", b"<!doctype html>", &etag, Some(&etag));
+        assert_eq!(revalidated.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(revalidated.headers()[header::ETAG], etag);
+
+        let weak_tag = format!("W/{etag}");
+        let weak_revalidated =
+            serve_bytes("index.html", b"<!doctype html>", &etag, Some(&weak_tag));
+        assert_eq!(weak_revalidated.status(), StatusCode::NOT_MODIFIED);
+
+        let stale = serve_bytes("index.html", b"<!doctype html>", &etag, Some("\"other\""));
+        assert_eq!(stale.status(), StatusCode::OK);
     }
 }

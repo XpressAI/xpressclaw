@@ -3,6 +3,7 @@
 	import { onDestroy, onMount } from 'svelte';
 	import yaml from 'js-yaml';
 	import { agents, conversations, projects, workflows, type Agent, type Conversation, type ConversationMessage, type ConversationMessageUpload, type ConversationTurn, type Project, type Task, type Workflow } from '$lib/api';
+	import { subscribeLiveUpdates, usePaneActive } from '$lib/liveUpdates';
 	import { clearComposerDraft, loadComposerDraft, saveComposerDraft } from '$lib/composerDrafts';
 	import { clipboardFiles, imageDataUrl, pastedImageFiles, shouldHandleImagePaste } from '$lib/imageAttachments';
 	import { PROJECT_MUTATION_EVENT, type ProjectMutation } from '$lib/projectEvents';
@@ -46,7 +47,8 @@
 	let fileInput = $state<HTMLInputElement>();
 	let composerInput = $state<HTMLTextAreaElement>();
 	let messagePane = $state<HTMLDivElement>();
-	let pollTimer: ReturnType<typeof setInterval> | null = null;
+	const paneActive = usePaneActive();
+	let unsubscribeLiveUpdates: (() => void) | null = null;
 	let eventSource: EventSource | null = null;
 	let stopInitialScrollPin: (() => void) | null = null;
 	let projectMutationVersion = 0;
@@ -91,12 +93,17 @@
 		draftReady = true;
 		void loadAll(true);
 		connectEvents();
-		pollTimer = setInterval(() => void refreshActivity(), 2500);
+		unsubscribeLiveUpdates = subscribeLiveUpdates(
+			['conversations', 'tasks', 'agents'],
+			() => refreshActivity(),
+			{ active: paneActive, fallbackIntervalMs: 2500 }
+		);
 		return () => window.removeEventListener(PROJECT_MUTATION_EVENT, handleProjectMutation);
 	});
 
 	onDestroy(() => {
-		if (pollTimer) clearInterval(pollTimer);
+		unsubscribeLiveUpdates?.();
+		unsubscribeLiveUpdates = null;
 		eventSource?.close();
 		stopInitialScrollPin?.();
 	});

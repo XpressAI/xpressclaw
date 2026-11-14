@@ -24,6 +24,7 @@ mod setup;
 mod speech;
 mod task_controls;
 mod tasks;
+mod ui;
 mod visualizations;
 mod workflows;
 mod workspace;
@@ -73,6 +74,7 @@ fn protected_api_routes() -> Router<AppState> {
         .nest("/settings", settings::routes())
         .nest("/speech", speech::routes())
         .nest("/setup", setup::routes())
+        .nest("/ui", ui::routes())
         .nest("/workflows", workflows::routes())
         .nest("/workspaces", workspace::routes())
 }

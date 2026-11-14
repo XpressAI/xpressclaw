@@ -1,7 +1,8 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, onDestroy } from 'svelte';
 	import { schedules } from '$lib/api';
 	import type { Schedule } from '$lib/api';
+	import { subscribeLiveUpdates, usePaneActive } from '$lib/liveUpdates';
 	import { timeAgo } from '$lib/utils';
 	import { serverTimestampMs } from '$lib/serverTime';
 
@@ -14,6 +15,9 @@
 	let scheduleList = $state<Schedule[]>([]);
 	let loading = $state(true);
 	let error = $state<string | null>(null);
+	let includeCompletedOnce = $state(false);
+	const paneActive = usePaneActive();
+	let unsubscribeLiveUpdates: (() => void) | null = null;
 
 	// Create form
 	let showCreateForm = $state(false);
@@ -26,14 +30,24 @@
 	let triggeringId = $state<string | null>(null);
 
 	onMount(() => {
-		loadSchedules();
+		void loadSchedules();
+		unsubscribeLiveUpdates = subscribeLiveUpdates(
+			['schedules'],
+			() => loadSchedules(false),
+			{ active: paneActive, fallbackIntervalMs: 10000 }
+		);
 	});
 
-	async function loadSchedules() {
-		loading = true;
+	onDestroy(() => {
+		unsubscribeLiveUpdates?.();
+		unsubscribeLiveUpdates = null;
+	});
+
+	async function loadSchedules(initial = true) {
+		if (initial) loading = true;
 		error = null;
 		try {
-			scheduleList = await schedules.list(agentId);
+			scheduleList = await schedules.list(agentId, { includeCompletedOnce });
 		} catch (e) {
 			error = `Failed to load schedules: ${e}`;
 		}
@@ -113,14 +127,26 @@
 
 <div class="space-y-6">
 	<div class="rounded-lg border border-border bg-card p-4 space-y-4">
-		<div class="flex items-center justify-between">
+		<div class="flex flex-wrap items-center justify-between gap-3">
 			<h2 class="text-sm font-semibold">Schedules</h2>
-			<button
-				onclick={() => { showCreateForm = !showCreateForm; }}
-				class="rounded-md border border-border px-3 py-1.5 text-xs text-foreground hover:bg-accent transition-colors"
-			>
-				{showCreateForm ? 'Cancel' : 'Create Schedule'}
-			</button>
+			<div class="flex flex-wrap items-center gap-3">
+				<label class="flex cursor-pointer items-center gap-2 text-xs text-muted-foreground">
+					<input
+						type="checkbox"
+						data-include-completed-wakeups
+						bind:checked={includeCompletedOnce}
+						onchange={() => void loadSchedules(false)}
+						class="h-3.5 w-3.5 rounded border-border accent-primary"
+					/>
+					Show completed wake-ups
+				</label>
+				<button
+					onclick={() => { showCreateForm = !showCreateForm; }}
+					class="rounded-md border border-border px-3 py-1.5 text-xs text-foreground hover:bg-accent transition-colors"
+				>
+					{showCreateForm ? 'Cancel' : 'Create Schedule'}
+				</button>
+			</div>
 		</div>
 
 		{#if showCreateForm}

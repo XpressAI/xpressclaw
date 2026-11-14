@@ -979,8 +979,26 @@ async function mockApi(
 			response = createdWorkflow ?? options.workflows?.find((workflow) => workflow.id === id) ?? {
 				error: `Unknown workflow: ${id}`,
 			};
+		} else if (path === '/api/ui/stream' || path === '/api/ui/revisions') {
+			await route.fulfill({ status: 204, body: '' });
+			return;
 		} else if (path === '/api/schedules') {
-			response = options.schedules ?? [];
+			const agentFilter = url.searchParams.get('agent_id');
+			const enabledOnly = url.searchParams.get('enabled') === 'true';
+			const includeCompletedOnce = url.searchParams.get('include_completed_once') === 'true';
+			response = (options.schedules ?? []).filter((schedule: Record<string, unknown>) => {
+				if (agentFilter && schedule.agent_id !== agentFilter) return false;
+				if (enabledOnly && !schedule.enabled) return false;
+				if (
+					!includeCompletedOnce
+					&& schedule.schedule_type === 'once'
+					&& !schedule.enabled
+					&& Number(schedule.run_count ?? 0) > 0
+				) {
+					return false;
+				}
+				return true;
+			});
 		} else if (path === '/api/setup/config') {
 			const configuredKind = options.agentKind?.value ?? agentRunnerKind;
 			response = {
@@ -1235,11 +1253,15 @@ async function mockApi(
 					delivery: payload.delivery === 'immediate' ? 'immediate' : (options.live ? 'after_tool' : 'queued'),
 				};
 			} else {
-				response = options.taskMessages ?? [
+				const allMessages = options.taskMessages ?? [
 					{ id: 1, task_id: taskId, role: 'assistant', content: firstAnswer, attachments: [], timestamp: timestamp(25) },
 					{ id: 2, task_id: taskId, role: 'user', content: userFollowUp, attachments: [], timestamp: timestamp(40) },
 					{ id: 3, task_id: taskId, role: 'assistant', content: secondAnswer, attachments: [], timestamp: timestamp(55) },
 				];
+				const afterId = url.searchParams.has('after_id') ? Number(url.searchParams.get('after_id')) : null;
+				response = afterId !== null && Number.isFinite(afterId)
+					? allMessages.filter((message) => Number(message.id) > afterId)
+					: allMessages;
 			}
 		} else if (path.startsWith(`/api/tasks/${taskId}/elicitations/`) && path.endsWith('/response')) {
 			const elicitationId = decodeURIComponent(path.split('/')[5]);
@@ -1328,6 +1350,9 @@ async function mockApi(
 		} else if (path === `/api/sessions/${agentId}`) {
 			response = {
 				session: { id: agentId, status: options.live ? 'running' : 'idle' },
+				active_task_count: listedTasks.filter(
+					(listedTask) => listedTask.agent_id === agentId && ['pending', 'in_progress'].includes(listedTask.status),
+				).length,
 				active_attempts: [],
 				queued_attempts: [],
 				recent_attempts: [],
@@ -1359,7 +1384,7 @@ async function mockApi(
 				], modes: null, notice: 'Last observed controls; changes will apply on the next turn.',
 			};
 		} else if (path === `/api/sessions/${agentId}/events`) {
-			response = [
+			const allEvents = [
 				{
 					...activityEvent(70),
 					event_type: 'session_config_options',
@@ -1379,6 +1404,18 @@ async function mockApi(
 					] },
 				},
 			];
+			const eventType = url.searchParams.get('event_type');
+			const after = url.searchParams.has('after') ? Number(url.searchParams.get('after')) : null;
+			const limit = url.searchParams.has('limit') ? Number(url.searchParams.get('limit')) : null;
+			let filteredEvents = allEvents.filter((event) => {
+				if (eventType && event.event_type !== eventType) return false;
+				if (after !== null && Number.isFinite(after) && event.id <= after) return false;
+				return true;
+			});
+			if (limit !== null && Number.isFinite(limit) && limit > 0) {
+				filteredEvents = filteredEvents.slice(-limit);
+			}
+			response = filteredEvents;
 		} else {
 			await route.fulfill({ status: 404, contentType: 'application/json', body: JSON.stringify({ error: `Unmocked API route: ${path}` }) });
 			return;
@@ -1405,7 +1442,7 @@ for (const history of ['evicted', 'sibling', 'abandoned']) {
 	test(`canonical picker ignores ${history} history and does not submit observed defaults`, async ({ page }) => {
 		const postedMessages: Record<string, unknown>[] = [];
 		await mockApi(page, { taskStatus: 'completed', postedMessages });
-		await page.route(`**/api/sessions/${agentId}/events`, route => route.fulfill({ json: history === 'evicted' ? [] : [{
+		await page.route(`**/api/sessions/${agentId}/events*`, route => route.fulfill({ json: history === 'evicted' ? [] : [{
 			...activityEvent(500), task_id: history === 'sibling' ? 'another-task' : taskId,
 			event_type: 'session_config_options', payload: pickerSnapshot('qwen'),
 		}] }));
@@ -8025,4 +8062,185 @@ test('stalled Git refresh times out and a later refresh recovers', async ({ page
     } finally {
         releaseGit();
     }
+});
+
+async function installMockUiStream(page: Page) {
+	await page.addInitScript(() => {
+		const originalFetch = window.fetch.bind(window);
+		const encoder = new TextEncoder();
+		const controllers = new Set<ReadableStreamDefaultController<Uint8Array>>();
+		let state = {
+			seq: 1,
+			projects: 1,
+			agents: 1,
+			conversations: 1,
+			tasks: 1,
+			sessions: 1,
+			schedules: 1,
+			workflows: 1,
+		};
+		const w = window as unknown as {
+			__mockUiStreamEmit?: (patch: Record<string, number>) => void;
+			__mockUiStreamSubscriberCount?: () => number;
+		};
+		w.__mockUiStreamSubscriberCount = () => controllers.size;
+		w.__mockUiStreamEmit = (patch: Record<string, number>) => {
+			state = { ...state, ...patch, seq: (patch.seq ?? state.seq + 1) };
+			const frame = encoder.encode(`event: revisions\ndata: ${JSON.stringify(state)}\n\n`);
+			for (const controller of controllers) {
+				try {
+					controller.enqueue(frame);
+				} catch {
+					controllers.delete(controller);
+				}
+			}
+		};
+		window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+			const rawUrl = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+			const parsed = new URL(rawUrl, window.location.origin);
+			if (parsed.pathname === '/api/ui/stream') {
+				let activeController: ReadableStreamDefaultController<Uint8Array> | null = null;
+				const stream = new ReadableStream<Uint8Array>({
+					start(controller) {
+						activeController = controller;
+						controllers.add(controller);
+						controller.enqueue(
+							encoder.encode(`event: revisions\ndata: ${JSON.stringify(state)}\n\n`),
+						);
+						init?.signal?.addEventListener('abort', () => {
+							controllers.delete(controller);
+							try { controller.close(); } catch {}
+						});
+					},
+					cancel() {
+						if (activeController) controllers.delete(activeController);
+					},
+				});
+				return new Response(stream, {
+					status: 200,
+					headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' },
+				});
+			}
+			return originalFetch(input, init);
+		};
+	});
+}
+
+test('scheduled wake-up updates a completed task via SSE without idle background polling', async ({ page }) => {
+	await installMockUiStream(page);
+	const messages: Record<string, unknown>[] = [
+		{ id: 1, task_id: taskId, role: 'user', content: 'Check status in 5 minutes.', attachments: [], timestamp: timestamp(10) },
+		{ id: 2, task_id: taskId, role: 'assistant', content: 'Scheduled a follow-up wake-up.', attachments: [], timestamp: timestamp(20) },
+	];
+	const attempts = [attempt('completed', 64_000, null, 'Scheduled a follow-up wake-up.')];
+	await mockApi(page, {
+		taskStatus: 'completed',
+		taskMessages: messages,
+		taskAttempts: attempts,
+		taskActivityEvents: [],
+	});
+
+	const seenRequests: string[] = [];
+	page.on('request', (req) => {
+		const url = new URL(req.url());
+		if (url.pathname.startsWith('/api/')) {
+			seenRequests.push(`${url.pathname}${url.search}`);
+		}
+	});
+
+	await page.goto(`/tasks/${taskId}`);
+	await expect(page.getByText('Scheduled a follow-up wake-up.', { exact: true })).toBeVisible();
+	await expect.poll(() =>
+		page.evaluate(() => (window as unknown as { __mockUiStreamSubscriberCount?: () => number }).__mockUiStreamSubscriberCount?.() ?? 0),
+	).toBeGreaterThan(0);
+
+	// Let initial load settle, then verify zero idle background polls while SSE is connected.
+	await page.waitForTimeout(200);
+	seenRequests.length = 0;
+	await page.waitForTimeout(3600);
+	expect(seenRequests).toEqual([]);
+
+	// Simulate a scheduled wake-up firing on the completed task in the backend.
+	const currentTask = await page.evaluate(async (id) => (await fetch(`/api/tasks/${id}`)).json(), taskId);
+	seenRequests.length = 0;
+	await page.route(`**/api/tasks/${taskId}`, (route) =>
+		route.fulfill({ json: { ...currentTask, status: 'in_progress', activity_status: 'in_progress', completed_at: null } }),
+	);
+	messages.push(
+		{ id: 3, task_id: taskId, role: 'user', content: 'Scheduled wake-up: Check deployment health', attachments: [], timestamp: timestamp(70) },
+		{ id: 4, task_id: taskId, role: 'assistant', content: 'Deployment is healthy after the scheduled check.', attachments: [], timestamp: timestamp(72) },
+	);
+
+	await page.evaluate(() => {
+		(window as unknown as { __mockUiStreamEmit?: (patch: Record<string, number>) => void }).__mockUiStreamEmit?.({
+			tasks: 2,
+			sessions: 2,
+		});
+	});
+
+	await expect(page.getByText('Scheduled wake-up: Check deployment health', { exact: true })).toBeVisible();
+	await expect(page.getByText('Deployment is healthy after the scheduled check.', { exact: true })).toBeVisible();
+	expect(seenRequests.some((entry) => entry.startsWith(`/api/tasks/${taskId}/messages?after_id=1`))).toBe(true);
+});
+
+test('completed one-shot wake-ups are hidden by default and revealed on demand', async ({ page }) => {
+	const scheduleRequests: string[] = [];
+	page.on('request', (req) => {
+		const url = new URL(req.url());
+		if (url.pathname === '/api/schedules') {
+			scheduleRequests.push(url.search);
+		}
+	});
+
+	await mockApi(page, {
+		schedules: [
+			{
+				id: 'schedule-recurring',
+				name: 'Morning digest',
+				cron: '0 8 * * *',
+				agent_id: agentId,
+				title: 'Send morning digest',
+				description: null,
+				enabled: true,
+				last_run: null,
+				run_count: 3,
+				created_at: timestamp(10),
+				schedule_type: 'cron',
+				run_at: null,
+				continuation_task_id: null,
+				conversation_id: null,
+			},
+			{
+				id: 'schedule-fired-wakeup',
+				name: 'Follow-up wake-up #1229',
+				cron: '',
+				agent_id: agentId,
+				title: 'Resume deployment check',
+				description: 'Historical fired one-shot continuation payload',
+				enabled: false,
+				last_run: timestamp(50),
+				run_count: 1,
+				created_at: timestamp(40),
+				schedule_type: 'once',
+				run_at: timestamp(50),
+				continuation_task_id: taskId,
+				conversation_id: null,
+			},
+		],
+	});
+
+	// Opening an Agent page must not fetch /api/schedules while Automations is not open.
+	await page.goto(`/agents/${agentId}`);
+	await expect(page.getByPlaceholder('Send work or ask a question…')).toBeVisible();
+	expect(scheduleRequests).toEqual([]);
+
+	// Opening Automations fetches only active/unfired schedules by default.
+	await page.goto('/automations');
+	await expect(page.getByText('Morning digest').first()).toBeVisible();
+	await expect(page.getByText('Follow-up wake-up #1229')).toHaveCount(0);
+
+	// Opting into completed wake-ups fetches with include_completed_once=true.
+	await page.locator('[data-include-completed-wakeups]').check();
+	await expect(page.getByText('Follow-up wake-up #1229')).toBeVisible();
+	expect(scheduleRequests.some((search) => search.includes('include_completed_once=true'))).toBe(true);
 });

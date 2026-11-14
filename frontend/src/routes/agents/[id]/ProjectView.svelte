@@ -1,24 +1,61 @@
+<script lang="ts" module>
+	import type { Component } from 'svelte';
+
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	type AnyTabComponent = Component<any>;
+	const tabComponentCache = new Map<string, AnyTabComponent>();
+	const inflightTabComponents = new Map<string, Promise<AnyTabComponent>>();
+	const tabComponentLoaders: Record<string, () => Promise<AnyTabComponent>> = {
+		runner: () => import('./RunnerTab.svelte').then((m) => m.default),
+		workspace: () => import('./WorkspaceTab.svelte').then((m) => m.default),
+		tasks: () => import('./TasksTab.svelte').then((m) => m.default),
+		schedules: () => import('./SchedulesTab.svelte').then((m) => m.default),
+		files: () => import('./FilesTab.svelte').then((m) => m.default),
+	};
+
+	function loadTabComponent(section: string): Promise<AnyTabComponent> {
+		const cached = tabComponentCache.get(section);
+		if (cached) return Promise.resolve(cached);
+		const inflight = inflightTabComponents.get(section);
+		if (inflight) return inflight;
+		const loader = tabComponentLoaders[section];
+		if (!loader) return Promise.reject(new Error(`Unknown tab section: ${section}`));
+		const pending = loader().then((component) => {
+			tabComponentCache.set(section, component);
+			inflightTabComponents.delete(section);
+			return component;
+		});
+		inflightTabComponents.set(section, pending);
+		return pending;
+	}
+</script>
+
 <script lang="ts">
-	import { onMount, onDestroy } from 'svelte';
+	import { onMount, onDestroy, untrack } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { agents, setup } from '$lib/api';
 	import type { Agent, LiveConfig } from '$lib/api';
+	import { subscribeLiveUpdates, usePaneActive } from '$lib/liveUpdates';
 	import { agentRuntimeSummary, agentRuntimeTitle, harnessMark, statusColor } from '$lib/utils';
 	import { projectPath, type ProjectSection } from '$lib/workspace';
 
 	import SessionTab from './SessionTab.svelte';
-	import RunnerTab from './RunnerTab.svelte';
-	import WorkspaceTab from './WorkspaceTab.svelte';
-	import TasksTab from './TasksTab.svelte';
-	import SchedulesTab from './SchedulesTab.svelte';
-	import FilesTab from './FilesTab.svelte';
 
 	let { agentId, section = 'session', route = '' }: { agentId: string; section?: ProjectSection; route?: string } = $props();
 
 	let agent = $state<Agent | null>(null);
 	let error = $state<string | null>(null);
 	let agentConfig = $state<LiveConfig['agents'][0] | null>(null);
+	let configLoadedForAgent = '';
+	let configLoading = false;
 	let activeTab = $derived(section);
+	const initialTabSection = untrack(() => activeTab);
+	if (initialTabSection !== 'session' && !tabComponentCache.has(initialTabSection)) {
+		void loadTabComponent(initialTabSection);
+	}
+	let ActiveTabComponent = $state<AnyTabComponent | null>(
+		initialTabSection === 'session' ? null : (tabComponentCache.get(initialTabSection) ?? null)
+	);
 	let saveMessage = $state('');
 	let showDeleteConfirm = $state(false);
 	let deleting = $state(false);
@@ -26,7 +63,8 @@
 	// Incremented to signal the active tab to save
 	let saveSignal = $state(0);
 
-	let pollTimer: ReturnType<typeof setInterval> | null = null;
+	const paneActive = usePaneActive();
+	let unsubscribeLiveUpdates: (() => void) | null = null;
 
 	const tabs: { id: ProjectSection; label: string }[] = [
 		{ id: 'session', label: 'Work' },
@@ -37,44 +75,104 @@
 		{ id: 'workspace', label: 'Environment' },
 	];
 
+	$effect(() => {
+		const targetTab = activeTab;
+		if (targetTab === 'session') {
+			ActiveTabComponent = null;
+			return;
+		}
+		const cached = tabComponentCache.get(targetTab);
+		if (cached) {
+			ActiveTabComponent = cached;
+			return;
+		}
+		ActiveTabComponent = null;
+		let cancelled = false;
+		void loadTabComponent(targetTab).then((component) => {
+			if (!cancelled) ActiveTabComponent = component;
+		});
+		return () => {
+			cancelled = true;
+		};
+	});
+
+	$effect(() => {
+		if (!agent) return;
+		if ((activeTab === 'runner' || activeTab === 'workspace') && configLoadedForAgent !== agent.id && !configLoading) {
+			void ensureAgentConfig(agent);
+		}
+	});
+
 	onMount(() => {
-		loadAgent(agentId);
+		void loadAgent(agentId);
+		unsubscribeLiveUpdates = subscribeLiveUpdates(
+			['agents', 'sessions', 'tasks'],
+			() => refreshAgentStatus(agentId),
+			{ active: paneActive, fallbackIntervalMs: 5000 }
+		);
 	});
 
 	onDestroy(() => {
-		if (pollTimer) clearInterval(pollTimer);
+		unsubscribeLiveUpdates?.();
+		unsubscribeLiveUpdates = null;
 	});
 
+	async function ensureAgentConfig(current: Agent) {
+		if (configLoading) return;
+		configLoading = true;
+		try {
+			const config = await setup.getConfig();
+			if (agent?.id === current.id) {
+				agentConfig = config.agents.find((a) => a.name === current.name) ?? null;
+				configLoadedForAgent = current.id;
+			}
+		} catch {
+			// Tab handles null agentConfig gracefully.
+		} finally {
+			configLoading = false;
+		}
+	}
+
+	async function refreshAgentStatus(id: string) {
+		try {
+			const fresh = await agents.get(id);
+			if (agent && agent.id === id) {
+				agent.status = fresh.status;
+				agent.desired_status = fresh.desired_status;
+				agent.observed_status = fresh.observed_status;
+				agent.container_id = fresh.container_id;
+				agent.error_message = fresh.error_message;
+				agent.restart_count = fresh.restart_count;
+				agent.started_at = fresh.started_at;
+				agent.stopped_at = fresh.stopped_at;
+			} else if (agentId === id) {
+				agent = fresh;
+			}
+		} catch {}
+	}
+
 	async function loadAgent(id: string) {
-		if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
 		error = null;
+		configLoadedForAgent = '';
+		agentConfig = null;
+		const needConfig = activeTab === 'runner' || activeTab === 'workspace';
+		if (needConfig) configLoading = true;
 
 		try {
-			agent = await agents.get(id);
-			const config = await setup.getConfig();
-			agentConfig = config.agents.find(a => a.name === agent!.name) ?? null;
+			const [loadedAgent, loadedConfig] = await Promise.all([
+				agents.get(id),
+				needConfig ? setup.getConfig().catch(() => null) : Promise.resolve(null),
+			]);
+			if (loadedAgent && loadedConfig) {
+				agentConfig = loadedConfig.agents.find((a) => a.name === loadedAgent.name) ?? null;
+				configLoadedForAgent = loadedAgent.id;
+			}
+			agent = loadedAgent;
 		} catch (e) {
 			error = String(e);
+		} finally {
+			if (needConfig) configLoading = false;
 		}
-
-		// Poll status every 5s — update fields in-place to avoid XCLAW-48
-		pollTimer = setInterval(async () => {
-			try {
-				const fresh = await agents.get(id);
-				if (agent) {
-					agent.status = fresh.status;
-					agent.desired_status = fresh.desired_status;
-					agent.observed_status = fresh.observed_status;
-					agent.container_id = fresh.container_id;
-					agent.error_message = fresh.error_message;
-					agent.restart_count = fresh.restart_count;
-					agent.started_at = fresh.started_at;
-					agent.stopped_at = fresh.stopped_at;
-				} else {
-					agent = fresh;
-				}
-			} catch {}
-		}, 5000);
 	}
 
 	async function handleDelete() {
@@ -185,16 +283,18 @@
 		<div class="flex-1 min-h-0 {activeTab === 'files' ? 'overflow-hidden' : 'overflow-y-auto px-3 py-4 sm:px-6'}">
 			{#if activeTab === 'session'}
 				<SessionTab agentId={agent.id} />
-			{:else if activeTab === 'runner'}
-				<RunnerTab {agentConfig} agentId={agent.id} onSave={handleSave} {saveSignal} />
-			{:else if activeTab === 'workspace'}
-				<WorkspaceTab agentId={agent.id} {agentConfig} onSave={handleSave} />
-			{:else if activeTab === 'tasks'}
-				<TasksTab agentId={agent.id} />
-			{:else if activeTab === 'schedules'}
-				<SchedulesTab agentId={agent.id} />
-			{:else if activeTab === 'files'}
-				<FilesTab agentId={agent.id} {route} />
+			{:else if ActiveTabComponent}
+				{#if activeTab === 'runner'}
+					<ActiveTabComponent {agentConfig} agentId={agent.id} onSave={handleSave} {saveSignal} />
+				{:else if activeTab === 'workspace'}
+					<ActiveTabComponent agentId={agent.id} {agentConfig} onSave={handleSave} />
+				{:else if activeTab === 'files'}
+					<ActiveTabComponent agentId={agent.id} {route} />
+				{:else}
+					<ActiveTabComponent agentId={agent.id} />
+				{/if}
+			{:else}
+				<div class="flex min-h-40 items-center justify-center text-sm text-muted-foreground">Loading…</div>
 			{/if}
 		</div>
 

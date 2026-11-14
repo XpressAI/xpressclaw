@@ -50,6 +50,12 @@ pub enum TaskListSort {
 #[derive(Deserialize)]
 pub struct RecentByAgentParams {
     pub limit: Option<i64>,
+    pub include_details: Option<bool>,
+}
+
+#[derive(Deserialize)]
+pub struct MessagesParams {
+    pub after_id: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -350,29 +356,28 @@ async fn list_tasks(
             .as_deref()
             .map(|status| vec![status])
             .unwrap_or_else(|| parse_comma_separated(params.statuses.as_deref()));
+        let excluded_statuses = parse_comma_separated(params.exclude_statuses.as_deref());
         match params.sort {
             TaskListSort::Scheduler => board
-                .list_page(
+                .list_page_excluding(
                     &included_statuses,
                     params.agent_id.as_deref(),
+                    &excluded_statuses,
                     search,
                     limit,
                     offset,
                 )
                 .map_err(internal_error)?,
-            TaskListSort::Recent => {
-                let excluded_statuses = parse_comma_separated(params.exclude_statuses.as_deref());
-                board
-                    .list_recent_page(
-                        &included_statuses,
-                        params.agent_id.as_deref(),
-                        &excluded_statuses,
-                        search,
-                        limit,
-                        offset,
-                    )
-                    .map_err(internal_error)?
-            }
+            TaskListSort::Recent => board
+                .list_recent_page(
+                    &included_statuses,
+                    params.agent_id.as_deref(),
+                    &excluded_statuses,
+                    search,
+                    limit,
+                    offset,
+                )
+                .map_err(internal_error)?,
         }
     };
 
@@ -419,8 +424,15 @@ async fn list_recent_tasks_by_agent(
     let board = TaskBoard::new(state.db.clone());
     let limit = params.limit.unwrap_or(5).clamp(1, 100);
     let tasks = board.list_recent_per_agent(limit).map_err(internal_error)?;
+    let mut enriched = enrich_tasks(&board, &tasks);
+    if !params.include_details.unwrap_or(false) {
+        for item in &mut enriched {
+            item["description"] = Value::Null;
+            item["context"] = json!({});
+        }
+    }
 
-    Ok(Json(json!({ "tasks": enrich_tasks(&board, &tasks) })))
+    Ok(Json(json!({ "tasks": enriched })))
 }
 
 pub(super) fn enrich_tasks(board: &TaskBoard, tasks: &[Task]) -> Vec<Value> {
@@ -792,9 +804,12 @@ async fn task_counts(
 async fn get_messages(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(params): Query<MessagesParams>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let conv = TaskConversation::new(state.db.clone());
-    let messages = conv.get_messages(&id).map_err(internal_error)?;
+    let messages = conv
+        .get_messages_after(&id, params.after_id)
+        .map_err(internal_error)?;
     Ok(Json(json!(messages)))
 }
 
@@ -955,6 +970,9 @@ async fn respond_to_elicitation(
                 Json(json!({ "error": "this question is no longer awaiting a response" })),
             ),
         })?;
+    state.db.bump_ui_domains(
+        xpressclaw_core::db::ui_domains::TASKS | xpressclaw_core::db::ui_domains::SESSIONS,
+    );
 
     if req.action == "accept" {
         let message = req
@@ -3464,5 +3482,93 @@ flows:
                 StatusCode::NOT_FOUND
             );
         }
+    }
+
+    #[tokio::test]
+    async fn incremental_messages_and_slim_recent_by_agent_payloads() {
+        let (app, db) = test_app_with_db();
+        let board = TaskBoard::new(db.clone());
+        let created = board
+            .create(&CreateTask {
+                backlog: false,
+                start_after: None,
+                title: "Sidebar summary check".to_string(),
+                description: Some("x".repeat(4096)),
+                agent_id: Some("atlas".to_string()),
+                parent_task_id: None,
+                sop_id: None,
+                conversation_id: None,
+                priority: None,
+                context: Some(json!({ "heavy": "y".repeat(4096) })),
+            })
+            .unwrap();
+        let conv = TaskConversation::new(db);
+        let first = conv.add_message(&created.id, "user", "First").unwrap();
+        let second = conv
+            .add_message(&created.id, "assistant", "Second")
+            .unwrap();
+
+        let delta_resp = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/tasks/{}/messages?after_id={}",
+                    created.id, first.id
+                ))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delta_resp.status(), StatusCode::OK);
+        let delta_messages = body_json(delta_resp.into_body()).await;
+        let arr = delta_messages.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["id"], second.id);
+
+        let slim_recent = app
+            .clone()
+            .oneshot(
+                Request::get("/tasks/recent-by-agent?limit=5")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(slim_recent.status(), StatusCode::OK);
+        let slim_body = body_json(slim_recent.into_body()).await;
+        assert!(slim_body["tasks"][0]["description"].is_null());
+        assert_eq!(slim_body["tasks"][0]["context"], json!({}));
+
+        let full_recent = app
+            .clone()
+            .oneshot(
+                Request::get("/tasks/recent-by-agent?limit=5&include_details=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(full_recent.status(), StatusCode::OK);
+        let full_body = body_json(full_recent.into_body()).await;
+        assert_eq!(
+            full_body["tasks"][0]["description"].as_str().unwrap().len(),
+            4096
+        );
+
+        board
+            .update_status(&created.id, "completed", Some("agent-1"))
+            .unwrap();
+        let active_only = app
+            .oneshot(
+                Request::get("/tasks?exclude_statuses=completed,cancelled")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(active_only.status(), StatusCode::OK);
+        let active_body = body_json(active_only.into_body()).await;
+        assert_eq!(active_body["tasks"].as_array().unwrap().len(), 0);
     }
 }

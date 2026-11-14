@@ -1,9 +1,12 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, Once};
 
 use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::watch;
 use tracing::info;
 use unicode_casefold::UnicodeCaseFold;
 use unicode_normalization::UnicodeNormalization;
@@ -55,6 +58,119 @@ fn register_sql_functions(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Bitmask of UI resource domains invalidated by a database commit or runtime update.
+pub mod ui_domains {
+    pub const PROJECTS: u32 = 1 << 0;
+    pub const AGENTS: u32 = 1 << 1;
+    pub const CONVERSATIONS: u32 = 1 << 2;
+    pub const TASKS: u32 = 1 << 3;
+    pub const SESSIONS: u32 = 1 << 4;
+    pub const SCHEDULES: u32 = 1 << 5;
+    pub const WORKFLOWS: u32 = 1 << 6;
+    pub const ALL: u32 =
+        PROJECTS | AGENTS | CONVERSATIONS | TASKS | SESSIONS | SCHEDULES | WORKFLOWS;
+}
+
+/// Monotonic per-domain UI revision counters (ADR-049).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiRevisions {
+    pub seq: u64,
+    pub projects: u64,
+    pub agents: u64,
+    pub conversations: u64,
+    pub tasks: u64,
+    pub sessions: u64,
+    pub schedules: u64,
+    pub workflows: u64,
+}
+
+impl UiRevisions {
+    pub fn advance(&mut self, mask: u32) {
+        if mask == 0 {
+            return;
+        }
+        self.seq = self.seq.wrapping_add(1);
+        if mask & ui_domains::PROJECTS != 0 {
+            self.projects = self.projects.wrapping_add(1);
+        }
+        if mask & ui_domains::AGENTS != 0 {
+            self.agents = self.agents.wrapping_add(1);
+        }
+        if mask & ui_domains::CONVERSATIONS != 0 {
+            self.conversations = self.conversations.wrapping_add(1);
+        }
+        if mask & ui_domains::TASKS != 0 {
+            self.tasks = self.tasks.wrapping_add(1);
+        }
+        if mask & ui_domains::SESSIONS != 0 {
+            self.sessions = self.sessions.wrapping_add(1);
+        }
+        if mask & ui_domains::SCHEDULES != 0 {
+            self.schedules = self.schedules.wrapping_add(1);
+        }
+        if mask & ui_domains::WORKFLOWS != 0 {
+            self.workflows = self.workflows.wrapping_add(1);
+        }
+    }
+}
+
+fn ui_domain_mask_for_table(table: &str) -> u32 {
+    match table {
+        "projects" | "project_sync_state" => ui_domains::PROJECTS,
+        "agents" | "agent_repository_selections" => ui_domains::AGENTS,
+        "conversations"
+        | "conversation_messages"
+        | "conversation_message_attachments"
+        | "conversation_message_sync"
+        | "conversation_participants"
+        | "conversation_turns"
+        | "conversation_agent_sessions" => ui_domains::CONVERSATIONS,
+        "tasks"
+        | "task_messages"
+        | "task_message_attachments"
+        | "task_message_sync"
+        | "task_queue"
+        | "task_dependencies"
+        | "task_pull_requests"
+        | "message_visualizations" => ui_domains::TASKS,
+        "logical_sessions" | "attempt_artifacts" => ui_domains::SESSIONS,
+        "work_attempts" | "session_events" => ui_domains::SESSIONS | ui_domains::TASKS,
+        "schedules" => ui_domains::SCHEDULES,
+        "workflows"
+        | "project_workflows"
+        | "workflow_instances"
+        | "workflow_step_executions"
+        | "workflow_node_executions"
+        | "workflow_instance_agent_bindings" => ui_domains::WORKFLOWS,
+        _ => 0,
+    }
+}
+
+fn install_ui_revision_hooks(conn: &Connection, sender: &watch::Sender<UiRevisions>) {
+    let pending = Arc::new(AtomicU32::new(0));
+    let pending_update = pending.clone();
+    conn.update_hook(Some(
+        move |_action: rusqlite::hooks::Action, _db_name: &str, table: &str, _row_id: i64| {
+            let mask = ui_domain_mask_for_table(table);
+            if mask != 0 {
+                pending_update.fetch_or(mask, Ordering::Relaxed);
+            }
+        },
+    ));
+    let pending_rollback = pending.clone();
+    conn.rollback_hook(Some(move || {
+        pending_rollback.store(0, Ordering::Relaxed);
+    }));
+    let sender_commit = sender.clone();
+    conn.commit_hook(Some(move || {
+        let mask = pending.swap(0, Ordering::AcqRel);
+        if mask != 0 {
+            sender_commit.send_modify(|revisions| revisions.advance(mask));
+        }
+        false
+    }));
+}
+
 /// Database manager for xpressclaw.
 ///
 /// Uses SQLite with WAL mode for concurrent reads.
@@ -62,6 +178,7 @@ fn register_sql_functions(conn: &Connection) -> Result<()> {
 pub struct Database {
     path: PathBuf,
     conn: Arc<Mutex<Connection>>,
+    ui_revisions: watch::Sender<UiRevisions>,
 }
 
 impl Database {
@@ -86,12 +203,18 @@ impl Database {
         )?;
         register_sql_functions(&conn)?;
 
+        let (ui_revisions, _) = watch::channel(UiRevisions::default());
         let db = Self {
             path: path.to_path_buf(),
             conn: Arc::new(Mutex::new(conn)),
+            ui_revisions,
         };
 
         db.migrate()?;
+        {
+            let conn = db.conn();
+            install_ui_revision_hooks(&conn, &db.ui_revisions);
+        }
         Ok(db)
     }
 
@@ -103,13 +226,37 @@ impl Database {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         register_sql_functions(&conn)?;
 
+        let (ui_revisions, _) = watch::channel(UiRevisions::default());
         let db = Self {
             path: PathBuf::from(":memory:"),
             conn: Arc::new(Mutex::new(conn)),
+            ui_revisions,
         };
 
         db.migrate()?;
+        {
+            let conn = db.conn();
+            install_ui_revision_hooks(&conn, &db.ui_revisions);
+        }
         Ok(db)
+    }
+
+    /// Current snapshot of UI domain revisions.
+    pub fn ui_revisions(&self) -> UiRevisions {
+        *self.ui_revisions.borrow()
+    }
+
+    /// Subscribe to UI domain revision updates.
+    pub fn subscribe_ui_revisions(&self) -> watch::Receiver<UiRevisions> {
+        self.ui_revisions.subscribe()
+    }
+
+    /// Advance UI domain revisions for in-memory state transitions outside SQLite.
+    pub fn bump_ui_domains(&self, mask: u32) {
+        if mask != 0 {
+            self.ui_revisions
+                .send_modify(|revisions| revisions.advance(mask));
+        }
     }
 
     /// Get a reference to the connection (locked).
@@ -4120,5 +4267,56 @@ flows:
         assert!(tables.contains(&"dashboard_metric_points".to_string()));
         assert!(tables.contains(&"dashboard_git_baselines".to_string()));
         assert!(tables.contains(&"workflow_instance_agent_bindings".to_string()));
+    }
+
+    #[test]
+    fn ui_revisions_track_committed_mutations_and_ignore_rollbacks() {
+        let db = Database::open_memory().unwrap();
+        let initial = db.ui_revisions();
+        assert_eq!(initial, UiRevisions::default());
+
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO agents (id, name, backend, config) VALUES ('a1', 'Atlas', 'codex', '{}')",
+                [],
+            )
+            .unwrap();
+        });
+        let after_agent = db.ui_revisions();
+        assert_eq!(after_agent.seq, 1);
+        assert_eq!(after_agent.agents, 1);
+        assert_eq!(after_agent.tasks, 0);
+
+        db.with_conn(|conn| {
+            let tx = conn.unchecked_transaction().unwrap();
+            tx.execute(
+                "INSERT INTO tasks (id, title, agent_id) VALUES ('t1', 'Rolled back', 'a1')",
+                [],
+            )
+            .unwrap();
+            tx.rollback().unwrap();
+        });
+        assert_eq!(db.ui_revisions(), after_agent);
+
+        db.with_conn(|conn| {
+            let tx = conn.unchecked_transaction().unwrap();
+            tx.execute(
+                "INSERT INTO tasks (id, title, agent_id) VALUES ('t1', 'Wake target', 'a1')",
+                [],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO schedules (id, name, cron, agent_id, title, schedule_type, run_at)
+                 VALUES ('s1', 'Wake', '', 'a1', 'Wake', 'once', '2030-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        });
+        let after_tx = db.ui_revisions();
+        assert_eq!(after_tx.seq, 2);
+        assert_eq!(after_tx.tasks, 1);
+        assert_eq!(after_tx.schedules, 1);
+        assert_eq!(after_tx.agents, 1);
     }
 }

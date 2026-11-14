@@ -10,6 +10,7 @@
     type Task,
     type PlanningAction,
   } from "$lib/api";
+  import { subscribeLiveUpdates, usePaneActive } from "$lib/liveUpdates";
   import {
     lanes,
     taskLane,
@@ -22,6 +23,7 @@
   import TaskTimeline from "$lib/components/planning/TaskTimeline.svelte";
   import CreateTask from "$lib/components/planning/CreateTask.svelte";
   let { route = "/tasks" }: { route?: string } = $props();
+  const paneActive = usePaneActive();
   let mounted = $state(false);
   let appliedRoute: string | undefined;
   $effect(() => {
@@ -142,12 +144,29 @@
     });
     resize.observe(root);
     mounted = true;
-    const poll = setInterval(() => {
-      if (!document.hidden && !dragging && !saving) void load(true);
-    }, 5000);
+    const unsubscribeLiveUpdates = subscribeLiveUpdates(
+      ["tasks", "projects", "agents"],
+      (_revisions, ctx) => {
+        if (dragging || saving) return;
+        void load(true);
+        if (
+          ctx.source !== "fallback" &&
+          (ctx.changedDomains.has("agents") ||
+            ctx.changedDomains.has("projects"))
+        ) {
+          void Promise.all([agents.list(), projects.list()])
+            .then(([a, p]) => {
+              agentList = a;
+              projectList = p;
+            })
+            .catch(() => {});
+        }
+      },
+      { active: paneActive, fallbackIntervalMs: 5000 },
+    );
     return () => {
       resize.disconnect();
-      clearInterval(poll);
+      unsubscribeLiveUpdates();
     };
   });
   onDestroy(() => clearTimeout(timer));

@@ -454,12 +454,22 @@ impl TaskConversation {
     }
 
     pub fn get_messages(&self, task_id: &str) -> Result<Vec<TaskMessage>> {
+        self.get_messages_after(task_id, None)
+    }
+
+    pub fn get_messages_after(
+        &self,
+        task_id: &str,
+        after_id: Option<i64>,
+    ) -> Result<Vec<TaskMessage>> {
+        let pivot = after_id.unwrap_or(0);
         let conn = self.db.conn();
-        let mut stmt =
-            conn.prepare("SELECT * FROM task_messages WHERE task_id = ?1 ORDER BY id ASC")?;
+        let mut stmt = conn.prepare(
+            "SELECT * FROM task_messages WHERE task_id = ?1 AND id > ?2 ORDER BY id ASC",
+        )?;
 
         let mut messages: Vec<TaskMessage> = stmt
-            .query_map([task_id], |row| {
+            .query_map(rusqlite::params![task_id, pivot], |row| {
                 Ok(TaskMessage {
                     id: row.get("id")?,
                     task_id: row.get("task_id")?,

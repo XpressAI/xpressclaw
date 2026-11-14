@@ -2,12 +2,14 @@
 	import { goto } from '$app/navigation';
 	import { onMount } from 'svelte';
 	import { agents, conversations, projects, tasks, type Agent, type Conversation, type Project, type Task } from '$lib/api';
+	import { subscribeLiveUpdates, usePaneActive } from '$lib/liveUpdates';
 	import { PROJECT_MUTATION_EVENT, publishProjectMutation, type ProjectMutation } from '$lib/projectEvents';
 	import { agentRuntimeSummary, harnessMark, timeAgo } from '$lib/utils';
 	import AgentLoading from '$lib/components/AgentLoading.svelte';
 	import ProjectSettingsDialog from '$lib/components/ProjectSettingsDialog.svelte';
 
 	let { projectId }: { projectId: string } = $props();
+	const paneActive = usePaneActive();
 	let project = $state<Project | null>(null);
 	let projectConversations = $state<Conversation[]>([]);
 	let agentList = $state<Agent[]>([]);
@@ -38,9 +40,13 @@
 		};
 		window.addEventListener(PROJECT_MUTATION_EVENT, handleProjectMutation);
 		void load();
-		const poll = setInterval(() => void load(), 5000);
+		const unsubscribeLiveUpdates = subscribeLiveUpdates(
+			['projects', 'conversations', 'agents', 'tasks'],
+			() => load(),
+			{ active: paneActive, fallbackIntervalMs: 5000 }
+		);
 		return () => {
-			clearInterval(poll);
+			unsubscribeLiveUpdates();
 			window.removeEventListener(PROJECT_MUTATION_EVENT, handleProjectMutation);
 		};
 	});

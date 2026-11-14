@@ -6,6 +6,8 @@ use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::Router;
+use tower_http::compression::predicate::{DefaultPredicate, NotForContentType};
+use tower_http::compression::{CompressionLayer, Predicate as _};
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
@@ -25,6 +27,15 @@ fn http_request_span(request: &Request) -> tracing::Span {
     tracing::info_span!("http_request", method = %request.method(), route)
 }
 
+fn http_compression_layer(
+) -> CompressionLayer<tower_http::compression::predicate::And<DefaultPredicate, NotForContentType>>
+{
+    CompressionLayer::new()
+        .gzip(true)
+        .br(true)
+        .compress_when(DefaultPredicate::new().and(NotForContentType::new("text/event-stream")))
+}
+
 /// Create the main Axum router with all routes.
 pub fn create_router(state: AppState) -> Router {
     let api = routes::public_api_routes(&state);
@@ -35,6 +46,7 @@ pub fn create_router(state: AppState) -> Router {
         // Base64 encoding expands image messages beyond Axum's 2 MiB JSON default.
         // Message handlers enforce tighter decoded per-image and aggregate limits.
         .layer(DefaultBodyLimit::max(30 * 1024 * 1024))
+        .layer(http_compression_layer())
         .layer(TraceLayer::new_for_http().make_span_with(http_request_span))
         .with_state(state)
 }
@@ -44,6 +56,7 @@ fn create_unprotected_router(state: AppState) -> Router {
         .nest("/api", routes::api_routes())
         .fallback(frontend::serve_frontend)
         .layer(DefaultBodyLimit::max(30 * 1024 * 1024))
+        .layer(http_compression_layer())
         .layer(TraceLayer::new_for_http().make_span_with(http_request_span))
         .with_state(state)
 }
@@ -401,10 +414,14 @@ pub async fn serve_on_with_bound_callback(
 
     // Start the cron schedule runner.
     let scheduler_db = state.db.clone();
+    let scheduler_event_bus = state.event_bus.clone();
     let scheduler_shutdown = shutdown.clone();
     tokio::spawn(async move {
         tokio::select! {
-            _ = xpressclaw_core::tasks::scheduler::start_schedule_runner(scheduler_db) => {}
+            _ = xpressclaw_core::tasks::scheduler::start_schedule_runner_with_events(
+                scheduler_db,
+                Some(scheduler_event_bus),
+            ) => {}
             _ = scheduler_shutdown.cancelled() => { info!("scheduler stopped"); }
         }
     });
@@ -1170,5 +1187,73 @@ mod tests {
                 assert!(json_body(response).await["error"].is_string(), "{path}");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn router_compresses_json_payloads_without_buffering_sse_streams() {
+        let s = state();
+        s.db.with_conn(|conn| {
+            for idx in 0..20 {
+                conn.execute(
+                    "INSERT INTO projects (id, name, description) VALUES (?1, ?2, ?3)",
+                    [
+                        format!("proj-{idx}"),
+                        format!("Project {idx}"),
+                        "Repeated project description payload to exceed compression threshold "
+                            .repeat(4),
+                    ],
+                )?;
+            }
+            Ok::<(), xpressclaw_core::error::Error>(())
+        })
+        .unwrap();
+        let app =
+            create_router(s).layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 43105))));
+
+        let json_resp = app
+            .clone()
+            .oneshot(
+                Request::get("/api/projects")
+                    .header(header::ACCEPT_ENCODING, "gzip, br")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(json_resp.status(), StatusCode::OK);
+        let encoding = json_resp
+            .headers()
+            .get(header::CONTENT_ENCODING)
+            .and_then(|val| val.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            encoding == "gzip" || encoding == "br",
+            "expected compressed JSON response, got Content-Encoding={encoding:?}"
+        );
+
+        let mut sse_resp = app
+            .oneshot(
+                Request::get("/api/ui/stream")
+                    .header(header::ACCEPT_ENCODING, "gzip, br")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sse_resp.status(), StatusCode::OK);
+        assert!(
+            sse_resp.headers().get(header::CONTENT_ENCODING).is_none(),
+            "SSE streams must never be compressed or buffered"
+        );
+        let first_frame = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            sse_resp.body_mut().frame(),
+        )
+        .await
+        .expect("initial SSE revisions frame should flush immediately")
+        .unwrap()
+        .unwrap();
+        let text = String::from_utf8(first_frame.into_data().unwrap().to_vec()).unwrap();
+        assert!(text.contains("event: revisions"));
     }
 }

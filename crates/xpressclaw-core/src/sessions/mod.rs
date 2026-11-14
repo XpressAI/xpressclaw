@@ -88,6 +88,8 @@ pub struct SessionOverview {
     pub recent_attempts: Vec<WorkAttempt>,
     pub recent_events: Vec<SessionEvent>,
     pub artifacts: Vec<AttemptArtifact>,
+    #[serde(default)]
+    pub active_task_count: usize,
 }
 
 /// Native work history scoped to one task. This is the task page's semantic
@@ -177,6 +179,32 @@ impl SessionManager {
         })
     }
 
+    pub fn active_task_count(&self, session_id: &str) -> Result<usize> {
+        self.db.with_conn(|conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM tasks
+                 WHERE agent_id = ?1 AND hidden = 0 AND backlog = 0
+                   AND status IN ('pending', 'in_progress')",
+                [session_id],
+                |row| row.get(0),
+            )?;
+            Ok(count.max(0) as usize)
+        })
+    }
+
+    pub fn overview_summary(&self, session_id: &str) -> Result<SessionOverview> {
+        let session = self.get(session_id)?;
+        Ok(SessionOverview {
+            active_attempts: self.list_attempts(session_id, Some("running"), 20)?,
+            queued_attempts: self.list_attempts(session_id, Some("queued"), 20)?,
+            recent_attempts: Vec::new(),
+            recent_events: Vec::new(),
+            artifacts: Vec::new(),
+            active_task_count: self.active_task_count(session_id)?,
+            session,
+        })
+    }
+
     pub fn overview(&self, session_id: &str) -> Result<SessionOverview> {
         let session = self.get(session_id)?;
         Ok(SessionOverview {
@@ -185,6 +213,7 @@ impl SessionManager {
             recent_attempts: self.list_attempts(session_id, None, 30)?,
             recent_events: self.list_events(session_id, None, 100)?,
             artifacts: self.list_artifacts(session_id, 50)?,
+            active_task_count: self.active_task_count(session_id)?,
             session,
         })
     }
@@ -236,29 +265,61 @@ impl SessionManager {
         after: Option<i64>,
         limit: i64,
     ) -> Result<Vec<SessionEvent>> {
+        self.list_events_filtered(session_id, after, None, limit)
+    }
+
+    pub fn list_events_filtered(
+        &self,
+        session_id: &str,
+        after: Option<i64>,
+        event_type: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<SessionEvent>> {
+        let event_type = event_type.map(str::trim).filter(|value| !value.is_empty());
         self.db.with_conn(|conn| {
-            let (sql, pivot) = if let Some(after_id) = after {
-                (
+            let (sql, pivot) = match (after, event_type.is_some()) {
+                (Some(after_id), false) => (
                     "SELECT id, session_id, attempt_id, task_id, source_type, source_id,
                             event_type, summary, payload, created_at
                      FROM session_events WHERE session_id = ?1 AND id > ?2
                      ORDER BY id ASC LIMIT ?3",
                     after_id,
-                )
-            } else {
-                (
+                ),
+                (None, false) => (
                     "SELECT id, session_id, attempt_id, task_id, source_type, source_id,
                             event_type, summary, payload, created_at
                      FROM session_events WHERE session_id = ?1 AND id > ?2
                      ORDER BY id DESC LIMIT ?3",
                     -1,
-                )
+                ),
+                (Some(after_id), true) => (
+                    "SELECT id, session_id, attempt_id, task_id, source_type, source_id,
+                            event_type, summary, payload, created_at
+                     FROM session_events WHERE session_id = ?1 AND id > ?2 AND event_type = ?4
+                     ORDER BY id ASC LIMIT ?3",
+                    after_id,
+                ),
+                (None, true) => (
+                    "SELECT id, session_id, attempt_id, task_id, source_type, source_id,
+                            event_type, summary, payload, created_at
+                     FROM session_events WHERE session_id = ?1 AND id > ?2 AND event_type = ?4
+                     ORDER BY id DESC LIMIT ?3",
+                    -1,
+                ),
             };
             let mut stmt = conn.prepare(sql)?;
-            let mut events: Vec<_> = stmt
-                .query_map(rusqlite::params![session_id, pivot, limit], row_to_event)?
+            let mut events: Vec<_> = if let Some(kind) = event_type {
+                stmt.query_map(
+                    rusqlite::params![session_id, pivot, limit, kind],
+                    row_to_event,
+                )?
                 .filter_map(|row| row.ok())
-                .collect();
+                .collect()
+            } else {
+                stmt.query_map(rusqlite::params![session_id, pivot, limit], row_to_event)?
+                    .filter_map(|row| row.ok())
+                    .collect()
+            };
             if after.is_none() {
                 events.reverse();
             }

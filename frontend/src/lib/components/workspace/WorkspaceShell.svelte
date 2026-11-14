@@ -1,10 +1,11 @@
 <script lang="ts">
 	import type { Snippet } from 'svelte';
 	import { onMount } from 'svelte';
-	import { goto } from '$app/navigation';
+	import { beforeNavigate, goto } from '$app/navigation';
 	import { page } from '$app/stores';
 	import { agents, conversations as conversationsApi, projects as projectsApi, request, schedules as schedulesApi, tasks as tasksApi, workflows as workflowsApi } from '$lib/api';
 	import type { Agent, Conversation, Project, Schedule, Task, Workflow } from '$lib/api';
+	import { isLiveStreamConnected, subscribeLiveStreamStatus, subscribeLiveUpdates, type UiDomain } from '$lib/liveUpdates';
 	import { PROJECT_CONTEXT_MENU_ITEMS, type ContextMenuItem } from '$lib/contextMenu';
 	import { openWorkspaceWindow, WORKSPACE_WINDOW_PARAM } from '$lib/openWorkspaceWindow';
 	import { PROJECT_MUTATION_EVENT, sortProjectsByRecency, type ProjectMutation } from '$lib/projectEvents';
@@ -89,10 +90,15 @@
 	let conversationList = $state<Conversation[]>([]);
 	let taskList = $state<Task[]>([]);
 	let sidebarTaskList = $state<Task[]>([]);
+	let tabTaskLookup = $state<Record<string, Task>>({});
 	let attentionSnapshot = $state<Task[]>([]);
 	let showAllAttention = $state(false);
 	let workflowList = $state<Workflow[]>([]);
 	let scheduleList = $state<Schedule[]>([]);
+	let workflowsLoaded = false;
+	let workflowsDirty = false;
+	let schedulesLoaded = false;
+	let schedulesDirty = false;
 	let contextMenu = $state<WorkspaceContextMenu | null>(null);
 	let projectMutationVersion = 0;
 	const projectMutations = new Map<string, { version: number; mutation: ProjectMutation }>();
@@ -101,6 +107,7 @@
 	let dockerInstalled = $state(true);
 	let dockerCanStart = $state(false);
 	let dockerStarting = $state(false);
+	let dockerCheckInFlight = false;
 	let serverConnected = $state(true);
 	let connectionCheckInFlight = false;
 	let firstConnectionFailureAt: number | null = null;
@@ -116,6 +123,7 @@
 		index,
 		isLast: index === pane.tabs.length - 1,
 	}))));
+	let hasWorkflowTab = $derived(openTabs.some(({ tab }) => tab.kind === 'workflow'));
 	let sidebarCategory = $derived(tabCategory(focusedTab?.kind));
 	let sidebarTitle = $derived(sidebarCategory === 'tasks'
 		? 'Tasks'
@@ -127,12 +135,18 @@
 	let attentionTasks = $derived([...attentionSnapshot]
 		.sort((left, right) => statusPriority(right.activity_status ?? right.status) - statusPriority(left.activity_status ?? left.status)
 			|| (serverTimestampMs(right.updated_at) ?? 0) - (serverTimestampMs(left.updated_at) ?? 0)));
+	function lookupKnownTask(id: string | null | undefined): Task | null {
+		if (!id) return null;
+		return taskList.find((candidate) => candidate.id === id)
+			?? sidebarTaskList.find((candidate) => candidate.id === id)
+			?? tabTaskLookup[id]
+			?? null;
+	}
 	let focusedAgent = $derived((() => {
 		if (!focusedTab) return null;
 		if (focusedTab.kind === 'agent') return agentList.find((agent) => agent.id === focusedTab.resourceId) ?? null;
 		if (focusedTab.kind === 'task') {
-			const task = taskList.find((candidate) => candidate.id === focusedTab.resourceId)
-				?? sidebarTaskList.find((candidate) => candidate.id === focusedTab.resourceId);
+			const task = lookupKnownTask(focusedTab.resourceId);
 			return agentList.find((agent) => agent.id === task?.agent_id) ?? null;
 		}
 		return null;
@@ -146,8 +160,7 @@
 		if (focusedConversation) return focusedConversation.project_id;
 		if (focusedAgent) return focusedAgent.project_id;
 		if (focusedTab.kind === 'task') {
-			const task = taskList.find((candidate) => candidate.id === focusedTab.resourceId)
-				?? sidebarTaskList.find((candidate) => candidate.id === focusedTab.resourceId);
+			const task = lookupKnownTask(focusedTab.resourceId);
 			const conversation = conversationList.find((candidate) => candidate.id === task?.conversation_id);
 			return task?.project_id ?? conversation?.project_id ?? agentList.find((agent) => agent.id === task?.agent_id)?.project_id ?? null;
 		}
@@ -161,6 +174,14 @@
 		{ kind: 'automations', label: 'Automations', href: '/automations', icon: 'M3.75 6.75h16.5M3.75 12h16.5m-16.5 5.25h16.5' },
 		{ kind: 'settings', label: 'Settings', href: '/settings', icon: 'M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.686.645.87.074.04.147.083.22.127.324.196.72.257 1.075.124l1.217-.456a1.125 1.125 0 011.37.49l1.296 2.247a1.125 1.125 0 01-.26 1.431l-1.003.827c-.293.24-.438.613-.431.992a6.759 6.759 0 010 .255c-.007.378.138.75.43.99l1.005.828c.424.35.534.954.26 1.43l-1.298 2.247a1.125 1.125 0 01-1.369.491l-1.217-.456c-.355-.133-.75-.072-1.076.124a6.57 6.57 0 01-.22.128c-.331.183-.581.495-.644.869l-.213 1.28c-.09.543-.56.941-1.11.941h-2.594c-.55 0-1.02-.398-1.11-.94l-.213-1.281c-.062-.374-.312-.686-.644-.87a6.52 6.52 0 01-.22-.127c-.325-.196-.72-.257-1.076-.124l-1.217.456a1.125 1.125 0 01-1.369-.49l-1.297-2.247a1.125 1.125 0 01.26-1.431l1.004-.827c.292-.24.437-.613.43-.992a6.932 6.932 0 010-.255c.007-.378-.138-.75-.43-.99l-1.004-.828a1.125 1.125 0 01-.26-1.43l1.297-2.247a1.125 1.125 0 011.37-.491l1.216.456c.356.133.751.072 1.076-.124.072-.044.146-.087.22-.128.332-.183.582-.495.644-.869l.214-1.281z M15 12a3 3 0 11-6 0 3 3 0 016 0z' },
 	];
+
+	beforeNavigate((navigation) => {
+		if (!workspaceReady || navigation.type !== 'link' || navigation.willUnload || !navigation.to?.url) return;
+		const route = routeFromUrl(navigation.to.url);
+		if (!workspacePath(route) || route === lastSyncedPath) return;
+		lastSyncedPath = route;
+		openPath(route, false);
+	});
 
 	$effect(() => {
 		const route = currentRoute();
@@ -238,11 +259,15 @@
 		}
 	}
 
-	function currentRoute(): string {
-		const search = new URLSearchParams($page.url.search);
+	function routeFromUrl(url: URL): string {
+		const search = new URLSearchParams(url.search);
 		search.delete(WORKSPACE_WINDOW_PARAM);
 		const query = search.toString();
-		return `${$page.url.pathname}${query ? `?${query}` : ''}${$page.url.hash}`;
+		return `${url.pathname}${query ? `?${query}` : ''}${url.hash}`;
+	}
+
+	function currentRoute(): string {
+		return routeFromUrl($page.url);
 	}
 
 	function workspaceStateStorage(): Storage {
@@ -300,8 +325,7 @@
 	function decorateTab(tab: WorkspaceTab): WorkspaceTab {
 		const description = describeWorkspacePath(tab.path);
 		if (description.kind === 'task') {
-			const task = taskList.find((candidate) => candidate.id === description.resourceId)
-				?? sidebarTaskList.find((candidate) => candidate.id === description.resourceId);
+			const task = lookupKnownTask(description.resourceId);
 			return { ...tab, ...description, title: task?.title ?? tab.title ?? 'Task', status: task?.status ?? tab.status };
 		}
 		if (description.kind === 'project') {
@@ -918,29 +942,91 @@
 		return agentList.find((agent) => agent.id === task.agent_id) ?? null;
 	}
 
-	async function loadWorkspaceSummary() {
+	$effect(() => {
+		if (!workspaceReady) return;
+		const wantWorkflows = (sidebarCategory === 'automations' || hasWorkflowTab) && (!workflowsLoaded || workflowsDirty);
+		const wantSchedules = sidebarCategory === 'automations' && (!schedulesLoaded || schedulesDirty);
+		if (!wantWorkflows && !wantSchedules) return;
+		const domains = new Set<UiDomain>();
+		if (wantWorkflows) domains.add('workflows');
+		if (wantSchedules) domains.add('schedules');
+		void loadWorkspaceSummary(domains);
+	});
+
+	async function loadWorkspaceSummary(domains?: ReadonlySet<UiDomain>) {
 		const startingProjectMutationVersion = projectMutationVersion;
+		const fetchAll = !domains;
+		const wantProjects = fetchAll || domains.has('projects');
+		const wantConversations = fetchAll || domains.has('conversations');
+		const wantAgents = fetchAll || domains.has('agents');
+		const wantTasks = fetchAll || domains.has('tasks');
+		const automationsVisible = sidebarCategory === 'automations';
+		const workflowsVisible = automationsVisible || hasWorkflowTab;
+		const wantWorkflows = (fetchAll || domains.has('workflows')) && workflowsVisible;
+		const wantSchedules = (fetchAll || domains.has('schedules')) && automationsVisible;
+
+		if ((fetchAll || domains.has('workflows')) && !workflowsVisible) workflowsDirty = true;
+		if ((fetchAll || domains.has('schedules')) && !automationsVisible) schedulesDirty = true;
+
 		try {
-			const [nextProjects, nextConversations, nextAgents, taskResult, sidebarTaskResult, nextWorkflows, nextSchedules, attentionResult] = await Promise.all([
-				projectsApi.list().catch(() => projectList),
-				conversationsApi.list(undefined, 200).catch(() => conversationList),
-				agents.list().catch(() => agentList),
-				tasksApi.list().catch(() => ({ tasks: taskList })),
-				tasksApi.recentByAgent().catch(() => null),
-				workflowsApi.list().catch(() => workflowList),
-				schedulesApi.list().catch(() => scheduleList),
-				tasksApi.attention().catch(() => null),
+			const [
+				nextProjects,
+				nextConversations,
+				nextAgents,
+				taskResult,
+				sidebarTaskResult,
+				nextWorkflows,
+				nextSchedules,
+				attentionResult,
+			] = await Promise.all([
+				wantProjects ? projectsApi.list().catch(() => projectList) : Promise.resolve(projectList),
+				wantConversations ? conversationsApi.list(undefined, 200).catch(() => conversationList) : Promise.resolve(conversationList),
+				wantAgents ? agents.list().catch(() => agentList) : Promise.resolve(agentList),
+				wantTasks
+					? tasksApi.list(undefined, undefined, { excludeStatuses: ['completed', 'cancelled'] }).catch(() => ({ tasks: taskList }))
+					: Promise.resolve({ tasks: taskList }),
+				wantTasks ? tasksApi.recentByAgent().catch(() => null) : Promise.resolve(null),
+				wantWorkflows ? workflowsApi.list().catch(() => workflowList) : Promise.resolve(workflowList),
+				wantSchedules ? schedulesApi.list().catch(() => scheduleList) : Promise.resolve(scheduleList),
+				wantTasks ? tasksApi.attention().catch(() => null) : Promise.resolve(null),
 			]);
-			projectList = [...projectMutations.values()]
-				.filter(({ version }) => version > startingProjectMutationVersion)
-				.reduce((list, { mutation }) => applyProjectMutation(list, mutation), nextProjects);
-			conversationList = nextConversations;
-			agentList = nextAgents;
-			taskList = taskResult.tasks;
-			if (attentionResult?.tasks) attentionSnapshot = attentionResult.tasks;
-			sidebarTaskList = [...new Map([...(sidebarTaskResult?.tasks ?? taskResult.tasks), ...attentionSnapshot].map(task => [task.id, task])).values()];
-			workflowList = nextWorkflows;
-			scheduleList = nextSchedules;
+			if (wantProjects) {
+				projectList = [...projectMutations.values()]
+					.filter(({ version }) => version > startingProjectMutationVersion)
+					.reduce((list, { mutation }) => applyProjectMutation(list, mutation), nextProjects);
+			}
+			if (wantConversations) conversationList = nextConversations;
+			if (wantAgents) agentList = nextAgents;
+			if (wantTasks) {
+				taskList = taskResult.tasks;
+				if (attentionResult?.tasks) attentionSnapshot = attentionResult.tasks;
+				sidebarTaskList = [...new Map([...(sidebarTaskResult?.tasks ?? taskResult.tasks), ...attentionSnapshot].map(task => [task.id, task])).values()];
+				const knownIds = new Set([...taskList.map(t => t.id), ...sidebarTaskList.map(t => t.id)]);
+				const openTaskIds = [...new Set(
+					panes
+						.flatMap((pane) => pane.tabs)
+						.filter((tab) => tab.kind === 'task' && tab.resourceId && !knownIds.has(tab.resourceId))
+						.map((tab) => tab.resourceId!)
+				)];
+				if (openTaskIds.length > 0) {
+					const resolved = await Promise.all(openTaskIds.map((id) => tasksApi.get(id).catch(() => null)));
+					const nextLookup: Record<string, Task> = { ...tabTaskLookup };
+					for (const item of resolved) {
+						if (item) nextLookup[item.id] = item;
+					}
+					tabTaskLookup = nextLookup;
+				}
+			}
+			if (wantWorkflows) {
+				workflowList = nextWorkflows;
+				workflowsLoaded = true;
+				workflowsDirty = false;
+			}
+			if (wantSchedules) {
+				scheduleList = nextSchedules;
+				schedulesLoaded = true;
+				schedulesDirty = false;
+			}
 			refreshTabMetadata();
 		} catch {}
 	}
@@ -994,13 +1080,17 @@
 	}
 
 	async function checkDocker() {
+		if (dockerCheckInFlight) return;
+		dockerCheckInFlight = true;
 		try {
 			const response = await fetch('/api/setup/check-docker');
 			const data = await response.json();
 			dockerAvailable = data.available;
 			dockerInstalled = data.installed;
 			dockerCanStart = data.can_start;
-		} catch {}
+		} catch {} finally {
+			dockerCheckInFlight = false;
+		}
 	}
 
 	async function startDocker() {
@@ -1019,6 +1109,7 @@
 	async function checkConnection() {
 		if (connectionCheckInFlight) return;
 		connectionCheckInFlight = true;
+		const attemptStartedAt = Date.now();
 		let connected = false;
 		try {
 			const response = await fetch('/api/health', { signal: AbortSignal.timeout(HEALTH_TIMEOUT_MS) });
@@ -1034,7 +1125,7 @@
 			return;
 		}
 
-		firstConnectionFailureAt ??= Date.now();
+		firstConnectionFailureAt ??= attemptStartedAt;
 		if (Date.now() - firstConnectionFailureAt >= DISCONNECT_GRACE_MS) serverConnected = false;
 	}
 
@@ -1081,8 +1172,8 @@
 			openPath(route, false);
 		}
 
-		loadWorkspaceSummary();
-		checkDocker();
+		void loadWorkspaceSummary();
+		void checkDocker();
 		const desktopViewport = window.matchMedia('(min-width: 1024px)');
 		const closeMobileOnDesktop = () => { if (desktopViewport.matches && !foldable) closeMobileMenu(); };
 		desktopViewport.addEventListener('change', closeMobileOnDesktop);
@@ -1090,13 +1181,28 @@
 		window.addEventListener('online', handleOnline);
 		window.addEventListener(PROJECT_MUTATION_EVENT, handleProjectMutation);
 		window.addEventListener(WORKSPACE_OPEN_SPLIT_EVENT, handleOpenSplit);
+		const unsubscribeLiveUpdates = subscribeLiveUpdates(
+			['projects', 'conversations', 'agents', 'tasks', 'workflows', 'schedules'],
+			(_revisions, ctx) => loadWorkspaceSummary(ctx.changedDomains),
+			{ fallbackIntervalMs: 3000 }
+		);
+		const unsubscribeStreamStatus = subscribeLiveStreamStatus((connected) => {
+			if (connected) {
+				const recovered = !serverConnected;
+				firstConnectionFailureAt = null;
+				serverConnected = true;
+				if (recovered) void loadWorkspaceSummary();
+			}
+		});
 		const interval = setInterval(() => {
-			loadWorkspaceSummary();
-			checkConnection();
-			if (!dockerAvailable) checkDocker();
+			if (document.hidden) return;
+			if (!isLiveStreamConnected()) void checkConnection();
+			if (!dockerAvailable) void checkDocker();
 		}, 3000);
 		return () => {
 			clearInterval(interval);
+			unsubscribeLiveUpdates();
+			unsubscribeStreamStatus();
 			desktopViewport.removeEventListener('change', closeMobileOnDesktop);
 			window.removeEventListener('online', handleOnline);
 			window.removeEventListener(PROJECT_MUTATION_EVENT, handleProjectMutation);
@@ -1237,6 +1343,7 @@
 						style={`display:${index >= paneStart && index < paneEnd ? 'flex' : 'none'};${region ? regionStyle(region) : `flex:${pane.width} 1 0%;min-width:${paneEnd - paneStart > 1 ? 280 : 0}px`}`}>
 						<WorkspacePane
 							{pane}
+							visible={index >= paneStart && index < paneEnd}
 							focused={pane.id === focusedPaneId}
 							compact={paneEnd - paneStart > 1}
 							showTabs={showPaneTabs}

@@ -2,6 +2,7 @@
 	import { onMount, onDestroy } from 'svelte';
 	import { tasks as tasksApi } from '$lib/api';
 	import type { Task } from '$lib/api';
+	import { subscribeLiveUpdates, usePaneActive } from '$lib/liveUpdates';
 	import { statusColor, timeAgo } from '$lib/utils';
 
 	interface Props {
@@ -12,7 +13,8 @@
 
 	let taskList = $state<Task[]>([]);
 	let loading = $state(true);
-	let pollTimer: ReturnType<typeof setInterval> | null = null;
+	const paneActive = usePaneActive();
+	let unsubscribeLiveUpdates: (() => void) | null = null;
 	let error = $state<string | null>(null);
 
 	// Create task form
@@ -22,10 +24,17 @@
 	let composing = $state(false);
 
 	onMount(() => {
-		loadTasks();
-		pollTimer = setInterval(() => loadTasks(false), 5000);
+		void loadTasks();
+		unsubscribeLiveUpdates = subscribeLiveUpdates(
+			['tasks'],
+			() => loadTasks(false),
+			{ active: paneActive, fallbackIntervalMs: 5000 }
+		);
 	});
-	onDestroy(() => { if (pollTimer) clearInterval(pollTimer); });
+	onDestroy(() => {
+		unsubscribeLiveUpdates?.();
+		unsubscribeLiveUpdates = null;
+	});
 
 	async function loadTasks(initial = true) {
 		if (initial) loading = true;

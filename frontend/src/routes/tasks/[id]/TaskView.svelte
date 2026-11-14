@@ -9,6 +9,7 @@
 	import { MIN_DETAILS_WIDTH } from '$lib/workspaceLayout';
 	import { goto } from '$app/navigation';
 	import { tasks, agents, sessions, workspaces, ApiError } from '$lib/api';
+	import { subscribeLiveUpdates, usePaneActive } from '$lib/liveUpdates';
 	import { selectChoices, isModelOption, isReasoningOption, isAdditionalModelOption, reconcileConfig, duplicatesReasoningMode } from '$lib/acpConfig';
 	import type { TaskControlSnapshot, AcpCommand, AcpConfigOption, AcpModeState, DelegatedWork, Task, TaskMessage, Agent, WorkAttempt, SessionEvent, ImageAttachmentUpload, GitChange, WorkspaceGitStatus, MessageVisualization } from '$lib/api';
 	import { timeAgo } from '$lib/utils';
@@ -194,7 +195,8 @@
 	let locallyResolvedElicitations = $state<Record<string, boolean>>({});
 	let controlsInitializedFor = '';
 	let composing = $state(false);
-	let pollTimer: ReturnType<typeof setInterval> | null = null;
+	const paneActive = usePaneActive();
+	let unsubscribeLiveUpdates: (() => void) | null = null;
 	let messagesEl = $state<HTMLDivElement>();
 	let composerEl = $state<HTMLDivElement>();
 	let taskViewEl = $state<HTMLDivElement>();
@@ -207,6 +209,9 @@
 	let showDetailsSidebar = $derived(detailsSidebarFits && !detailsCollapsed && !detailsSheetOpen);
 	let prevMessageCount = 0;
 	let lastActivityEventId = 0;
+	let lastCommandsEventId = 0;
+	let allTasksLoaded = false;
+	let allTasksLoading = false;
 	let hasEarlierActivity = $state(false);
 	let loadingEarlierActivity = $state(false);
 	let initialLoad = true;
@@ -825,6 +830,7 @@
 		workspaceGitRequest = null;
 		workspaceGit = null;
 		lastWorkspaceGitRefresh = 0;
+		lastCommandsEventId = 0;
 		sessionEvents = [];
 		configOptions = [];
 		selectedConfig = {};
@@ -910,6 +916,88 @@
 		updateDetailsSidebarVisibility();
 	});
 
+	function isTaskOrDelegatesActive(): boolean {
+		return Boolean(
+			task && (
+				['in_progress', 'pending', 'waiting_for_input'].includes(task.status)
+				|| delegatedWork.some((item) => !['completed', 'cancelled'].includes(item.status))
+			)
+		);
+	}
+
+	function hasPendingControls(): boolean {
+		return Boolean(controlSnapshot && Object.keys(controlSnapshot.pending ?? {}).length > 0);
+	}
+
+	function incrementalMessagePivot(existing: TaskMessage[]): number | undefined {
+		if (existing.length < 2) return undefined;
+		let earliestMutableIdx = existing.length - 1;
+		for (let idx = existing.length - 1; idx >= 0; idx -= 1) {
+			if (existing[idx].role === 'assistant') {
+				earliestMutableIdx = idx;
+				break;
+			}
+		}
+		return earliestMutableIdx > 0 ? existing[earliestMutableIdx - 1].id : undefined;
+	}
+
+	function messagesEqual(left: TaskMessage, right: TaskMessage | undefined): boolean {
+		if (!right) return false;
+		return (
+			left.id === right.id
+			&& left.role === right.role
+			&& left.content === right.content
+			&& left.agent_id === right.agent_id
+			&& (left.attachments?.length ?? 0) === (right.attachments?.length ?? 0)
+			&& JSON.stringify(left.visualizations ?? []) === JSON.stringify(right.visualizations ?? [])
+		);
+	}
+
+	function mergeTaskMessages(
+		existing: TaskMessage[],
+		incoming: TaskMessage[],
+		afterMessageId: number | undefined,
+	): { merged: TaskMessage[]; changed: boolean; shouldScroll: boolean } {
+		const isFullSnapshot =
+			afterMessageId === undefined
+			|| existing.length === 0
+			|| incoming.some((msg) => msg.id <= afterMessageId);
+		const merged = isFullSnapshot
+			? incoming
+			: [
+				...existing.filter((msg) => msg.id <= afterMessageId),
+				...[...incoming].sort((a, b) => a.id - b.id),
+			];
+		const changed =
+			merged.length !== existing.length
+			|| merged.some((msg, idx) => !messagesEqual(msg, existing[idx]));
+		if (!changed) {
+			return { merged: existing, changed: false, shouldScroll: false };
+		}
+		const prevLast = existing.at(-1);
+		const nextLast = merged.at(-1);
+		const shouldScroll =
+			merged.length > existing.length
+			|| Boolean(prevLast && nextLast && prevLast.id === nextLast.id && nextLast.content.length > prevLast.content.length);
+		return { merged, changed: true, shouldScroll };
+	}
+
+	async function ensureAllTasksLoaded() {
+		if (allTasksLoaded || allTasksLoading || disposed) return;
+		allTasksLoading = true;
+		try {
+			const all = await tasks.list();
+			if (!disposed) {
+				allTasks = all.tasks;
+				allTasksLoaded = true;
+			}
+		} catch {
+			if (!disposed) allTasks = [];
+		} finally {
+			allTasksLoading = false;
+		}
+	}
+
 	onMount(async () => {
 		try { detailsCollapsed = localStorage.getItem(detailsPreferenceKey) === 'true'; } catch { /* Use the default when storage is unavailable. */ }
 		document.addEventListener('pointerdown', handleComposerPointerDown);
@@ -921,23 +1009,38 @@
 		await load();
 		if (disposed) return;
 		loading = false;
-		// Auto-poll while task is in progress
-		pollTimer = setInterval(async () => {
-			if (task && (['in_progress', 'pending', 'waiting_for_input'].includes(task.status)
-				|| delegatedWork.some(item => !['completed', 'cancelled'].includes(item.status)))) {
+		unsubscribeLiveUpdates = subscribeLiveUpdates(
+			['tasks', 'sessions', 'agents'],
+			async (_revisions, ctx) => {
+				if (ctx.source === 'fallback') {
+					if (isTaskOrDelegatesActive()) {
+						await poll();
+					}
+					if (modelMenuOpen || hasPendingControls() || isTaskOrDelegatesActive()) {
+						await refreshModelMenu();
+					}
+					return;
+				}
+				// Live SSE / revision push (including scheduled wake-ups on completed tasks!):
 				await poll();
-			}
-			// Idle adapters can publish dependent controls after a configuration
-			// response. Keep an open picker live even on a completed task.
-			await refreshModelMenu();
-		}, 3000);
+				if (modelMenuOpen || hasPendingControls() || ctx.changedDomains.has('sessions') || ctx.changedDomains.has('agents')) {
+					await refreshModelMenu();
+				}
+			},
+			{
+				active: paneActive,
+				fallbackIntervalMs: 3000,
+				fallbackActive: () => isTaskOrDelegatesActive() || modelMenuOpen || hasPendingControls(),
+			},
+		);
 	});
 
 	onDestroy(() => {
 		disposed = true;
 		workspaceGitRequest?.abort();
 		++configRequestVersion;
-		if (pollTimer) clearInterval(pollTimer);
+		unsubscribeLiveUpdates?.();
+		unsubscribeLiveUpdates = null;
 		taskViewResizeObserver?.disconnect();
 		document.removeEventListener('pointerdown', handleComposerPointerDown);
 	});
@@ -945,11 +1048,12 @@
 	async function load() {
 		try {
 			const id = taskId;
-			const [loadedTask, loadedAgents, loadedMessages, activity] = await Promise.all([
+			const [loadedTask, loadedAgents, loadedMessages, activity, subResult] = await Promise.all([
 				tasks.get(id),
 				agents.list().catch(() => []),
 				tasks.messages(id),
 				tasks.activity(id),
+				tasks.subtasks(id).catch(() => ({ tasks: [] as Task[] })),
 			]);
 			if (disposed || taskId !== id) return;
 			task = loadedTask;
@@ -961,25 +1065,31 @@
 			delegatedWork = activity.delegated_work ?? [];
 			activityEvents = activity.events;
 			hasEarlierActivity = activity.has_more_before;
+			subtaskList = subResult.tasks;
 			prevMessageCount = messages.length;
 			lastActivityEventId = activityEvents.at(-1)?.id ?? 0;
 			if (loadedTask.agent_id) {
 				void refreshWorkspaceGit(loadedTask.agent_id);
-				const events = await sessions.events(loadedTask.agent_id).catch(() => []);
+				const events = await sessions.events(loadedTask.agent_id, {
+					eventType: 'available_commands',
+					limit: 1,
+				}).catch(() => []);
 				if (task?.id !== id || task.agent_id !== loadedTask.agent_id) return;
 				sessionEvents = events;
+				lastCommandsEventId = events.at(-1)?.id ?? 0;
 				refreshHarnessControls(sessionEvents, loadedTask.agent_id);
 			} else {
 				sessionEvents = []; configOptions = []; availableCommands = []; workspaceGit = null;
 			}
-			try {
-				const sub = await tasks.subtasks(id);
-				subtaskList = sub.tasks;
-			} catch { subtaskList = []; }
-			try {
-				const all = await tasks.list();
-				allTasks = all.tasks;
-			} catch { allTasks = []; }
+			if (
+				(loadedTask.depends_on?.length ?? 0) > 0
+				|| (loadedTask.dependents?.length ?? 0) > 0
+				|| (loadedTask.blocked_by?.length ?? 0) > 0
+				|| Boolean(loadedTask.parent_task_id)
+				|| editing
+			) {
+				void ensureAllTasksLoaded();
+			}
 			if (initialLoad) {
 				initialLoad = false;
 				scrollToBottom(true);
@@ -1040,10 +1150,12 @@
 		pollInFlight = true;
 		try {
 			const id = taskId;
-			const [newTask, newMessages, newActivity] = await Promise.all([
+			const afterMessageId = incrementalMessagePivot(messages);
+			const [newTask, incomingMessages, newActivity, subResult] = await Promise.all([
 				tasks.get(id),
-				tasks.messages(id),
+				tasks.messages(id, afterMessageId),
 				tasks.activity(id, { after: lastActivityEventId || undefined }),
+				tasks.subtasks(id).catch(() => ({ tasks: subtaskList })),
 			]);
 			if (disposed || taskId !== id) return;
 			// Update task status/details in-place
@@ -1051,12 +1163,13 @@
 			resetHarnessControls(newTask.agent_id);
 			attempts = newActivity.attempts;
 			delegatedWork = newActivity.delegated_work ?? [];
+			subtaskList = subResult.tasks;
 			let shouldScroll = false;
-			// Only update messages and scroll if count changed
-			if (newMessages.length !== prevMessageCount) {
-				messages = newMessages;
-				prevMessageCount = newMessages.length;
-				shouldScroll = true;
+			const mergedResult = mergeTaskMessages(messages, incomingMessages, afterMessageId);
+			if (mergedResult.changed) {
+				messages = mergedResult.merged;
+				prevMessageCount = messages.length;
+				if (mergedResult.shouldScroll) shouldScroll = true;
 			}
 			if (newActivity.events.length > 0) {
 				const known = new Set(activityEvents.map(event => event.id));
@@ -1068,20 +1181,21 @@
 				shouldScroll = true;
 			}
 			if (newTask.agent_id) {
-				const latestSessionEvents = await sessions.events(newTask.agent_id).catch(() => sessionEvents);
+				void refreshWorkspaceGit(newTask.agent_id);
+				const latestCommandEvents = await sessions.events(newTask.agent_id, {
+					after: lastCommandsEventId || undefined,
+					eventType: 'available_commands',
+					limit: 1,
+				}).catch(() => []);
 				if (task?.id !== id || task.agent_id !== newTask.agent_id) return;
-				if (latestSessionEvents.length !== sessionEvents.length || latestSessionEvents.at(-1)?.id !== sessionEvents.at(-1)?.id) {
-					sessionEvents = latestSessionEvents;
+				if (latestCommandEvents.length > 0) {
+					sessionEvents = latestCommandEvents;
+					lastCommandsEventId = latestCommandEvents.at(-1)?.id ?? lastCommandsEventId;
 					refreshHarnessControls(sessionEvents, newTask.agent_id);
 				}
-				void refreshWorkspaceGit(newTask.agent_id);
 			}
 			if (shouldScroll) scrollToBottom();
-			try {
-				const sub = await tasks.subtasks(id);
-				subtaskList = sub.tasks;
-			} catch { subtaskList = []; }
-		} catch { /* Retry on the next polling interval. */ }
+		} catch { /* Retry on the next update or fallback interval. */ }
 		finally { pollInFlight = false; }
 	}
 
@@ -1279,6 +1393,7 @@
 
 	function startEditing() {
 		if (!task || platformManaged) return;
+		void ensureAllTasksLoaded();
 		editError = '';
 		editTitle = task.title;
 		editDesc = task.description || '';
