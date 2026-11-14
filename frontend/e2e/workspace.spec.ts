@@ -8820,3 +8820,116 @@ test('lazy-loaded workspace views and agent tabs evict failed chunk promises and
 	expect(serverSettingsRequests).toBe(2);
 });
 
+test('opening an older completed task outside recent-by-agent resolves tab title and agent context while SSE is idle', async ({ page }) => {
+	await page.addInitScript(() => {
+		const originalFetch = window.fetch.bind(window);
+		const encoder = new TextEncoder();
+		window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+			const rawUrl = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+			const parsed = new URL(rawUrl, window.location.origin);
+			if (parsed.pathname === '/api/ui/stream') {
+				const initial = {
+					seq: 1,
+					projects: 1,
+					agents: 1,
+					conversations: 1,
+					tasks: 1,
+					sessions: 1,
+					schedules: 1,
+					workflows: 1,
+				};
+				const stream = new ReadableStream<Uint8Array>({
+					start(controller) {
+						controller.enqueue(
+							encoder.encode(`event: revisions\ndata: ${JSON.stringify(initial)}\n\n`),
+						);
+						init?.signal?.addEventListener('abort', () => {
+							try { controller.close(); } catch {}
+						});
+					},
+				});
+				return new Response(stream, {
+					status: 200,
+					headers: {
+						'Content-Type': 'text/event-stream',
+						'Cache-Control': 'no-cache',
+						'x-ui-revisions': '1,1,1,1,1,1,1,1',
+					},
+				});
+			}
+			return originalFetch(input, init);
+		};
+	});
+
+	await mockApi(page, { completedTaskCount: 7 });
+
+	const archivedTaskId = 'completed-task-1';
+	const archivedTask = {
+		id: archivedTaskId,
+		title: 'Completed task 1',
+		description: 'Older completed work outside the five most recent tasks.',
+		status: 'completed',
+		activity_status: 'completed',
+		priority: 0,
+		revision: 1,
+		agent_id: agentId,
+		project_id: projectId,
+		parent_task_id: null,
+		sop_id: null,
+		conversation_id: null,
+		created_at: timestamp(0),
+		updated_at: timestamp(0),
+		completed_at: timestamp(0),
+		context: null,
+	};
+	let archivedTaskGets = 0;
+	await page.route(`**/api/tasks/${archivedTaskId}`, (route) => {
+		archivedTaskGets += 1;
+		return route.fulfill({
+			headers: { 'x-ui-revisions': '1,1,1,1,1,1,1,1' },
+			json: archivedTask,
+		});
+	});
+	await page.route(`**/api/tasks/${archivedTaskId}/messages*`, (route) =>
+		route.fulfill({ headers: { 'x-ui-revisions': '1,1,1,1,1,1,1,1' }, json: [] }),
+	);
+	await page.route(`**/api/tasks/${archivedTaskId}/activity*`, (route) =>
+		route.fulfill({
+			headers: { 'x-ui-revisions': '1,1,1,1,1,1,1,1' },
+			json: { attempts: [], events: [], has_more_before: false, has_more_after: false },
+		}),
+	);
+	await page.route(`**/api/tasks/${archivedTaskId}/config*`, (route) =>
+		route.fulfill({
+			headers: { 'x-ui-revisions': '1,1,1,1,1,1,1,1' },
+			json: {
+				context: { agent_id: agentId, runner_kind: 'codex', native_session_id: null },
+				availability: 'cached',
+				revision: null,
+				event_id: null,
+				pending: {},
+				model_pending: false,
+				config_options: [],
+				modes: null,
+				notice: null,
+			},
+		}),
+	);
+
+	await page.goto('/tasks?view=list', { waitUntil: 'domcontentloaded' });
+	await page.getByRole('button', { name: /^Done\b/ }).click();
+	const archivedLink = page.getByRole('link', { name: /Completed task 1/ }).first();
+	await expect(archivedLink).toBeVisible();
+	expect(archivedTaskGets).toBe(0);
+
+	await archivedLink.click();
+	await expect(page.getByRole('heading', { level: 1, name: 'Completed task 1' })).toBeVisible();
+	await expect(
+		page
+			.getByRole('group', { name: 'Pane tabs' })
+			.locator('[data-workspace-tab-active="true"][data-workspace-tab-title="Completed task 1"]'),
+	).toBeVisible();
+	expect(archivedTaskGets).toBeGreaterThanOrEqual(1);
+});
+
+

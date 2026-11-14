@@ -91,6 +91,10 @@
 	let taskList = $state<Task[]>([]);
 	let sidebarTaskList = $state<Task[]>([]);
 	let tabTaskLookup = $state<Record<string, Task>>({});
+	let tasksLoaded = $state(false);
+	let tabTaskRetryNonce = $state(0);
+	const inflightTabTaskIds = new Set<string>();
+	const missingTabTaskIds = new Set<string>();
 	let attentionSnapshot = $state<Task[]>([]);
 	let showAllAttention = $state(false);
 	let workflowList = $state<Workflow[]>([]);
@@ -971,6 +975,65 @@
 		void loadWorkspaceSummary(domains);
 	});
 
+	async function resolveUnknownOpenTaskTabs(taskIds: string[]) {
+		const pendingIds = taskIds.filter(
+			(id) => !inflightTabTaskIds.has(id) && !missingTabTaskIds.has(id)
+		);
+		if (pendingIds.length === 0) return;
+		const startGen = nextDomainGen.tasks;
+		for (const id of pendingIds) inflightTabTaskIds.add(id);
+		try {
+			const results = await Promise.all(
+				pendingIds.map(async (id) => {
+					try {
+						const item = await tasksApi.get(id);
+						return { id, item, transient: false };
+					} catch (err) {
+						return { id, item: null, transient: isTransientRefreshError(err) };
+					}
+				})
+			);
+			let changed = false;
+			const nextLookup: Record<string, Task> = { ...tabTaskLookup };
+			for (const { id, item, transient } of results) {
+				if (item) {
+					if (appliedDomainGen.tasks <= startGen || !lookupKnownTask(id)) {
+						nextLookup[id] = item;
+						changed = true;
+					}
+				} else if (!transient) {
+					missingTabTaskIds.add(id);
+				}
+			}
+			if (changed) {
+				tabTaskLookup = nextLookup;
+				refreshTabMetadata();
+			}
+		} finally {
+			for (const id of pendingIds) inflightTabTaskIds.delete(id);
+		}
+	}
+
+	$effect(() => {
+		if (!workspaceReady || !tasksLoaded) return;
+		void tabTaskRetryNonce;
+		const unknownTaskIds = [
+			...new Set(
+				openTabs
+					.filter(
+						({ tab }) =>
+							tab.kind === 'task' &&
+							Boolean(tab.resourceId) &&
+							!lookupKnownTask(tab.resourceId)
+					)
+					.map(({ tab }) => tab.resourceId!)
+			),
+		];
+		if (unknownTaskIds.length > 0) {
+			void resolveUnknownOpenTaskTabs(unknownTaskIds);
+		}
+	});
+
 	async function loadWorkspaceSummary(domains?: ReadonlySet<UiDomain>, rethrowTransient = false) {
 		const startingProjectMutationVersion = projectMutationVersion;
 		const fetchAll = !domains;
@@ -1059,6 +1122,7 @@
 			}
 			if (wantTasks && tasksSucceeded && tasksGen >= appliedDomainGen.tasks) {
 				appliedDomainGen.tasks = tasksGen;
+				missingTabTaskIds.clear();
 				taskList = taskResult.tasks;
 				if (attentionResult?.tasks) attentionSnapshot = attentionResult.tasks;
 				sidebarTaskList = [...new Map([...(sidebarTaskResult?.tasks ?? taskResult.tasks), ...attentionSnapshot].map(task => [task.id, task])).values()];
@@ -1070,15 +1134,33 @@
 						.map((tab) => tab.resourceId!)
 				)];
 				if (openTaskIds.length > 0) {
-					const resolved = await Promise.all(openTaskIds.map((id) => guard(tasksApi.get(id), null)));
+					const resolved = await Promise.all(
+						openTaskIds.map(async (id) => {
+							try {
+								const item = await tasksApi.get(id);
+								return { id, item, transient: false };
+							} catch (err) {
+								if (isTransientRefreshError(err)) transientError ??= err;
+								return { id, item: null, transient: isTransientRefreshError(err) };
+							}
+						})
+					);
 					if (tasksGen === appliedDomainGen.tasks) {
 						const nextLookup: Record<string, Task> = { ...tabTaskLookup };
-						for (const item of resolved) {
-							if (item) nextLookup[item.id] = item;
+						for (const { id, item, transient } of resolved) {
+							if (item) {
+								nextLookup[id] = item;
+							} else if (!transient) {
+								delete nextLookup[id];
+								missingTabTaskIds.add(id);
+							}
 						}
 						tabTaskLookup = nextLookup;
 					}
 				}
+				tasksLoaded = true;
+			} else if (wantTasks && !tasksLoaded) {
+				tasksLoaded = true;
 			}
 			if (wantWorkflows && workflowsSucceeded && workflowsGen >= appliedDomainGen.workflows) {
 				appliedDomainGen.workflows = workflowsGen;
@@ -1247,7 +1329,10 @@
 		const desktopViewport = window.matchMedia('(min-width: 1024px)');
 		const closeMobileOnDesktop = () => { if (desktopViewport.matches && !foldable) closeMobileMenu(); };
 		desktopViewport.addEventListener('change', closeMobileOnDesktop);
-		const handleOnline = () => void checkConnection();
+		const handleOnline = () => {
+			tabTaskRetryNonce += 1;
+			void checkConnection();
+		};
 		window.addEventListener('online', handleOnline);
 		window.addEventListener(PROJECT_MUTATION_EVENT, handleProjectMutation);
 		window.addEventListener(WORKSPACE_OPEN_SPLIT_EVENT, handleOpenSplit);
@@ -1258,6 +1343,7 @@
 		);
 		const unsubscribeStreamStatus = subscribeLiveStreamStatus((connected) => {
 			if (connected) {
+				tabTaskRetryNonce += 1;
 				const recovered = !serverConnected;
 				firstConnectionFailureAt = null;
 				serverConnected = true;
