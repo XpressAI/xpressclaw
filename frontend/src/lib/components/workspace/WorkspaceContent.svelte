@@ -1,11 +1,8 @@
 <script lang="ts" module>
-	import type { Component } from 'svelte';
+	import { createLazyComponentRegistry, type AnyLazyComponent } from '$lib/lazyComponent';
 	import type { WorkspaceTabKind } from '$lib/workspace';
 
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	type AnyComponent = Component<any>;
-
-	const loaders: Record<string, () => Promise<{ default: AnyComponent }>> = {
+	const loaders = {
 		home: () => import('../../../routes/+page.svelte'),
 		dashboard: () => import('../../../routes/dashboard/+page.svelte'),
 		projects: () => import('../../../routes/projects/ProjectsPage.svelte'),
@@ -21,53 +18,75 @@
 		settings: () => import('./SettingsView.svelte')
 	};
 
-	const resolvedViews = new Map<string, AnyComponent>();
-	const inflightViews = new Map<string, Promise<AnyComponent>>();
+	type ViewGroupKey = keyof typeof loaders;
+	const views = createLazyComponentRegistry<ViewGroupKey>(loaders);
 
-	function viewGroup(kind: WorkspaceTabKind): string {
+	function viewGroup(kind: WorkspaceTabKind): ViewGroupKey {
 		if (kind === 'automations' || kind === 'schedules' || kind === 'workflows') return 'automations';
-		if (kind in loaders) return kind;
+		if (kind in loaders) return kind as ViewGroupKey;
 		return 'settings';
-	}
-
-	function loadView(group: string): Promise<AnyComponent> {
-		const cached = resolvedViews.get(group);
-		if (cached) return Promise.resolve(cached);
-		const inflight = inflightViews.get(group);
-		if (inflight) return inflight;
-		const loader = loaders[group] ?? loaders.settings;
-		const pending = loader().then((mod) => {
-			resolvedViews.set(group, mod.default);
-			inflightViews.delete(group);
-			return mod.default;
-		});
-		inflightViews.set(group, pending);
-		return pending;
 	}
 </script>
 
 <script lang="ts">
-	import { untrack } from 'svelte';
+	import { onMount, untrack } from 'svelte';
 	import { projectSection, type WorkspaceTab } from '$lib/workspace';
 
 	let { tab, compact = false }: { tab: WorkspaceTab; compact?: boolean } = $props();
 	let group = $derived(viewGroup(tab.kind));
 	const initialGroup = untrack(() => group);
-	if (!resolvedViews.has(initialGroup)) void loadView(initialGroup);
-	let ActiveView = $state<AnyComponent | null>(resolvedViews.get(initialGroup) ?? null);
+	let initialLoad: Promise<AnyLazyComponent> | null = views.has(initialGroup)
+		? null
+		: views.load(initialGroup);
+	initialLoad?.catch(() => {});
+
+	let ActiveView = $state<AnyLazyComponent | null>(views.get(initialGroup));
+	let viewLoadError = $state<string | null>(null);
+	let retryNonce = $state(0);
+	let failedRetries = $state(0);
+
+	onMount(() => {
+		const handleOnline = () => {
+			if (viewLoadError) retryNonce += 1;
+		};
+		window.addEventListener('online', handleOnline);
+		return () => window.removeEventListener('online', handleOnline);
+	});
 
 	$effect(() => {
 		const targetGroup = group;
-		const cached = resolvedViews.get(targetGroup);
+		const currentRetry = retryNonce;
+		const cached = views.get(targetGroup);
 		if (cached) {
+			initialLoad = null;
 			ActiveView = cached;
+			viewLoadError = null;
+			failedRetries = 0;
 			return;
 		}
 		ActiveView = null;
+		viewLoadError = null;
 		let cancelled = false;
-		void loadView(targetGroup).then((component) => {
-			if (!cancelled) ActiveView = component;
-		});
+		const pending =
+			initialLoad && targetGroup === initialGroup && currentRetry === 0
+				? initialLoad
+				: views.load(targetGroup);
+		initialLoad = null;
+		pending
+			.then((component) => {
+				if (!cancelled) {
+					ActiveView = component;
+					viewLoadError = null;
+					failedRetries = 0;
+				}
+			})
+			.catch((err) => {
+				if (!cancelled) {
+					viewLoadError =
+						err instanceof Error && err.message ? err.message : 'Could not load this view.';
+					if (currentRetry > 0) failedRetries += 1;
+				}
+			});
 		return () => {
 			cancelled = true;
 		};
@@ -92,4 +111,26 @@
 	{:else}
 		<ActiveView />
 	{/if}
+{:else if viewLoadError}
+	<div role="alert" data-view-load-error class="flex h-full flex-col items-center justify-center gap-3 p-6 text-center">
+		<p class="text-sm text-destructive">Could not load this view. Check your connection and try again.</p>
+		<div class="flex items-center gap-2">
+			<button
+				type="button"
+				onclick={() => { retryNonce += 1; }}
+				class="rounded-md bg-primary px-4 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90"
+			>
+				Retry
+			</button>
+			{#if failedRetries > 0}
+				<button
+					type="button"
+					onclick={() => window.location.reload()}
+					class="rounded-md border border-border bg-card px-4 py-1.5 text-xs font-medium hover:bg-accent"
+				>
+					Reload page
+				</button>
+			{/if}
+		</div>
+	</div>
 {/if}

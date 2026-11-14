@@ -8714,3 +8714,109 @@ test('x-ui-revisions baseline avoids duplicate idle fetches while reconciling ra
 	).toBeVisible();
 	expect(taskGetCount).toBe(2);
 });
+
+test('lazy-loaded workspace views and agent tabs evict failed chunk promises and recover on retry', async ({ page }) => {
+	await mockApi(page);
+
+	let failTaskView = true;
+	let taskViewRequests = 0;
+	await page.route('**/src/routes/tasks/\\[id\\]/TaskView.svelte*', async (route) => {
+		if (!route.request().url().includes('svelte&type=style')) {
+			taskViewRequests += 1;
+			if (failTaskView) {
+				failTaskView = false;
+				await route.abort('failed');
+				return;
+			}
+		}
+		await route.continue();
+	});
+
+	let failSchedulesTab = true;
+	let schedulesTabRequests = 0;
+	await page.route('**/src/routes/agents/\\[id\\]/SchedulesTab.svelte*', async (route) => {
+		if (!route.request().url().includes('svelte&type=style')) {
+			schedulesTabRequests += 1;
+			if (failSchedulesTab) {
+				failSchedulesTab = false;
+				await route.abort('failed');
+				return;
+			}
+		}
+		await route.continue();
+	});
+
+	let failServerSettings = true;
+	let serverSettingsRequests = 0;
+	await page.route('**/src/routes/settings/server/+page.svelte*', async (route) => {
+		if (!route.request().url().includes('svelte&type=style')) {
+			serverSettingsRequests += 1;
+			if (failServerSettings) {
+				failServerSettings = false;
+				await route.abort('failed');
+				return;
+			}
+		}
+		await route.continue();
+	});
+
+	let failProjectOverview = true;
+	let projectOverviewRequests = 0;
+	await page.route('**/src/routes/projects/\\[id\\]/ProjectOverview.svelte*', async (route) => {
+		if (!route.request().url().includes('svelte&type=style')) {
+			projectOverviewRequests += 1;
+			if (failProjectOverview) {
+				failProjectOverview = false;
+				await route.abort('failed');
+				return;
+			}
+		}
+		await route.continue();
+	});
+
+	// 1. WorkspaceContent lazy view recovery via Retry button (TaskView)
+	await page.goto(`/tasks/${taskId}`, { waitUntil: 'domcontentloaded' });
+	const viewAlert = page.locator('[data-view-load-error]');
+	await expect(viewAlert).toBeVisible();
+	expect(taskViewRequests).toBe(1);
+
+	await viewAlert.getByRole('button', { name: 'Retry' }).click();
+	await expect(viewAlert).toBeHidden();
+	await expect(page.getByRole('heading', { name: 'Browser-tested workspace' })).toBeVisible();
+	expect(taskViewRequests).toBe(2);
+
+	// 2. WorkspaceContent recovery when closing and reopening a failed tab after connectivity returns
+	await page.getByRole('link', { name: 'Browser collaboration project' }).click();
+	await expect(viewAlert).toBeVisible();
+	expect(projectOverviewRequests).toBe(1);
+
+	await page.getByRole('button', { name: 'Close Browser collaboration project', exact: true }).click();
+	await expect(viewAlert).toBeHidden();
+	await page.getByRole('link', { name: 'Browser collaboration project' }).click();
+	await expect(viewAlert).toBeHidden();
+	await expect(page.getByRole('heading', { level: 1, name: 'Browser collaboration project' })).toBeVisible();
+	expect(projectOverviewRequests).toBe(2);
+
+	// 3. ProjectView lazy sub-tab recovery (SchedulesTab)
+	await page.goto(`/agents/${agentId}?tab=schedules`, { waitUntil: 'domcontentloaded' });
+	const tabAlert = page.locator('[data-tab-load-error]');
+	await expect(tabAlert).toBeVisible();
+	expect(schedulesTabRequests).toBe(1);
+
+	await tabAlert.getByRole('button', { name: 'Retry' }).click();
+	await expect(tabAlert).toBeHidden();
+	await expect(page.getByText('Show completed wake-ups')).toBeVisible();
+	expect(schedulesTabRequests).toBe(2);
+
+	// 4. SettingsView lazy page recovery (/settings/server)
+	await page.goto('/settings/server', { waitUntil: 'domcontentloaded' });
+	const settingsAlert = page.locator('[data-settings-load-error]');
+	await expect(settingsAlert).toBeVisible();
+	expect(serverSettingsRequests).toBe(1);
+
+	await settingsAlert.getByRole('button', { name: 'Retry' }).click();
+	await expect(settingsAlert).toBeHidden();
+	await expect(page.getByRole('heading', { level: 1, name: 'Instance' })).toBeVisible();
+	expect(serverSettingsRequests).toBe(2);
+});
+

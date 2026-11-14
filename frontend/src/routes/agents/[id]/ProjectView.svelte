@@ -1,33 +1,16 @@
 <script lang="ts" module>
-	import type { Component } from 'svelte';
+	import { createLazyComponentRegistry, type AnyLazyComponent } from '$lib/lazyComponent';
 
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	type AnyTabComponent = Component<any>;
-	const tabComponentCache = new Map<string, AnyTabComponent>();
-	const inflightTabComponents = new Map<string, Promise<AnyTabComponent>>();
-	const tabComponentLoaders: Record<string, () => Promise<AnyTabComponent>> = {
-		runner: () => import('./RunnerTab.svelte').then((m) => m.default),
-		workspace: () => import('./WorkspaceTab.svelte').then((m) => m.default),
-		tasks: () => import('./TasksTab.svelte').then((m) => m.default),
-		schedules: () => import('./SchedulesTab.svelte').then((m) => m.default),
-		files: () => import('./FilesTab.svelte').then((m) => m.default),
+	const tabLoaders = {
+		runner: () => import('./RunnerTab.svelte'),
+		workspace: () => import('./WorkspaceTab.svelte'),
+		tasks: () => import('./TasksTab.svelte'),
+		schedules: () => import('./SchedulesTab.svelte'),
+		files: () => import('./FilesTab.svelte'),
 	};
 
-	function loadTabComponent(section: string): Promise<AnyTabComponent> {
-		const cached = tabComponentCache.get(section);
-		if (cached) return Promise.resolve(cached);
-		const inflight = inflightTabComponents.get(section);
-		if (inflight) return inflight;
-		const loader = tabComponentLoaders[section];
-		if (!loader) return Promise.reject(new Error(`Unknown tab section: ${section}`));
-		const pending = loader().then((component) => {
-			tabComponentCache.set(section, component);
-			inflightTabComponents.delete(section);
-			return component;
-		});
-		inflightTabComponents.set(section, pending);
-		return pending;
-	}
+	type LazyTabSection = keyof typeof tabLoaders;
+	const tabComponents = createLazyComponentRegistry<LazyTabSection>(tabLoaders);
 </script>
 
 <script lang="ts">
@@ -50,12 +33,17 @@
 	let configLoading = false;
 	let activeTab = $derived(section);
 	const initialTabSection = untrack(() => activeTab);
-	if (initialTabSection !== 'session' && !tabComponentCache.has(initialTabSection)) {
-		void loadTabComponent(initialTabSection);
-	}
-	let ActiveTabComponent = $state<AnyTabComponent | null>(
-		initialTabSection === 'session' ? null : (tabComponentCache.get(initialTabSection) ?? null)
+	let initialTabLoad: Promise<AnyLazyComponent> | null =
+		initialTabSection !== 'session' && !tabComponents.has(initialTabSection)
+			? tabComponents.load(initialTabSection)
+			: null;
+	initialTabLoad?.catch(() => {});
+	let ActiveTabComponent = $state<AnyLazyComponent | null>(
+		initialTabSection === 'session' ? null : tabComponents.get(initialTabSection)
 	);
+	let tabLoadError = $state<string | null>(null);
+	let tabRetryNonce = $state(0);
+	let tabFailedRetries = $state(0);
 	let saveMessage = $state('');
 	let showDeleteConfirm = $state(false);
 	let deleting = $state(false);
@@ -79,20 +67,44 @@
 
 	$effect(() => {
 		const targetTab = activeTab;
+		const currentRetry = tabRetryNonce;
 		if (targetTab === 'session') {
+			initialTabLoad = null;
 			ActiveTabComponent = null;
+			tabLoadError = null;
+			tabFailedRetries = 0;
 			return;
 		}
-		const cached = tabComponentCache.get(targetTab);
+		const cached = tabComponents.get(targetTab);
 		if (cached) {
+			initialTabLoad = null;
 			ActiveTabComponent = cached;
+			tabLoadError = null;
+			tabFailedRetries = 0;
 			return;
 		}
 		ActiveTabComponent = null;
+		tabLoadError = null;
 		let cancelled = false;
-		void loadTabComponent(targetTab).then((component) => {
-			if (!cancelled) ActiveTabComponent = component;
-		});
+		const pending =
+			initialTabLoad && targetTab === initialTabSection && currentRetry === 0
+				? initialTabLoad
+				: tabComponents.load(targetTab);
+		initialTabLoad = null;
+		pending
+			.then((component) => {
+				if (!cancelled) {
+					ActiveTabComponent = component;
+					tabLoadError = null;
+					tabFailedRetries = 0;
+				}
+			})
+			.catch((err) => {
+				if (!cancelled) {
+					tabLoadError = err instanceof Error && err.message ? err.message : 'Could not load this tab.';
+					if (currentRetry > 0) tabFailedRetries += 1;
+				}
+			});
 		return () => {
 			cancelled = true;
 		};
@@ -105,7 +117,12 @@
 		}
 	});
 
+	function handleOnlineTabRetry() {
+		if (tabLoadError) tabRetryNonce += 1;
+	}
+
 	onMount(() => {
+		window.addEventListener('online', handleOnlineTabRetry);
 		void loadAgent(agentId);
 		unsubscribeLiveUpdates = subscribeLiveUpdates(
 			['agents', 'sessions', 'tasks'],
@@ -115,6 +132,7 @@
 	});
 
 	onDestroy(() => {
+		window.removeEventListener('online', handleOnlineTabRetry);
 		unsubscribeLiveUpdates?.();
 		unsubscribeLiveUpdates = null;
 	});
@@ -305,6 +323,28 @@
 				{:else}
 					<ActiveTabComponent agentId={agent.id} />
 				{/if}
+			{:else if tabLoadError}
+				<div role="alert" data-tab-load-error class="flex min-h-40 flex-col items-center justify-center gap-3 p-6 text-center">
+					<p class="text-sm text-destructive">Could not load this section. Check your connection and try again.</p>
+					<div class="flex items-center gap-2">
+						<button
+							type="button"
+							onclick={() => { tabRetryNonce += 1; }}
+							class="rounded-md bg-primary px-4 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90"
+						>
+							Retry
+						</button>
+						{#if tabFailedRetries > 0}
+							<button
+								type="button"
+								onclick={() => window.location.reload()}
+								class="rounded-md border border-border bg-card px-4 py-1.5 text-xs font-medium hover:bg-accent"
+							>
+								Reload page
+							</button>
+						{/if}
+					</div>
+				</div>
 			{:else}
 				<div class="flex min-h-40 items-center justify-center text-sm text-muted-foreground">Loading…</div>
 			{/if}
