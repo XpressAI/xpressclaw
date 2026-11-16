@@ -4,7 +4,9 @@
 	import { request, environments } from '$lib/api';
 	import { openExternal } from '$lib/utils';
 
-	let { agentId, initialSession = 'xpressclaw' }: { agentId: string; initialSession?: string } = $props();
+	let { agentId, initialSession = 'xpressclaw', authenticationMethod, onAuthenticated }: {
+		agentId: string; initialSession?: string; authenticationMethod?: string; onAuthenticated?: () => void;
+	} = $props();
 	let host = $state<HTMLDivElement>();
 	let connected = $state(false);
 	let connecting = $state(true);
@@ -56,6 +58,7 @@
 			requestAnimationFrame(() => fitAddon.fit());
 
 			let websocket: WebSocket | null = null;
+			let signedIn = false;
 			const encoder = new TextEncoder();
 			const decoder = new TextDecoder();
 
@@ -65,13 +68,18 @@
 				websocket?.close();
 				connected = false;
 				connecting = true;
+				signedIn = false;
 				error = '';
-				terminal.writeln('\x1b[90mConnecting to the retained project environment…\x1b[0m');
-				const url = new URL(`/api/workspaces/${encodeURIComponent(agentId)}/terminal`, window.location.href);
+				if (authenticationMethod) terminal.reset();
+				terminal.writeln(authenticationMethod ? '\x1b[90mStarting sign-in…\x1b[0m' : '\x1b[90mConnecting to the retained project environment…\x1b[0m');
+				const url = new URL(authenticationMethod
+					? `/api/sessions/${encodeURIComponent(agentId)}/authentication/terminal`
+					: `/api/workspaces/${encodeURIComponent(agentId)}/terminal`, window.location.href);
 				url.protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
 				url.searchParams.set('columns', String(terminal.cols));
 				url.searchParams.set('rows', String(terminal.rows));
 				url.searchParams.set('session', requestedSession);
+				if (authenticationMethod) url.searchParams.set('method_id', authenticationMethod);
 				websocket = new WebSocket(url);
 				const connection = websocket;
 				websocket.binaryType = 'arraybuffer';
@@ -85,7 +93,12 @@
 								joinedSession = requestedSession;
 								connecting = false;
 								terminal.focus();
-								void refreshSessions();
+								if (!authenticationMethod) void refreshSessions();
+							} else if (control.type === 'authenticated') {
+								signedIn = true;
+								connected = false;
+								connecting = false;
+								onAuthenticated?.();
 							} else if (control.type === 'error') {
 								error = control.message || 'The terminal failed to start.';
 								connecting = false;
@@ -122,6 +135,7 @@
 					if (websocket !== connection || disposed) return;
 					connected = false;
 					connecting = false;
+					if (authenticationMethod && !signedIn && !error) error = 'Sign-in was interrupted. You can try again.';
 				};
 			}
 
@@ -179,14 +193,16 @@
 	<div class="flex h-8 shrink-0 items-center justify-between border-b border-border px-3 text-[11px] text-muted-foreground">
 		<div class="flex items-center gap-2">
 			<span class="h-1.5 w-1.5 rounded-full {connected ? 'bg-emerald-500' : connecting ? 'animate-pulse bg-amber-500' : 'bg-muted-foreground'}"></span>
-			<span>{connected ? 'Container terminal' : connecting ? 'Connecting…' : 'Terminal disconnected'}</span>
+			<span>{authenticationMethod ? (connected ? 'Agent sign-in' : connecting ? 'Connecting…' : 'Sign-in disconnected') : (connected ? 'Container terminal' : connecting ? 'Connecting…' : 'Terminal disconnected')}</span>
 		</div>
+		{#if !authenticationMethod}
 		<form class="flex items-center gap-2" onsubmit={(event) => { event.preventDefault(); shareMessage = ''; reconnect(); }}>
 			<input aria-label="tmux session name" list={`terminal-sessions-${agentId}`} bind:value={session} class="w-28 rounded border border-border bg-background px-2 py-0.5" />
 			<datalist id={`terminal-sessions-${agentId}`}>{#each sessions as name}<option value={name}></option>{/each}</datalist>
 			<button class="rounded border border-border px-2 py-0.5">Join / create</button>
 			<button type="button" disabled={!connected} onclick={shareSession} class="rounded border border-border px-2 py-0.5 disabled:opacity-50">Share</button>
 		</form>
+		{/if}
 		{#if !connected && !connecting}
 			<button type="button" onclick={() => reconnect()} class="rounded border border-border px-2 py-0.5 hover:bg-accent">Reconnect</button>
 		{/if}

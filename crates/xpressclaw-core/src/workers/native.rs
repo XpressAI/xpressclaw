@@ -416,6 +416,9 @@ impl ConversationAcpProcesses {
     }
 }
 
+#[path = "native_auth.rs"]
+pub mod authentication;
+
 impl ProjectAcpProcesses {
     /// Resolve only an existing connection; opening a picker must not launch
     /// containers, create work attempts, or make a model request.
@@ -3637,6 +3640,7 @@ fn build_spec(
         "HOME=/home/node".to_string(),
         "CI=1".to_string(),
         "NO_COLOR=1".to_string(),
+        "NO_BROWSER=1".to_string(),
     ];
     if agent.runner.ssh_agent_forwarding {
         if let Some(host_ssh) = host_ssh_directory() {

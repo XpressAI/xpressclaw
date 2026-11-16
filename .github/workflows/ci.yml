@@ -147,6 +147,9 @@ jobs:
           test_name=routes::sessions::tests::readiness_and_prepare_reuse_retained_environment_without_pulling
           XPRESSCLAW_RETENTION_TEST_IMAGE=xpressclaw-environment-test:local cargo test -p xpressclaw-server --lib "$test_name" -- --ignored --exact --nocapture
 
+      - name: Test managed Agent sign-in
+        run: XPRESSCLAW_AUTH_TEST_ROOT="$PWD/target/auth-tests" XPRESSCLAW_ENVIRONMENT_TEST_IMAGE=xpressclaw-environment-test:local cargo test -p xpressclaw-core --lib workers::native::authentication::tests::managed_sign_in_reconnects_without_tasks_and_cleans_up_cancelled_terminals -- --ignored --exact --nocapture
+
       - name: Clippy
         run: cargo clippy -p xpressclaw-core -p xpressclaw-server -p xpressclaw-cli -p xpressclaw-tauri --all-targets -- -D warnings
 

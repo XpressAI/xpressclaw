@@ -639,7 +639,14 @@ export interface SessionOverview {
 	artifacts: AttemptArtifact[];
 }
 
+export interface AgentAuthentication {
+	kind: string;
+	status: 'unknown' | 'required' | 'authenticated';
+	methods: { id: string; name: string; description: string | null; kind: 'terminal' | 'agent'; api_key: boolean }[];
+}
+
 export interface RunnerReadiness {
+	authentication_status?: AgentAuthentication['status'];
 	protocol: string;
 	ready: boolean;
 	docker_available: boolean;
@@ -681,6 +688,8 @@ export interface ImageAttachmentUpload {
 }
 
 export const sessions = {
+	prepareAuthentication: (id: string) => request<AgentAuthentication>(`/api/sessions/${encodeURIComponent(id)}/authentication`, { method: 'POST', body: '{}' }),
+	authentication: (id: string) => request<AgentAuthentication>(`/api/sessions/${encodeURIComponent(id)}/authentication`),
 	get: (id: string, includeDetails = false) =>
 		request<SessionOverview>(`/api/sessions/${id}${includeDetails ? '?include_details=true' : ''}`),
 	readiness: (id: string) => request<RunnerReadiness>(`/api/sessions/${id}/readiness`),

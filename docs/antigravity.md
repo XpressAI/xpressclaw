@@ -8,25 +8,24 @@ CLI; installing it on the host is optional. See Google's
 
 ## Google account login
 
-With a host installation, run `agy acp --login` and leave **Use my existing
-Google Antigravity login** enabled. The command prints a Google authorization
-URL and accepts the resulting code in the terminal.
+Open **Agent → Harness → Sign in**, or choose **Sign in** on a failed Task or
+Conversation. XpressClaw starts Antigravity's advertised login flow inside the
+dialog. Open its Google URL in your browser and paste the resulting code into
+the dialog. Once it completes, XpressClaw reconnects the runner and offers a
+task retry. Sending `/login` as a task message does not initiate authentication.
 
-To sign in inside the Agent, disable host login, create the Agent, open
-**Files → Terminal**, and run:
+Keep **Use host login and harness configuration** enabled when you want to
+share its configuration files. Host logins stored only in the OS keyring need
+the in-app sign-in flow because the keyring is not part of the mounted files.
+Antigravity's headless login stores its token at
+`~/.gemini/antigravity-cli/antigravity-oauth-token`; the mounted directory retains
+it for subsequent sessions. Disable host sharing for a separate Agent login.
 
-```sh
-agy acp --login
-```
-
-This also works when the control plane runs on another machine. Antigravity's
-headless Linux login stores its token at
-`~/.gemini/antigravity-cli/antigravity-oauth-token`. A host desktop login held
-only in an OS keyring needs a separate login inside the container.
+See [Agent sign-in](agent-sign-in.md) for the shared authentication lifecycle.
 
 ## Gemini API key
 
-Add `GEMINI_API_KEY` using **Runner → Environment** and save. In the same
+Add `GEMINI_API_KEY` under **Harness → Harness environment** and save. In the same
 home directory used by the runner, create or edit
 `~/.gemini/antigravity-cli/settings.json`, preserving other settings:
 
@@ -41,7 +40,7 @@ With host login enabled, edit that file on the host. Otherwise edit it in
 setting the environment variable alone leaves ACP sessions unauthenticated.
 The key uses the existing runner environment path and is read by the CLI.
 To return to Google account authentication, remove `modelProvider` and the
-runner's API-key environment entry, then sign in with `agy acp --login`.
+runner's API-key environment entry, then choose **Sign in** in XpressClaw.
 
 ## State and sessions
 

@@ -26,6 +26,10 @@ use crate::external_tools::path_for_external_tool;
 mod recovery;
 pub use recovery::PreservedEnvironment;
 
+#[path = "authentication.rs"]
+mod authentication;
+pub use authentication::AuthenticationTerminal;
+
 const LIFECYCLE_LABEL: &str = "io.xpressclaw.lifecycle";
 const PROJECT_LIFECYCLE: &str = "project";
 const SPEC_FINGERPRINT_LABEL: &str = "io.xpressclaw.spec-fingerprint";
