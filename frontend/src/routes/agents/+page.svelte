@@ -3,6 +3,7 @@
 	import { goto } from '$app/navigation';
 	import { agents } from '$lib/api';
 	import type { Agent } from '$lib/api';
+	import { isTransientRefreshError, subscribeLiveUpdates, usePaneActive } from '$lib/liveUpdates';
 	import ContextMenu from '$lib/components/ContextMenu.svelte';
 	import { PROJECT_CONTEXT_MENU_ITEMS } from '$lib/contextMenu';
 	import { openWorkspaceWindow } from '$lib/openWorkspaceWindow';
@@ -11,20 +12,42 @@
 
 	let agentList = $state<Agent[]>([]);
 	let loading = $state(true);
-	let pollTimer: ReturnType<typeof setInterval> | null = null;
+	const paneActive = usePaneActive();
+	let unsubscribeLiveUpdates: (() => void) | null = null;
 	let projectMenu = $state<{ agent: Agent; x: number; y: number } | null>(null);
+	let loadGeneration = 0;
+	let appliedGeneration = 0;
 
-	onMount(async () => {
-		agentList = await agents.list().catch(() => []);
-		loading = false;
-		// Poll every 5s so reconciler progress is visible
-		pollTimer = setInterval(async () => {
-			agentList = await agents.list().catch(() => agentList);
-		}, 5000);
+	async function refreshAgents(rethrowTransient = false) {
+		const gen = ++loadGeneration;
+		try {
+			const next = await agents.list();
+			if (gen >= appliedGeneration) {
+				appliedGeneration = gen;
+				agentList = next;
+			}
+		} catch (err) {
+			if (rethrowTransient && isTransientRefreshError(err)) throw err;
+		} finally {
+			if (appliedGeneration > 0 || gen === loadGeneration) loading = false;
+		}
+	}
+
+	onMount(() => {
+		const initialLoad = refreshAgents(false);
+		unsubscribeLiveUpdates = subscribeLiveUpdates(
+			['agents', 'sessions', 'tasks'],
+			async () => {
+				await initialLoad;
+				await refreshAgents(true);
+			},
+			{ active: paneActive, fallbackIntervalMs: 5000 }
+		);
 	});
 
 	onDestroy(() => {
-		if (pollTimer) clearInterval(pollTimer);
+		unsubscribeLiveUpdates?.();
+		unsubscribeLiveUpdates = null;
 	});
 
 	function showProjectMenu(event: MouseEvent, agent: Agent) {

@@ -486,3 +486,144 @@ test("planning phone controls support filtering, assignment, priority, schedule,
   ).toBe("2030-10-13T00:00:00.000Z");
   await page.close();
 });
+
+test("planning board preserves SSE invalidations received during a cancelled drag", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    const originalFetch = window.fetch.bind(window);
+    const encoder = new TextEncoder();
+    const controllers = new Set<ReadableStreamDefaultController<Uint8Array>>();
+    let state: Record<string, number> = {
+      seq: 1,
+      projects: 1,
+      agents: 1,
+      conversations: 1,
+      tasks: 1,
+      sessions: 1,
+      schedules: 1,
+      workflows: 1,
+    };
+    const w = window as unknown as {
+      __mockUiStreamEmit?: (patch: Record<string, number>) => void;
+      __mockUiStreamSubscriberCount?: () => number;
+    };
+    w.__mockUiStreamSubscriberCount = () => controllers.size;
+    w.__mockUiStreamEmit = (patch: Record<string, number>) => {
+      state = { ...state, ...patch, seq: patch.seq ?? state.seq + 1 };
+      const frame = encoder.encode(
+        `event: revisions\ndata: ${JSON.stringify(state)}\n\n`,
+      );
+      for (const controller of controllers) {
+        try {
+          controller.enqueue(frame);
+        } catch {
+          controllers.delete(controller);
+        }
+      }
+    };
+    window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+      const rawUrl =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input.url;
+      const parsed = new URL(rawUrl, window.location.origin);
+      if (parsed.pathname === "/api/ui/stream") {
+        let activeController: ReadableStreamDefaultController<Uint8Array> | null =
+          null;
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            activeController = controller;
+            controllers.add(controller);
+            controller.enqueue(
+              encoder.encode(
+                `event: revisions\ndata: ${JSON.stringify(state)}\n\n`,
+              ),
+            );
+            init?.signal?.addEventListener("abort", () => {
+              controllers.delete(controller);
+              try {
+                controller.close();
+              } catch {}
+            });
+          },
+          cancel() {
+            if (activeController) controllers.delete(activeController);
+          },
+        });
+        return new Response(stream, {
+          status: 200,
+          headers: {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+          },
+        });
+      }
+      return originalFetch(input, init);
+    };
+  });
+
+  await page.setViewportSize({ width: 2400, height: 1000 });
+  const state = await planningApi(page);
+  await page.goto("/tasks?view=board");
+  const summary = page.locator(".planner-header p");
+  await expect(summary).toHaveText("56 tasks · All projects");
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (
+            window as unknown as {
+              __mockUiStreamSubscriberCount?: () => number;
+            }
+          ).__mockUiStreamSubscriberCount?.() ?? 0,
+      ),
+    )
+    .toBeGreaterThan(0);
+
+  // Start dragging card task-0 without dropping it yet.
+  const card = page.locator('[data-planning-card="task-0"]');
+  await card.evaluate((el) => {
+    const dt = new DataTransfer();
+    el.dispatchEvent(
+      new DragEvent("dragstart", {
+        bubbles: true,
+        cancelable: true,
+        dataTransfer: dt,
+      }),
+    );
+  });
+
+  const queriesBeforeEmit = state.planningQueries.length;
+  state.rows.unshift({
+    ...state.rows[0],
+    id: "task-mid-drag",
+    title: "Urgent hotfix added mid-drag",
+    position: -1024,
+  });
+
+  // Emit a live SSE tasks invalidation while the drag is active.
+  await page.evaluate(() => {
+    (
+      window as unknown as {
+        __mockUiStreamEmit?: (patch: Record<string, number>) => void;
+      }
+    ).__mockUiStreamEmit?.({ tasks: 2 });
+  });
+
+  // Board must stay untouched while the user is actively dragging.
+  await page.waitForTimeout(150);
+  expect(state.planningQueries.length).toBe(queriesBeforeEmit);
+
+  // Cancel the drag (dragend without drop); preserved invalidation must flush automatically.
+  await page.evaluate(() => {
+    window.dispatchEvent(new DragEvent("dragend", { bubbles: true }));
+  });
+
+  await expect(summary).toHaveText("57 tasks · All projects");
+  await expect(
+    page.locator('[data-planning-card="task-mid-drag"]'),
+  ).toContainText("Urgent hotfix added mid-drag");
+});

@@ -4,6 +4,7 @@
 	import { page } from '$app/stores';
 	import { agents, schedules, workflows } from '$lib/api';
 	import type { Agent, Schedule, Workflow } from '$lib/api';
+	import { isTransientRefreshError, subscribeLiveUpdates, usePaneActive } from '$lib/liveUpdates';
 	import { timeAgo } from '$lib/utils';
 	import { serverTimestampMs } from '$lib/serverTime';
 	import { dateLabel } from '$lib/taskPlanning';
@@ -13,7 +14,9 @@
 	let scheduleList = $state<Schedule[]>([]);
 	let agentList = $state<Agent[]>([]);
 	let loading = $state(true);
-	let pollTimer: ReturnType<typeof setInterval> | null = null;
+	let includeCompletedOnce = $state(false);
+	const paneActive = usePaneActive();
+	let unsubscribeLiveUpdates: (() => void) | null = null;
 	let confirmDeleteId = $state<string | null>(null);
 	let showScheduleCreate = $state(false);
 	let scheduleForm = $state({
@@ -54,13 +57,25 @@
 		if (!scheduleForm.agent_id) scheduleForm.agent_id = agentList[0].id;
 	});
 
-	onMount(async () => {
-		await loadAll();
-		pollTimer = setInterval(loadAutomations, 10000);
+	let automationsGeneration = 0;
+	let appliedWorkflowsGeneration = 0;
+	let appliedSchedulesGeneration = 0;
+
+	onMount(() => {
+		const initialLoad = loadAll();
+		unsubscribeLiveUpdates = subscribeLiveUpdates(
+			['workflows', 'schedules'],
+			async () => {
+				await initialLoad;
+				await loadAutomations(true);
+			},
+			{ active: paneActive, fallbackIntervalMs: 10000 }
+		);
 	});
 
 	onDestroy(() => {
-		if (pollTimer) clearInterval(pollTimer);
+		unsubscribeLiveUpdates?.();
+		unsubscribeLiveUpdates = null;
 	});
 
 	async function loadAll() {
@@ -68,13 +83,35 @@
 		loading = false;
 	}
 
-	async function loadAutomations() {
+	async function loadAutomations(rethrowTransient = false) {
+		const gen = ++automationsGeneration;
+		const requestedIncludeCompletedOnce = includeCompletedOnce;
+		let transientError: unknown = null;
+		let workflowsOk = true;
+		let schedulesOk = true;
 		const [nextWorkflows, nextSchedules] = await Promise.all([
-			workflows.list().catch(() => workflowList),
-			schedules.list().catch(() => scheduleList),
+			workflows.list().catch((err) => {
+				workflowsOk = false;
+				if (isTransientRefreshError(err)) transientError ??= err;
+				return workflowList;
+			}),
+			schedules.list(undefined, { includeCompletedOnce: requestedIncludeCompletedOnce }).catch((err) => {
+				schedulesOk = false;
+				if (isTransientRefreshError(err)) transientError ??= err;
+				return scheduleList;
+			}),
 		]);
-		workflowList = nextWorkflows;
-		scheduleList = nextSchedules;
+		if (workflowsOk && gen >= appliedWorkflowsGeneration) {
+			appliedWorkflowsGeneration = gen;
+			workflowList = nextWorkflows;
+		}
+		if (schedulesOk && requestedIncludeCompletedOnce === includeCompletedOnce && gen >= appliedSchedulesGeneration) {
+			appliedSchedulesGeneration = gen;
+			scheduleList = nextSchedules;
+		}
+		if (rethrowTransient && transientError !== null) {
+			throw transientError;
+		}
 	}
 
 	async function loadAgents() {
@@ -299,7 +336,19 @@
 					<h2 class="text-lg font-semibold">Schedules</h2>
 					<p class="mt-1 text-sm text-muted-foreground">Start or resume agent work once or on a recurring schedule.</p>
 				</div>
-				<button type="button" onclick={openScheduleCreate} disabled={agentList.length === 0} class="self-start rounded-md border border-border bg-card px-3 py-1.5 text-xs font-medium transition-colors hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50">New Schedule</button>
+				<div class="flex flex-wrap items-center gap-3 self-start">
+					<label class="flex cursor-pointer items-center gap-2 text-xs text-muted-foreground">
+						<input
+							type="checkbox"
+							data-include-completed-wakeups
+							bind:checked={includeCompletedOnce}
+							onchange={() => void loadAutomations()}
+							class="h-3.5 w-3.5 rounded border-border accent-primary"
+						/>
+						Show completed wake-ups
+					</label>
+					<button type="button" onclick={openScheduleCreate} disabled={agentList.length === 0} class="rounded-md border border-border bg-card px-3 py-1.5 text-xs font-medium transition-colors hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50">New Schedule</button>
+				</div>
 			</div>
 
 			{#if agentList.length === 0}

@@ -573,11 +573,25 @@ impl TaskBoard {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<Task>> {
+        self.list_page_excluding(statuses, agent_id, &[], search, limit, offset)
+    }
+
+    /// List a page of scheduler-ordered tasks matching any supplied status while
+    /// excluding statuses not needed by the caller.
+    pub fn list_page_excluding(
+        &self,
+        statuses: &[&str],
+        agent_id: Option<&str>,
+        excluded_statuses: &[&str],
+        search: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Task>> {
         self.list_inner(
             TaskListFilter {
                 statuses,
                 agent_id,
-                excluded_statuses: &[],
+                excluded_statuses,
                 search,
             },
             TaskListPage { limit, offset },

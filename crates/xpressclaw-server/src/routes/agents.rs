@@ -1535,4 +1535,38 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::OK);
     }
+
+    #[tokio::test]
+    async fn agent_get_endpoints_do_not_retrigger_ui_revisions_once_ensured() {
+        let (app, db) = test_app();
+        let registry = AgentRegistry::new(db.clone());
+        registry.ensure("atlas", "generic").unwrap();
+
+        let warmup = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/agents")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(warmup.status(), StatusCode::OK);
+        let baseline = db.ui_revisions();
+
+        for uri in ["/agents", "/agents/atlas"] {
+            let resp = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                db.ui_revisions(),
+                baseline,
+                "GET {uri} must not bump UI revisions"
+            );
+        }
+    }
 }

@@ -1,5 +1,6 @@
 <script lang="ts">
 	import type { WorkspacePaneState, WorkspaceTab } from '$lib/workspace';
+	import { notifyLiveUpdatesVisibilityChanged, providePaneActive } from '$lib/liveUpdates';
 	import { revealActiveTab } from '$lib/tabStrip';
 	import { measurePane } from '$lib/workspaceLayout';
 	import SortableTab from './SortableTab.svelte';
@@ -11,6 +12,7 @@
 		focused,
 		compact,
 		canSplit,
+		visible = true,
 		showTabs = true,
 		splitDirection = 'right',
 		onbrowse,
@@ -25,6 +27,7 @@
 		focused: boolean;
 		compact: boolean;
 		canSplit: boolean;
+		visible?: boolean;
 		showTabs?: boolean;
 		splitDirection?: 'right' | 'below';
 		onbrowse?: () => void;
@@ -35,6 +38,12 @@
 		onsplit: () => void;
 		dropIndex?: number | null;
 	} = $props();
+
+	providePaneActive(() => visible);
+
+	$effect(() => {
+		if (visible) notifyLiveUpdatesVisibilityChanged();
+	});
 
 	let tabStrip = $state<HTMLDivElement>();
 	let activeTab = $derived(pane.tabs.find((tab) => tab.id === pane.activeTabId) ?? pane.tabs[0]);

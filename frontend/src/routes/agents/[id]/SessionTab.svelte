@@ -3,6 +3,7 @@
 	import { goto } from '$app/navigation';
 	import { sessions, tasks } from '$lib/api';
 	import type { ImageAttachmentUpload, SessionOverview, RunnerReadiness, Task } from '$lib/api';
+	import { isTransientRefreshError, subscribeLiveUpdates, usePaneActive } from '$lib/liveUpdates';
 	import ImageAttachmentPreviews from '$lib/components/ImageAttachmentPreviews.svelte';
 	import DictationButton from '$lib/components/DictationButton.svelte';
 	import { clearComposerDraft, loadComposerDraft, saveComposerDraft } from '$lib/composerDrafts';
@@ -14,7 +15,6 @@
 	const messageDraftScope = () => `session.${agentId}`;
 	let overview = $state<SessionOverview | null>(null);
 	let readiness = $state<RunnerReadiness | null>(null);
-	let taskList = $state<Task[]>([]);
 	let error = $state<string | null>(null);
 	let readinessError = $state<string | null>(null);
 	let prepareError = $state<string | null>(null);
@@ -32,46 +32,71 @@
 		name: attachment.name,
 		src: imageDataUrl(attachment),
 	})));
-	let pollTimer: ReturnType<typeof setInterval> | null = null;
+	const paneActive = usePaneActive();
+	let unsubscribeLiveUpdates: (() => void) | null = null;
 	let readinessTimer: ReturnType<typeof setInterval> | null = null;
 	let preparationTimer: ReturnType<typeof setInterval> | null = null;
 	let readinessRequest = 0;
 	let loadingReadiness = false;
 	let lastReadinessCheck = 0;
+	let loadGeneration = 0;
+	let appliedGeneration = 0;
 
 	const RECENT_WORK_LIMIT = 5;
 	const ATTENTION_STATUSES = ['waiting_for_input', 'blocked'];
 	let attentionTasks = $state<Task[]>([]);
-	let activeTasks = $derived(taskList.filter((task) => ['pending', 'in_progress'].includes(task.status)));
 	let recentWorkTasks = $state<Task[]>([]);
+	let activeTaskCount = $derived(
+		typeof overview?.active_task_count === 'number'
+			? overview.active_task_count
+			: new Set(
+					[...recentWorkTasks, ...attentionTasks]
+						.filter((task) => ['pending', 'in_progress'].includes(task.status))
+						.map((task) => task.id)
+				).size
+	);
 
 	$effect(() => {
 		if (messageDraftReady) saveComposerDraft(messageDraftScope(), message);
 	});
 
+	function handleVisibilityChange() {
+		if (!document.hidden && paneActive() && (!readiness?.ready || Date.now() - lastReadinessCheck >= 60_000)) {
+			void loadReadiness();
+		}
+	}
+
 	onMount(() => {
 		message = loadComposerDraft(messageDraftScope());
 		messageDraftReady = true;
-		load();
-		loadReadiness();
-		pollTimer = setInterval(load, 2500);
+		void load();
+		void loadReadiness();
+		unsubscribeLiveUpdates = subscribeLiveUpdates(
+			['sessions', 'tasks', 'agents'],
+			() => load(true),
+			{ active: paneActive, fallbackIntervalMs: 2500 }
+		);
+		document.addEventListener('visibilitychange', handleVisibilityChange);
 		readinessTimer = setInterval(() => {
+			if (document.hidden || !paneActive()) return;
 			if (!readiness?.ready || Date.now() - lastReadinessCheck >= 60_000) void loadReadiness();
 		}, 10_000);
 	});
 
 	onDestroy(() => {
-		if (pollTimer) clearInterval(pollTimer);
+		unsubscribeLiveUpdates?.();
+		unsubscribeLiveUpdates = null;
+		document.removeEventListener('visibilitychange', handleVisibilityChange);
 		if (readinessTimer) clearInterval(readinessTimer);
 		if (preparationTimer) clearInterval(preparationTimer);
 		readinessRequest++;
 	});
 
-	async function load() {
+	async function load(rethrowTransient = false) {
+		const gen = ++loadGeneration;
 		try {
-			const [nextOverview, result, recentWork, attention] = await Promise.all([
+			const [nextOverview, recentWork, attention] = await Promise.all([
 				sessions.get(agentId),
-				tasks.list(undefined, agentId),
 				tasks.list(undefined, agentId, {
 					limit: RECENT_WORK_LIMIT,
 					sort: 'recent',
@@ -79,13 +104,15 @@
 				}),
 				tasks.attention(agentId),
 			]);
+			if (gen < appliedGeneration) return;
+			appliedGeneration = gen;
 			overview = nextOverview;
-			taskList = result.tasks;
 			recentWorkTasks = recentWork.tasks.filter(task => !ATTENTION_STATUSES.includes(task.activity_status ?? task.status));
-			attentionTasks = attention.tasks ?? result.tasks.filter(task => ATTENTION_STATUSES.includes(task.activity_status ?? task.status));
+			attentionTasks = attention.tasks ?? [];
 			error = null;
 		} catch (e) {
-			error = e instanceof Error ? e.message : String(e);
+			if (gen >= appliedGeneration) error = e instanceof Error ? e.message : String(e);
+			if (rethrowTransient && isTransientRefreshError(e)) throw e;
 		}
 	}
 
@@ -255,7 +282,7 @@
 					{projectStatus.label}
 				</div>
 				<div class="text-xs text-muted-foreground">
-					{#if activeTasks.length > 0}{activeTasks.length} active{:else}No active tasks{/if}
+					{#if activeTaskCount > 0}{activeTaskCount} active{:else}No active tasks{/if}
 					{#if overview.queued_attempts.length > 0} · {overview.queued_attempts.length} queued{/if}
 				</div>
 			</div>

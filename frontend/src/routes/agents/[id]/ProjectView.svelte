@@ -1,24 +1,49 @@
+<script lang="ts" module>
+	import { createLazyComponentRegistry, type AnyLazyComponent } from '$lib/lazyComponent';
+
+	const tabLoaders = {
+		runner: () => import('./RunnerTab.svelte'),
+		workspace: () => import('./WorkspaceTab.svelte'),
+		tasks: () => import('./TasksTab.svelte'),
+		schedules: () => import('./SchedulesTab.svelte'),
+		files: () => import('./FilesTab.svelte'),
+	};
+
+	type LazyTabSection = keyof typeof tabLoaders;
+	const tabComponents = createLazyComponentRegistry<LazyTabSection>(tabLoaders);
+</script>
+
 <script lang="ts">
-	import { onMount, onDestroy } from 'svelte';
+	import { onMount, onDestroy, untrack } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { agents, setup } from '$lib/api';
 	import type { Agent, LiveConfig } from '$lib/api';
+	import { isTransientRefreshError, subscribeLiveUpdates, usePaneActive } from '$lib/liveUpdates';
 	import { agentRuntimeSummary, agentRuntimeTitle, harnessMark, statusColor } from '$lib/utils';
 	import { projectPath, type ProjectSection } from '$lib/workspace';
 
 	import SessionTab from './SessionTab.svelte';
-	import RunnerTab from './RunnerTab.svelte';
-	import WorkspaceTab from './WorkspaceTab.svelte';
-	import TasksTab from './TasksTab.svelte';
-	import SchedulesTab from './SchedulesTab.svelte';
-	import FilesTab from './FilesTab.svelte';
 
 	let { agentId, section = 'session', route = '' }: { agentId: string; section?: ProjectSection; route?: string } = $props();
 
 	let agent = $state<Agent | null>(null);
 	let error = $state<string | null>(null);
 	let agentConfig = $state<LiveConfig['agents'][0] | null>(null);
+	let configLoadedForAgent = '';
+	let configLoading = false;
 	let activeTab = $derived(section);
+	const initialTabSection = untrack(() => activeTab);
+	let initialTabLoad: Promise<AnyLazyComponent> | null =
+		initialTabSection !== 'session' && !tabComponents.has(initialTabSection)
+			? tabComponents.load(initialTabSection)
+			: null;
+	initialTabLoad?.catch(() => {});
+	let ActiveTabComponent = $state<AnyLazyComponent | null>(
+		initialTabSection === 'session' ? null : tabComponents.get(initialTabSection)
+	);
+	let tabLoadError = $state<string | null>(null);
+	let tabRetryNonce = $state(0);
+	let tabFailedRetries = $state(0);
 	let saveMessage = $state('');
 	let showDeleteConfirm = $state(false);
 	let deleting = $state(false);
@@ -26,7 +51,10 @@
 	// Incremented to signal the active tab to save
 	let saveSignal = $state(0);
 
-	let pollTimer: ReturnType<typeof setInterval> | null = null;
+	const paneActive = usePaneActive();
+	let unsubscribeLiveUpdates: (() => void) | null = null;
+	let agentFetchGen = 0;
+	let appliedAgentGen = 0;
 
 	const tabs: { id: ProjectSection; label: string }[] = [
 		{ id: 'session', label: 'Work' },
@@ -37,44 +65,144 @@
 		{ id: 'workspace', label: 'Environment' },
 	];
 
+	$effect(() => {
+		const targetTab = activeTab;
+		const currentRetry = tabRetryNonce;
+		if (targetTab === 'session') {
+			initialTabLoad = null;
+			ActiveTabComponent = null;
+			tabLoadError = null;
+			tabFailedRetries = 0;
+			return;
+		}
+		const cached = tabComponents.get(targetTab);
+		if (cached) {
+			initialTabLoad = null;
+			ActiveTabComponent = cached;
+			tabLoadError = null;
+			tabFailedRetries = 0;
+			return;
+		}
+		ActiveTabComponent = null;
+		tabLoadError = null;
+		let cancelled = false;
+		const pending =
+			initialTabLoad && targetTab === initialTabSection && currentRetry === 0
+				? initialTabLoad
+				: tabComponents.load(targetTab);
+		initialTabLoad = null;
+		pending
+			.then((component) => {
+				if (!cancelled) {
+					ActiveTabComponent = component;
+					tabLoadError = null;
+					tabFailedRetries = 0;
+				}
+			})
+			.catch((err) => {
+				if (!cancelled) {
+					tabLoadError = err instanceof Error && err.message ? err.message : 'Could not load this tab.';
+					if (currentRetry > 0) tabFailedRetries += 1;
+				}
+			});
+		return () => {
+			cancelled = true;
+		};
+	});
+
+	$effect(() => {
+		if (!agent) return;
+		if ((activeTab === 'runner' || activeTab === 'workspace') && configLoadedForAgent !== agent.id && !configLoading) {
+			void ensureAgentConfig(agent);
+		}
+	});
+
+	function handleOnlineTabRetry() {
+		if (tabLoadError) tabRetryNonce += 1;
+	}
+
 	onMount(() => {
-		loadAgent(agentId);
+		window.addEventListener('online', handleOnlineTabRetry);
+		void loadAgent(agentId);
+		unsubscribeLiveUpdates = subscribeLiveUpdates(
+			['agents', 'sessions', 'tasks'],
+			() => refreshAgentStatus(agentId, true),
+			{ active: paneActive, fallbackIntervalMs: 5000 }
+		);
 	});
 
 	onDestroy(() => {
-		if (pollTimer) clearInterval(pollTimer);
+		window.removeEventListener('online', handleOnlineTabRetry);
+		unsubscribeLiveUpdates?.();
+		unsubscribeLiveUpdates = null;
 	});
 
+	async function ensureAgentConfig(current: Agent) {
+		if (configLoading) return;
+		configLoading = true;
+		try {
+			const config = await setup.getConfig();
+			if (agent?.id === current.id) {
+				agentConfig = config.agents.find((a) => a.name === current.name) ?? null;
+				configLoadedForAgent = current.id;
+			}
+		} catch {
+			// Tab handles null agentConfig gracefully.
+		} finally {
+			configLoading = false;
+		}
+	}
+
+	async function refreshAgentStatus(id: string, rethrowTransient = false) {
+		const gen = ++agentFetchGen;
+		try {
+			const fresh = await agents.get(id);
+			if (gen < appliedAgentGen) return;
+			appliedAgentGen = gen;
+			if (agent && agent.id === id) {
+				agent.status = fresh.status;
+				agent.desired_status = fresh.desired_status;
+				agent.observed_status = fresh.observed_status;
+				agent.container_id = fresh.container_id;
+				agent.error_message = fresh.error_message;
+				agent.restart_count = fresh.restart_count;
+				agent.started_at = fresh.started_at;
+				agent.stopped_at = fresh.stopped_at;
+			} else if (agentId === id) {
+				agent = fresh;
+			}
+			error = null;
+		} catch (err) {
+			if (rethrowTransient && isTransientRefreshError(err)) throw err;
+		}
+	}
+
 	async function loadAgent(id: string) {
-		if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+		const gen = ++agentFetchGen;
 		error = null;
+		configLoadedForAgent = '';
+		agentConfig = null;
+		const needConfig = activeTab === 'runner' || activeTab === 'workspace';
+		if (needConfig) configLoading = true;
 
 		try {
-			agent = await agents.get(id);
-			const config = await setup.getConfig();
-			agentConfig = config.agents.find(a => a.name === agent!.name) ?? null;
+			const [loadedAgent, loadedConfig] = await Promise.all([
+				agents.get(id),
+				needConfig ? setup.getConfig().catch(() => null) : Promise.resolve(null),
+			]);
+			if (loadedAgent && loadedConfig) {
+				agentConfig = loadedConfig.agents.find((a) => a.name === loadedAgent.name) ?? null;
+				configLoadedForAgent = loadedAgent.id;
+			}
+			if (gen >= appliedAgentGen) {
+				appliedAgentGen = gen;
+				agent = loadedAgent;
+			}
 		} catch (e) {
-			error = String(e);
+			if (gen >= appliedAgentGen) error = String(e);
+		} finally {
+			if (needConfig) configLoading = false;
 		}
-
-		// Poll status every 5s — update fields in-place to avoid XCLAW-48
-		pollTimer = setInterval(async () => {
-			try {
-				const fresh = await agents.get(id);
-				if (agent) {
-					agent.status = fresh.status;
-					agent.desired_status = fresh.desired_status;
-					agent.observed_status = fresh.observed_status;
-					agent.container_id = fresh.container_id;
-					agent.error_message = fresh.error_message;
-					agent.restart_count = fresh.restart_count;
-					agent.started_at = fresh.started_at;
-					agent.stopped_at = fresh.stopped_at;
-				} else {
-					agent = fresh;
-				}
-			} catch {}
-		}, 5000);
 	}
 
 	async function handleDelete() {
@@ -185,16 +313,40 @@
 		<div class="flex-1 min-h-0 {activeTab === 'files' ? 'overflow-hidden' : 'overflow-y-auto px-3 py-4 sm:px-6'}">
 			{#if activeTab === 'session'}
 				<SessionTab agentId={agent.id} />
-			{:else if activeTab === 'runner'}
-				<RunnerTab {agentConfig} agentId={agent.id} onSave={handleSave} {saveSignal} />
-			{:else if activeTab === 'workspace'}
-				<WorkspaceTab agentId={agent.id} {agentConfig} onSave={handleSave} />
-			{:else if activeTab === 'tasks'}
-				<TasksTab agentId={agent.id} />
-			{:else if activeTab === 'schedules'}
-				<SchedulesTab agentId={agent.id} />
-			{:else if activeTab === 'files'}
-				<FilesTab agentId={agent.id} {route} />
+			{:else if ActiveTabComponent}
+				{#if activeTab === 'runner'}
+					<ActiveTabComponent {agentConfig} agentId={agent.id} onSave={handleSave} {saveSignal} />
+				{:else if activeTab === 'workspace'}
+					<ActiveTabComponent agentId={agent.id} {agentConfig} onSave={handleSave} />
+				{:else if activeTab === 'files'}
+					<ActiveTabComponent agentId={agent.id} {route} />
+				{:else}
+					<ActiveTabComponent agentId={agent.id} />
+				{/if}
+			{:else if tabLoadError}
+				<div role="alert" data-tab-load-error class="flex min-h-40 flex-col items-center justify-center gap-3 p-6 text-center">
+					<p class="text-sm text-destructive">Could not load this section. Check your connection and try again.</p>
+					<div class="flex items-center gap-2">
+						<button
+							type="button"
+							onclick={() => { tabRetryNonce += 1; }}
+							class="rounded-md bg-primary px-4 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90"
+						>
+							Retry
+						</button>
+						{#if tabFailedRetries > 0}
+							<button
+								type="button"
+								onclick={() => window.location.reload()}
+								class="rounded-md border border-border bg-card px-4 py-1.5 text-xs font-medium hover:bg-accent"
+							>
+								Reload page
+							</button>
+						{/if}
+					</div>
+				</div>
+			{:else}
+				<div class="flex min-h-40 items-center justify-center text-sm text-muted-foreground">Loading…</div>
 			{/if}
 		</div>
 

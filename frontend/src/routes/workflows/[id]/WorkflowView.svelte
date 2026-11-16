@@ -260,8 +260,11 @@
 			]);
 				workflow = wf; workflowName = wf.name; yamlContent = wf.yaml_content; agentList = wf.project_id ? al.filter(agent => agent.project_id === wf.project_id) : al;
 			const capabilities = await Promise.all(al.map(async (agent) => {
-				const events = await sessions.events(agent.id).catch(() => []);
-				return [agent.name, controlsFromEvents(events, agent.config?.runner?.mcp_servers ?? [])] as const;
+				const [configEvents, commandEvents] = await Promise.all([
+					sessions.events(agent.id, { eventType: 'session_config_options', limit: 1 }).catch(() => []),
+					sessions.events(agent.id, { eventType: 'available_commands', limit: 1 }).catch(() => []),
+				]);
+				return [agent.name, controlsFromEvents([...configEvents, ...commandEvents], agent.config?.runner?.mcp_servers ?? [])] as const;
 			}));
 			harnessCapabilities = Object.fromEntries(capabilities);
 			const parsed = yamlToFlows(wf.yaml_content);
