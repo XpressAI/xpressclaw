@@ -285,7 +285,26 @@ export interface ConversationMessageUpload {
 	data: string;
 }
 
+export interface StoragePolicy { enabled: boolean; days: number }
+export interface StorageWorktree {
+    id: string; repository: string; path: string; branch: string | null; head: string;
+    agent_ids: string[]; bytes: number; size_complete: boolean; missing: boolean;
+    eligible: boolean; reasons: string[]; eligible_since: number | null; first_seen_at: number; fingerprint: string;
+}
+export interface StorageRecoveryImage {
+    id: string; agent_id: string; name: string; created_at: number; bytes: number | null; eligible: boolean; reasons: string[];
+}
+export interface ProjectStorage {
+    policy: StoragePolicy; worktrees: StorageWorktree[]; scanned_at: number; last_cleanup_at: number | null; errors: string[];
+    engine: { image_bytes: number | null; volume_bytes: number; unused_volume_bytes: number; recovery_images: StorageRecoveryImage[] } | null;
+    engine_error: string | null;
+}
+export interface StorageCleanupResult { removed: string[]; kept: { id: string; reason: string }[]; finished_at: number }
+
 export const projects = {
+    storage: (id: string) => request<ProjectStorage>(`/api/projects/${encodeURIComponent(id)}/storage`),
+    saveStoragePolicy: (id: string, policy: StoragePolicy) => request<StoragePolicy>(`/api/projects/${encodeURIComponent(id)}/storage`, { method: 'PATCH', body: JSON.stringify(policy) }),
+    cleanupStorage: (id: string, selection: { worktrees: Record<string, string>; recovery_images: string[] }) => request<StorageCleanupResult>(`/api/projects/${encodeURIComponent(id)}/storage/cleanup`, { method: 'POST', body: JSON.stringify(selection) }),
 	list: () => request<Project[]>('/api/projects'),
 	get: (id: string) => request<Project>(`/api/projects/${encodeURIComponent(id)}`),
 	create: (data: { name: string; description?: string; icon?: string }) =>

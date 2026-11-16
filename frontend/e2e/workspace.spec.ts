@@ -1,5 +1,6 @@
 import { expect, test, type Locator, type Page, type Route } from '@playwright/test';
 import yaml from 'js-yaml';
+import type { ProjectStorage } from '../src/lib/api';
 
 const taskId = 'task-browser-test';
 const agentId = 'project-browser-test';
@@ -9177,3 +9178,52 @@ test('sessions SSE invalidations refresh shell agent tab busy indicator when age
 
 	await expect(activeTabDot).not.toHaveClass(/animate-pulse/);
 });
+
+for (const width of [1280, 390]) {
+    test(`Project cleanup tracks worktrees and confirms selected removals at ${width}px`, async ({ page }) => {
+        await page.setViewportSize({ width, height: 900 });
+        await mockApi(page);
+        const report: ProjectStorage = {
+            policy: { enabled: false, days: 14 }, scanned_at: 1794835200, last_cleanup_at: null, errors: [],
+            engine_error: null, engine: { image_bytes: 140_000_000_000, volume_bytes: 48_000_000_000, unused_volume_bytes: 40_000_000_000, recovery_images: [
+                { id: 'snapshot', agent_id: agentId, name: 'localhost/xpressclaw-recovery:old', created_at: 1790000000, bytes: 100_000_000, eligible: true, reasons: [] },
+            ] },
+            worktrees: [
+                { id: 'finished', repository: '/workspace/project', path: '/workspace/project/.worktrees/finished', branch: 'finished-feature', head: 'abc', agent_ids: [agentId], bytes: 2_000_000_000, size_complete: true, missing: false, eligible: true, reasons: [], eligible_since: 1790000000, first_seen_at: 1790000000, fingerprint: 'preview-version' },
+                { id: 'dirty', repository: '/workspace/project', path: '/workspace/project/.worktrees/ongoing', branch: 'ongoing-feature', head: 'def', agent_ids: [agentId], bytes: 500_000_000, size_complete: true, missing: false, eligible: false, reasons: ['Uncommitted or untracked files'], eligible_since: null, first_seen_at: 1790000000, fingerprint: 'dirty-version' },
+            ],
+        };
+        const cleanups: unknown[] = [];
+        const policies: unknown[] = [];
+        await page.route(`**/api/projects/${projectId}/storage`, async route => {
+            if (route.request().method() === 'PATCH') {
+                report.policy = route.request().postDataJSON(); policies.push(report.policy);
+                await route.fulfill({ json: report.policy });
+            } else await route.fulfill({ json: report });
+        });
+        await page.route(`**/api/projects/${projectId}/storage/cleanup`, async route => {
+            cleanups.push(route.request().postDataJSON());
+            report.worktrees = report.worktrees.filter(tree => tree.id !== 'finished');
+            await route.fulfill({ json: { removed: ['finished'], kept: [], finished_at: 1794835200 } });
+        });
+        await page.goto(`/projects/${projectId}`);
+        await page.getByRole('button', { name: 'Clean up', exact: true }).click();
+        const dialog = page.getByRole('dialog', { name: 'Project storage and cleanup' });
+        await expect(dialog.getByLabel('Select worktree ongoing-feature')).toBeDisabled();
+        await expect(dialog.getByLabel('Enable automatic cleanup')).not.toBeChecked();
+        await dialog.getByLabel('Enable automatic cleanup').check();
+        await dialog.getByLabel('Retention days').fill('7');
+        await dialog.getByRole('button', { name: 'Save retention' }).click();
+        await expect.poll(() => policies).toEqual([{ enabled: true, days: 7 }]);
+        expect(cleanups).toEqual([]);
+        await dialog.getByRole('button', { name: 'Select eligible worktrees' }).click();
+        await expect(dialog.getByLabel('Select recovery snapshot localhost/xpressclaw-recovery:old')).not.toBeChecked();
+        await page.screenshot({ path: test.info().outputPath(`project-storage-${width}.png`) });
+        await dialog.getByRole('button', { name: 'Clean up selected' }).click();
+        expect(cleanups).toEqual([]);
+        await dialog.getByRole('button', { name: 'Confirm cleanup' }).click();
+        await expect.poll(() => cleanups).toEqual([{ worktrees: { finished: 'preview-version' }, recovery_images: [] }]);
+        await expect(dialog.getByText('Removed 1 item.')).toBeVisible();
+        await expect(dialog.getByLabel('Select worktree ongoing-feature')).toBeDisabled();
+    });
+}

@@ -969,7 +969,10 @@ fn normalize_relative_path(raw: &str) -> Result<PathBuf> {
     Ok(normalized)
 }
 
-fn inspect_repository(bootstrap_root: &Path, directory: &Path) -> Option<RepositoryCandidate> {
+pub(crate) fn inspect_repository(
+    bootstrap_root: &Path,
+    directory: &Path,
+) -> Option<RepositoryCandidate> {
     let directory = directory.canonicalize().ok()?;
     if directory != bootstrap_root && !directory.starts_with(bootstrap_root) {
         return None;
@@ -1283,7 +1286,7 @@ fn is_git_config_include_key(key: &str) -> bool {
     key == "include.path" || (key.starts_with("includeif.") && key.ends_with(".path"))
 }
 
-fn bounded_command_output(command: &mut Command, timeout: Duration) -> Option<Output> {
+pub(crate) fn bounded_command_output(command: &mut Command, timeout: Duration) -> Option<Output> {
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

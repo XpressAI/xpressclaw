@@ -14,7 +14,7 @@ pub struct PreservedEnvironment {
 }
 
 const RECOVERY_SOURCE_LABEL: &str = "io.xpressclaw.recovery-source";
-const RECOVERY_SNAPSHOT_LABEL: &str = "io.xpressclaw.recovery-snapshot";
+pub(super) const RECOVERY_SNAPSHOT_LABEL: &str = "io.xpressclaw.recovery-snapshot";
 
 impl DockerManager {
     /// Rebuild only the current environment. Historical environments with

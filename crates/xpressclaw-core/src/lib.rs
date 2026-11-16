@@ -23,6 +23,7 @@ pub mod message_artifacts;
 pub mod projects;
 pub mod repositories;
 pub mod sessions;
+pub mod storage;
 pub mod tasks;
 pub mod tools;
 pub mod visualizations;

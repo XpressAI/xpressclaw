@@ -289,6 +289,11 @@ pub async fn serve_on_with_bound_callback(
     // Shutdown token: cancels all background tasks on Ctrl+C.
     let shutdown = tokio_util::sync::CancellationToken::new();
 
+    tokio::spawn(crate::routes::project_storage::run_retention(
+        state.clone(),
+        shutdown.clone(),
+    ));
+
     // Ensure every configured runtime context has a durable logical session.
     {
         let sessions = xpressclaw_core::sessions::SessionManager::new(state.db.clone());

@@ -29,6 +29,9 @@ pub use recovery::PreservedEnvironment;
 #[path = "authentication.rs"]
 mod authentication;
 pub use authentication::AuthenticationTerminal;
+#[path = "storage.rs"]
+mod storage;
+pub use storage::{EngineStorage, RecoveryImage};
 
 const LIFECYCLE_LABEL: &str = "io.xpressclaw.lifecycle";
 const PROJECT_LIFECYCLE: &str = "project";
@@ -2268,7 +2271,7 @@ pub(crate) mod tests {
                 let mut fields = first.split_whitespace();
                 let method = fields.next().unwrap_or_default();
                 let url = fields.next().unwrap_or_default();
-                let path = ["/containers", "/images"]
+                let path = ["/containers", "/images", "/system"]
                     .iter()
                     .find_map(|prefix| url.find(prefix))
                     .map(|i| &url[i..])
