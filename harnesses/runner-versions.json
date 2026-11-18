@@ -4,7 +4,7 @@
   "runners": {
     "codex": {
       "auto_update": true,
-      "version": "2.2.2",
+      "version": "2.7.0",
       "acp_command": [
         "codex-acp"
       ],
@@ -18,7 +18,7 @@
         }
       ],
       "build_args": {
-        "CODEX_ACP_VERSION": "2.2.2"
+        "CODEX_ACP_VERSION": "2.7.0"
       }
     },
     "claude": {
