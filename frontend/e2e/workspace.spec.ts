@@ -494,6 +494,7 @@ async function mockApi(
 		status,
 		priority: 0,
 		agent_id: options.taskAgentId === undefined ? agentId : options.taskAgentId,
+		project_id: projectId,
 		parent_task_id: options.taskParentId ?? null,
 		parent_review_required: options.taskParentReviewRequired ?? false,
 		sop_id: null,
@@ -558,6 +559,9 @@ async function mockApi(
 			agent_id: options.projectCount
 				? availableAgents[index % availableAgents.length].id
 				: task.agent_id,
+			project_id: options.projectCount
+				? availableAgents[index % availableAgents.length].project_id
+				: task.project_id,
 			status: 'completed',
 			created_at: timestamp(index),
 			updated_at: timestamp(index),
@@ -1132,10 +1136,11 @@ async function mockApi(
 		} else if (path === '/api/tasks/planning') {
             const laneFor = (task: {status:string;activity_status?:string}) => ({pending:'queue',in_progress:'working',waiting_for_input:'input',blocked:'blocked',completed:'done',cancelled:'done',idle:'queue',awaiting_review:'review'}[task.activity_status??task.status]??'queue');
             const terms=(url.searchParams.get('search')??'').toLocaleLowerCase().split(/\s+/).filter(Boolean);
-            const matching=listedTasks.filter(t=>terms.every(term=>(t.title+' '+(t.description??'')).toLocaleLowerCase().includes(term)));
+            const matching=listedTasks.filter(t=>(!url.searchParams.get('project_id')||t.project_id===url.searchParams.get('project_id'))&&(!url.searchParams.get('agent_id')||t.agent_id===url.searchParams.get('agent_id'))&&terms.every(term=>(t.title+' '+(t.description??'')).toLocaleLowerCase().includes(term)));
             const counts:Record<string,number>={};for(const task of matching){const lane=laneFor(task);counts[lane]=(counts[lane]??0)+1;}
             const selected=url.searchParams.get('status')??'active';
             const filtered=matching.filter(t=>selected==='all'||selected==='active'&&laneFor(t)!=='done'||selected==='attention'&&['input','blocked','review'].includes(laneFor(t))||laneFor(t)===selected);
+            if(url.searchParams.get('sort')==='newest') filtered.sort((a,b)=>Date.parse(b.created_at)-Date.parse(a.created_at)||b.id.localeCompare(a.id));
             const offset=Number(url.searchParams.get('offset')??0);const limit=Number(url.searchParams.get('limit')??100);
             response={tasks:filtered.slice(offset,offset+limit).map(t=>({...t,revision:0,position:0,start_after:null,backlog:false,planning:{lane:laneFor(t),disabled_reason:laneFor(t)==='done'?'Finished':null,queued:t.status==='pending',actual_started_at:null}})),total:filtered.length,counts};
         } else if (path === '/api/tasks') {
@@ -4067,8 +4072,42 @@ test('agent Work shows only the five most recently updated tasks', async ({ page
 		'/tasks/project-task-4',
 		'/tasks/project-task-2',
 	]);
-	await expect(page.getByRole('link', { name: 'All tasks' })).toHaveAttribute('href', '/tasks');
+	await expect(page.getByRole('link', { name: 'All tasks' })).toHaveAttribute('href', `/tasks?view=list&agent=${agentId}&status=all&sort=newest`);
 });
+
+for (const source of ['project', 'agent'] as const) {
+	test(`All tasks links scope history to the ${source} with newest tasks first`, async ({ page }, info) => {
+		await page.setViewportSize(source === 'agent' ? { width: 390, height: 844 } : { width: 1440, height: 1000 });
+		await mockApi(page, { completedTaskCount: 45, projectCount: 2 });
+		await page.addInitScript(() => localStorage.setItem('xpressclaw.tasks.view', 'board'));
+		await page.goto(source === 'project' ? `/projects/${projectId}` : `/agents/${agentId}`);
+		const request = page.waitForRequest((request) => new URL(request.url()).pathname === '/api/tasks/planning');
+		await page.locator('[data-workspace-pane]').getByRole('link', { name: 'All tasks', exact: true }).click();
+		const params = new URL((await request).url()).searchParams;
+		expect(params.get(source === 'project' ? 'project_id' : 'agent_id')).toBe(source === 'project' ? projectId : agentId);
+		expect(params.get('status')).toBe('all');
+		expect(params.get('sort')).toBe('newest');
+		const planner = page.locator('.task-planner:visible');
+		const rows = planner.locator('[data-task-row]');
+		await expect(planner.locator('.planner-header p')).toContainText('23 tasks');
+		await expect(planner.getByLabel('Task order')).toHaveValue('newest');
+		await expect(rows).toHaveCount(20);
+		await expect(rows.first()).toContainText('Completed task 45');
+		await expect(rows.last()).toContainText('Completed task 7');
+		await page.screenshot({ path: info.outputPath(`all-tasks-${source}.png`) });
+		await planner.getByRole('button', { name: 'Next', exact: true }).click();
+		await expect(rows).toHaveCount(3);
+		await expect(rows.locator('.title a')).toHaveText(['Completed task 5', 'Completed task 3', 'Completed task 1']);
+		await page.reload();
+		await expect(rows).toHaveCount(20);
+		await expect(rows.first()).toContainText('Completed task 45');
+		await expect(planner.locator('.filter-summary')).toContainText(source === 'project' ? 'Browser collaboration project' : 'Browser-tested workspace');
+		await planner.getByLabel('Task order').selectOption('planning');
+		await expect(rows.first()).toContainText('Completed task 1');
+		await planner.getByRole('button', { name: 'Clear filters', exact: true }).click();
+		await expect(planner.locator('.planner-header p')).toContainText('45 tasks');
+	});
+}
 
 test('runner preparation errors survive session polling and clear on successful retry', async ({ page }) => {
 	await page.clock.install();

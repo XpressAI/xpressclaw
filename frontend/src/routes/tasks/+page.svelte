@@ -42,8 +42,7 @@
         const mode = url.searchParams.get("view");
         if (mode && ["board", "timeline", "list"].includes(mode))
           view = mode as View;
-        projectId = url.searchParams.get("project") ?? "";
-        agentId = "";
+        applyRouteFilters(url);
         reset();
       });
   });
@@ -60,6 +59,7 @@
     });
   }
   type View = "board" | "timeline" | "list";
+  type Sort = "planning" | "newest";
   let root: HTMLDivElement;
   let scroller: HTMLDivElement;
   let filters: HTMLDialogElement;
@@ -67,6 +67,7 @@
   let projectId = $state("");
   let agentId = $state("");
   let status = $state("active");
+  let sort = $state<Sort>("planning");
   let draftProjectId = $state("");
   let draftAgentId = $state("");
   let draftStatus = $state("active");
@@ -105,8 +106,9 @@
         status === l.id,
     ),
   );
+  const canReorder = $derived(view !== "list" || sort === "planning");
   const selectedNeighbors = $derived.by(() => {
-    if (!selected) return {};
+    if (!selected || !canReorder) return {};
     const lane = taskList.filter(
       (t) =>
         taskLane(t) === taskLane(selected!) && !t.planning?.disabled_reason,
@@ -126,7 +128,7 @@
       localStorage.getItem("xpressclaw.tasks.view");
     if (["board", "timeline", "list"].includes(saved ?? ""))
       view = saved as View;
-    projectId = url.searchParams.get("project") ?? "";
+    applyRouteFilters(url);
     void Promise.all([agents.list(), projects.list()])
       .then(([a, p]) => {
         agentList = a;
@@ -183,6 +185,14 @@
     };
   });
   onDestroy(() => clearTimeout(timer));
+  function applyRouteFilters(url: URL) {
+    projectId = url.searchParams.get("project") ?? "";
+    agentId = url.searchParams.get("agent") ?? "";
+    const selectedStatus = url.searchParams.get("status");
+    status = selectedStatus && ["all", "active", "attention", ...lanes.map((lane) => lane.id)].includes(selectedStatus)
+      ? selectedStatus : "active";
+    sort = url.searchParams.get("sort") === "newest" ? "newest" : "planning";
+  }
   async function load(quiet = false, rethrowTransient = false) {
     const request = ++generation;
     if (!quiet) loading = true;
@@ -192,6 +202,7 @@
         agent_id: agentId,
         status,
         search,
+        sort: view === "list" ? sort : "planning",
         limit: pageSize,
         offset: page * pageSize,
       });
@@ -486,6 +497,12 @@
       ></label
     >
   </div>
+  {#if view === "list"}<label class="sort-control">
+      Order<select aria-label="Task order" value={sort} onchange={(event) => { sort = event.currentTarget.value as Sort; reset(); }}>
+        <option value="newest">Newest first</option>
+        <option value="planning">Planning order</option>
+      </select>
+    </label>{/if}
   {#if projectId || agentId}<div class="filter-summary">
       {projectList.find((p) => p.id === projectId)?.name ?? "All projects"} · {(agentList.find(
         (a) => a.id === agentId,
@@ -581,12 +598,13 @@
             <TaskCard
               {task}
               showDescription
+              draggable={canReorder}
               project={projectName(task)}
               agent={agentName(task)}
               onactions={openActions}
               ondrag={startDrag}
-              ondrop={dropCard}
-              onreorder={reorder}
+              ondrop={canReorder ? dropCard : undefined}
+              onreorder={canReorder ? reorder : undefined}
             />
           </div>{/each}
       </div>{/if}
@@ -788,6 +806,15 @@
     color: hsl(var(--muted-foreground));
   }
   .lane-filter select {
+    margin-left: 8px;
+    min-height: 34px;
+  }
+  .sort-control {
+    padding: 0 24px 12px;
+    font-size: 11px;
+    color: hsl(var(--muted-foreground));
+  }
+  .sort-control select {
     margin-left: 8px;
     min-height: 34px;
   }

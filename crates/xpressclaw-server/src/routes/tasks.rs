@@ -1689,6 +1689,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn planning_history_filters_and_orders_before_paginating() {
+        let (app, db) = test_app_with_db();
+        db.with_conn(|conn| conn.execute_batch(
+            "INSERT INTO projects(id,name) VALUES ('store','Store'),('lab','Lab');
+             UPDATE agents SET project_id='store' WHERE id IN ('atlas','beta');
+             UPDATE agents SET project_id='lab' WHERE id='zephyr';
+             INSERT INTO tasks(id,title,project_id,agent_id,status,priority,position,created_at,updated_at) VALUES
+             ('oldest','Old urgent task','store','atlas','pending',10,0,'2026-11-10 10:00:00','2026-11-20 10:00:00'),
+             ('middle','Finished task','store','atlas','completed',0,1,'2026-11-10T12:00:00Z','2026-11-10 12:00:00'),
+             ('newest','New task','store','beta','pending',0,2,'2026-11-10 13:00:00','2026-11-10 13:00:00'),
+             ('unassigned','Unassigned task','store',NULL,'pending',0,3,'2026-11-10T12:00:00+01:00','2026-11-10 11:00:00'),
+             ('other','Other project','lab','zephyr','pending',0,4,'2026-11-10 14:00:00','2026-11-10 14:00:00');"
+        )).unwrap();
+
+        for (query, expected, total) in [
+            (
+                "project_id=store&sort=newest&limit=2",
+                vec!["newest", "middle"],
+                4,
+            ),
+            (
+                "project_id=store&sort=newest&limit=2&offset=2",
+                vec!["unassigned", "oldest"],
+                4,
+            ),
+            ("agent_id=atlas&sort=newest&limit=1", vec!["middle"], 2),
+            (
+                "agent_id=atlas&sort=newest&limit=1&offset=1",
+                vec!["oldest"],
+                2,
+            ),
+            (
+                "project_id=store&agent_id=beta&sort=newest",
+                vec!["newest"],
+                1,
+            ),
+            ("project_id=lab&agent_id=atlas&sort=newest", vec![], 0),
+            ("project_id=store&limit=2", vec!["oldest", "middle"], 4),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get(format!("/tasks/planning?status=all&{query}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{query}");
+            let page = body_json(response.into_body()).await;
+            let ids: Vec<_> = page["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|task| task["id"].as_str().unwrap())
+                .collect();
+            assert_eq!(ids, expected, "{query}");
+            assert_eq!(page["total"], total, "{query}");
+            assert_eq!(
+                page["counts"]
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .map(|count| count.as_i64().unwrap())
+                    .sum::<i64>(),
+                total,
+                "{query}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn backlog_creation_never_dispatches_and_default_creation_remains_to_do() {
         let (app, db) = test_app_with_db();
         for batch in [false, true] {

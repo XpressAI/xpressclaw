@@ -223,7 +223,7 @@
 
 			<div class="grid gap-8 lg:grid-cols-[minmax(0,1fr)_minmax(18rem,0.65fr)]">
 				<section>
-					<div class="mb-3 flex items-center justify-between"><div><h2 class="font-semibold">Recent tasks</h2><p class="text-xs text-muted-foreground">Work created here or from a conversation.</p></div><a href="/tasks" class="text-xs text-primary hover:underline">All tasks</a></div>
+					<div class="mb-3 flex items-center justify-between"><div><h2 class="font-semibold">Recent tasks</h2><p class="text-xs text-muted-foreground">Work created here or from a conversation.</p></div><a href={`/tasks?view=list&project=${encodeURIComponent(projectId)}&status=all&sort=newest`} class="text-xs text-primary hover:underline">All tasks</a></div>
 					<div class="ai-card overflow-hidden">{#if taskList.length === 0}<p class="p-5 text-sm text-muted-foreground">No tasks in this project yet.</p>{:else}{#each taskList.slice(0, 8) as task (task.id)}<a href="/tasks/{task.id}" class="flex items-center gap-3 border-b border-border/70 px-4 py-3 last:border-0 hover:bg-[hsl(var(--hover))]"><span class="h-2 w-2 shrink-0 rounded-full {taskDot(task.activity_status ?? task.status)}"></span><span class="min-w-0 flex-1"><span class="block truncate text-sm">{task.title}</span><span class="text-[11px] text-muted-foreground">{(task.activity_status ?? task.status).replaceAll('_', ' ')} · {timeAgo(task.updated_at)}</span></span><span class="text-muted-foreground">→</span></a>{/each}{/if}</div>
 				</section>
 
