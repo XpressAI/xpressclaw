@@ -8977,13 +8977,13 @@ test('lazy-loaded workspace views and agent tabs evict failed chunk promises and
 	expect(taskViewRequests).toBe(2);
 
 	// 2. WorkspaceContent recovery when closing and reopening a failed tab after connectivity returns
-	await page.getByRole('link', { name: 'Browser collaboration project' }).click();
+	await page.locator('h2').getByRole('link', { name: 'Browser collaboration project' }).click();
 	await expect(viewAlert).toBeVisible();
 	expect(projectOverviewRequests).toBe(1);
 
 	await page.getByRole('button', { name: 'Close Browser collaboration project', exact: true }).click();
 	await expect(viewAlert).toBeHidden();
-	await page.getByRole('link', { name: 'Browser collaboration project' }).click();
+	await page.locator('h2').getByRole('link', { name: 'Browser collaboration project' }).click();
 	await expect(viewAlert).toBeHidden();
 	await expect(page.getByRole('heading', { level: 1, name: 'Browser collaboration project' })).toBeVisible();
 	expect(projectOverviewRequests).toBe(2);
