@@ -84,7 +84,9 @@ pub fn save_state(db: &Database, project: &str, state: &StorageState) -> Result<
 #[derive(Clone, Debug, Serialize)]
 pub struct Worktree {
     pub id: String,
+    #[serde(serialize_with = "serialize_path")]
     pub repository: PathBuf,
+    #[serde(serialize_with = "serialize_path")]
     pub path: PathBuf,
     pub branch: Option<String>,
     pub head: String,
@@ -115,6 +117,36 @@ struct Entry {
     branch: Option<String>,
     locked: bool,
     bare: bool,
+}
+
+fn serialize_path<S: serde::Serializer>(
+    path: &Path,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    path_for_external_tool(path).serialize(serializer)
+}
+
+/// Resolve filesystem aliases before comparing paths. A missing worktree still
+/// has a canonical identity through its existing parent, so Git's stale
+/// registration can be inspected without treating it as outside the workspace.
+fn canonical_worktree_path(path: &Path) -> Option<PathBuf> {
+    let mut parent = path;
+    let mut missing = Vec::new();
+    loop {
+        match parent.canonicalize() {
+            Ok(mut canonical) => {
+                for component in missing.into_iter().rev() {
+                    canonical.push(component);
+                }
+                return Some(canonical);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(parent.file_name()?.to_owned());
+                parent = parent.parent()?;
+            }
+            Err(_) => return None,
+        }
+    }
 }
 
 fn git(repo: &Path, args: &[&str]) -> Result<Output> {
@@ -209,7 +241,7 @@ fn process_paths() -> Vec<PathBuf> {
             [process.cwd(), process.exe()]
                 .into_iter()
                 .flatten()
-                .map(Path::to_owned)
+                .filter_map(canonical_worktree_path)
         })
         .collect()
 }
@@ -474,11 +506,14 @@ pub fn inventory(
                 continue;
             }
         };
+        let paths = list
+            .iter()
+            .map(|entry| canonical_worktree_path(&entry.path))
+            .collect::<Vec<_>>();
         let base = default_branch(&repo);
-        for entry in &list {
+        for (entry, canonical) in list.iter().zip(&paths) {
             let mut reasons = Vec::new();
             let missing = !entry.path.exists();
-            let canonical = entry.path.canonicalize().ok();
             let path = canonical.as_ref().unwrap_or(&entry.path);
             if entry.bare || path == &repo {
                 reasons.push("Primary checkout".into());
@@ -491,7 +526,9 @@ pub fn inventory(
                 reasons.push("Outside the configured project workspace".into());
             }
             let mut component = entry.path.as_path();
-            while component.starts_with(&bootstrap) && component != bootstrap {
+            while canonical_worktree_path(component)
+                .is_some_and(|path| path.starts_with(&bootstrap) && path != bootstrap)
+            {
                 if std::fs::symlink_metadata(component)
                     .is_ok_and(|metadata| metadata.file_type().is_symlink())
                 {
@@ -509,9 +546,10 @@ pub fn inventory(
             {
                 reasons.push("An Agent uses this workspace or repository".into());
             }
-            if list
+            if paths
                 .iter()
-                .any(|other| other.path != entry.path && other.path.starts_with(path))
+                .flatten()
+                .any(|other| other != path && other.starts_with(path))
             {
                 reasons.push("Contains another registered worktree".into());
             }
@@ -535,7 +573,7 @@ pub fn inventory(
                 } else {
                     reasons.push("Worktree metadata does not match its repository inside the approved workspace".into());
                 }
-            } else if !missing && canonical.is_none() {
+            } else if canonical.is_none() {
                 reasons.push("Worktree path is unavailable".into());
             }
             let id = format!(
@@ -569,7 +607,7 @@ pub fn inventory(
             worktrees.push(Worktree {
                 id,
                 repository: repo.clone(),
-                path: entry.path.clone(),
+                path: path.clone(),
                 branch: entry.branch.clone(),
                 head: entry.head.clone(),
                 agent_ids: agents.clone(),
@@ -610,7 +648,7 @@ pub fn remove_worktree(tree: &Worktree) -> Result<()> {
     }
     let registered = entries(&tree.repository)?
         .into_iter()
-        .find(|entry| entry.path == tree.path)
+        .find(|entry| canonical_worktree_path(&entry.path).as_ref() == Some(&tree.path))
         .ok_or_else(|| {
             Error::Backend("Worktree registration changed; refresh the inventory".into())
         })?;
@@ -713,7 +751,7 @@ mod tests {
             root,
             &["worktree", "add", "-b", branch, path.to_str().unwrap()],
         );
-        path
+        path.canonicalize().unwrap()
     }
     #[test]
     fn cleanup_removes_only_finished_clean_worktrees_and_preserves_branches() {
@@ -729,7 +767,14 @@ mod tests {
         std::fs::write(unmerged.join("source.txt"), "new commit").unwrap();
         run(&unmerged, &["commit", "-am", "unmerged work"]);
         let locked = add(root.path(), "locked");
-        run(root.path(), &["worktree", "lock", locked.to_str().unwrap()]);
+        run(
+            root.path(),
+            &[
+                "worktree",
+                "lock",
+                path_for_external_tool(&locked).to_str().unwrap(),
+            ],
+        );
         let report = inventory(db.clone(), &config, "agent", true).unwrap();
         let eligible = report
             .worktrees
@@ -738,6 +783,14 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(eligible.len(), 1, "{:#?}", report.worktrees);
         assert_eq!(eligible[0].path, clean);
+        assert!(eligible[0]
+            .path
+            .starts_with(eligible[0].repository.join(".worktrees")));
+        let public = serde_json::to_value(eligible[0]).unwrap();
+        assert_eq!(
+            public["path"],
+            path_for_external_tool(&clean).to_str().unwrap()
+        );
         remove_worktree(eligible[0]).unwrap();
         assert!(!clean.exists());
         assert!(git_text(root.path(), &["rev-parse", "--verify", "refs/heads/clean"]).is_some());
@@ -767,6 +820,62 @@ mod tests {
             .unwrap();
         assert!(!tree.eligible);
         assert!(tree.eligible_since.is_none());
+    }
+
+    #[test]
+    fn nested_worktrees_keep_their_parent_checkout() {
+        let (root, db, config) = fixture();
+        let parent = add(root.path(), "parent");
+        let child = parent.join(".worktrees/child");
+        run(
+            root.path(),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "child",
+                path_for_external_tool(&child).to_str().unwrap(),
+            ],
+        );
+        let report = inventory(db, &config, "agent", false).unwrap();
+        let tree = report
+            .worktrees
+            .iter()
+            .find(|tree| tree.path == parent)
+            .unwrap();
+        assert!(!tree.eligible);
+        assert!(tree
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("another registered worktree")));
+        assert!(remove_worktree(tree).is_err());
+        assert!(child.join("source.txt").exists());
+    }
+
+    #[test]
+    fn missing_worktrees_keep_their_canonical_identity_and_branch() {
+        let (root, db, config) = fixture();
+        let path = add(root.path(), "missing");
+        std::fs::remove_dir_all(&path).unwrap();
+        let report = inventory(db, &config, "agent", false).unwrap();
+        let tree = report
+            .worktrees
+            .iter()
+            .find(|tree| tree.path == path)
+            .unwrap();
+        assert!(tree.missing);
+        assert!(tree.eligible, "{:?}", tree.reasons);
+        assert!(tree.path.starts_with(tree.repository.join(".worktrees")));
+        remove_worktree(tree).unwrap();
+        assert!(git_text(
+            root.path(),
+            &["rev-parse", "--verify", "refs/heads/missing"]
+        )
+        .is_some());
+        assert!(!entries(root.path())
+            .unwrap()
+            .iter()
+            .any(|entry| canonical_worktree_path(&entry.path).as_ref() == Some(&path)));
     }
 
     #[test]
