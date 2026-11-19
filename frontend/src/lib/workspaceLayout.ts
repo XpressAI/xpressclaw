@@ -1,6 +1,8 @@
 export const MIN_PANE_WIDTH = 380;
 export const MIN_DETAILS_WIDTH = 668; // 380px conversation + 288px details.
 export const PANE_DIVIDER_WIDTH = 4;
+// Phone-width panes collapse view headers to save vertical space.
+export const NARROW_PANE_WIDTH = 640;
 
 export interface ViewportSegment {
 	x: number;
@@ -61,6 +63,7 @@ export function measurePane(node: HTMLElement) {
 		const { width, height } = node.getBoundingClientRect();
 		node.style.setProperty('--workspace-pane-height', `${height}px`);
 		node.toggleAttribute('data-short-pane', height < 400);
+		node.toggleAttribute('data-narrow-pane', width < NARROW_PANE_WIDTH);
 		node.toggleAttribute('data-pane-wide-details', width >= MIN_DETAILS_WIDTH);
 	};
 	const observer = new ResizeObserver(update);

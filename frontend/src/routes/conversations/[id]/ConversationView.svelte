@@ -7,6 +7,7 @@
 	import { clearComposerDraft, loadComposerDraft, saveComposerDraft } from '$lib/composerDrafts';
 	import { clipboardFiles, imageDataUrl, pastedImageFiles, shouldHandleImagePaste } from '$lib/imageAttachments';
 	import { PROJECT_MUTATION_EVENT, type ProjectMutation } from '$lib/projectEvents';
+	import { collaborationProjectPath } from '$lib/workspace';
 	import { harnessMark, timeAgo } from '$lib/utils';
 	import AgentLoading from '$lib/components/AgentLoading.svelte';
 	import AgentSignIn from '$lib/components/AgentSignIn.svelte';
@@ -550,7 +551,7 @@
 	{:else if conversation}
 		<header class="conversation-header shrink-0 border-b border-border bg-card/30 px-4 pt-3 sm:px-6">
 			<div class="flex flex-wrap items-center justify-between gap-3">
-				<div class="min-w-0"><p class="conversation-breadcrumbs truncate text-xs text-muted-foreground"><a href="/projects/{encodeURIComponent(project?.id || '')}" class="hover:text-foreground">{project?.name || 'Project'}</a> / Conversation</p><h1 class="mt-1 truncate text-lg font-semibold"><span class="mr-2 text-muted-foreground">#</span>{conversation.title || 'Untitled conversation'}</h1></div>
+				<div class="min-w-0"><p class="conversation-breadcrumbs truncate text-xs text-muted-foreground"><a href="/projects/{encodeURIComponent(project?.id || '')}" class="hover:text-foreground">{project?.name || 'Project'}</a> / Conversation</p><div class="conversation-title-line mt-1 flex min-w-0 items-baseline gap-1.5">{#if project}<span class="conversation-compact-project hidden min-w-0 max-w-[45%] shrink-0 items-baseline gap-1.5 text-sm text-muted-foreground"><a href={collaborationProjectPath(project.id)} title={project.name} class="truncate hover:text-foreground">{project.name}</a><span aria-hidden="true">/</span></span>{/if}<h1 class="min-w-0 truncate text-lg font-semibold"><span class="mr-2 text-muted-foreground">#</span>{conversation.title || 'Untitled conversation'}</h1></div></div>
 				<div class="relative flex items-center gap-2"><div class="hidden -space-x-2 sm:flex">{#each participantAgents.slice(0, 5) as agent}<span title={agent.title || agent.name} class="flex h-8 w-8 items-center justify-center rounded-full border-2 border-background bg-muted text-[10px] font-semibold">{harnessMark(agent.backend)}</span>{/each}</div><button type="button" onclick={() => (showPeople = !showPeople)} class="rounded-lg border border-border px-3 py-1.5 text-xs">{participantAgents.length} Agent{participantAgents.length === 1 ? '' : 's'}</button><button type="button" onclick={() => (showTaskComposer = true)} class="rounded-lg bg-primary px-3 py-1.5 text-xs text-primary-foreground">Continue with task</button>
 					{#if showPeople}<div class="absolute right-0 top-10 z-30 w-72 rounded-xl border border-border bg-card p-3 shadow-xl"><p class="mb-2 text-xs font-semibold">Conversation Agents</p><div class="space-y-1">{#each projectAgents as agent}<button type="button" onclick={() => void toggleParticipant(agent)} class="flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-xs hover:bg-accent"><span class="flex h-7 w-7 items-center justify-center rounded-full bg-muted text-[9px]">{harnessMark(agent.backend)}</span><span class="min-w-0 flex-1 truncate">{agent.title || agent.name}</span><span class="text-primary">{participantAgentIds.includes(agent.id) ? '✓' : '+'}</span></button>{/each}</div>{#if availableAgents.length === 0}<a href="/projects/{encodeURIComponent(project?.id || '')}" class="mt-2 block text-xs text-primary">Manage project Agents</a>{/if}</div>{/if}
 				</div>
@@ -701,11 +702,23 @@
 	/* History paging and follow-to-latest manage this scroller explicitly. */
 	[data-conversation-message-pane] { overflow-anchor: none; }
 	:global([data-pane-wide-details]) .conversation-tasks { display: block; }
-	:global([data-short-pane]) .conversation-header { padding-top: 6px; }
-	:global([data-short-pane]) .conversation-breadcrumbs { display: none; }
-	:global([data-short-pane]) .conversation-header > div { flex-wrap: nowrap; gap: 4px; }
-	:global([data-short-pane]) .conversation-header > div > div:last-child { flex-shrink: 0; }
-	:global([data-short-pane]) .conversation-header h1 { font-size: 16px; line-height: 24px; margin-top: 0; }
-	:global([data-short-pane]) .conversation-header nav { margin-top: 4px; }
-	:global([data-short-pane]) .conversation-header > div button { padding: 6px 8px; }
+	/* Short and phone-width panes fold the breadcrumbs into the title line. */
+	:global([data-short-pane]) .conversation-header,
+	:global([data-narrow-pane]) .conversation-header { padding-top: 6px; }
+	:global([data-short-pane]) .conversation-breadcrumbs,
+	:global([data-narrow-pane]) .conversation-breadcrumbs { display: none; }
+	:global([data-short-pane]) .conversation-compact-project,
+	:global([data-narrow-pane]) .conversation-compact-project { display: flex; }
+	:global([data-short-pane]) .conversation-header > div,
+	:global([data-narrow-pane]) .conversation-header > div { flex-wrap: nowrap; gap: 4px; }
+	:global([data-short-pane]) .conversation-header > div > div:last-child,
+	:global([data-narrow-pane]) .conversation-header > div > div:last-child { flex-shrink: 0; }
+	:global([data-short-pane]) .conversation-title-line,
+	:global([data-narrow-pane]) .conversation-title-line { margin-top: 0; }
+	:global([data-short-pane]) .conversation-header h1,
+	:global([data-narrow-pane]) .conversation-header h1 { font-size: 16px; line-height: 24px; }
+	:global([data-short-pane]) .conversation-header nav,
+	:global([data-narrow-pane]) .conversation-header nav { margin-top: 4px; }
+	:global([data-short-pane]) .conversation-header > div button,
+	:global([data-narrow-pane]) .conversation-header > div button { padding: 6px 8px; }
 </style>

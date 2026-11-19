@@ -19,6 +19,7 @@
 	import ActivityEventRow from '$lib/components/ActivityEventRow.svelte';
 	import AgentLoading from '$lib/components/AgentLoading.svelte';
 	import AgentSignIn from '$lib/components/AgentSignIn.svelte';
+	import ProjectLink from '$lib/components/ProjectLink.svelte';
 	import DelegatedWorkPanel from '$lib/components/DelegatedWorkPanel.svelte';
 	import AiMessage from '$lib/components/AiMessage.svelte';
 	import ImageAttachmentPreviews from '$lib/components/ImageAttachmentPreviews.svelte';
@@ -157,6 +158,7 @@
 	let delegatedWork = $state<DelegatedWork[]>([]);
 	let planSteps = $derived(subtaskList.filter(item => item.provenance === 'native_plan'));
 	let agentList = $state<Agent[]>([]);
+	let taskProjectId = $derived(task?.project_id || agentList.find((agent) => agent.id === task?.agent_id)?.project_id || null);
 	let allTasks = $state<Task[]>([]);
 	let workspaceGit = $state<WorkspaceGitStatus | null>(null);
 	let error = $state<string | null>(null);
@@ -1835,7 +1837,8 @@
 	<!-- Header -->
 	<div class="task-header shrink-0 border-b border-border px-3 py-3 sm:px-6 sm:py-4">
 		<div class="task-breadcrumbs flex items-center gap-2 text-sm text-muted-foreground mb-2">
-			<a href="/tasks" class="hover:text-foreground">Tasks</a>
+			{#if taskProjectId}<ProjectLink projectId={taskProjectId} separator />{/if}
+			<a href={taskProjectId ? `/tasks?project=${encodeURIComponent(taskProjectId)}` : '/tasks'} class="hover:text-foreground">Tasks</a>
 			<span>/</span>
 			<span class="text-foreground truncate">{task?.title ?? '...'}</span>
 		</div>
@@ -1861,9 +1864,12 @@
 		{:else if task}
 			<div class="task-title-row flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
 				<div class="min-w-0">
-					<h1 class="text-lg font-bold sm:text-xl">{task.title}</h1>
+					<div class="task-title-line flex min-w-0 items-baseline gap-1.5">
+						{#if taskProjectId}<span class="task-compact-project hidden min-w-0 max-w-[45%] shrink-0 items-baseline gap-1.5 text-sm text-muted-foreground"><ProjectLink projectId={taskProjectId} separator /></span>{/if}
+						<h1 class="min-w-0 text-lg font-bold sm:text-xl">{task.title}</h1>
+					</div>
 					{#if task.start_after || task.backlog}
-						<div class="mt-1 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+						<div class="task-header-schedule mt-1 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
 							{#if task.start_after}<span>Start no earlier than {dateLabel(task.start_after)}</span>{/if}
 							{#if task.backlog}<span>Backlog</span>{/if}
 						</div>
@@ -2571,11 +2577,20 @@
 
 <style>
 	[data-task-transcript-scroll] { overflow-anchor: none; }
-	:global([data-short-pane]) .task-header { padding: 6px 12px; }
+	/* Short and phone-width panes fold the breadcrumbs into the title line. */
+	:global([data-short-pane]) .task-header,
+	:global([data-narrow-pane]) .task-header { padding: 6px 12px; }
 	:global([data-short-pane]) .task-breadcrumbs,
+	:global([data-narrow-pane]) .task-breadcrumbs,
+	:global([data-short-pane]) .task-header-schedule,
 	:global([data-short-pane]) .task-header-metadata { display: none; }
-	:global([data-short-pane]) .task-title-row { flex-direction: row; align-items: center; gap: 8px; }
-	:global([data-short-pane]) .task-title-row h1 { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 16px; }
+	:global([data-short-pane]) .task-compact-project,
+	:global([data-narrow-pane]) .task-compact-project { display: flex; }
+	:global([data-short-pane]) .task-title-row,
+	:global([data-narrow-pane]) .task-title-row { flex-direction: row; align-items: center; justify-content: space-between; gap: 8px; }
+	:global([data-short-pane]) .task-title-row h1,
+	:global([data-narrow-pane]) .task-title-row h1 { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 16px; }
+	:global([data-narrow-pane]) .task-header-metadata { flex-wrap: nowrap; overflow: hidden; white-space: nowrap; margin-top: 2px; }
 	.task-action {
 		display: inline-flex;
 		align-items: center;
