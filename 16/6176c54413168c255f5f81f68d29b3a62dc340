@@ -1,0 +1,10 @@
+branch: fix/opencode-binary-runner
+why: Runner-version PR #267 failed only on build-native-runners (opencode, 2.3.2). The ACP Registry now lists OpenCode 2.3.2 as binary-only (repo moved to anomalyco/opencode); npm opencode-ai latest is 1.19.6, so 'npm install opencode-ai@2.3.2' 404s. The gh tool returned empty job logs; diagnosis came from comparing the registry entry with npm view.
+change: opencode runner -> dockerfile 'binary', source {kind: acp-registry, target: binary}, AGENT_PATH 'opencode' (registry cmd './opencode'). Deleted harnesses/native/opencode/Dockerfile, its docker-bake targets, and the 'opencode' dockerfile kind in the validator; README/ADR-025 build command now use scripts/build-runner-images.sh opencode.
+fix location: main, not the automation branch — update-runner-versions.yml regenerates automation/update-runner-versions from main via create-pull-request, so edits there would be overwritten.
+rejected: pinning opencode at 1.19.x (PR body's suggested escape hatch) would unblock #267 but freeze OpenCode on the abandoned npm line.
+validation:
+  - node --test scripts/runner-versions.test.mjs (8 pass)
+  - node scripts/runner-versions.mjs update against the live registry leaves the opencode entry byte-identical
+  - scripts/build-runner-images.sh opencode: sha256 OK, 'ACP smoke: initialize succeeded', runner + runner-host stages build, image runs 'opencode v2.3.2' (648MB vs 819MB npm image)
+  - only amd64 built locally; arm64 archive/checksum come from the same registry entry and CI builds both.
