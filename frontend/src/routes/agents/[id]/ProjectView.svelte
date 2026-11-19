@@ -22,6 +22,7 @@
 	import { agentRuntimeSummary, agentRuntimeTitle, harnessMark, statusColor } from '$lib/utils';
 	import { projectPath, type ProjectSection } from '$lib/workspace';
 
+	import ProjectLink from '$lib/components/ProjectLink.svelte';
 	import SessionTab from './SessionTab.svelte';
 
 	let { agentId, section = 'session', route = '' }: { agentId: string; section?: ProjectSection; route?: string } = $props();
@@ -250,8 +251,9 @@
 
 <div class="flex flex-col h-full">
 	<!-- Header -->
-	<div class="shrink-0 space-y-3 border-b border-border px-4 py-3 sm:px-6 sm:py-4">
-		<div class="flex items-center gap-2 text-sm text-muted-foreground">
+	<div class="agent-header shrink-0 space-y-3 border-b border-border px-4 py-3 sm:px-6 sm:py-4">
+		<div class="flex items-center gap-2 text-sm text-muted-foreground" class:agent-breadcrumbs={!!agent}>
+			{#if agent?.project_id}<ProjectLink projectId={agent.project_id} separator />{/if}
 			<a href="/agents" class="hover:text-foreground">Agents</a>
 			<span>/</span>
 			<span class="text-foreground">{sessionTitle()}</span>
@@ -266,7 +268,10 @@
 						{harnessMark(agent.backend)}
 					</div>
 					<div class="min-w-0">
-						<h1 class="truncate text-lg font-bold sm:text-xl">{sessionTitle()}</h1>
+						<div class="flex min-w-0 items-baseline gap-1.5">
+							{#if agent.project_id}<span class="agent-compact-project hidden min-w-0 max-w-[45%] shrink-0 items-baseline gap-1.5 text-sm text-muted-foreground"><ProjectLink projectId={agent.project_id} separator /></span>{/if}
+							<h1 class="min-w-0 truncate text-lg font-bold sm:text-xl">{sessionTitle()}</h1>
+						</div>
 						<p class="truncate text-sm text-muted-foreground" title={agentRuntimeTitle(agent)}>
 							<span class="{statusColor(agent.status)}">{agent.status === 'waiting_for_input' ? 'waiting for you' : agent.status.replaceAll('_', ' ')}</span>
 							&middot; {agentRuntimeSummary(agent)}
@@ -385,3 +390,15 @@
 		</div>
 	</div>
 {/if}
+
+<style>
+	/* Short and phone-width panes fold the breadcrumbs into the title line. */
+	:global([data-short-pane]) .agent-header,
+	:global([data-narrow-pane]) .agent-header { padding: 6px 12px; }
+	:global([data-short-pane]) .agent-breadcrumbs,
+	:global([data-narrow-pane]) .agent-breadcrumbs { display: none; }
+	:global([data-short-pane]) .agent-compact-project,
+	:global([data-narrow-pane]) .agent-compact-project { display: flex; }
+	:global([data-short-pane]) .agent-header h1,
+	:global([data-narrow-pane]) .agent-header h1 { font-size: 16px; }
+</style>

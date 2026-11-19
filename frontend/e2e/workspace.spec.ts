@@ -4506,6 +4506,61 @@ test('task changed files use normal navigation at the workspace pane limit', asy
 	await expect(focusedPane.locator('[data-monaco-editor]')).toHaveCount(0);
 });
 
+test('task and agent headers always link back to their project', async ({ page }) => {
+	await page.setViewportSize({ width: 1280, height: 900 });
+	await mockApi(page);
+	const projectHref = `/projects/${projectId}`;
+
+	await page.goto(`/tasks/${taskId}`);
+	const taskCrumbs = page.locator('.task-breadcrumbs');
+	await expect(taskCrumbs.getByRole('link', { name: 'Browser collaboration project' })).toHaveAttribute('href', projectHref);
+	await expect(taskCrumbs.getByRole('link', { name: 'Tasks' })).toHaveAttribute('href', `/tasks?project=${projectId}`);
+	await expect(page.locator('.task-compact-project')).toBeHidden();
+
+	await page.goto(`/agents/${agentId}`);
+	const agentCrumbs = page.locator('.agent-breadcrumbs');
+	await expect(agentCrumbs.getByRole('link', { name: 'Browser collaboration project' })).toHaveAttribute('href', projectHref);
+	await expect(page.locator('.agent-compact-project')).toBeHidden();
+});
+
+test('phone headers fold the project link into the title line', async ({ page }) => {
+	await page.setViewportSize({ width: 390, height: 844 });
+	await mockApi(page, {
+		conversations: [{
+			id: conversationId, project_id: projectId, title: 'Phone header conversation', icon: null,
+			created_at: timestamp(1), updated_at: timestamp(61), last_message_at: timestamp(61), participants: [],
+		}],
+	});
+	const projectHref = `/projects/${projectId}`;
+	const sameLine = async (link: Locator, heading: Locator) => {
+		const [linkBox, headingBox] = await Promise.all([link.boundingBox(), heading.boundingBox()]);
+		expect(linkBox && headingBox).toBeTruthy();
+		// Same row: the two boxes overlap vertically instead of stacking.
+		expect(Math.min(linkBox!.y + linkBox!.height, headingBox!.y + headingBox!.height) - Math.max(linkBox!.y, headingBox!.y), JSON.stringify({ linkBox, headingBox })).toBeGreaterThan(8);
+	};
+
+	await page.goto(`/tasks/${taskId}`);
+	await expect(page.locator('.task-breadcrumbs')).toBeHidden();
+	const taskLink = page.locator('.task-compact-project').getByRole('link', { name: 'Browser collaboration project' });
+	await expect(taskLink).toHaveAttribute('href', projectHref);
+	await sameLine(taskLink, page.locator('.task-title-row h1'));
+	await sameLine(page.locator('.task-title-row h1'), page.locator('[data-task-header-actions]'));
+	await expect(page.locator('[data-task-activity-status]').first()).toBeVisible();
+
+	await page.goto(`/agents/${agentId}`);
+	await expect(page.locator('.agent-breadcrumbs')).toBeHidden();
+	const agentLink = page.locator('.agent-compact-project').getByRole('link', { name: 'Browser collaboration project' });
+	await expect(agentLink).toHaveAttribute('href', projectHref);
+	await sameLine(agentLink, page.locator('.agent-header h1'));
+
+	await page.goto(`/conversations/${conversationId}`);
+	await expect(page.locator('.conversation-breadcrumbs')).toBeHidden();
+	const conversationLink = page.locator('.conversation-compact-project').getByRole('link', { name: 'Browser collaboration project' });
+	await expect(conversationLink).toHaveAttribute('href', projectHref);
+	await sameLine(conversationLink, page.locator('.conversation-header h1'));
+	await sameLine(page.locator('.conversation-header h1'), page.getByRole('button', { name: 'Continue with task' }));
+});
+
 test('narrow manual task splits preserve the compact task layout', async ({ page }) => {
 	await page.setViewportSize({ width: 1024, height: 768 });
 	await mockApi(page);
