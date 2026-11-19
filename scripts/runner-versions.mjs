@@ -94,7 +94,7 @@ export function validateRunnerVersions(manifest) {
     ) {
       fail(`${id}.acp_command must be a non-empty array of single-line strings`);
     }
-    if (!['codex', 'claude', 'opencode', 'npm', 'binary'].includes(runner.dockerfile)) {
+    if (!['codex', 'claude', 'npm', 'binary'].includes(runner.dockerfile)) {
       fail(`${id}.dockerfile is unsupported`);
     }
     if (!Array.isArray(runner.sources) || runner.sources.length === 0) {

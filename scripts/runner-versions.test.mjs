@@ -78,7 +78,7 @@ test('the checked-in runner manifest is complete and produces exact build argume
 });
 
 test('convenience native builds retain usable ACP smoke defaults', async () => {
-  for (const id of ['codex', 'claude', 'opencode']) {
+  for (const id of ['codex', 'claude']) {
     const dockerfile = await readFile(new URL(`${id}/Dockerfile`, nativeHarnessUrl), 'utf8');
     const encoded = dockerfile.match(/^ARG ACP_SMOKE_COMMAND_B64=(\S+)$/m)?.[1];
     assert.ok(encoded, `${id} Dockerfile must provide a direct-build smoke command`);

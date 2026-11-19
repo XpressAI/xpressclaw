@@ -266,7 +266,7 @@ Build the runner images you use with:
 ```bash
 docker buildx build --load -f harnesses/native/codex/Dockerfile -t xpressclaw-runner-codex:latest -t localhost/xpressclaw-runner-codex:latest harnesses/native
 docker buildx build --load -f harnesses/native/claude/Dockerfile -t xpressclaw-runner-claude:latest -t localhost/xpressclaw-runner-claude:latest harnesses/native
-docker buildx build --load -f harnesses/native/opencode/Dockerfile -t xpressclaw-runner-opencode:latest -t localhost/xpressclaw-runner-opencode:latest harnesses/native
+scripts/build-runner-images.sh opencode  # binary template, pinned by harnesses/runner-versions.json
 ```
 
 Then sign in on the host with the selected CLI. API-key based LLM router

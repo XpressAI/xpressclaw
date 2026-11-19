@@ -12,7 +12,7 @@ variable "TAG" {
 }
 
 group "default" {
-  targets = ["native-codex", "native-claude", "native-opencode", "native-codex-docker", "native-claude-docker", "native-opencode-docker"]
+  targets = ["native-codex", "native-claude", "native-codex-docker", "native-claude-docker"]
 }
 
 // Retained only for developers maintaining the pre-ACP compatibility images.
@@ -35,13 +35,6 @@ target "native-claude" {
   tags       = ["xpressclaw-runner-claude:${TAG}", "localhost/xpressclaw-runner-claude:${TAG}", "${REGISTRY}/xpressclaw-runner-claude:${TAG}"]
 }
 
-target "native-opencode" {
-  context    = "./native"
-  dockerfile = "opencode/Dockerfile"
-  target     = "runner"
-  tags       = ["xpressclaw-runner-opencode:${TAG}", "localhost/xpressclaw-runner-opencode:${TAG}", "${REGISTRY}/xpressclaw-runner-opencode:${TAG}"]
-}
-
 target "native-codex-docker" {
   context    = "./native"
   dockerfile = "codex/Dockerfile"
@@ -54,13 +47,6 @@ target "native-claude-docker" {
   dockerfile = "claude/Dockerfile"
   target     = "runner-host"
   tags       = ["xpressclaw-runner-claude-docker:${TAG}", "localhost/xpressclaw-runner-claude-docker:${TAG}", "${REGISTRY}/xpressclaw-runner-claude-docker:${TAG}"]
-}
-
-target "native-opencode-docker" {
-  context    = "./native"
-  dockerfile = "opencode/Dockerfile"
-  target     = "runner-host"
-  tags       = ["xpressclaw-runner-opencode-docker:${TAG}", "localhost/xpressclaw-runner-opencode-docker:${TAG}", "${REGISTRY}/xpressclaw-runner-opencode-docker:${TAG}"]
 }
 
 target "base" {
