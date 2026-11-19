@@ -1,0 +1,12 @@
+branch: feat/project-breadcrumbs
+summary: Task and agent breadcrumbs start with a ProjectLink (task project falls back to its agent's project_id because mock/older tasks omit project_id). Task 'Tasks' crumb now links to /tasks?project=<id>. measurePane sets data-narrow-pane (width < 640, NARROW_PANE_WIDTH) alongside data-short-pane; headers treat either as compact and fold the project link inline before the title.
+why: On phones (390x844) panes are never 'short' (height >= 400), so task headers showed breadcrumb, title, metadata, and a wrapped actions row.
+decisions:
+  - ProjectLink owns loading and listens to PROJECT_MUTATION_EVENT so renames/deletes update the label; it renders its own '/' separator so a deleted project leaves no dangling slash.
+  - Conversation view keeps its existing project state (already mutation-aware) instead of ProjectLink to avoid a second fetch.
+  - Narrow task panes keep the metadata line (single-line, nowrap) because 390px e2e tests require the header status dot to stay visible; short panes still hide it.
+  - Compact project spans are separate elements (not inside the breadcrumb <p>) so the existing 'header p a' locator stays unique.
+validation:
+  - npm --prefix frontend run check (0 errors) and npm --prefix frontend run build
+  - TZ=UTC npx playwright test --project=chromium e2e/workspace.spec.ts -g 'always link back|fold the project link|narrow manual task splits|mobile|390' (23 passed; 'background refresh ... at 1024px' fails identically on origin/main without this change)
+env: needed npm install (mermaid missing), npx playwright install chromium, npx playwright install-deps chromium.
