@@ -1,0 +1,4 @@
+branch: feat/project-breadcrumbs
+summary: CI Frontend e2e failed only on 'lazy-loaded workspace views and agent tabs evict failed chunk promises' (strict-mode violation: the new task breadcrumb ProjectLink and the sidebar h2 link share the name). Scoped both clicks at lines 8980/8986 to locator('h2'), which was the original target per the error snapshot.
+lesson: any new link labelled with the project name collides with unscoped getByRole('link', { name: project }) locators; grep e2e for them when adding project links.
+validation: lazy-load test passes x2 plus both new header tests; full local suite earlier showed 4 other failures (file-downloads x2, 1024px tab-strip chromium+webkit) that fail identically on origin/main locally and pass in CI, so they are environmental.
