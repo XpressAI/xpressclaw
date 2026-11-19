@@ -19,6 +19,7 @@ use crate::state::AppState;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
+        .merge(super::project_storage::routes())
         .route("/", get(list_projects).post(create_project))
         .route(
             "/{id}",

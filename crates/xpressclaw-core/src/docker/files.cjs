@@ -37,6 +37,16 @@ function mime(filename) {
   return ({ '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp', '.pdf': 'application/pdf', '.txt': 'text/plain', '.md': 'text/markdown', '.json': 'application/json', '.csv': 'text/csv', '.zip': 'application/zip', '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation', '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })[path.extname(filename).toLowerCase()] ?? 'application/octet-stream';
 }
 async function main(input) {
+  if (input.operation === 'process_paths') {
+    const paths = new Set();
+    for (const pid of (await fs.readdir('/proc')).filter(name => /^\d+$/.test(name))) {
+      for (const entry of ['cwd', 'exe']) {
+        try { paths.add(await fs.readlink(`/proc/${pid}/${entry}`)); }
+        catch (error) { if (!['ENOENT', 'ESRCH', 'EINVAL'].includes(error.code)) throw new Error('Could not inspect active container processes'); }
+      }
+    }
+    return { paths: [...paths] };
+  }
   if (input.operation === 'stage') {
     const workspace = await fs.realpath(input.workspace);
     if (typeof input.data !== 'string' || input.data.length > Math.ceil(MAX_UPLOAD / 3) * 4) throw new Error('Upload exceeds 20 MiB');

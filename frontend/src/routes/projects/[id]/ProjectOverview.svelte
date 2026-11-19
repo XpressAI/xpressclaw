@@ -7,6 +7,7 @@
 	import { agentRuntimeSummary, harnessMark, timeAgo } from '$lib/utils';
 	import AgentLoading from '$lib/components/AgentLoading.svelte';
 	import ProjectSettingsDialog from '$lib/components/ProjectSettingsDialog.svelte';
+	import ProjectStorageDialog from '$lib/components/ProjectStorageDialog.svelte';
 
 	let { projectId }: { projectId: string } = $props();
 	const paneActive = usePaneActive();
@@ -23,6 +24,7 @@
 	let selectedAgentToMove = $state('');
 	let projectIdCopied = $state(false);
 	let showingProjectSettings = $state(false);
+	let showingStorage = $state(false);
 	let error = $state('');
 	let projectMutationVersion = 0;
 	let loadGeneration = 0;
@@ -177,6 +179,7 @@
 					<div class="min-w-0"><p class="text-xs text-muted-foreground"><a href="/projects" class="hover:text-foreground">Projects</a> /</p><h1 class="truncate text-2xl font-bold">{project.name}</h1><p class="mt-1 text-sm text-muted-foreground">{project.description || 'A shared context for conversations, Agents, tasks, and memory.'}</p><div class="mt-2 flex min-w-0 items-center gap-2 text-[11px] text-muted-foreground"><span class="shrink-0 font-medium">Project ID</span><code data-project-id class="min-w-0 select-all truncate rounded bg-muted px-1.5 py-0.5 font-mono">{project.id}</code><button type="button" aria-label="Copy project ID" onclick={() => void copyProjectId()} class="shrink-0 font-medium text-primary hover:underline">{projectIdCopied ? 'Copied' : 'Copy ID'}</button></div></div>
 				</div>
 				<div class="flex shrink-0 items-center gap-2">
+					<button type="button" onclick={() => (showingStorage = true)} class="rounded-lg border border-border px-3 py-2 text-sm font-medium text-muted-foreground hover:bg-accent hover:text-foreground">Clean up</button>
 					<button type="button" onclick={() => (showingProjectSettings = true)} class="rounded-lg border border-border px-3 py-2 text-sm font-medium text-muted-foreground hover:bg-accent hover:text-foreground">Project settings</button>
 					<button type="button" onclick={() => (creatingConversation = !creatingConversation)} class="rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground">+ Conversation</button>
 				</div>
@@ -243,4 +246,8 @@
 		onupdated={projectUpdated}
 		ondeleted={projectDeleted}
 	/>
+{/if}
+
+{#if project && showingStorage}
+	<ProjectStorageDialog {projectId} projectName={project.name} onclose={() => showingStorage = false} />
 {/if}

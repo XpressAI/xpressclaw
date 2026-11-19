@@ -13,6 +13,7 @@ mod environment;
 mod health;
 mod memory;
 mod open_url;
+pub(crate) mod project_storage;
 mod projects;
 mod schedules;
 mod sessions;

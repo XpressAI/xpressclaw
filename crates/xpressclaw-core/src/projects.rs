@@ -589,6 +589,7 @@ impl ProjectManager {
                     "this Project is not empty; use explicit cascade acknowledgement to permanently delete its Agents, tasks, conversations, memory, workflow definitions, runs or schedules, and sync configuration".into(),
                 ));
             }
+            transaction.execute("DELETE FROM config WHERE key = ?1", [format!("project_storage:{id}")])?;
             transaction.execute("DELETE FROM projects WHERE id = ?1", [id])?;
             transaction.commit()?;
             Ok(())
@@ -1071,6 +1072,7 @@ impl ProjectManager {
                 [id],
             )?;
             transaction.execute("DELETE FROM config WHERE key IN (SELECT 'port_forwards:' || id FROM agents WHERE project_id = ?1)", [id])?;
+            transaction.execute("DELETE FROM config WHERE key = ?1", [format!("project_storage:{id}")])?;
             transaction.execute("DELETE FROM agents WHERE project_id = ?1", [id])?;
             transaction.execute(
                 "DELETE FROM project_memory_notes WHERE project_id = ?1",

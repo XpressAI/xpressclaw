@@ -58,6 +58,8 @@ pub struct AppState {
     /// Serialize writes that replace the file-backed and in-memory
     /// configuration so handlers cannot persist and apply stale snapshots.
     pub config_write_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serialize project storage scans, retention updates, and cleanup.
+    pub storage_lock: Arc<tokio::sync::Mutex<()>>,
     /// Serialize explicit Git-backed Project sync operations so fetch and
     /// publish cannot race through the same temporary Git store state.
     pub project_sync_lock: Arc<tokio::sync::Mutex<()>>,
@@ -155,6 +157,7 @@ impl AppState {
             task_controls_lock: Arc::new(tokio::sync::Mutex::new(())),
             native_runtime_lifecycle: Arc::new(NativeRuntimeLifecycle::default()),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            storage_lock: Arc::new(tokio::sync::Mutex::new(())),
             project_sync_lock: Arc::new(tokio::sync::Mutex::new(())),
             collaboration_lifecycle_lock: Arc::new(tokio::sync::Mutex::new(())),
             effective_instance: Arc::new(effective_instance),
