@@ -1,0 +1,4 @@
+branch: automation/update-runner-versions (PR #267)
+summary: Cherry-picked 166176c5 (OpenCode via registry binaries) onto the bot branch at the user's request so #267 can go green. Conflict in runner-versions.json resolved by keeping the bot's file and replacing only runners.opencode with the binary entry.
+caveat: update-runner-versions.yml (peter-evans/create-pull-request, daily 08:17 UTC) regenerates this branch from main; this commit is dropped on the next run unless the same change is on main (branch fix/opencode-binary-runner).
+validation: node --test scripts/runner-versions.test.mjs (8 pass); live-registry update leaves runners.opencode unchanged (other runners have newer upstream releases, deliberately not included); image build validated earlier on 166176c5.
