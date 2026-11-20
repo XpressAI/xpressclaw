@@ -5,12 +5,16 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use xpressclaw_core::acp::{is_builtin_runner_image_for_kind, latest_runner_image};
 use xpressclaw_core::agents::registry::{AgentRecord, AgentRegistry};
 use xpressclaw_core::config::{
     AgentConfig, AgentLlmConfig, BudgetConfig, HooksConfig, NativeRunnerConfig, RateLimitConfig,
     WakeOnConfig,
 };
 use xpressclaw_core::sessions::LogicalSession;
+use xpressclaw_core::sessions::SessionManager;
+use xpressclaw_core::workers::acp::AcpInterruptMode;
+use xpressclaw_core::workers::native::{resolve_runner_kind, runner_image_compatible};
 
 use crate::state::AppState;
 
@@ -24,6 +28,15 @@ pub fn routes() -> Router<AppState> {
         .route("/", get(list_agents))
         .route("/{id}", get(get_agent).delete(delete_agent))
         .route("/{id}/config", axum::routing::patch(update_agent_config))
+        .route(
+            "/{id}/runner-image/update",
+            axum::routing::post(update_runner_image),
+        )
+        .route("/{id}/environment", get(environment_status))
+        .route(
+            "/{id}/environment/rebuild",
+            axum::routing::post(rebuild_environment),
+        )
         .route("/{id}/start", axum::routing::post(start_agent))
         .route("/{id}/stop", axum::routing::post(stop_agent))
         .route("/{id}/logs", get(raw_logs_removed))
@@ -42,6 +55,7 @@ fn agent_json(
         "name": record.name,
         "title": agent_cfg.map(|config| config.context_label()).unwrap_or_else(|| record.name.clone()),
         "backend": record.backend,
+        "project_id": record.project_id,
         "status": status,
         "desired_status": "available",
         "observed_status": "native",
@@ -116,48 +130,88 @@ async fn delete_agent(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<Value>)> {
+    // Match rebuild/Project deletion lock ordering and keep both boundaries
+    // until the environment, configuration, and durable records are removed.
+    let _config_guard = state.config_write_lock.lock().await;
     let registry = AgentRegistry::new(state.db.clone());
-    registry.get(&id).map_err(|e| match &e {
+    let record = registry.get(&id).map_err(|e| match &e {
         xpressclaw_core::error::Error::AgentNotFound { .. } => not_found(&e),
         _ => internal_error(e),
     })?;
+    state
+        .native_runtime_lifecycle
+        .release_finished_workers(&state.db, &record.name)
+        .map_err(internal_error)?;
+    let _runtime_guards = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        state.native_runtime_lifecycle.quiesce_agents(std::slice::from_ref(&record.name)),
+    ).await.map_err(|_| environment_conflict(
+        "The Agent runtime is busy. Stop active work or wait for environment recovery to finish, then retry deletion."
+    ))?;
     let sessions = xpressclaw_core::sessions::SessionManager::new(state.db.clone());
-    let attempts = sessions.list_attempts(&id, None, 1_000).unwrap_or_default();
+    // Cleanup is not a paginated history view: an older active attempt may
+    // still own a container even after thousands of newer completed attempts.
+    let attempts = sessions
+        .list_attempts(&id, None, -1)
+        .map_err(internal_error)?;
     if let Some(docker) = state.docker().await {
+        docker
+            .ensure_project_removable(&record.name)
+            .await
+            .map_err(environment_conflict)?;
         for attempt in attempts.iter().filter(|attempt| {
             !matches!(
                 attempt.status.as_str(),
                 "completed" | "failed" | "cancelled" | "interrupted"
             )
         }) {
-            let _ = docker.stop(&format!("attempt-{}", attempt.id)).await;
+            docker
+                .stop(&format!("attempt-{}", attempt.id))
+                .await
+                .map_err(environment_conflict)?;
         }
-        // Clean up a legacy long-running container from pre-ADR-025 installs.
-        let _ = docker.stop(&id).await;
+        // Project deletion is the explicit cleanup boundary for the retained
+        // environment (and also removes a pre-ADR-025 legacy container).
+        docker
+            .remove_owned_workload(&record.name)
+            .await
+            .map_err(environment_conflict)?;
     }
-    registry.delete(&id).map_err(internal_error)?;
-    sessions.delete(&id).map_err(internal_error)?;
-
-    // Remove from YAML config
     let old_config = state.config();
-    let new_agents: Vec<_> = old_config
-        .agents
-        .iter()
-        .filter(|a| a.name != id)
-        .cloned()
-        .collect();
-    let new_config = xpressclaw_core::config::Config {
-        agents: new_agents,
-        llm: old_config.llm.clone(),
-        mcp_servers: old_config.mcp_servers.clone(),
-        system: old_config.system.clone(),
-        tools: old_config.tools.clone(),
-        tool_policies: old_config.tool_policies.clone(),
-        memory: old_config.memory.clone(),
-    };
-    let _ = new_config.save(&state.config_path);
+    let mut new_config = (*old_config).clone();
+    new_config.agents.retain(|agent| agent.name != record.name);
+    new_config
+        .collaboration
+        .authorized_agents
+        .retain(|agent| agent != &record.name && agent != &record.id);
+    // Persist the protected config mutation first. A write failure must not
+    // delete the database record and leave an assignment that Settings can no
+    // longer render or repair.
+    new_config
+        .save(&state.config_path)
+        .map_err(internal_error)?;
+
+    if let Err(error) = registry.delete_with_running_conversation_turns(&id, |turn_id| {
+        state
+            .turn_controls
+            .request_interrupt(turn_id, AcpInterruptMode::Immediate);
+        state.elicitations.cancel_attempt(turn_id);
+    }) {
+        return match old_config.save(&state.config_path) {
+            Ok(()) => Err(internal_error(error)),
+            Err(rollback_error) => Err(internal_error(format!(
+                "failed to delete Agent ({error}) and failed to restore its configuration ({rollback_error})"
+            ))),
+        };
+    }
+
     let new_config = std::sync::Arc::new(new_config);
     state.apply_config(new_config, state.llm_router());
+    state
+        .conversation_processes
+        .retire_agent_everywhere(&id)
+        .await;
+    sessions.delete(&id).map_err(internal_error)?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -204,6 +258,265 @@ async fn stop_agent(
     Ok(Json(agent_json(&record, &config, session.as_ref())))
 }
 
+/// Pull the newest published image for a built-in ACP harness and pin this
+/// Agent to the immutable digest that was actually received. This only selects
+/// the image for a future rebuild, so active work never blocks the download.
+async fn update_runner_image(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let registry = AgentRegistry::new(state.db.clone());
+    let record = registry.get(&id).map_err(|error| match &error {
+        xpressclaw_core::error::Error::AgentNotFound { .. } => not_found(&error),
+        _ => internal_error(error),
+    })?;
+    let docker = state.docker().await.ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "Docker or Podman is not available" })),
+        )
+    })?;
+
+    let current_config = state.config();
+    let current_agent = current_config
+        .agents
+        .iter()
+        .find(|agent| agent.name == record.name)
+        .ok_or_else(|| not_found(format!("Agent configuration not found: {}", record.name)))?;
+    let kind = resolve_runner_kind(current_agent).map_err(bad_request)?;
+    if !is_builtin_runner_image_for_kind(&current_agent.runner.image, &kind)
+        && !current_agent.runner.image.trim().is_empty()
+    {
+        return Err(bad_request(
+            "Only built-in XpressClaw harness images can be updated from the published registry",
+        ));
+    }
+    let latest_image = latest_runner_image(&kind, current_agent.runner.container_engine)
+        .ok_or_else(|| bad_request("The selected harness has no published XpressClaw image"))?;
+    docker
+        .pull_image(&latest_image)
+        .await
+        .map_err(internal_error)?;
+    let host_image = current_agent.runner.container_engine
+        == xpressclaw_core::config::ContainerEngineAccess::Host;
+    if !runner_image_compatible(&docker, &latest_image, true, host_image, kind == "pi").await {
+        return Err(internal_error(format!(
+            "The newest published {kind} image is incompatible with this XpressClaw version"
+        )));
+    }
+    let image = docker
+        .image_repo_digest(&latest_image)
+        .await
+        .map_err(internal_error)?;
+    let version = docker
+        .image_label(&latest_image, "io.xpressclaw.runner.version")
+        .await;
+
+    let changed =
+        pin_downloaded_runner_image(&state, &record.name, &current_agent.runner, &kind, &image)
+            .await?;
+
+    Ok(Json(json!({
+        "image": image,
+        "version": version,
+        "changed": changed,
+        "environment_stopped": false,
+        "environment_preserved": true,
+    })))
+}
+
+async fn pin_downloaded_runner_image(
+    state: &AppState,
+    agent_name: &str,
+    original_runner: &NativeRunnerConfig,
+    kind: &str,
+    image: &str,
+) -> Result<bool, (StatusCode, Json<Value>)> {
+    // Do not hold the global configuration lock during a registry download.
+    // Merge into the latest config and refuse to overwrite a concurrent change
+    // to this Agent's image or harness selection.
+    let _config_guard = state.config_write_lock.lock().await;
+    let current_config = state.config();
+    let current_agent = current_config
+        .agents
+        .iter()
+        .find(|agent| agent.name == agent_name)
+        .ok_or_else(|| not_found(format!("Agent configuration not found: {}", agent_name)))?;
+    if resolve_runner_kind(current_agent).map_err(bad_request)? != kind
+        || current_agent.runner.kind != original_runner.kind
+        || current_agent.runner.container_engine != original_runner.container_engine
+        || (current_agent.runner.image != original_runner.image
+            && current_agent.runner.image != image)
+    {
+        return Err(environment_conflict("Harness settings changed during the download. The image was downloaded; retry to select it for this Agent."));
+    }
+    let changed = current_agent.runner.image != image;
+    if changed {
+        let mut new_config = (*current_config).clone();
+        let agent = new_config
+            .agents
+            .iter_mut()
+            .find(|agent| agent.name == agent_name)
+            .ok_or_else(|| not_found(format!("Agent configuration not found: {}", agent_name)))?;
+        agent.runner.image = image.to_string();
+        new_config
+            .save(&state.config_path)
+            .map_err(internal_error)?;
+        let new_config = std::sync::Arc::new(new_config);
+        let new_router = std::sync::Arc::new(
+            xpressclaw_core::llm::router::LlmRouter::build_from_config(&new_config),
+        );
+        state.apply_config(new_config, Some(new_router));
+    }
+
+    Ok(changed)
+}
+
+async fn environment_status(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let record = AgentRegistry::new(state.db.clone())
+        .get(&id)
+        .map_err(not_found)?;
+    let docker = state
+        .docker()
+        .await
+        .ok_or_else(|| environment_conflict("Docker or Podman is not available"))?;
+    let preserved = docker
+        .preserved_project_environments(&record.name)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(json!({ "preserved_environments": preserved })))
+}
+
+async fn enter_environment_maintenance(
+    state: &AppState,
+    agent: &str,
+) -> Result<Vec<tokio::sync::OwnedRwLockWriteGuard<()>>, (StatusCode, Json<Value>)> {
+    ensure_agent_has_no_active_work(state, agent)?;
+    state
+        .native_runtime_lifecycle
+        .release_finished_workers(&state.db, agent)
+        .map_err(internal_error)?;
+    let guards = match tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        state
+            .native_runtime_lifecycle
+            .quiesce_agents(&[agent.to_string()]),
+    )
+    .await
+    {
+        Ok(guards) => guards,
+        Err(_) => {
+            ensure_agent_has_no_active_work(state, agent)?;
+            return Err((
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "code": "runtime_busy",
+                    "error": "No active work remains, but another environment operation is still finishing. Retry the rebuild shortly."
+                })),
+            ));
+        }
+    };
+    // A dispatcher can claim work while maintenance waits for the real lease.
+    ensure_agent_has_no_active_work(state, agent)?;
+    Ok(guards)
+}
+
+#[derive(Deserialize)]
+struct RebuildEnvironmentRequest {
+    discard_installed_tools: bool,
+}
+
+fn environment_conflict(error: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({"error": error.to_string()})),
+    )
+}
+
+/// The only image/configuration update path that discards an existing
+/// environment. The next queued turn creates it from the saved settings.
+async fn rebuild_environment(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<RebuildEnvironmentRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !request.discard_installed_tools {
+        return Err(bad_request(
+            "Confirm that rebuilding discards installed tools and files outside mounted folders",
+        ));
+    }
+    let _config_guard = state.config_write_lock.lock().await;
+    let record = AgentRegistry::new(state.db.clone())
+        .get(&id)
+        .map_err(|error| match &error {
+            xpressclaw_core::error::Error::AgentNotFound { .. } => not_found(&error),
+            _ => internal_error(error),
+        })?;
+    let _runtime_guards = enter_environment_maintenance(&state, &record.name).await?;
+    let docker = state.docker().await.ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error":"Docker or Podman is not available"})),
+        )
+    })?;
+    // Stopped helper containers keep an archived parent instead of preventing
+    // a rebuild. Running helpers are reported by name before any changes.
+    let preserved = docker
+        .rebuild_project_environment(&record.name)
+        .await
+        .map_err(environment_conflict)?;
+    state
+        .conversation_processes
+        .retire_agent_everywhere(&record.name)
+        .await;
+    SessionManager::new(state.db.clone())
+        .invalidate_native_sessions(&record.id)
+        .map_err(internal_error)?;
+    Ok(Json(
+        json!({"rebuilt": true, "preserved_environments": preserved}),
+    ))
+}
+
+fn ensure_agent_has_no_active_work(
+    state: &AppState,
+    agent_id: &str,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    let blockers = state
+        .db
+        .with_conn(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT 'Task: ' || COALESCE(t.title, a.id) FROM work_attempts a
+             LEFT JOIN tasks t ON t.id=a.task_id WHERE a.session_id=?1
+             AND a.status NOT IN ('queued','completed','failed','cancelled','interrupted')
+             UNION SELECT CASE WHEN a.status IN ('completed','failed','cancelled','interrupted')
+                 THEN 'Task worker finishing: ' ELSE 'Task: ' END || COALESCE(t.title, CAST(q.id AS TEXT))
+             FROM task_queue q LEFT JOIN tasks t ON t.id=q.task_id
+             LEFT JOIN work_attempts a ON a.id=q.attempt_id
+             WHERE q.agent_id=?1 AND q.status='running'
+             UNION SELECT 'Conversation: ' || COALESCE(c.title, r.conversation_id)
+             FROM conversation_turns r LEFT JOIN conversations c ON c.id=r.conversation_id
+             WHERE r.agent_id=?1 AND r.status='running'",
+            )?;
+            let rows = statement.query_map([agent_id], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+        })
+        .map_err(internal_error)?;
+    if blockers.is_empty() {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "code": "active_work", "blockers": blockers,
+                "error": format!("Wait for or stop this Agent's work before rebuilding: {}", blockers.join("; "))
+            })),
+        ))
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct UpdateAgentConfigRequest {
     model: Option<String>,
@@ -225,6 +538,7 @@ async fn update_agent_config(
     Path(id): Path<String>,
     Json(req): Json<UpdateAgentConfigRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let _config_guard = state.config_write_lock.lock().await;
     let registry = AgentRegistry::new(state.db.clone());
     let record = registry.get(&id).map_err(|e| match &e {
         xpressclaw_core::error::Error::AgentNotFound { .. } => not_found(&e),
@@ -310,6 +624,9 @@ async fn update_agent_config(
     // Save updated config — preserve all top-level fields
     let new_config = xpressclaw_core::config::Config {
         agents: new_agents,
+        instance: old_config.instance.clone(),
+        collaboration: old_config.collaboration.clone(),
+        proxy: old_config.proxy.clone(),
         llm: old_config.llm.clone(),
         mcp_servers: old_config.mcp_servers.clone(),
         system: old_config.system.clone(),
@@ -400,6 +717,13 @@ fn not_found(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
     )
 }
 
+fn bad_request(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": e.to_string() })),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -434,6 +758,399 @@ mod tests {
     async fn body_json(body: Body) -> Value {
         let bytes = body.collect().await.unwrap().to_bytes();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn rebuild_requires_explicit_acknowledgement_before_engine_access() {
+        let (app, _) = test_app();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/agents/atlas/environment/rebuild")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"discard_installed_tools":false}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(body_json(response.into_body()).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("Confirm"));
+    }
+
+    #[tokio::test]
+    async fn rebuild_refuses_an_active_attempt_without_changing_it() {
+        use xpressclaw_core::tasks::{
+            board::{CreateTask, TaskBoard},
+            queue::TaskQueue,
+        };
+        let (app, db) = test_app();
+        AgentRegistry::new(db.clone())
+            .ensure("atlas", "codex")
+            .unwrap();
+        let sessions = SessionManager::new(db.clone());
+        sessions.ensure("atlas", None).unwrap();
+        let task = TaskBoard::new(db.clone())
+            .create(&CreateTask {
+                title: "active work".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let queue = TaskQueue::new(db.clone());
+        let item = queue.enqueue(&task.id, "atlas").unwrap();
+        let attempt = sessions
+            .get_attempt(item.attempt_id.as_deref().unwrap())
+            .unwrap();
+        sessions
+            .transition_attempt(&attempt.id, "preparing", "Preparing", None, None)
+            .unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/agents/atlas/environment/rebuild")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"discard_installed_tools":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = body_json(response.into_body()).await;
+        assert_eq!(body["code"], "active_work");
+        assert!(body["error"].as_str().unwrap().contains("active work"));
+        assert_eq!(
+            sessions.get_attempt(&attempt.id).unwrap().status,
+            "preparing"
+        );
+    }
+
+    #[tokio::test]
+    async fn downloaded_image_can_be_selected_during_work_without_overwriting_concurrent_settings()
+    {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.yaml");
+        let db = Arc::new(Database::open_memory().unwrap());
+        let mut config = Config::default();
+        let mut agent = AgentConfig {
+            name: "atlas".into(),
+            backend: "codex".into(),
+            ..Default::default()
+        };
+        agent.runner.kind = "codex".into();
+        agent.runner.image = "old-image".into();
+        let original = agent.runner.clone();
+        agent
+            .runner
+            .environment
+            .insert("CONCURRENT_SETTING".into(), "keep".into());
+        config.agents.push(agent);
+        config.save(&path).unwrap();
+        let state = AppState::new(Arc::new(config), db.clone(), None, path.clone(), true);
+        AgentRegistry::new(db.clone())
+            .ensure("atlas", "codex")
+            .unwrap();
+        SessionManager::new(db.clone())
+            .ensure("atlas", None)
+            .unwrap();
+        db.with_conn(|conn| conn.execute("INSERT INTO work_attempts(id,session_id,runner,status) VALUES ('attempt','atlas','codex','running')", [])).unwrap();
+        let _busy = state
+            .native_runtime_lifecycle
+            .quiesce_agents(&["atlas".into()])
+            .await;
+        assert!(ensure_agent_has_no_active_work(&state, "atlas").is_err());
+        assert!(pin_downloaded_runner_image(
+            &state,
+            "atlas",
+            &original,
+            "codex",
+            "downloaded-image"
+        )
+        .await
+        .unwrap());
+        assert_eq!(state.config().agents[0].runner.image, "downloaded-image");
+        assert_eq!(
+            state.config().agents[0].runner.environment["CONCURRENT_SETTING"],
+            "keep"
+        );
+        assert_eq!(
+            SessionManager::new(db.clone())
+                .get_attempt("attempt")
+                .unwrap()
+                .status,
+            "running"
+        );
+        let saved = std::fs::read(&path).unwrap();
+        assert!(pin_downloaded_runner_image(
+            &state,
+            "atlas",
+            &original,
+            "codex",
+            "another-download"
+        )
+        .await
+        .is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), saved);
+    }
+
+    #[tokio::test]
+    async fn maintenance_reports_runtime_contention_without_inventing_active_work() {
+        let state = AppState::new(
+            Arc::new(Config::default()),
+            Arc::new(Database::open_memory().unwrap()),
+            None,
+            "test.yaml".into(),
+            true,
+        );
+        let held = state
+            .native_runtime_lifecycle
+            .quiesce_agents(&["atlas".into()])
+            .await;
+        let error = enter_environment_maintenance(&state, "atlas")
+            .await
+            .unwrap_err();
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        assert_eq!(error.1["code"], "runtime_busy");
+        drop(held);
+        assert!(enter_environment_maintenance(&state, "atlas").await.is_ok());
+    }
+
+    #[test]
+    fn environment_maintenance_allows_queued_work_but_preserves_running_leases() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let state = AppState::new(
+            Arc::new(Config::default()),
+            db.clone(),
+            None,
+            "test.yaml".into(),
+            true,
+        );
+        AgentRegistry::new(db.clone())
+            .ensure("atlas", "codex")
+            .unwrap();
+        SessionManager::new(db.clone())
+            .ensure("atlas", None)
+            .unwrap();
+        db.with_conn(|conn| {
+            conn.execute("INSERT INTO work_attempts (id, session_id, runner, status) VALUES ('attempt', 'atlas', 'codex', 'queued')", [])?;
+            conn.execute("INSERT INTO conversations (id,title) VALUES ('chat','Queued chat')", [])?;
+            conn.execute("INSERT INTO conversation_turns (id,conversation_id,agent_id,status) VALUES ('turn','chat','atlas','queued')", [])?;
+            Ok::<_, xpressclaw_core::error::Error>(())
+        }).unwrap();
+        assert!(ensure_agent_has_no_active_work(&state, "atlas").is_ok());
+        for status in ["preparing", "running", "waiting_for_input", "review"] {
+            db.with_conn(|conn| conn.execute("UPDATE work_attempts SET status=?1", [status]))
+                .unwrap();
+            assert!(
+                ensure_agent_has_no_active_work(&state, "atlas").is_err(),
+                "{status}"
+            );
+        }
+        db.with_conn(|conn| conn.execute("UPDATE work_attempts SET status='failed'", []))
+            .unwrap();
+        assert!(ensure_agent_has_no_active_work(&state, "atlas").is_ok());
+        db.with_conn(|conn| conn.execute("UPDATE conversation_turns SET status='running'", []))
+            .unwrap();
+        assert!(ensure_agent_has_no_active_work(&state, "atlas").is_err());
+        db.with_conn(|conn| conn.execute("UPDATE conversation_turns SET status='failed'", []))
+            .unwrap();
+        db.with_conn(|conn| {
+            conn.execute("INSERT INTO tasks (id,title) VALUES ('task','Failed task')", [])?;
+            conn.execute("INSERT INTO task_queue (task_id,agent_id,status,attempt_id) VALUES ('task','atlas','running','attempt')", [])?;
+            Ok::<_, xpressclaw_core::error::Error>(())
+        }).unwrap();
+        assert!(ensure_agent_has_no_active_work(&state, "atlas").is_err());
+    }
+
+    /// Exercise the HTTP lifecycle against the engine, including writable-layer
+    /// loss and a legacy attempt that cannot be removed. Only isolated fixtures
+    /// belonging to this test installation are mutated.
+    #[tokio::test]
+    #[ignore = "requires Docker/Podman and XPRESSCLAW_RETENTION_TEST_IMAGE"]
+    async fn rebuild_and_delete_preserve_session_and_container_boundaries() {
+        use bollard::{
+            container::{Config as EngineConfig, CreateContainerOptions, RemoveContainerOptions},
+            models::HostConfig,
+            Docker,
+        };
+        use futures_util::FutureExt;
+        use xpressclaw_core::docker::manager::{ContainerSpec, DockerManager};
+
+        let Ok(image) = std::env::var("XPRESSCLAW_RETENTION_TEST_IMAGE") else {
+            eprintln!("skipping Agent environment lifecycle integration test; set XPRESSCLAW_RETENTION_TEST_IMAGE to the built fixture image to run it");
+            return;
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.yaml");
+        let agent = format!("retention-routes-{}", uuid::Uuid::new_v4());
+        let other = format!("other-{agent}");
+        let attempt_id = format!("work-{agent}");
+        let legacy_id = format!("attempt-{attempt_id}");
+        let child_name = format!("child-{agent}");
+        let db = Arc::new(Database::open_memory().unwrap());
+        let mut config = Config::default();
+        for name in [&agent, &other] {
+            config.agents.push(AgentConfig {
+                name: name.clone(),
+                ..Default::default()
+            });
+            AgentRegistry::new(db.clone())
+                .ensure(name, "codex")
+                .unwrap();
+            SessionManager::new(db.clone()).ensure(name, None).unwrap();
+            db.with_conn(|conn| {
+                conn.execute("INSERT INTO work_attempts (id, session_id, runner, status, native_session_id, result) VALUES (?1,?2,'codex','completed','native-task','saved result')", [&format!("work-{name}"), name])?;
+                conn.execute("INSERT INTO conversations (id,title) VALUES (?1,'preserved conversation')", [name])?;
+                conn.execute("INSERT INTO conversation_agent_sessions (conversation_id,agent_id,native_session_id) VALUES (?1,?1,'native-chat')", [name])?;
+                Ok::<_, xpressclaw_core::error::Error>(())
+            }).unwrap();
+        }
+        config.save(&config_path).unwrap();
+        let state = AppState::new(
+            Arc::new(config),
+            db.clone(),
+            None,
+            config_path.clone(),
+            true,
+        );
+        let docker = Arc::new(
+            DockerManager::connect_for_installation(&db.installation_id().unwrap())
+                .await
+                .unwrap(),
+        );
+        *state.docker.write().unwrap() = Some(docker.clone());
+        let app = Router::new()
+            .nest("/agents", routes())
+            .with_state(state.clone());
+        let engine = Docker::connect_with_defaults().unwrap();
+        let spec = ContainerSpec {
+            image: image.clone(),
+            expose_port: None,
+            cmd: Some(vec![
+                "node".into(),
+                "-e".into(),
+                "setInterval(()=>{},1000)".into(),
+            ]),
+            ..Default::default()
+        };
+        let retained = docker.launch_project_attached(&agent, &spec).await.unwrap();
+        let result = std::panic::AssertUnwindSafe(async {
+            async fn child(engine: &Docker, name: &str, image: &str, parent: &str) {
+                let child = engine.create_container(Some(CreateContainerOptions { name, platform: None }), EngineConfig {
+                    image: Some(image), cmd: Some(vec!["node", "-e", "setInterval(()=>{},1000)"]),
+                    host_config: Some(HostConfig { network_mode: Some(format!("container:{parent}")), ..Default::default() }), ..Default::default()
+                }).await.unwrap();
+                engine.start_container::<String>(&child.id,None).await.unwrap();
+            }
+            async fn request(app: &Router, agent: &str, rebuild: bool) -> axum::response::Response {
+                let request = if rebuild {
+                    Request::builder().method("POST").uri(format!("/agents/{agent}/environment/rebuild"))
+                        .header("content-type", "application/json").body(Body::from(r#"{"discard_installed_tools":true}"#)).unwrap()
+                } else {
+                    Request::builder().method("DELETE").uri(format!("/agents/{agent}")).body(Body::empty()).unwrap()
+                };
+                app.clone().oneshot(request).await.unwrap()
+            }
+            fn native_ids(db: &Arc<Database>, agent: &str) -> (Option<String>, Option<String>) {
+                db.with_conn(|conn| (
+                    conn.query_row("SELECT native_session_id FROM work_attempts WHERE session_id=?1", [agent], |row| row.get(0)).unwrap(),
+                    conn.query_row("SELECT native_session_id FROM conversation_agent_sessions WHERE agent_id=?1", [agent], |row| row.get(0)).unwrap(),
+                ))
+            }
+
+            child(&engine, &child_name, &image, &retained.info.container_id).await;
+            let blocked = request(&app, &agent, true).await;
+            assert_eq!(blocked.status(), StatusCode::CONFLICT);
+            assert_eq!(native_ids(&db,&agent), (Some("native-task".into()),Some("native-chat".into())));
+            assert!(docker.is_container_running(&retained.info.container_id).await);
+            engine.stop_container(&child_name, Some(bollard::container::StopContainerOptions { t: 1 })).await.unwrap();
+
+            let rebuilt = request(&app, &agent, true).await;
+            assert_eq!(rebuilt.status(), StatusCode::OK);
+            let saved = body_json(rebuilt.into_body()).await;
+            assert_eq!(saved["preserved_environments"][0]["container_id"], retained.info.container_id);
+            assert_eq!(saved["preserved_environments"][0]["dependents"][0], child_name);
+            let inventory = app.clone().oneshot(Request::builder().uri(format!("/agents/{agent}/environment")).body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(body_json(inventory.into_body()).await["preserved_environments"], saved["preserved_environments"]);
+            assert!(engine.inspect_container(&child_name, None).await.is_ok());
+            engine.remove_container(&child_name,Some(RemoveContainerOptions{force:true,..Default::default()})).await.unwrap();
+            assert_eq!(native_ids(&db,&agent), (None,None));
+            assert_eq!(native_ids(&db,&other), (Some("native-task".into()),Some("native-chat".into())));
+            let attempt = SessionManager::new(db.clone()).get_attempt(&attempt_id).unwrap();
+            assert_eq!(attempt.result.as_deref(),Some("saved result"));
+            assert_eq!(attempt.status,"completed");
+            assert!(!docker.is_container_running(&retained.info.container_id).await);
+
+            let retained = docker.launch_project_attached(&agent, &spec).await.unwrap();
+            let legacy = docker.launch(&legacy_id,&spec).await.unwrap();
+            db.with_conn(|conn| {
+                conn.execute("UPDATE work_attempts SET status='running',container_id=?1,created_at='2000-01-01' WHERE id=?2", [&legacy.container_id,&attempt_id])?;
+                conn.execute("WITH RECURSIVE history(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM history WHERE n<1001)
+                    INSERT INTO work_attempts(id,session_id,runner,status)
+                    SELECT ?1 || '-history-' || n,?1,'codex','completed' FROM history", [&agent])?;
+                Ok::<_, xpressclaw_core::error::Error>(())
+            }).unwrap();
+            child(&engine, &child_name, &image, &legacy.container_id).await;
+            let saved_config = std::fs::read(&config_path).unwrap();
+            let blocked = request(&app, &agent, false).await;
+            assert_eq!(blocked.status(), StatusCode::CONFLICT);
+            assert!(body_json(blocked.into_body()).await["error"].as_str().unwrap().contains(&child_name));
+            assert!(AgentRegistry::new(db.clone()).get(&agent).is_ok());
+            assert_eq!(std::fs::read(&config_path).unwrap(),saved_config);
+            assert!(state.config().agents.iter().any(|record| record.name==agent));
+            assert_eq!(SessionManager::new(db.clone()).get_attempt(&attempt_id).unwrap().status,"running");
+            assert!(docker.is_container_running(&retained.info.container_id).await);
+            assert!(docker.is_container_running(&legacy.container_id).await);
+            assert!(docker.is_container_running(&child_name).await);
+
+            engine.remove_container(&child_name,Some(RemoveContainerOptions{force:true,..Default::default()})).await.unwrap();
+            // Queued work has no legacy container yet. Its absence must not
+            // prevent retrying deletion after the dependency is repaired.
+            db.with_conn(|conn| conn.execute("INSERT INTO work_attempts (id,session_id,runner,status) VALUES (?1,?2,'codex','queued')", [&format!("queued-{agent}"),&agent])).unwrap();
+            // Deletion must wait across the recovery rename/create boundary,
+            // then remove the replacement too before deleting the Agent row.
+            let recovery = state.native_runtime_lifecycle.quiesce_agents(std::slice::from_ref(&agent)).await;
+            let deleting_app = app.clone();
+            let deleting_agent = agent.clone();
+            let mut deletion = tokio::spawn(async move { request(&deleting_app, &deleting_agent, false).await });
+            assert!(tokio::time::timeout(std::time::Duration::from_millis(50), &mut deletion).await.is_err());
+            assert!(AgentRegistry::new(db.clone()).get(&agent).is_ok());
+            assert!(docker.is_container_running(&retained.info.container_id).await);
+            let changed = ContainerSpec { environment: vec!["RECOVERED=yes".into()], ..spec.clone() };
+            docker.recover_project_configuration(&agent, &changed).await.unwrap();
+            docker.finish_project_recovery(&agent).await.unwrap();
+            let replacement = docker.launch_project_attached(&agent, &changed).await.unwrap();
+            // A busy operation can outlast the bounded HTTP wait. It must
+            // leave both the Agent and its replacement intact for retry.
+            let blocked = deletion.await.unwrap();
+            assert_eq!(blocked.status(), StatusCode::CONFLICT);
+            assert!(AgentRegistry::new(db.clone()).get(&agent).is_ok());
+            assert!(docker.is_container_running(&replacement.info.container_id).await);
+            drop(recovery);
+            let deleted = request(&app, &agent, false).await;
+            assert_eq!(deleted.status(),StatusCode::NO_CONTENT);
+            assert!(AgentRegistry::new(db.clone()).get(&agent).is_err());
+            assert!(!docker.is_container_running(&retained.info.container_id).await);
+            assert!(!docker.is_container_running(&legacy.container_id).await);
+            assert!(matches!(engine.inspect_container(&replacement.info.container_id, None).await, Err(bollard::errors::Error::DockerResponseServerError { status_code: 404, .. })));
+        }).catch_unwind().await;
+        let _ = engine
+            .remove_container(
+                &child_name,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+        docker.remove_owned_workload(&legacy_id).await.unwrap();
+        docker.remove_owned_workload(&agent).await.unwrap();
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     #[tokio::test]
@@ -551,6 +1268,68 @@ mod tests {
         let state = AppState::new(config, db, None, config_path.clone(), true);
         let app = Router::new().nest("/agents", routes()).with_state(state);
         (app, config_path)
+    }
+
+    #[tokio::test]
+    async fn deleting_an_agent_removes_its_collaboration_assignment() {
+        let config_path = std::env::temp_dir().join(format!(
+            "test-xpressclaw-agent-collaboration-{}.yaml",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let db = Arc::new(Database::open_memory().unwrap());
+        let mut config = Config::default();
+        config.agents.push(AgentConfig {
+            name: "atlas".to_string(),
+            backend: "generic".to_string(),
+            ..Default::default()
+        });
+        config.collaboration.enabled = true;
+        config.collaboration.authorized_agents = vec!["atlas".to_string()];
+        config.save(&config_path).unwrap();
+        AgentRegistry::new(db.clone())
+            .ensure("atlas", "generic")
+            .unwrap();
+        let state = AppState::new(Arc::new(config), db, None, config_path.clone(), true);
+        let app = Router::new()
+            .nest("/agents", routes())
+            .nest(
+                "/settings/collaboration",
+                crate::routes::settings_collaboration::routes(),
+            )
+            .with_state(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/agents/atlas")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let saved = Config::load(&config_path).unwrap();
+        assert!(!saved.agents.iter().any(|agent| agent.name == "atlas"));
+        assert!(saved.collaboration.authorized_agents.is_empty());
+        saved.collaboration.validate().unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/settings/collaboration")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&saved.collaboration).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = std::fs::remove_file(config_path);
     }
 
     #[tokio::test]
@@ -755,5 +1534,39 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn agent_get_endpoints_do_not_retrigger_ui_revisions_once_ensured() {
+        let (app, db) = test_app();
+        let registry = AgentRegistry::new(db.clone());
+        registry.ensure("atlas", "generic").unwrap();
+
+        let warmup = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/agents")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(warmup.status(), StatusCode::OK);
+        let baseline = db.ui_revisions();
+
+        for uri in ["/agents", "/agents/atlas"] {
+            let resp = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                db.ui_revisions(),
+                baseline,
+                "GET {uri} must not bump UI revisions"
+            );
+        }
     }
 }

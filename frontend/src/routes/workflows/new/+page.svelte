@@ -3,25 +3,40 @@
 	import { goto } from '$app/navigation';
 	import { agents, workflows } from '$lib/api';
 	import type { Agent } from '$lib/api';
+	import {
+		BLANK_WORKFLOW_TEMPLATE,
+		WORKFLOW_TEMPLATES,
+		renderWorkflowTemplate,
+		uniqueWorkflowName,
+		workflowTemplate,
+		type WorkflowTemplateDefinition,
+	} from '$lib/workflows/templates';
+
+	type SelectedTemplateId = WorkflowTemplateDefinition['id'];
 
 	let agentList = $state<Agent[]>([]);
 	let existingNames = $state(new Set<string>());
-	let template = $state<'blank' | 'code-review'>('code-review');
-	let workflowName = $state('Code Review Loop');
-	let builderId = $state('');
-	let reviewerId = $state('');
+	let selectedTemplateId = $state<SelectedTemplateId>('goal-loop');
+	let workflowName = $state('Goal Loop');
+	let scheduleAgentId = $state('');
+	let scheduleCron = $state('');
 	let loading = $state(true);
 	let creating = $state(false);
 	let error = $state('');
+	let selectedTemplate = $derived(workflowTemplate(selectedTemplateId));
+	let canCreate = $derived(Boolean(
+		workflowName.trim()
+		&& !creating
+		&& (!selectedTemplate.schedule || (scheduleAgentId && scheduleCron.trim())),
+	));
 
 	onMount(async () => {
 		try {
 			const [existing, sessions] = await Promise.all([workflows.list(), agents.list()]);
 			existingNames = new Set(existing.map((workflow) => workflow.name));
 			agentList = sessions;
-			builderId = sessions.find((agent) => agent.backend.toLowerCase().includes('codex'))?.id ?? sessions[0]?.id ?? '';
-			reviewerId = sessions.find((agent) => agent.backend.toLowerCase().includes('claude'))?.id ?? sessions[1]?.id ?? sessions[0]?.id ?? '';
-			workflowName = uniqueName(workflowName);
+			scheduleAgentId = sessions[0]?.id ?? '';
+			workflowName = uniqueWorkflowName(selectedTemplate.defaultName, existingNames);
 		} catch (cause) {
 			error = cause instanceof Error ? cause.message : String(cause);
 		} finally {
@@ -29,136 +44,33 @@
 		}
 	});
 
-	function uniqueName(base: string): string {
-		if (!existingNames.has(base)) return base;
-		let suffix = 2;
-		while (existingNames.has(`${base} ${suffix}`)) suffix += 1;
-		return `${base} ${suffix}`;
+	function chooseTemplate(id: SelectedTemplateId) {
+		const definition = workflowTemplate(id);
+		selectedTemplateId = id;
+		workflowName = uniqueWorkflowName(definition.defaultName, existingNames);
+		scheduleCron = definition.schedule?.defaultCron ?? '';
+		error = '';
 	}
 
-	function displayName(agent: Agent): string {
+	function agentLabel(agent: Agent): string {
 		return agent.title || agent.name;
 	}
 
-	function chooseTemplate(value: 'blank' | 'code-review') {
-		template = value;
-		workflowName = uniqueName(value === 'code-review' ? 'Code Review Loop' : 'New Workflow');
-	}
-
-	function blankYaml(name: string): string {
-		return `name: ${JSON.stringify(name.toLowerCase().replace(/\s+/g, '-'))}
-description: A reusable native-agent workflow.
-version: 1
-
-variables:
-  goal: "Describe the requested outcome here"
-
-flows:
-  main:
-    color: "#22c55e"
-    steps:
-      - id: work
-        type: step
-        label: Do the work
-        agent: ${JSON.stringify(builderId)}
-        prompt: |
-          Complete this goal autonomously in the configured workspace:
-
-          @goal
-        outputs:
-          result:
-            type: string
-            description: Outcome and verification summary.
-`;
-	}
-
-	function codeReviewYaml(name: string): string {
-		return `name: ${JSON.stringify(name.toLowerCase().replace(/\s+/g, '-'))}
-description: One project context implements, another reviews, and the loop continues until approval.
-version: 1
-
-variables:
-  goal: "Describe the requested code change here"
-
-flows:
-  main:
-    color: "#4A90D9"
-    steps:
-      - id: implement
-        type: step
-        label: Implementation
-        agent: ${JSON.stringify(builderId)}
-        prompt: |
-          Implement this goal in the current repository:
-
-          @goal
-
-          Address feedback from the previous review if present:
-
-          @review.feedback
-
-          Run the relevant checks and leave the working tree ready for review.
-        outputs:
-          summary:
-            type: string
-            description: What changed and how it was verified.
-
-      - id: review
-        type: step
-        label: Independent review
-        agent: ${JSON.stringify(reviewerId)}
-        prompt: |
-          Review the actual implementation and diff for this goal:
-
-          @goal
-
-          Approve only when it is correct, complete, maintainable, and tested.
-          Return a verdict of exactly "approved" or "changes_requested".
-        outputs:
-          verdict:
-            type: string
-            description: Either approved or changes_requested.
-          feedback:
-            type: string
-            description: Specific actionable feedback for the implementer.
-
-      - id: review_gate
-        type: when
-        label: Review decision
-        switch: "@review.verdict"
-        arms:
-          - match: approved
-            continue: true
-          - match: changes_requested
-            goto: step implement
-
-      - id: mark_ready
-        type: step
-        label: Mark PR ready
-        agent: ${JSON.stringify(builderId)}
-        prompt: |
-          The independent review approved the implementation. Verify final checks,
-          push the branch if needed, and mark its GitHub pull request ready for review.
-        outputs:
-          pull_request_url:
-            type: string
-            description: URL of the ready pull request.
-          checks:
-            type: string
-            description: Final verification summary.
-`;
-	}
-
 	async function createWorkflow() {
-		if (!workflowName.trim() || !builderId || creating) return;
+		if (!canCreate) return;
 		creating = true;
 		error = '';
 		try {
-			const yaml = template === 'code-review' ? codeReviewYaml(workflowName.trim()) : blankYaml(workflowName.trim());
-			const description = template === 'code-review'
-				? 'Implementation and independent review loop using native agent products.'
-				: 'A reusable native-agent workflow.';
-			const workflow = await workflows.create({ name: workflowName.trim(), description, yaml_content: yaml });
+			const name = workflowName.trim();
+			const yaml = renderWorkflowTemplate(selectedTemplate, name, {
+				scheduleAgentId,
+				scheduleCron,
+			});
+			const workflow = await workflows.create({
+				name,
+				description: selectedTemplate.apiDescription,
+				yaml_content: yaml,
+			});
 			goto(`/workflows/${workflow.id}`);
 		} catch (cause) {
 			error = cause instanceof Error ? cause.message : String(cause);
@@ -168,63 +80,101 @@ flows:
 	}
 </script>
 
-<div class="mx-auto w-full max-w-3xl space-y-6 p-6">
-	<div>
-		<a href="/workflows" class="text-xs text-muted-foreground hover:text-foreground">← Workflows</a>
-		<h1 class="mt-2 text-2xl font-bold">New workflow</h1>
-		<p class="mt-1 text-sm text-muted-foreground">Start with a working multi-agent pattern or a single editable step.</p>
+<div class="mx-auto w-full max-w-5xl space-y-5 p-4 sm:p-6">
+	<div class="flex flex-wrap items-end justify-between gap-3">
+		<div>
+			<a href="/automations" class="text-xs text-muted-foreground hover:text-foreground">← Automations</a>
+			<h1 class="mt-2 text-2xl font-bold">New workflow</h1>
+			<p class="mt-1 text-sm text-muted-foreground">Choose a practical multi-agent pattern, then tailor it in the visual editor.</p>
+		</div>
+		<button
+			type="button"
+			data-start-blank
+			aria-pressed={selectedTemplateId === 'blank'}
+			onclick={() => chooseTemplate('blank')}
+			class="rounded-md border px-3 py-1.5 text-xs font-medium transition-colors {selectedTemplateId === 'blank' ? 'border-primary bg-primary/10 text-foreground' : 'border-border bg-background text-muted-foreground hover:bg-accent hover:text-foreground'}"
+		>
+			+ Start blank
+		</button>
 	</div>
 
 	{#if loading}
-		<div class="text-sm text-muted-foreground">Loading projects…</div>
+		<div class="text-sm text-muted-foreground">Loading agents…</div>
 	{:else if agentList.length === 0}
 		<div class="rounded-xl border border-dashed border-border bg-card p-8 text-center">
-			<h2 class="text-base font-semibold">Workflows need at least one project</h2>
-			<p class="mt-2 text-sm text-muted-foreground">Create the project contexts that will perform each step.</p>
-			<a href="/setup?mode=add-session" class="mt-4 inline-flex rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground">Create project</a>
+			<h2 class="text-base font-semibold">Workflows need at least one agent</h2>
+			<p class="mt-2 text-sm text-muted-foreground">Create the durable agents that will perform each step.</p>
+			<a href="/setup?mode=add-session" class="mt-4 inline-flex rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground">Create agent</a>
 		</div>
 	{:else}
-		<div class="grid gap-3 sm:grid-cols-2">
-			<button onclick={() => chooseTemplate('code-review')} class="rounded-xl border p-4 text-left {template === 'code-review' ? 'border-primary bg-primary/5' : 'border-border bg-card hover:border-primary/40'}">
-				<div class="text-sm font-semibold">Implementation + review loop</div>
-				<p class="mt-1 text-xs leading-relaxed text-muted-foreground">One agent product writes the code, another reviews it, and rejected changes loop back until approval before the PR is marked ready.</p>
-			</button>
-			<button onclick={() => chooseTemplate('blank')} class="rounded-xl border p-4 text-left {template === 'blank' ? 'border-primary bg-primary/5' : 'border-border bg-card hover:border-primary/40'}">
-				<div class="text-sm font-semibold">Single-step workflow</div>
-				<p class="mt-1 text-xs leading-relaxed text-muted-foreground">A minimal executable workflow you can extend in the visual editor.</p>
-			</button>
+		<div data-workflow-template-gallery class="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+			{#each WORKFLOW_TEMPLATES as candidate}
+				<button
+					type="button"
+					data-workflow-template-card={candidate.id}
+					aria-pressed={selectedTemplateId === candidate.id}
+					onclick={() => chooseTemplate(candidate.id)}
+					class="min-h-28 rounded-xl border p-3 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring {selectedTemplateId === candidate.id ? 'border-primary bg-primary/10 shadow-sm' : 'border-border bg-card hover:border-primary/40 hover:bg-accent/30'}"
+				>
+					<div class="flex items-start justify-between gap-2">
+						<div class="text-sm font-semibold leading-snug">{candidate.title}</div>
+						{#if selectedTemplateId === candidate.id}
+							<span class="shrink-0 rounded-full bg-primary px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-primary-foreground">Selected</span>
+						{:else if candidate.schedule}
+							<span class="shrink-0 rounded-full bg-muted px-2 py-0.5 text-[9px] font-medium uppercase tracking-wide text-muted-foreground">Scheduled</span>
+						{/if}
+					</div>
+					<p class="mt-1.5 text-xs leading-relaxed text-muted-foreground">{candidate.description}</p>
+				</button>
+			{/each}
 		</div>
 
-		<div class="space-y-4 rounded-xl border border-border bg-card p-5">
+		<div class="space-y-4 rounded-xl border border-border bg-card p-4 sm:p-5">
+			<div class="flex flex-wrap items-start justify-between gap-2">
+				<div>
+					<div class="text-sm font-semibold">{selectedTemplate.title}</div>
+					<p class="mt-0.5 text-xs text-muted-foreground">{selectedTemplate.description}</p>
+				</div>
+				{#if selectedTemplateId === 'blank'}
+					<span class="rounded-full border border-border px-2 py-0.5 text-[10px] text-muted-foreground">One-step starter</span>
+				{/if}
+			</div>
+
 			<div>
 				<label for="workflow-name" class="mb-1 block text-xs font-medium text-muted-foreground">Name</label>
 				<input id="workflow-name" bind:value={workflowName} class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring" />
 			</div>
-			<div class="grid gap-4 sm:grid-cols-2">
-				<div>
-					<label for="builder-session" class="mb-1 block text-xs font-medium text-muted-foreground">{template === 'code-review' ? 'Implementation project' : 'Project'}</label>
-					<select id="builder-session" bind:value={builderId} class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring">
-						{#each agentList as agent}<option value={agent.id}>{displayName(agent)} · {agent.backend}</option>{/each}
-					</select>
-				</div>
-				{#if template === 'code-review'}
-					<div>
-						<label for="reviewer-session" class="mb-1 block text-xs font-medium text-muted-foreground">Review project</label>
-						<select id="reviewer-session" bind:value={reviewerId} class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring">
-							{#each agentList as agent}<option value={agent.id}>{displayName(agent)} · {agent.backend}</option>{/each}
-						</select>
+
+			{#if selectedTemplate.schedule}
+				<div data-template-schedule class="grid gap-3 rounded-lg border border-sky-500/25 bg-sky-500/5 p-3 sm:grid-cols-2">
+					<div class="sm:col-span-2">
+						<div class="text-xs font-medium">Automatic schedule</div>
+						<p class="mt-1 text-xs leading-relaxed text-muted-foreground">{selectedTemplate.schedule.description} The workflow is created enabled; you can change or pause the schedule from its Inputs &amp; trigger block.</p>
 					</div>
-				{/if}
-			</div>
-			{#if template === 'code-review' && builderId === reviewerId}
-				<p class="text-xs text-amber-600">Using separate implementation and review contexts gives you a genuinely independent review.</p>
-			{:else if template === 'code-review'}
-				<p class="text-xs text-muted-foreground">Both contexts should use the same workspace so the reviewer sees the implementer's actual diff.</p>
+					<label for="schedule-cron" class="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+						Cron · server-local time
+						<input id="schedule-cron" aria-label="Workflow schedule" bind:value={scheduleCron} class="mt-1 w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs normal-case tracking-normal text-foreground outline-none focus:ring-1 focus:ring-ring" />
+					</label>
+					<label for="schedule-agent" class="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+						Agent for automatic runs
+						<select id="schedule-agent" aria-label="Scheduled agent" bind:value={scheduleAgentId} class="mt-1 w-full rounded-md border border-input bg-background px-3 py-2 text-xs normal-case tracking-normal text-foreground outline-none focus:ring-1 focus:ring-ring">
+							{#each agentList as agent}<option value={agent.id}>{agentLabel(agent)}</option>{/each}
+						</select>
+					</label>
+				</div>
 			{/if}
+
+			<div class="rounded-lg border border-border/70 bg-background/50 p-3">
+				<div class="text-xs font-medium">Run-time Agent roles</div>
+				<p class="mt-1 text-xs leading-relaxed text-muted-foreground">{selectedTemplate.roleGuidance}</p>
+			</div>
+
 			{#if error}<p class="text-xs text-destructive">{error}</p>{/if}
 			<div class="flex justify-end gap-2">
-				<a href="/workflows" class="rounded-md border border-border px-4 py-2 text-sm hover:bg-accent">Cancel</a>
-				<button onclick={createWorkflow} disabled={!workflowName.trim() || !builderId || (template === 'code-review' && !reviewerId) || creating} class="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50">{creating ? 'Creating…' : 'Create workflow'}</button>
+				<a href="/automations" class="rounded-md border border-border px-4 py-2 text-sm hover:bg-accent">Cancel</a>
+				<button onclick={createWorkflow} disabled={!canCreate} class="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50">
+					{creating ? 'Creating…' : selectedTemplate.schedule ? 'Create scheduled workflow' : 'Create workflow'}
+				</button>
 			</div>
 		</div>
 	{/if}

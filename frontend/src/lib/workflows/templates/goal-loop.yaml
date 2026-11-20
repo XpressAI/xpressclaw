@@ -1,0 +1,51 @@
+name: __WORKFLOW_NAME__
+description: One agent pursues a goal in bounded iterations and stops when it reports completion.
+version: 1
+
+inputs:
+  goal:
+    type: string
+    description: The outcome the agent should pursue.
+    required: true
+  worker:
+    type: agent
+    description: Agent context that pursues the goal.
+    required: true
+    primary: true
+
+flows:
+  main:
+    color: "#8b5cf6"
+    steps:
+      - id: pursue_goal
+        type: step
+        label: Make progress
+        agent: "@worker"
+        prompt: |
+          Work autonomously toward this goal in the current workspace:
+
+          @goal
+
+          Inspect the current state, make one meaningful verified increment, and
+          decide whether the goal is complete. Return status as exactly "complete"
+          or "continue", plus a progress summary and the next action if needed.
+        outputs:
+          status:
+            type: string
+            description: Either complete or continue.
+          progress:
+            type: string
+            description: What changed and how it was verified.
+          next_action:
+            type: string
+            description: The next useful increment when status is continue.
+
+      - id: goal_gate
+        type: when
+        label: Goal complete?
+        switch: "@pursue_goal.status"
+        arms:
+          - match: complete
+            continue: true
+          - match: continue
+            goto: step pursue_goal

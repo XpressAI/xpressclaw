@@ -1,11 +1,17 @@
 use std::sync::Arc;
 
 use chrono::Utc;
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use super::queue::TaskQueue;
 use crate::db::Database;
 use crate::error::{Error, Result};
+use crate::projects::ensure_project_accepts_work;
+#[cfg(test)]
+#[path = "project_planning_tests.rs"]
+mod project_planning_tests;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -50,14 +56,33 @@ pub struct Task {
     pub description: Option<String>,
     pub status: TaskStatus,
     pub priority: i32,
+    #[serde(default)]
+    pub start_after: Option<String>,
+    #[serde(default)]
+    pub backlog: bool,
+    #[serde(default)]
+    pub position: f64,
+    #[serde(default)]
+    pub revision: i64,
     pub agent_id: Option<String>,
     pub parent_task_id: Option<String>,
     pub sop_id: Option<String>,
     pub conversation_id: Option<String>,
+    pub project_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     pub completed_at: Option<String>,
     pub context: Option<serde_json::Value>,
+    /// Durable provenance for lifecycle decisions. ACP plan rows use
+    /// `native_plan`; explicit tasks retain a durable origin.
+    #[serde(default = "default_task_provenance")]
+    pub provenance: String,
+    /// Whether an unfinished child prevents its parent from completing.
+    #[serde(default = "default_blocks_parent")]
+    pub blocks_parent: bool,
+    /// A delegated worker result needs acceptance by its parent before completion.
+    #[serde(default)]
+    pub parent_review_required: bool,
     /// Task type: "normal" or "IDLE" (hidden single-turn idle tasks).
     #[serde(default = "default_task_type")]
     pub task_type: String,
@@ -66,12 +91,31 @@ pub struct Task {
     pub hidden: bool,
 }
 
+impl Task {
+    pub fn is_native_plan_item(&self) -> bool {
+        self.provenance == NATIVE_PLAN_PROVENANCE
+    }
+}
+
 fn default_task_type() -> String {
     "normal".to_string()
 }
 
+fn default_task_provenance() -> String {
+    "durable".to_string()
+}
+
+const fn default_blocks_parent() -> bool {
+    true
+}
+
+const NATIVE_PLAN_PROVENANCE: &str = "native_plan";
+
 #[derive(Debug, Default, Deserialize)]
 pub struct CreateTask {
+    #[serde(default)]
+    pub backlog: bool,
+    pub start_after: Option<String>,
     pub title: String,
     pub description: Option<String>,
     pub agent_id: Option<String>,
@@ -100,6 +144,12 @@ pub struct TaskCounts {
     pub cancelled: i64,
 }
 
+#[derive(Debug, Default)]
+pub struct PlanReconciliation {
+    pub deferred_items: usize,
+    pub completed_tasks: Vec<Task>,
+}
+
 /// A step reported by a native coding harness through its plan/todo stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReportedSubtask {
@@ -125,6 +175,14 @@ impl TaskListPage {
     }
 }
 
+#[derive(Clone, Copy)]
+struct TaskListFilter<'a> {
+    statuses: &'a [&'a str],
+    agent_id: Option<&'a str>,
+    excluded_statuses: &'a [&'a str],
+    search: Option<&'a str>,
+}
+
 /// Kanban task board with CRUD operations and status transitions.
 pub struct TaskBoard {
     db: Arc<Database>,
@@ -136,37 +194,191 @@ impl TaskBoard {
     }
 
     pub fn create(&self, req: &CreateTask) -> Result<Task> {
+        self.create_with_conversation_agent(req, None)
+    }
+
+    /// Create work requested by an Agent from one of its Conversations.
+    ///
+    /// The membership check shares the same immediate transaction as task
+    /// insertion. Participant removal therefore linearizes either before this
+    /// call (and rejects it) or after the task has already been created.
+    pub fn create_for_conversation_agent(
+        &self,
+        req: &CreateTask,
+        creator_agent_id: &str,
+    ) -> Result<Task> {
+        self.create_with_conversation_agent(req, Some(creator_agent_id))
+    }
+
+    fn create_with_conversation_agent(
+        &self,
+        req: &CreateTask,
+        creator_agent_id: Option<&str>,
+    ) -> Result<Task> {
+        let id = self.db.with_conn(|conn| {
+            // Reserve the writer before resolving any ownership inputs. Agent,
+            // Conversation, and parent-task moves must not be able to invalidate
+            // the Project boundary between validation and task insertion.
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let id = Self::create_in_transaction(&transaction, req, creator_agent_id)?;
+            transaction.commit()?;
+            Ok::<_, Error>(id)
+        })?;
+
+        self.get(&id)
+    }
+
+    /// Insert a task while the caller owns the surrounding write transaction.
+    ///
+    /// Conversation work uses this to commit task creation, dispatch, and the
+    /// linked Conversation publication as one lifecycle operation.
+    pub(crate) fn create_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        req: &CreateTask,
+        creator_agent_id: Option<&str>,
+    ) -> Result<String> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now()
             .naive_utc()
             .format("%Y-%m-%d %H:%M:%S")
             .to_string();
         let priority = req.priority.unwrap_or(0);
+        let start_after = super::planning::normalize_start_after(req.start_after.as_deref())?;
         let context_json = req.context.as_ref().map(|c| c.to_string());
+        let provenance = req
+            .context
+            .as_ref()
+            .and_then(|context| context.get("origin"))
+            .and_then(serde_json::Value::as_str)
+            // `native_plan` is reserved for rows synchronized from ACP. An
+            // explicit create_task call is durable even if a caller copies
+            // internal context metadata.
+            .filter(|origin| *origin != NATIVE_PLAN_PROVENANCE)
+            .unwrap_or("durable");
+        let blocks_parent = true;
+        let requested_project = req
+            .context
+            .as_ref()
+            .and_then(|context| context.get("project_id"))
+            .and_then(serde_json::Value::as_str);
 
-        {
-            let conn = self.db.conn();
-            conn.execute(
-                "INSERT INTO tasks (id, title, description, status, priority, agent_id, parent_task_id, sop_id, conversation_id, context, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                rusqlite::params![
-                    id,
-                    req.title,
-                    req.description,
-                    "pending",
-                    priority,
-                    req.agent_id,
-                    req.parent_task_id,
-                    req.sop_id,
-                    req.conversation_id,
-                    context_json,
-                    now,
-                    now,
-                ],
+        let conversation_project = if let Some(conversation_id) = req.conversation_id.as_deref() {
+            let project = transaction
+                .query_row(
+                    "SELECT project_id FROM conversations WHERE id = ?1",
+                    [conversation_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?;
+            match project {
+                Some(project_id) => project_id,
+                None => {
+                    return Err(Error::ConversationNotFound {
+                        id: conversation_id.to_string(),
+                    });
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(creator_agent_id) = creator_agent_id {
+            let conversation_id = req.conversation_id.as_deref().ok_or_else(|| {
+                Error::Conversation("an Agent may only create work from a conversation".into())
+            })?;
+            if req.agent_id.as_deref() != Some(creator_agent_id) {
+                return Err(Error::Conversation(
+                    "an Agent may only create a conversation task for itself".into(),
+                ));
+            }
+            let is_participant = transaction.query_row(
+                "SELECT EXISTS(
+                        SELECT 1 FROM conversation_participants
+                        WHERE conversation_id = ?1
+                          AND participant_type = 'agent'
+                          AND participant_id = ?2
+                    )",
+                rusqlite::params![conversation_id, creator_agent_id],
+                |row| row.get::<_, bool>(0),
             )?;
+            if !is_participant {
+                return Err(Error::Conversation(format!(
+                    "Agent '{creator_agent_id}' is not a participant in conversation '{conversation_id}'"
+                )));
+            }
         }
-
-        self.get(&id)
+        let agent_project = if let Some(agent_id) = req.agent_id.as_deref() {
+            transaction
+                .query_row(
+                    "SELECT project_id FROM agents WHERE id = ?1",
+                    [agent_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .ok_or_else(|| Error::AgentNotFound {
+                    name: agent_id.to_string(),
+                })?
+        } else {
+            None
+        };
+        let parent_project = if let Some(parent_task_id) = req.parent_task_id.as_deref() {
+            // A local child would change the platform task's completion/roll-up
+            // semantics. ACP plan rows use their separate non-blocking sync path.
+            TaskQueue::ensure_locally_scheduled(transaction, parent_task_id)?;
+            transaction
+                .query_row(
+                    "SELECT project_id FROM tasks WHERE id = ?1",
+                    [parent_task_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .ok_or_else(|| Error::TaskNotFound {
+                    id: parent_task_id.to_string(),
+                })?
+        } else {
+            None
+        };
+        let requested_project = requested_project.map(str::to_string);
+        let project_id = consistent_project_id([
+            ("conversation", conversation_project.as_deref()),
+            ("request", requested_project.as_deref()),
+            ("Agent", agent_project.as_deref()),
+            ("parent task", parent_project.as_deref()),
+        ])?;
+        if let Some(project_id) = project_id.as_deref() {
+            ensure_project_accepts_work(transaction, project_id)?;
+        }
+        if req.parent_task_id.is_some() && parent_project.is_none() && project_id.is_some() {
+            return Err(Error::Task(
+                "a task in a Project cannot be added beneath a projectless parent task".into(),
+            ));
+        }
+        transaction.execute(
+            "INSERT INTO tasks (id, title, description, status, priority, agent_id, parent_task_id, sop_id, conversation_id, context, created_at, updated_at, project_id, provenance, blocks_parent, start_after, backlog, position)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, (SELECT COALESCE(MAX(position), 0) + 1024.0 FROM tasks))",
+            rusqlite::params![
+                id,
+                req.title,
+                req.description,
+                "pending",
+                priority,
+                req.agent_id,
+                req.parent_task_id,
+                req.sop_id,
+                req.conversation_id,
+                context_json,
+                now,
+                now,
+                project_id,
+                provenance,
+                blocks_parent,
+                start_after,
+                req.backlog,
+            ],
+        )?;
+        Ok(id)
     }
 
     /// Create a hidden single-turn idle task for an agent (XCLAW-47).
@@ -178,14 +390,33 @@ impl TaskBoard {
             .to_string();
         let title = format!("[Idle] {agent_id}");
 
-        {
-            let conn = self.db.conn();
-            conn.execute(
-                "INSERT INTO tasks (id, title, description, status, priority, agent_id, task_type, hidden, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, 'pending', 0, ?4, 'IDLE', 1, ?5, ?6)",
+        self.db.with_conn(|conn| {
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let project_id = transaction
+                .query_row(
+                    "SELECT project_id FROM agents WHERE id = ?1",
+                    [agent_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .ok_or_else(|| Error::AgentNotFound {
+                    name: agent_id.to_string(),
+                })?;
+            if let Some(project_id) = project_id.as_deref() {
+                ensure_project_accepts_work(&transaction, project_id)?;
+            }
+            transaction.execute(
+                "INSERT INTO tasks (id, title, description, status, priority, agent_id, task_type, hidden, created_at, updated_at, project_id)
+                 VALUES (?1, ?2, ?3, 'pending', 0, ?4, 'IDLE', 1, ?5, ?6,
+                         (SELECT project_id FROM agents WHERE id = ?4))",
                 rusqlite::params![id, title, description, agent_id, now, now],
             )?;
-        }
+            transaction.commit()?;
+            Ok::<_, Error>(())
+        })?;
 
         self.get(&id)
     }
@@ -201,13 +432,83 @@ impl TaskBoard {
         Ok(task)
     }
 
+    /// Check local authority before an API operation performs external side effects.
+    /// Connect mappings are immutable and created with a new task in one transaction;
+    /// an existing local task cannot acquire a platform owner after this check.
+    pub fn ensure_locally_managed(&self, task_id: &str) -> Result<()> {
+        self.db
+            .with_conn(|conn| TaskQueue::ensure_locally_scheduled(conn, task_id))
+    }
+
     pub fn set_conversation_id(&self, task_id: &str, conversation_id: &str) -> Result<()> {
         let conn = self.db.conn();
-        conn.execute(
-            "UPDATE tasks SET conversation_id = ?1, updated_at = datetime('now') WHERE id = ?2",
-            rusqlite::params![conversation_id, task_id],
+        let transaction =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+        let conversation_project = transaction
+            .query_row(
+                "SELECT project_id FROM conversations WHERE id = ?1",
+                [conversation_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .ok_or_else(|| Error::ConversationNotFound {
+                id: conversation_id.to_string(),
+            })?
+            .ok_or_else(|| {
+                Error::Conversation(format!(
+                    "conversation '{conversation_id}' is not assigned to a project"
+                ))
+            })?;
+        let (task_project, agent_project) = transaction
+            .query_row(
+                "SELECT tasks.project_id, agents.project_id
+                 FROM tasks
+                 LEFT JOIN agents ON agents.id = tasks.agent_id
+                 WHERE tasks.id = ?1",
+                [task_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| Error::TaskNotFound {
+                id: task_id.to_string(),
+            })?;
+        let project_id = consistent_project_id([
+            ("conversation", Some(conversation_project.as_str())),
+            ("task", task_project.as_deref()),
+            ("Agent", agent_project.as_deref()),
+        ])?
+        .expect("the conversation always supplies a project");
+        ensure_project_accepts_work(&transaction, &project_id)?;
+        ensure_task_hierarchy_project(&transaction, task_id, &project_id)?;
+
+        transaction.execute(
+            "UPDATE tasks
+             SET conversation_id = ?1,
+                 project_id = ?2,
+                 updated_at = datetime('now')
+             WHERE id = ?3",
+            rusqlite::params![conversation_id, project_id, task_id],
         )?;
+        transaction.commit()?;
         Ok(())
+    }
+
+    pub fn project_id(&self, task_id: &str) -> Result<Option<String>> {
+        self.db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT project_id FROM tasks WHERE id = ?1",
+                [task_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| Error::TaskNotFound {
+                id: task_id.to_string(),
+            })
+        })
     }
 
     pub fn list(
@@ -218,13 +519,49 @@ impl TaskBoard {
     ) -> Result<Vec<Task>> {
         let statuses = status.into_iter().collect::<Vec<_>>();
         self.list_inner(
-            &statuses,
-            agent_id,
-            &[],
+            TaskListFilter {
+                statuses: &statuses,
+                agent_id,
+                excluded_statuses: &[],
+                search: None,
+            },
             TaskListPage::first(limit),
             false,
             TaskListOrder::Scheduler,
         )
+    }
+
+    /// List visible tasks linked to a conversation, newest first.
+    pub fn list_for_conversation(&self, conversation_id: &str) -> Result<Vec<Task>> {
+        self.db.with_conn(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT * FROM tasks WHERE conversation_id = ?1 AND hidden = 0
+                 ORDER BY created_at DESC",
+            )?;
+            let mut rows = statement.query([conversation_id])?;
+            let mut tasks = Vec::new();
+            while let Some(row) = rows.next()? {
+                tasks.push(row_to_task(row)?);
+            }
+            Ok(tasks)
+        })
+    }
+
+    /// List visible durable tasks owned by a project, newest first.
+    pub fn list_for_project(&self, project_id: &str, limit: i64) -> Result<Vec<Task>> {
+        self.db.with_conn(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT * FROM tasks
+                 WHERE project_id = ?1 AND hidden = 0 AND provenance != 'native_plan'
+                 ORDER BY updated_at DESC, created_at DESC LIMIT ?2",
+            )?;
+            let mut rows = statement.query(rusqlite::params![project_id, limit])?;
+            let mut tasks = Vec::new();
+            while let Some(row) = rows.next()? {
+                tasks.push(row_to_task(row)?);
+            }
+            Ok(tasks)
+        })
     }
 
     /// List a page of scheduler-ordered tasks matching any supplied status.
@@ -232,13 +569,31 @@ impl TaskBoard {
         &self,
         statuses: &[&str],
         agent_id: Option<&str>,
+        search: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Task>> {
+        self.list_page_excluding(statuses, agent_id, &[], search, limit, offset)
+    }
+
+    /// List a page of scheduler-ordered tasks matching any supplied status while
+    /// excluding statuses not needed by the caller.
+    pub fn list_page_excluding(
+        &self,
+        statuses: &[&str],
+        agent_id: Option<&str>,
+        excluded_statuses: &[&str],
+        search: Option<&str>,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<Task>> {
         self.list_inner(
-            statuses,
-            agent_id,
-            &[],
+            TaskListFilter {
+                statuses,
+                agent_id,
+                excluded_statuses,
+                search,
+            },
             TaskListPage { limit, offset },
             false,
             TaskListOrder::Scheduler,
@@ -256,9 +611,12 @@ impl TaskBoard {
     ) -> Result<Vec<Task>> {
         let statuses = status.into_iter().collect::<Vec<_>>();
         self.list_inner(
-            &statuses,
-            agent_id,
-            excluded_statuses,
+            TaskListFilter {
+                statuses: &statuses,
+                agent_id,
+                excluded_statuses,
+                search: None,
+            },
             TaskListPage::first(limit),
             false,
             TaskListOrder::Recent,
@@ -271,20 +629,24 @@ impl TaskBoard {
         statuses: &[&str],
         agent_id: Option<&str>,
         excluded_statuses: &[&str],
+        search: Option<&str>,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<Task>> {
         self.list_inner(
-            statuses,
-            agent_id,
-            excluded_statuses,
+            TaskListFilter {
+                statuses,
+                agent_id,
+                excluded_statuses,
+                search,
+            },
             TaskListPage { limit, offset },
             false,
             TaskListOrder::Recent,
         )
     }
 
-    /// List the most recently updated top-level tasks for each agent.
+    /// List the most recently updated durable tasks for each agent.
     pub fn list_recent_per_agent(&self, limit: i64) -> Result<Vec<Task>> {
         let conn = self.db.conn();
         let mut stmt = conn.prepare(
@@ -295,7 +657,7 @@ impl TaskBoard {
                         ORDER BY updated_at DESC, created_at DESC, id DESC
                     ) AS recency_rank
                 FROM tasks
-                WHERE hidden = 0 AND parent_task_id IS NULL
+                WHERE hidden = 0 AND provenance != 'native_plan'
             )
             SELECT *
             FROM ranked_tasks
@@ -321,9 +683,12 @@ impl TaskBoard {
     ) -> Result<Vec<Task>> {
         let statuses = status.into_iter().collect::<Vec<_>>();
         self.list_inner(
-            &statuses,
-            agent_id,
-            &[],
+            TaskListFilter {
+                statuses: &statuses,
+                agent_id,
+                excluded_statuses: &[],
+                search: None,
+            },
             TaskListPage::first(limit),
             true,
             TaskListOrder::Scheduler,
@@ -332,9 +697,7 @@ impl TaskBoard {
 
     fn list_inner(
         &self,
-        statuses: &[&str],
-        agent_id: Option<&str>,
-        excluded_statuses: &[&str],
+        filter: TaskListFilter<'_>,
         page: TaskListPage,
         include_hidden: bool,
         order: TaskListOrder,
@@ -347,12 +710,13 @@ impl TaskBoard {
             sql.push_str(" AND hidden = 0");
         }
 
-        // Subtasks belong inside their parent, not the top-level list.
-        sql.push_str(" AND parent_task_id IS NULL");
+        // Durable delegated work is real assigned work. Only harness checklist
+        // rows stay within the parent transcript.
+        sql.push_str(" AND provenance != 'native_plan'");
 
-        if !statuses.is_empty() {
+        if !filter.statuses.is_empty() {
             sql.push_str(" AND status IN (");
-            for (index, status) in statuses.iter().enumerate() {
+            for (index, status) in filter.statuses.iter().enumerate() {
                 if index > 0 {
                     sql.push_str(", ");
                 }
@@ -361,14 +725,15 @@ impl TaskBoard {
             }
             sql.push(')');
         }
-        if let Some(a) = agent_id {
+        if let Some(a) = filter.agent_id {
             sql.push_str(" AND agent_id = ?");
             params.push(Box::new(a.to_string()));
         }
-        for excluded_status in excluded_statuses {
+        for excluded_status in filter.excluded_statuses {
             sql.push_str(" AND status != ?");
             params.push(Box::new((*excluded_status).to_string()));
         }
+        append_task_search(&mut sql, &mut params, filter.search);
 
         match order {
             TaskListOrder::Scheduler => {
@@ -402,17 +767,32 @@ impl TaskBoard {
         status: &str,
         agent_id: Option<&str>,
     ) -> Result<Task> {
+        self.update_status_with_agent_repository(task_id, status, agent_id, None)
+    }
+
+    pub fn update_status_with_agent_repository(
+        &self,
+        task_id: &str,
+        status: &str,
+        agent_id: Option<&str>,
+        agent_repository: Option<(&str, &str)>,
+    ) -> Result<Task> {
         let parsed = TaskStatus::parse(status)?;
         let now = Utc::now()
             .naive_utc()
             .format("%Y-%m-%d %H:%M:%S")
             .to_string();
+        let checked_at = Utc::now().to_rfc3339();
 
         {
             let conn = self.db.conn();
+            let transaction = rusqlite::Transaction::new_unchecked(
+                &conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
 
             // Verify task exists
-            let exists: bool = conn.query_row(
+            let exists: bool = transaction.query_row(
                 "SELECT COUNT(*) FROM tasks WHERE id = ?1",
                 [task_id],
                 |row| row.get::<_, i64>(0).map(|c| c > 0),
@@ -423,32 +803,89 @@ impl TaskBoard {
                     id: task_id.to_string(),
                 });
             }
+            if parsed == TaskStatus::Completed
+                && transaction.query_row(
+                    "SELECT parent_review_required FROM tasks WHERE id=?1",
+                    [task_id],
+                    |row| row.get::<_, bool>(0),
+                )?
+            {
+                return Err(Error::Task(
+                    "The parent Agent must accept this delegated result before it can complete"
+                        .into(),
+                ));
+            }
+            if parsed != TaskStatus::Cancelled {
+                let project_id = transaction.query_row(
+                    "SELECT project_id FROM tasks WHERE id = ?1",
+                    [task_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )?;
+                if let Some(project_id) = project_id.as_deref() {
+                    ensure_project_accepts_work(&transaction, project_id)?;
+                }
+            }
 
             // Update status. Reopening a completed task must also clear its
             // old completion timestamp so the API does not report two
             // conflicting states.
-            conn.execute(
+            transaction.execute(
                 "UPDATE tasks SET status = ?1, updated_at = ?2,
                     completed_at = CASE WHEN ?1 = 'completed' THEN ?2 ELSE NULL END
                  WHERE id = ?3",
                 rusqlite::params![status, now, task_id],
             )?;
 
+            // Release the external review gate in the same transaction as
+            // cancellation so a stale poll cannot revive it after a reopen.
+            if parsed == TaskStatus::Cancelled {
+                transaction.execute(
+                    "UPDATE task_pull_requests SET status = 'cancelled', next_poll_at = NULL,
+                        last_checked_at = ?1, last_error = NULL
+                     WHERE task_id = ?2 AND status IN ('waiting', 'attention')",
+                    rusqlite::params![checked_at, task_id],
+                )?;
+                Self::release_child_parent_reviews_in_transaction(&transaction, task_id)?;
+            }
+
             // Set agent_id if transitioning to in_progress
             if parsed == TaskStatus::InProgress {
                 if let Some(aid) = agent_id {
-                    conn.execute(
+                    ensure_task_agent_project(&transaction, task_id, aid)?;
+                    let previous = synchronize_pull_request_agent(
+                        &transaction,
+                        task_id,
+                        aid,
+                        agent_repository,
+                    )?;
+                    transaction.execute(
                         "UPDATE tasks SET agent_id = ?1 WHERE id = ?2",
                         rusqlite::params![aid, task_id],
                     )?;
+                    if let Some(previous) = previous {
+                        refresh_logical_session_status(&transaction, &previous)?;
+                        if previous != aid {
+                            refresh_logical_session_status(&transaction, aid)?;
+                        }
+                    }
                 }
             }
+            transaction.commit()?;
         }
 
         self.get(task_id)
     }
 
     pub fn update(&self, task_id: &str, req: &UpdateTask) -> Result<Task> {
+        self.update_with_agent_repository(task_id, req, None)
+    }
+
+    pub fn update_with_agent_repository(
+        &self,
+        task_id: &str,
+        req: &UpdateTask,
+        agent_repository: Option<(&str, &str)>,
+    ) -> Result<Task> {
         let now = Utc::now()
             .naive_utc()
             .format("%Y-%m-%d %H:%M:%S")
@@ -456,9 +893,13 @@ impl TaskBoard {
 
         {
             let conn = self.db.conn();
+            let transaction = rusqlite::Transaction::new_unchecked(
+                &conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
 
             // Verify task exists
-            let exists: bool = conn.query_row(
+            let exists: bool = transaction.query_row(
                 "SELECT COUNT(*) FROM tasks WHERE id = ?1",
                 [task_id],
                 |row| row.get::<_, i64>(0).map(|c| c > 0),
@@ -469,34 +910,49 @@ impl TaskBoard {
                     id: task_id.to_string(),
                 });
             }
+            super::queue::TaskQueue::ensure_locally_scheduled(&transaction, task_id)?;
 
             if let Some(ref title) = req.title {
-                conn.execute(
+                transaction.execute(
                     "UPDATE tasks SET title = ?1, updated_at = ?2 WHERE id = ?3",
                     rusqlite::params![title, now, task_id],
                 )?;
             }
 
             if let Some(ref desc) = req.description {
-                conn.execute(
+                transaction.execute(
                     "UPDATE tasks SET description = ?1, updated_at = ?2 WHERE id = ?3",
                     rusqlite::params![desc, now, task_id],
                 )?;
             }
 
             if let Some(ref agent_id) = req.agent_id {
-                conn.execute(
+                ensure_task_agent_project(&transaction, task_id, agent_id)?;
+                let previous = synchronize_pull_request_agent(
+                    &transaction,
+                    task_id,
+                    agent_id,
+                    agent_repository,
+                )?;
+                transaction.execute(
                     "UPDATE tasks SET agent_id = ?1, updated_at = ?2 WHERE id = ?3",
                     rusqlite::params![agent_id, now, task_id],
                 )?;
+                if let Some(previous) = previous {
+                    refresh_logical_session_status(&transaction, &previous)?;
+                    if previous != *agent_id {
+                        refresh_logical_session_status(&transaction, agent_id)?;
+                    }
+                }
             }
 
             if let Some(priority) = req.priority {
-                conn.execute(
+                transaction.execute(
                     "UPDATE tasks SET priority = ?1, updated_at = ?2 WHERE id = ?3",
                     rusqlite::params![priority, now, task_id],
                 )?;
             }
+            transaction.commit()?;
         }
 
         self.get(task_id)
@@ -517,23 +973,38 @@ impl TaskBoard {
     }
 
     /// Replace the ACP agent's current plan with its latest snapshot.
-    /// These rows are normal subtasks so the UI and completion semantics do
-    /// not need a second, runner-specific representation.
+    /// These rows remain visible as task steps, but explicit provenance keeps
+    /// them separate from durable children that gate parent completion.
     pub fn sync_reported_subtasks(
         &self,
         parent_task_id: &str,
         attempt_id: &str,
         items: &[ReportedSubtask],
     ) -> Result<Vec<Task>> {
-        self.get(parent_task_id)?;
         let now = Utc::now()
             .naive_utc()
             .format("%Y-%m-%d %H:%M:%S")
             .to_string();
 
         self.db.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT id, context FROM tasks WHERE parent_task_id = ?1 ORDER BY created_at ASC",
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let parent_project = transaction
+                .query_row(
+                    "SELECT project_id FROM tasks WHERE id = ?1",
+                    [parent_task_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .ok_or_else(|| Error::TaskNotFound {
+                    id: parent_task_id.to_string(),
+                })?;
+            let mut stmt = transaction.prepare(
+                "SELECT id, context FROM tasks
+                 WHERE parent_task_id = ?1 AND provenance = 'native_plan'
+                 ORDER BY created_at ASC",
             )?;
             let existing: Vec<(String, usize)> = stmt
                 .query_map([parent_task_id], |row| {
@@ -557,31 +1028,37 @@ impl TaskBoard {
             for (index, item) in items.iter().enumerate() {
                 let completed_at = (item.status == TaskStatus::Completed).then_some(now.as_str());
                 let context = serde_json::json!({
-                    "origin": "native_plan",
+                    "origin": NATIVE_PLAN_PROVENANCE,
+                    "lifecycle": "ephemeral",
+                    "completion_gate": false,
                     "attempt_id": attempt_id,
                     "index": index,
                 })
                 .to_string();
                 if let Some((id, _)) = existing.iter().find(|(_, current)| *current == index) {
-                    conn.execute(
+                    transaction.execute(
                         "UPDATE tasks SET title = ?1, status = ?2, updated_at = ?3,
-                            completed_at = ?4, context = ?5 WHERE id = ?6",
+                            completed_at = ?4, context = ?5, project_id = ?6,
+                            provenance = 'native_plan', blocks_parent = 0 WHERE id = ?7",
                         rusqlite::params![
                             item.title,
                             item.status.as_str(),
                             now,
                             completed_at,
                             context,
+                            parent_project,
                             id,
                         ],
                     )?;
                 } else {
                     let id = Uuid::new_v4().to_string();
-                    conn.execute(
+                    transaction.execute(
                         "INSERT INTO tasks
                             (id, title, status, priority, parent_task_id, context,
-                             created_at, updated_at, completed_at)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8)",
+                             created_at, updated_at, completed_at, project_id,
+                             provenance, blocks_parent)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9,
+                                 'native_plan', 0)",
                         rusqlite::params![
                             id,
                             item.title,
@@ -591,6 +1068,7 @@ impl TaskBoard {
                             context,
                             now,
                             completed_at,
+                            parent_project,
                         ],
                     )?;
                 }
@@ -598,9 +1076,10 @@ impl TaskBoard {
 
             for (id, index) in existing {
                 if index >= items.len() {
-                    conn.execute("DELETE FROM tasks WHERE id = ?1", [id])?;
+                    transaction.execute("DELETE FROM tasks WHERE id = ?1", [id])?;
                 }
             }
+            transaction.commit()?;
             Ok::<_, Error>(())
         })?;
 
@@ -611,69 +1090,451 @@ impl TaskBoard {
     /// without steps can be completed by its own successful response.
     pub fn subtasks_complete(&self, task_id: &str) -> Result<bool> {
         let subtasks = self.list_subtasks(task_id)?;
-        Ok(subtasks.is_empty()
-            || subtasks
-                .iter()
-                .all(|subtask| subtask.status == TaskStatus::Completed))
+        Ok(subtasks
+            .iter()
+            .filter(|subtask| subtask.blocks_parent)
+            .all(|subtask| subtask.status == TaskStatus::Completed))
+    }
+
+    /// Close unfinished ACP plan rows without claiming that speculative work
+    /// was completed. Explicitly delegated children are never touched.
+    pub fn defer_reported_subtasks(&self, parent_task_id: &str, reason: &str) -> Result<usize> {
+        let now = Utc::now()
+            .naive_utc()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        self.db.with_conn(|conn| {
+            Self::defer_reported_subtasks_on_conn(conn, parent_task_id, reason, &now)
+        })
+    }
+
+    pub(super) fn defer_reported_subtasks_on_conn(
+        conn: &rusqlite::Connection,
+        parent_task_id: &str,
+        reason: &str,
+        now: &str,
+    ) -> Result<usize> {
+        let mut statement = conn.prepare(
+            "SELECT id, context FROM tasks
+             WHERE parent_task_id = ?1 AND provenance = 'native_plan'
+               AND status NOT IN ('completed', 'cancelled')",
+        )?;
+        let rows = statement
+            .query_map([parent_task_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?
+            .filter_map(|row| row.ok())
+            .collect::<Vec<_>>();
+        drop(statement);
+        for (id, raw_context) in &rows {
+            let mut context = raw_context
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                .unwrap_or_else(|| serde_json::json!({}));
+            if let Some(object) = context.as_object_mut() {
+                object.insert(
+                    "plan_disposition".to_string(),
+                    serde_json::Value::String("deferred".to_string()),
+                );
+                object.insert(
+                    "resolved_reason".to_string(),
+                    serde_json::Value::String(reason.to_string()),
+                );
+                object.insert(
+                    "resolved_at".to_string(),
+                    serde_json::Value::String(now.to_string()),
+                );
+            }
+            conn.execute(
+                "UPDATE tasks SET status = 'cancelled', updated_at = ?1,
+                    completed_at = NULL, context = ?2 WHERE id = ?3",
+                rusqlite::params![now, context.to_string(), id],
+            )?;
+        }
+        Ok(rows.len())
+    }
+
+    /// Repair tasks stranded by the legacy rule that treated ACP plan rows as
+    /// durable blockers. Only tasks whose latest turn completed successfully,
+    /// with no queued or active work, are eligible for automatic completion.
+    pub fn reconcile_finished_reported_plans(&self) -> Result<PlanReconciliation> {
+        let candidates = self.db.with_conn(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT DISTINCT parent.id
+                 FROM tasks plan
+                 JOIN tasks parent ON parent.id = plan.parent_task_id
+                 WHERE plan.provenance = 'native_plan'
+                   AND parent.status = 'in_progress'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM work_attempts active
+                       WHERE active.task_id = parent.id
+                         AND active.status IN (
+                             'queued', 'preparing', 'running', 'waiting_for_input', 'review'
+                         )
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM task_queue queued
+                       WHERE queued.task_id = parent.id
+                         AND queued.status IN ('queued', 'running')
+                   )
+                   AND 'completed' = (
+                       SELECT latest.status FROM work_attempts latest
+                       WHERE latest.task_id = parent.id
+                       ORDER BY latest.created_at DESC, latest.rowid DESC
+                       LIMIT 1
+                   )",
+            )?;
+            let ids = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .filter_map(|row| row.ok())
+                .collect::<Vec<_>>();
+            Ok::<_, Error>(ids)
+        })?;
+
+        let mut reconciliation = PlanReconciliation::default();
+        for task_id in candidates {
+            reconciliation.deferred_items +=
+                self.defer_reported_subtasks(&task_id, "successful_attempt_reconciled")?;
+            reconciliation
+                .completed_tasks
+                .extend(self.complete_and_roll_up(&task_id, None)?);
+        }
+        Ok(reconciliation)
+    }
+
+    /// Derive what the UI should say from actual attempts, queue entries,
+    /// review gates, and durable blocking descendants.
+    pub fn activity_status(&self, task: &Task) -> Result<String> {
+        if matches!(task.status, TaskStatus::Pending | TaskStatus::InProgress)
+            && (task.backlog || super::planning::is_scheduled(task.start_after.as_deref()))
+        {
+            let owned = self.db.with_conn(|conn| conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM task_queue WHERE task_id=?1 AND status='running')
+                 OR EXISTS(SELECT 1 FROM work_attempts WHERE task_id=?1 AND status IN ('preparing','running','waiting_for_input','review'))
+                 OR EXISTS(SELECT 1 FROM task_pull_requests WHERE task_id=?1 AND status IN ('waiting','attention'))",
+                [&task.id], |row| row.get::<_, bool>(0),
+            ))?;
+            if !owned {
+                return Ok(if task.backlog { "backlog" } else { "scheduled" }.into());
+            }
+        }
+        if !matches!(task.status, TaskStatus::Pending | TaskStatus::InProgress) {
+            return Ok(task.status.as_str().to_string());
+        }
+        self.db.with_conn(|conn| {
+            // Descendant work keeps the parent alive, but does not mean the
+            // parent's worker is running. Keep list/sidebar and detail labels
+            // consistent with the same completion gate used by the scheduler.
+            let executing: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM work_attempts WHERE task_id=?1
+                    AND status IN ('preparing','running'))
+                 OR EXISTS(SELECT 1 FROM task_queue WHERE task_id=?1 AND status='running')",
+                [&task.id], |row| row.get(0),
+            )?;
+            if executing {
+                return Ok("in_progress".to_string());
+            }
+            let input_pending: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM work_attempts WHERE task_id=?1 AND status='waiting_for_input')",
+                [&task.id], |row| row.get(0),
+            )?;
+            if input_pending {
+                return Ok("waiting_for_input".to_string());
+            }
+            let dependencies_pending: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM task_dependencies d
+                 JOIN tasks prerequisite ON prerequisite.id=d.depends_on_id
+                 WHERE d.task_id=?1 AND prerequisite.status!='completed')",
+                [&task.id], |row| row.get(0),
+            )?;
+            if dependencies_pending {
+                return Ok("waiting_for_dependencies".into());
+            }
+            let awaiting_review: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM task_pull_requests WHERE task_id=?1 AND status IN ('waiting','attention'))
+                 OR EXISTS(SELECT 1 FROM work_attempts WHERE task_id=?1 AND status='review')",
+                [&task.id], |row| row.get(0),
+            )?;
+            if awaiting_review {
+                return Ok("awaiting_review".to_string());
+            }
+            let awaiting_subtasks: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM tasks WHERE parent_task_id=?1
+                    AND blocks_parent=1 AND status!='completed')",
+                [&task.id], |row| row.get(0),
+            )?;
+            if awaiting_subtasks {
+                if super::planning::has_eligible_response(conn, &task.id)? {
+                    return Ok("queued".into());
+                }
+                let needs_attention: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM tasks WHERE parent_task_id=?1 AND blocks_parent=1
+                     AND status IN ('blocked','waiting_for_input','cancelled'))",
+                    [&task.id], |row| row.get(0),
+                )?;
+                return Ok(if needs_attention { "blocked" } else { "waiting_for_subtasks" }.to_string());
+            }
+            if task.parent_review_required && conn.query_row(
+                "SELECT NOT EXISTS(SELECT 1 FROM task_queue WHERE task_id=?1 AND status IN ('queued','running'))
+                    AND (SELECT status FROM work_attempts WHERE task_id=?1 ORDER BY created_at DESC,rowid DESC LIMIT 1)='completed'",
+                [&task.id], |row| row.get::<_, Option<bool>>(0),
+            )?.unwrap_or(false) {
+                return Ok("awaiting_parent_review".into());
+            }
+            let queued: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM work_attempts WHERE task_id=?1 AND status='queued')
+                 OR EXISTS(SELECT 1 FROM task_queue WHERE task_id=?1 AND status='queued')",
+                [&task.id], |row| row.get(0),
+            )?;
+            Ok(if queued && task.status == TaskStatus::InProgress {
+                "in_progress"
+            } else if task.status == TaskStatus::Pending {
+                "pending"
+            } else {
+                "idle"
+            }.to_string())
+        })
     }
 
     /// Complete a task whose steps are done, then roll that completion through
     /// any ready parents. Parents with queued/running work are left active.
     pub fn complete_and_roll_up(&self, task_id: &str, agent_id: Option<&str>) -> Result<Vec<Task>> {
+        self.complete_and_roll_up_with(task_id, agent_id, |_| Ok(()))
+    }
+
+    /// Complete and roll up one task at a time, invoking `on_completed` before
+    /// considering its parent. A callback may reopen the just-completed task
+    /// (for example by queuing a default workflow continuation); roll-up then
+    /// stops so no ancestor becomes terminal ahead of its blocking child.
+    pub fn complete_and_roll_up_with<F>(
+        &self,
+        task_id: &str,
+        agent_id: Option<&str>,
+        mut on_completed: F,
+    ) -> Result<Vec<Task>>
+    where
+        F: FnMut(&Task) -> Result<()>,
+    {
         let mut completed = Vec::new();
         let mut current_id = Some(task_id.to_string());
-        let mut first = true;
 
         while let Some(id) = current_id {
-            if !self.subtasks_complete(&id)? {
+            let Some(task) = self.complete_if_ready(&id)? else {
                 break;
-            }
-            if self.has_open_attempt(&id)? {
-                break;
-            }
-            let task = self.update_status(&id, "completed", if first { agent_id } else { None })?;
-            current_id = task.parent_task_id.clone();
+            };
+            let parent_task_id = task.parent_task_id.clone();
+            on_completed(&task)?;
+            let remains_completed = self.get(&task.id)?.status == TaskStatus::Completed;
             completed.push(task);
-            first = false;
+            if !remains_completed {
+                break;
+            }
+            current_id = parent_task_id;
         }
+
+        // Completion does not change assignment. Keep this argument for API
+        // compatibility with callers that refresh the first task's session.
+        let _ = agent_id;
 
         Ok(completed)
     }
 
-    fn has_open_attempt(&self, task_id: &str) -> Result<bool> {
+    /// Complete one task only while every precondition and the nonterminal
+    /// status still hold in the same transaction.
+    fn complete_if_ready(&self, task_id: &str) -> Result<Option<Task>> {
+        let now = Utc::now()
+            .naive_utc()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
         self.db.with_conn(|conn| {
-            conn.query_row(
+            let transaction = conn.unchecked_transaction()?;
+            let status: String = transaction.query_row(
+                "SELECT status FROM tasks WHERE id = ?1",
+                [task_id],
+                |row| row.get(0),
+            )?;
+            if matches!(status.as_str(), "completed" | "cancelled") {
+                transaction.commit()?;
+                return Ok(None);
+            }
+            let pull_request_gate_satisfied: bool = transaction.query_row(
+                "SELECT NOT EXISTS(
+                    SELECT 1 FROM task_pull_requests
+                    WHERE task_id = ?1 AND status NOT IN ('approved', 'merged', 'cancelled')
+                 )",
+                [task_id],
+                |row| row.get(0),
+            )?;
+            let subtasks_complete: bool = transaction.query_row(
+                "SELECT NOT EXISTS(
+                    SELECT 1 FROM tasks
+                    WHERE parent_task_id = ?1 AND blocks_parent = 1
+                      AND status != 'completed'
+                 )",
+                [task_id],
+                |row| row.get(0),
+            )?;
+            super::delegation_notifications::reconcile_in_transaction(&transaction)?;
+            let parent_review_required: bool = transaction.query_row(
+                "SELECT parent_review_required FROM tasks WHERE id=?1",
+                [task_id],
+                |row| row.get(0),
+            )?;
+            let has_open_attempt: bool = transaction.query_row(
                 "SELECT EXISTS(
                     SELECT 1 FROM work_attempts WHERE task_id = ?1
                     AND status IN ('queued', 'preparing', 'running', 'waiting_for_input', 'review')
                 )",
                 [task_id],
                 |row| row.get(0),
-            )
-            .map_err(Error::from)
+            )?;
+            if !pull_request_gate_satisfied
+                || !subtasks_complete
+                || has_open_attempt
+                || parent_review_required
+            {
+                transaction.commit()?;
+                return Ok(None);
+            }
+            Self::defer_reported_subtasks_on_conn(&transaction, task_id, "task_completed", &now)?;
+            let changed = transaction.execute(
+                "UPDATE tasks SET status = 'completed', updated_at = ?1, completed_at = ?1
+                 WHERE id = ?2 AND status NOT IN ('completed', 'cancelled')",
+                rusqlite::params![now, task_id],
+            )?;
+            if changed != 1 {
+                transaction.commit()?;
+                return Ok(None);
+            }
+            let task = transaction.query_row(
+                "SELECT * FROM tasks WHERE id = ?1",
+                [task_id],
+                |row| Ok(row_to_task(row)),
+            )??;
+            transaction.commit()?;
+            Ok(Some(task))
         })
+    }
+
+    /// A cancelled parent can no longer accept results. Its locally reviewed
+    /// children survive independently, with their attempts and task status intact.
+    pub(crate) fn release_child_parent_reviews_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        task_id: &str,
+    ) -> Result<()> {
+        transaction.execute(
+            "UPDATE tasks SET parent_task_id=NULL, parent_review_required=0, updated_at=CURRENT_TIMESTAMP
+             WHERE parent_task_id=?1 AND parent_review_required=1
+               AND NOT EXISTS(SELECT 1 FROM connect_work w WHERE w.kind='task_turn' AND w.local_id=tasks.id)
+               AND NOT EXISTS(SELECT 1 FROM workflow_step_executions e JOIN workflow_instances i ON i.id=e.instance_id
+                   WHERE e.task_id=tasks.id AND e.task_id IS NOT i.source_task_id)",
+            [task_id],
+        )?;
+        Ok(())
     }
 
     pub fn delete(&self, task_id: &str) -> Result<()> {
         let conn = self.db.conn();
-        conn.execute("DELETE FROM tasks WHERE id = ?1", [task_id])?;
+        let transaction =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+        TaskQueue::ensure_locally_scheduled(&transaction, task_id)?;
+        transaction.execute("UPDATE tasks SET parent_task_id=NULL,parent_review_required=0
+            WHERE parent_task_id=?1 AND NOT EXISTS(SELECT 1 FROM connect_work w WHERE w.kind='task_turn' AND w.local_id=tasks.id)", [task_id])?;
+        transaction.execute("DELETE FROM tasks WHERE id = ?1", [task_id])?;
+        transaction.commit()?;
         Ok(())
     }
 
     pub fn delete_by_status(&self, status: &str) -> Result<i64> {
         let conn = self.db.conn();
-        let count = conn.execute("DELETE FROM tasks WHERE status = ?1", [status])?;
+        let transaction =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+        transaction.execute("UPDATE tasks SET parent_task_id=NULL,parent_review_required=0
+            WHERE parent_task_id IN (SELECT parent.id FROM tasks parent WHERE parent.status=?1
+                AND NOT EXISTS(SELECT 1 FROM connect_work w WHERE w.kind='task_turn' AND w.local_id=parent.id))
+              AND NOT EXISTS(SELECT 1 FROM connect_work w WHERE w.kind='task_turn' AND w.local_id=tasks.id)", [status])?;
+        let count = transaction.execute(
+            "DELETE FROM tasks WHERE status = ?1 AND NOT EXISTS (
+                SELECT 1 FROM connect_work WHERE kind='task_turn' AND local_id=tasks.id
+            )",
+            [status],
+        )?;
+        transaction.commit()?;
         Ok(count as i64)
     }
 
+    pub fn current_error(&self, task: &Task) -> Result<Option<String>> {
+        if matches!(task.status, TaskStatus::Completed | TaskStatus::Cancelled) {
+            return Ok(None);
+        }
+        self.db.with_conn(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT CASE WHEN status='failed' THEN error_message END FROM work_attempts
+                 WHERE task_id=?1 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                    [&task.id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten())
+        })
+    }
+
+    /// All unresolved work is available independently of recent-history limits.
+    pub fn list_attention(&self, agent_id: Option<&str>) -> Result<Vec<Task>> {
+        let candidates = self.db.with_conn(|conn| -> Result<Vec<Task>> {
+            let mut statement = conn.prepare(
+                "SELECT * FROM tasks WHERE hidden=0 AND provenance!='native_plan'
+                 AND (?1 IS NULL OR agent_id=?1)
+                 AND (status IN ('blocked','waiting_for_input')
+                   OR (status IN ('pending','in_progress') AND (
+                     EXISTS(SELECT 1 FROM tasks child WHERE child.parent_task_id=tasks.id
+                       AND child.blocks_parent=1 AND child.status IN ('blocked','waiting_for_input','cancelled'))
+                     OR EXISTS(SELECT 1 FROM work_attempts WHERE task_id=tasks.id AND status='waiting_for_input'))))
+                 ORDER BY updated_at DESC, created_at DESC, id DESC",
+            )?;
+            let mut rows = statement.query([agent_id])?;
+            let mut tasks = Vec::new();
+            while let Some(row) = rows.next()? {
+                tasks.push(row_to_task(row)?);
+            }
+            Ok(tasks)
+        })?;
+        let mut attention = Vec::new();
+        for task in candidates {
+            // A cancelled required review still blocks its active parent. Show
+            // the parent needing intervention, without treating resolved or
+            // optional cancelled work as a new error. Reuse activity precedence
+            // so a running worker or deferred task is not mislabeled blocked.
+            if matches!(
+                self.activity_status(&task)?.as_str(),
+                "blocked" | "waiting_for_input"
+            ) {
+                attention.push(task);
+            }
+        }
+        Ok(attention)
+    }
+
     pub fn counts(&self) -> Result<TaskCounts> {
+        self.counts_for_search(None)
+    }
+
+    /// Count durable tasks by status, optionally restricted to tasks whose
+    /// visible task text or conversation contains every search term.
+    pub fn counts_for_search(&self, search: Option<&str>) -> Result<TaskCounts> {
         let conn = self.db.conn();
-        let mut stmt = conn.prepare(
-            "SELECT status, COUNT(*) as count FROM tasks
-             WHERE hidden = 0 AND parent_task_id IS NULL GROUP BY status",
-        )?;
+        let mut sql = "SELECT status, COUNT(*) as count FROM tasks
+             WHERE hidden = 0 AND provenance != 'native_plan'"
+            .to_string();
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        append_task_search(&mut sql, &mut params, search);
+        sql.push_str(" GROUP BY status");
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|param| param.as_ref()).collect();
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
-            .query_map([], |row| {
+            .query_map(param_refs.as_slice(), |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
             })?
             .filter_map(|r| r.ok())
@@ -708,36 +1569,49 @@ impl TaskBoard {
     /// Add a dependency: task_id cannot start until depends_on_id completes.
     /// Returns error if this would create a cycle.
     pub fn add_dependency(&self, task_id: &str, depends_on_id: &str) -> Result<()> {
-        if task_id == depends_on_id {
-            return Err(Error::Task("a task cannot depend on itself".into()));
-        }
-        // Cycle detection: DFS from depends_on_id — can we reach task_id?
-        if self.would_create_cycle(task_id, depends_on_id)? {
-            return Err(Error::Task(format!(
-                "cannot add dependency: would create a cycle ({task_id} → {depends_on_id} → ... → {task_id})"
-            )));
-        }
         self.db.with_conn(|conn| {
-            conn.execute(
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn, rusqlite::TransactionBehavior::Immediate)?;
+            TaskQueue::ensure_locally_scheduled(&transaction, task_id)?;
+            if task_id == depends_on_id {
+                return Err(Error::Task("a task cannot depend on itself".into()));
+            }
+            // Hold the writer lock through cycle detection and insertion.
+            if Self::would_create_cycle(&transaction, task_id, depends_on_id)? {
+                return Err(Error::Task(format!(
+                    "cannot add dependency: would create a cycle ({task_id} → {depends_on_id} → ... → {task_id})"
+                )));
+            }
+            transaction.execute(
                 "INSERT OR IGNORE INTO task_dependencies (task_id, depends_on_id) VALUES (?1, ?2)",
                 rusqlite::params![task_id, depends_on_id],
-            )
-        })?;
-        Ok(())
+            )?;
+            transaction.commit()?;
+            Ok(())
+        })
     }
 
     /// Check if adding task_id → depends_on_id would create a cycle.
-    fn would_create_cycle(&self, task_id: &str, depends_on_id: &str) -> Result<bool> {
-        // DFS from depends_on_id: can we reach task_id?
+    fn would_create_cycle(
+        conn: &rusqlite::Connection,
+        task_id: &str,
+        depends_on_id: &str,
+    ) -> Result<bool> {
         let mut visited = std::collections::HashSet::new();
         let mut stack = vec![depends_on_id.to_string()];
+        // Parent completion also waits on durable blocking children. Include
+        // those edges so indirect dependencies cannot deadlock a whole plan.
+        let mut dependencies = conn.prepare(
+            "SELECT depends_on_id FROM task_dependencies WHERE task_id=?1
+             UNION SELECT id FROM tasks WHERE parent_task_id=?1 AND blocks_parent=1",
+        )?;
         while let Some(current) = stack.pop() {
             if current == task_id {
                 return Ok(true);
             }
             if visited.insert(current.clone()) {
-                for dep in self.get_dependencies(&current)? {
-                    stack.push(dep);
+                for dep in dependencies.query_map([&current], |row| row.get::<_, String>(0))? {
+                    stack.push(dep?);
                 }
             }
         }
@@ -809,52 +1683,467 @@ impl TaskBoard {
         tasks: &[BatchTaskInput],
         parent_task_id: Option<&str>,
     ) -> Result<Vec<Task>> {
-        let mut ref_to_id: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-        let mut created = Vec::new();
+        self.create_batch_inner(tasks, parent_task_id, None)
+    }
 
-        // First pass: create all tasks and map refs to UUIDs
-        for input in tasks {
-            let task = self.create(&CreateTask {
-                title: input.title.clone(),
-                description: input.description.clone(),
-                agent_id: input.agent_id.clone(),
-                parent_task_id: parent_task_id.map(|s| s.to_string()),
-                sop_id: None,
-                conversation_id: None,
-                priority: input.priority,
-                context: Some(serde_json::json!({
-                    "session_mode": if input.new_session { "new" } else { "continue" },
-                })),
-            })?;
-            if let Some(ref r) = input.ref_name {
-                ref_to_id.insert(r.clone(), task.id.clone());
-            }
-            created.push(task);
+    /// Commit a manager's complete plan and its queue entries together.
+    pub fn create_batch_for_agent(
+        &self,
+        tasks: &[BatchTaskInput],
+        parent_task_id: Option<&str>,
+        creator: &str,
+    ) -> Result<Vec<Task>> {
+        self.create_batch_inner(tasks, parent_task_id, Some(creator))
+    }
+
+    fn create_batch_inner(
+        &self,
+        tasks: &[BatchTaskInput],
+        parent_task_id: Option<&str>,
+        creator: Option<&str>,
+    ) -> Result<Vec<Task>> {
+        if tasks.is_empty() || tasks.len() > 100 {
+            return Err(Error::Task(
+                "Create between 1 and 100 tasks per batch".into(),
+            ));
         }
-
-        // Second pass: add dependency edges
-        for (i, input) in tasks.iter().enumerate() {
-            if let Some(ref deps) = input.depends_on {
-                let task_id = &created[i].id;
-                for dep_ref in deps {
-                    // Resolve ref to UUID — could be a batch ref or an existing task UUID
-                    let dep_id = ref_to_id
-                        .get(dep_ref)
-                        .cloned()
-                        .unwrap_or_else(|| dep_ref.clone());
-                    self.add_dependency(task_id, &dep_id)?;
+        self.db.with_conn(|conn| {
+            let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+            let project = creator.map(|agent| crate::projects::agent_project(&tx, agent)).transpose()?;
+            if let (Some(project), Some(parent)) = (project.as_deref(), parent_task_id) {
+                // Idle turns have a hidden current task, which must still be
+                // able to delegate through the existing default-parent contract.
+                if !tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?1 AND project_id=?2
+                     AND provenance!='native_plan' AND (hidden=0 OR agent_id=?3))",
+                    rusqlite::params![parent, project, creator], |row| row.get::<_, bool>(0),
+                )? {
+                    return Err(Error::ProjectAccess("Parent task was not found in the current Project".into()));
                 }
             }
-        }
+            let mut references = std::collections::HashMap::new();
+            let mut ids = Vec::new();
+            for input in tasks {
+                if input.title.trim().is_empty() {
+                    return Err(Error::Task("Task titles must not be empty".into()));
+                }
+                if input.priority.is_some_and(|priority| !(-1000..=1000).contains(&priority)) {
+                    return Err(Error::Task("Priority must be between -1000 and 1000".into()));
+                }
+                let mut context = serde_json::json!({
+                    "session_mode": if input.new_session { "new" } else { "continue" },
+                });
+                if let Some(project) = &project {
+                    let assigned = input.agent_id.as_deref().or(creator).unwrap();
+                    if !tx.query_row("SELECT EXISTS(SELECT 1 FROM agents WHERE id=?1 AND project_id=?2)",
+                        rusqlite::params![assigned, project], |row| row.get::<_, bool>(0))? {
+                        return Err(Error::ProjectAccess("Assigned Agent was not found in the current Project; use list_project_agents to obtain its ID".into()));
+                    }
+                    context["project_id"] = project.clone().into();
+                }
+                let id = Self::create_in_transaction(&tx, &CreateTask {
+                    start_after: input.start_after.clone(), backlog: input.backlog,
+                    title: input.title.clone(), description: input.description.clone(),
+                    agent_id: input.agent_id.clone().or_else(|| creator.map(str::to_owned)),
+                    parent_task_id: parent_task_id.map(str::to_owned),
+                    priority: input.priority, context: Some(context), ..Default::default()
+                }, None)?;
+                if let Some(reference) = &input.ref_name {
+                    if reference.trim().is_empty() || references.insert(reference.clone(), id.clone()).is_some() {
+                        return Err(Error::Task("Batch task refs must be non-empty and unique".into()));
+                    }
+                }
+                ids.push(id);
+            }
+            for (input, id) in tasks.iter().zip(&ids) {
+                for reference in input.depends_on.iter().flatten() {
+                    let dependency = references.get(reference).unwrap_or(reference);
+                    if let Some(project) = project.as_deref() {
+                        crate::projects::require_project_task(&tx, project, dependency)?;
+                    }
+                    if Self::would_create_cycle(&tx, id, dependency)? {
+                        return Err(Error::Task("Task dependencies would create a completion cycle".into()));
+                    }
+                    TaskQueue::ensure_locally_scheduled(&tx, dependency)?;
+                    tx.execute("INSERT OR IGNORE INTO task_dependencies(task_id,depends_on_id) VALUES(?1,?2)",
+                        rusqlite::params![id, dependency])?;
+                }
+            }
+            if creator.is_some() {
+                for (input, id) in tasks.iter().zip(&ids).filter(|(input, _)| !input.backlog) {
+                    TaskQueue::enqueue_in_transaction(&tx, id,
+                        input.agent_id.as_deref().or(creator).unwrap())?;
+                }
+            }
+            let created = ids.iter().map(|id| {
+                tx.query_row("SELECT * FROM tasks WHERE id=?1", [id], |row| Ok(row_to_task(row)))
+                    .map_err(Error::from)?
+            }).collect::<Result<Vec<_>>>()?;
+            tx.commit()?;
+            Ok(created)
+        })
+    }
+}
 
-        Ok(created)
+fn consistent_project_id<const N: usize>(
+    candidates: [(&str, Option<&str>); N],
+) -> Result<Option<String>> {
+    let mut selected: Option<(&str, &str)> = None;
+    for (label, project_id) in candidates {
+        let Some(project_id) = project_id else {
+            continue;
+        };
+        if let Some((selected_label, selected_project_id)) = selected {
+            if selected_project_id != project_id {
+                return Err(Error::Task(format!(
+                    "task {label} belongs to project '{project_id}', but its {selected_label} belongs to project '{selected_project_id}'"
+                )));
+            }
+        } else {
+            selected = Some((label, project_id));
+        }
+    }
+    Ok(selected.map(|(_, project_id)| project_id.to_string()))
+}
+
+pub(super) fn ensure_task_agent_project(
+    conn: &rusqlite::Connection,
+    task_id: &str,
+    agent_id: &str,
+) -> Result<()> {
+    let (current_agent, task_project) = conn.query_row(
+        "SELECT agent_id, project_id FROM tasks WHERE id = ?1",
+        [task_id],
+        |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+            ))
+        },
+    )?;
+    // Native status transitions retain the bound Agent. Local assignment
+    // changes (including unassignment) must not invalidate a platform lease.
+    if current_agent.as_deref() != Some(agent_id) {
+        super::queue::TaskQueue::ensure_locally_scheduled(conn, task_id)?;
+    }
+    // The update API historically uses an empty string as its unassigned
+    // sentinel. Preserve that behavior; monitored pull requests apply their
+    // stricter unassignment rule immediately after this check.
+    if agent_id.is_empty() {
+        return Ok(());
+    }
+    let agent_project = conn
+        .query_row(
+            "SELECT project_id FROM agents WHERE id = ?1",
+            [agent_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .ok_or_else(|| Error::AgentNotFound {
+            name: agent_id.to_string(),
+        })?;
+    let project_id = consistent_project_id([
+        ("task", task_project.as_deref()),
+        ("Agent", agent_project.as_deref()),
+    ])?;
+    if let Some(project_id) = project_id {
+        ensure_project_accepts_work(conn, &project_id)?;
+        ensure_task_hierarchy_project(conn, task_id, &project_id)?;
+    }
+    Ok(())
+}
+
+/// Adopt an otherwise-projectless parent/child component into one Project.
+///
+/// Project assignment is an invariant of the complete task hierarchy rather
+/// than one row. Callers hold an IMMEDIATE transaction, so validation and the
+/// null-only adoption cannot race another hierarchy mutation. Any existing
+/// conflicting scope fails closed without changing part of the tree.
+fn ensure_task_hierarchy_project(
+    conn: &rusqlite::Connection,
+    task_id: &str,
+    project_id: &str,
+) -> Result<()> {
+    let has_conflicting_scope: bool = conn.query_row(
+        "WITH RECURSIVE
+         task_links(origin_id, linked_id) AS (
+             SELECT id, parent_task_id FROM tasks WHERE parent_task_id IS NOT NULL
+             UNION
+             SELECT parent_task_id, id FROM tasks WHERE parent_task_id IS NOT NULL
+         ),
+         hierarchy(id) AS (
+             SELECT ?1
+             UNION
+             SELECT task_links.linked_id
+             FROM hierarchy
+             JOIN task_links ON task_links.origin_id = hierarchy.id
+         )
+         SELECT EXISTS(
+             SELECT 1
+             FROM tasks
+             JOIN hierarchy ON hierarchy.id = tasks.id
+             WHERE (tasks.project_id IS NOT NULL AND tasks.project_id <> ?2)
+                OR EXISTS (
+                    SELECT 1 FROM agents
+                    WHERE agents.id = tasks.agent_id
+                      AND agents.project_id IS NOT NULL
+                      AND agents.project_id <> ?2
+                )
+                OR EXISTS (
+                    SELECT 1 FROM conversations
+                    WHERE conversations.id = tasks.conversation_id
+                      AND conversations.project_id IS NOT NULL
+                      AND conversations.project_id <> ?2
+                )
+         )",
+        rusqlite::params![task_id, project_id],
+        |row| row.get(0),
+    )?;
+    if has_conflicting_scope {
+        return Err(Error::Task(format!(
+            "task hierarchy cannot be assigned to project '{project_id}' because part of it belongs to another project"
+        )));
+    }
+
+    conn.execute(
+        "WITH RECURSIVE
+         task_links(origin_id, linked_id) AS (
+             SELECT id, parent_task_id FROM tasks WHERE parent_task_id IS NOT NULL
+             UNION
+             SELECT parent_task_id, id FROM tasks WHERE parent_task_id IS NOT NULL
+         ),
+         hierarchy(id) AS (
+             SELECT ?1
+             UNION
+             SELECT task_links.linked_id
+             FROM hierarchy
+             JOIN task_links ON task_links.origin_id = hierarchy.id
+         )
+         UPDATE tasks
+         SET project_id = ?2
+         WHERE project_id IS NULL AND id IN (SELECT id FROM hierarchy)",
+        rusqlite::params![task_id, project_id],
+    )?;
+    Ok(())
+}
+
+fn synchronize_pull_request_agent(
+    conn: &rusqlite::Connection,
+    task_id: &str,
+    agent_id: &str,
+    agent_repository: Option<(&str, &str)>,
+) -> Result<Option<String>> {
+    let has_active_pull_request: bool = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM task_pull_requests
+            WHERE task_id = ?1 AND status IN ('waiting', 'attention')
+         )",
+        [task_id],
+        |row| row.get(0),
+    )?;
+    if !has_active_pull_request {
+        return Ok(None);
+    }
+    if agent_id.trim().is_empty() {
+        return Err(Error::Task(
+            "cannot unassign a task while pull-request review monitoring is active".into(),
+        ));
+    }
+    let previous_agent_id: String = conn.query_row(
+        "SELECT agent_id FROM tasks WHERE id = ?1",
+        [task_id],
+        |row| row.get(0),
+    )?;
+    let running_dispatch: bool = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM task_queue
+            WHERE task_id = ?1 AND status = 'running'
+         )",
+        [task_id],
+        |row| row.get(0),
+    )?;
+    if previous_agent_id != agent_id && running_dispatch {
+        return Err(Error::Task(
+            "cannot reassign a task while its agent turn is running; stop it first".into(),
+        ));
+    }
+    if previous_agent_id != agent_id {
+        let Some((owner, repo)) = agent_repository else {
+            return Err(Error::Task(
+                "cannot reassign a monitored pull request because the destination agent's project-scoped GitHub repository could not be verified".into(),
+            ));
+        };
+        let incompatible_repository: bool = conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM task_pull_requests
+                WHERE task_id = ?1 AND status IN ('waiting', 'attention')
+                  AND (owner != ?2 COLLATE NOCASE OR repo != ?3 COLLATE NOCASE)
+             )",
+            rusqlite::params![task_id, owner, repo],
+            |row| row.get(0),
+        )?;
+        if incompatible_repository {
+            return Err(Error::Task(
+                "cannot reassign a monitored pull request to an agent using a different GitHub repository".into(),
+            ));
+        }
+        let destination_lane_reserved: bool = conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM task_pull_requests destination_pr
+                JOIN tasks destination_task ON destination_task.id = destination_pr.task_id
+                WHERE destination_pr.agent_id = ?1
+                  AND destination_pr.task_id != ?2
+                  AND destination_pr.status IN ('waiting', 'attention')
+                  AND destination_task.status NOT IN ('completed', 'cancelled')
+             )",
+            rusqlite::params![agent_id, task_id],
+            |row| row.get(0),
+        )?;
+        if destination_lane_reserved {
+            return Err(Error::Task(
+                "cannot reassign a monitored pull request because the destination agent is already reserved by another active pull-request review task".into(),
+            ));
+        }
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO logical_sessions (id, agent_id) VALUES (?1, ?1)",
+        [agent_id],
+    )?;
+    conn.execute(
+        "UPDATE task_pull_requests SET agent_id = ?1
+         WHERE task_id = ?2 AND status IN ('waiting', 'attention')",
+        rusqlite::params![agent_id, task_id],
+    )?;
+    conn.execute(
+        "UPDATE session_events SET session_id = ?1
+         WHERE attempt_id IN (
+            SELECT attempt_id FROM task_queue
+            WHERE task_id = ?2 AND status = 'queued' AND attempt_id IS NOT NULL
+         )",
+        rusqlite::params![agent_id, task_id],
+    )?;
+    conn.execute(
+        "UPDATE attempt_artifacts SET session_id = ?1
+         WHERE attempt_id IN (
+            SELECT attempt_id FROM task_queue
+            WHERE task_id = ?2 AND status = 'queued' AND attempt_id IS NOT NULL
+         )",
+        rusqlite::params![agent_id, task_id],
+    )?;
+    conn.execute(
+        "UPDATE work_attempts SET session_id = ?1
+         WHERE id IN (
+            SELECT attempt_id FROM task_queue
+            WHERE task_id = ?2 AND status = 'queued' AND attempt_id IS NOT NULL
+         ) AND status = 'queued'",
+        rusqlite::params![agent_id, task_id],
+    )?;
+    conn.execute(
+        "UPDATE task_queue SET agent_id = ?1
+         WHERE task_id = ?2 AND status = 'queued'",
+        rusqlite::params![agent_id, task_id],
+    )?;
+    conn.execute(
+        "UPDATE tasks SET session_id = ?1 WHERE id = ?2",
+        rusqlite::params![agent_id, task_id],
+    )?;
+    Ok(Some(previous_agent_id))
+}
+
+pub(super) fn refresh_logical_session_status(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+) -> Result<()> {
+    let active_attempt: bool = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM work_attempts
+            WHERE session_id = ?1 AND status IN ('preparing', 'running', 'review')
+         )",
+        [session_id],
+        |row| row.get(0),
+    )?;
+    let queued_attempt: bool = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM work_attempts WHERE session_id = ?1 AND status = 'queued'
+         )",
+        [session_id],
+        |row| row.get(0),
+    )?;
+    let waiting_task: bool = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM tasks WHERE agent_id = ?1 AND status = 'waiting_for_input'
+         )",
+        [session_id],
+        |row| row.get(0),
+    )?;
+    let blocked_task: bool = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM tasks WHERE agent_id = ?1 AND status = 'blocked'
+         )",
+        [session_id],
+        |row| row.get(0),
+    )?;
+    let status = if active_attempt {
+        "running"
+    } else if queued_attempt {
+        "queued"
+    } else if waiting_task {
+        "waiting_for_input"
+    } else if blocked_task {
+        "blocked"
+    } else {
+        "idle"
+    };
+    conn.execute(
+        "UPDATE logical_sessions SET status = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+        rusqlite::params![status, session_id],
+    )?;
+    Ok(())
+}
+
+pub(super) fn append_task_search(
+    sql: &mut String,
+    params: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
+    search: Option<&str>,
+) {
+    let mut seen = std::collections::HashSet::new();
+    let terms = search
+        .into_iter()
+        .flat_map(str::split_whitespace)
+        .map(crate::db::task_search_key)
+        .filter(|term| !term.is_empty())
+        .filter(|term| seen.insert(term.clone()));
+
+    for term in terms {
+        sql.push_str(
+            " AND (
+                instr(xpressclaw_task_search_key(tasks.title), ?) > 0
+                OR instr(xpressclaw_task_search_key(COALESCE(tasks.description, '')), ?) > 0
+                OR EXISTS (
+                    SELECT 1 FROM task_messages
+                    WHERE task_messages.task_id = tasks.id
+                      AND instr(xpressclaw_task_search_key(task_messages.content), ?) > 0
+                )
+                OR EXISTS (
+                    SELECT 1 FROM session_events
+                    WHERE session_events.task_id = tasks.id
+                      AND session_events.event_type IN ('runner_progress', 'agent_thought')
+                      AND instr(xpressclaw_task_search_key(session_events.summary), ?) > 0
+                )
+            )",
+        );
+        for _ in 0..4 {
+            params.push(Box::new(term.clone()));
+        }
     }
 }
 
 /// Input for batch task creation.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 pub struct BatchTaskInput {
+    #[serde(default)]
+    pub backlog: bool,
+    pub start_after: Option<String>,
     /// Local reference name for cross-referencing within the batch.
     #[serde(rename = "ref")]
     pub ref_name: Option<String>,
@@ -871,7 +2160,7 @@ pub struct BatchTaskInput {
     pub depends_on: Option<Vec<String>>,
 }
 
-fn row_to_task(row: &rusqlite::Row) -> Result<Task> {
+pub(super) fn row_to_task(row: &rusqlite::Row) -> Result<Task> {
     let context_str: Option<String> = row.get("context")?;
     let context = context_str
         .as_deref()
@@ -885,14 +2174,24 @@ fn row_to_task(row: &rusqlite::Row) -> Result<Task> {
         description: row.get("description")?,
         status: TaskStatus::parse(&status_str)?,
         priority: row.get("priority")?,
+        start_after: row.get("start_after").unwrap_or(None),
+        backlog: row.get("backlog").unwrap_or(false),
+        position: row.get("position").unwrap_or(0.0),
+        revision: row.get("revision").unwrap_or(0),
         agent_id: row.get("agent_id")?,
         parent_task_id: row.get("parent_task_id")?,
         sop_id: row.get("sop_id")?,
         conversation_id: row.get("conversation_id").unwrap_or(None),
+        project_id: row.get("project_id").unwrap_or(None),
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
         completed_at: row.get("completed_at")?,
         context,
+        provenance: row
+            .get::<_, String>("provenance")
+            .unwrap_or_else(|_| default_task_provenance()),
+        blocks_parent: row.get::<_, i32>("blocks_parent").unwrap_or(1) != 0,
+        parent_review_required: row.get("parent_review_required").unwrap_or(false),
         task_type: row
             .get::<_, String>("task_type")
             .unwrap_or_else(|_| "normal".to_string()),
@@ -910,11 +2209,115 @@ mod tests {
         (db, board)
     }
 
+    fn add_test_agents(db: &Arc<Database>, agent_ids: &[&str]) {
+        db.with_conn(|conn| {
+            for agent_id in agent_ids {
+                conn.execute(
+                    "INSERT INTO agents (id, name, backend, config) VALUES (?1, ?1, 'native', '{}')",
+                    [agent_id],
+                )?;
+            }
+            Ok::<_, rusqlite::Error>(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn attention_includes_parent_blocked_by_cancelled_required_review() {
+        let (db, board) = setup();
+        db.conn()
+            .execute_batch(
+                "INSERT INTO tasks(id,title,status,agent_id) VALUES
+            ('parent','Benchmark','in_progress','owner'),
+            ('optional-parent','Optional review','in_progress','owner'),
+            ('finished-parent','Finished','completed','owner');
+            INSERT INTO tasks(id,title,status,agent_id,parent_task_id,blocks_parent) VALUES
+            ('required','Required review','cancelled','reviewer','parent',1),
+            ('optional','Optional review','cancelled','reviewer','optional-parent',0),
+            ('finished-child','Old review','cancelled','reviewer','finished-parent',1);",
+            )
+            .unwrap();
+        for i in 0..110 {
+            db.conn().execute("INSERT INTO tasks(id,title,status,agent_id) VALUES(?1,'Newer history','completed','owner')", [format!("history-{i}")]).unwrap();
+        }
+        let attention = board.list_attention(Some("owner")).unwrap();
+        assert_eq!(
+            attention
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["parent"]
+        );
+        assert_eq!(board.activity_status(&attention[0]).unwrap(), "blocked");
+        assert!(board.current_error(&attention[0]).unwrap().is_none());
+        assert!(board.list_attention(Some("reviewer")).unwrap().is_empty());
+        db.conn()
+            .execute("UPDATE tasks SET blocks_parent=0 WHERE id='required'", [])
+            .unwrap();
+        assert!(board.list_attention(None).unwrap().is_empty());
+        db.conn()
+            .execute(
+                "UPDATE tasks SET blocks_parent=1,status='completed' WHERE id='required'",
+                [],
+            )
+            .unwrap();
+        assert!(board.list_attention(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn delegated_tasks_appear_in_lists_counts_and_attention() {
+        let (db, board) = setup();
+        db.conn().execute_batch("INSERT INTO projects(id,name) VALUES('p','Project');
+            INSERT INTO tasks(id,title,status,project_id) VALUES('parent','Parent','in_progress','p');
+            INSERT INTO tasks(id,title,status,agent_id,project_id,parent_task_id,provenance,hidden) VALUES
+              ('child','Review','blocked','reviewer','p','parent','durable',0),
+              ('plan','Step','blocked','reviewer','p','parent','native_plan',0),
+              ('hidden','Idle','blocked','reviewer','p',NULL,'durable',1);").unwrap();
+        let list = board
+            .list_page(&[], Some("reviewer"), None, 100, 0)
+            .unwrap();
+        assert_eq!(
+            list.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            vec!["child"]
+        );
+        assert_eq!(board.list_recent_per_agent(5).unwrap().len(), 2);
+        assert_eq!(board.list_for_project("p", 100).unwrap().len(), 2);
+        assert_eq!(board.counts().unwrap().blocked, 1);
+        assert_eq!(board.counts_for_search(Some("Review")).unwrap().blocked, 1);
+        assert_eq!(board.list_attention(Some("reviewer")).unwrap().len(), 1);
+        assert!(board
+            .list_attention(Some("different-agent"))
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            board
+                .activity_status(&board.get("parent").unwrap())
+                .unwrap(),
+            "blocked"
+        );
+        db.conn()
+            .execute(
+                "UPDATE tasks SET status='completed' WHERE id IN ('child','plan')",
+                [],
+            )
+            .unwrap();
+        assert!(board.list_attention(None).unwrap().is_empty());
+    }
+
     #[test]
     fn test_create_and_get_task() {
-        let (_, board) = setup();
+        let (db, board) = setup();
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO agents (id, name, backend, config) VALUES ('atlas', 'Atlas', 'native', '{}')",
+                [],
+            )
+        })
+        .unwrap();
         let task = board
             .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "Test task".to_string(),
                 description: Some("A test".to_string()),
                 agent_id: Some("atlas".to_string()),
@@ -935,10 +2338,327 @@ mod tests {
     }
 
     #[test]
-    fn test_update_status() {
-        let (_, board) = setup();
+    fn tasks_preserve_their_project_boundary() {
+        let (db, board) = setup();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO projects (id, name) VALUES ('one', 'One'), ('two', 'Two');
+                 INSERT INTO agents (id, name, backend, config, project_id)
+                 VALUES ('atlas', 'Atlas', 'native', '{}', 'one'),
+                        ('other', 'Other', 'native', '{}', 'two');
+                 INSERT INTO conversations (id, title, project_id)
+                 VALUES ('launch', 'Launch', 'one');",
+            )
+        })
+        .unwrap();
+
         let task = board
             .create(&CreateTask {
+                title: "Ship it".into(),
+                agent_id: Some("atlas".into()),
+                conversation_id: Some("launch".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(task.project_id.as_deref(), Some("one"));
+
+        let mismatch = board.create(&CreateTask {
+            title: "Wrong project".into(),
+            agent_id: Some("other".into()),
+            conversation_id: Some("launch".into()),
+            ..Default::default()
+        });
+        assert!(matches!(mismatch, Err(Error::Task(_))));
+
+        let reassignment = board.update(
+            &task.id,
+            &UpdateTask {
+                title: None,
+                description: None,
+                agent_id: Some("other".into()),
+                priority: None,
+            },
+        );
+        assert!(matches!(reassignment, Err(Error::Task(_))));
+
+        let detached = board
+            .create(&CreateTask {
+                title: "Adopt the conversation project".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        board.set_conversation_id(&detached.id, "launch").unwrap();
+        let detached = board.get(&detached.id).unwrap();
+        assert_eq!(detached.conversation_id.as_deref(), Some("launch"));
+        assert_eq!(detached.project_id.as_deref(), Some("one"));
+
+        let legacy_parent = board
+            .create(&CreateTask {
+                title: "Legacy parent".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let legacy_child = board
+            .create(&CreateTask {
+                title: "Legacy child".into(),
+                parent_task_id: Some(legacy_parent.id.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        board
+            .set_conversation_id(&legacy_child.id, "launch")
+            .unwrap();
+        assert_eq!(
+            board.get(&legacy_parent.id).unwrap().project_id.as_deref(),
+            Some("one")
+        );
+        assert_eq!(
+            board.get(&legacy_child.id).unwrap().project_id.as_deref(),
+            Some("one")
+        );
+
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO conversations (id, title, project_id)
+                 VALUES ('other-launch', 'Other launch', 'two')",
+                [],
+            )
+        })
+        .unwrap();
+        let mismatch = board.set_conversation_id(&task.id, "other-launch");
+        assert!(matches!(mismatch, Err(Error::Task(_))));
+        assert_eq!(
+            board.get(&task.id).unwrap().conversation_id.as_deref(),
+            Some("launch")
+        );
+        assert!(matches!(
+            board.set_conversation_id(&task.id, "missing"),
+            Err(Error::ConversationNotFound { .. })
+        ));
+        assert!(matches!(
+            board.set_conversation_id("missing", "launch"),
+            Err(Error::TaskNotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn agent_created_conversation_tasks_require_current_membership() {
+        let (db, board) = setup();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO projects (id, name) VALUES ('one', 'One');
+                 INSERT INTO agents (id, name, backend, config, project_id)
+                 VALUES ('atlas', 'Atlas', 'native', '{}', 'one');
+                 INSERT INTO conversations (id, title, project_id)
+                 VALUES ('launch', 'Launch', 'one');
+                 INSERT INTO conversation_participants
+                 (conversation_id, participant_type, participant_id)
+                 VALUES ('launch', 'agent', 'atlas');",
+            )
+        })
+        .unwrap();
+
+        board
+            .create_for_conversation_agent(
+                &CreateTask {
+                    title: "Authorized work".into(),
+                    agent_id: Some("atlas".into()),
+                    conversation_id: Some("launch".into()),
+                    ..Default::default()
+                },
+                "atlas",
+            )
+            .unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "DELETE FROM conversation_participants
+                 WHERE conversation_id = 'launch' AND participant_id = 'atlas'",
+                [],
+            )
+        })
+        .unwrap();
+
+        let rejected = board.create_for_conversation_agent(
+            &CreateTask {
+                title: "Stale work".into(),
+                agent_id: Some("atlas".into()),
+                conversation_id: Some("launch".into()),
+                ..Default::default()
+            },
+            "atlas",
+        );
+        assert!(matches!(rejected, Err(Error::Conversation(_))));
+        assert_eq!(board.list_for_conversation("launch").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn child_tasks_inherit_their_parent_project() {
+        let (db, board) = setup();
+        db.with_conn(|conn| {
+            conn.execute("INSERT INTO projects (id, name) VALUES ('one', 'One')", [])
+        })
+        .unwrap();
+        let parent = board
+            .create(&CreateTask {
+                title: "Parent".into(),
+                context: Some(serde_json::json!({ "project_id": "one" })),
+                ..Default::default()
+            })
+            .unwrap();
+        let child = board
+            .create(&CreateTask {
+                title: "Child".into(),
+                parent_task_id: Some(parent.id),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(child.project_id.as_deref(), Some("one"));
+    }
+
+    #[test]
+    fn projectless_parent_rejects_a_newly_scoped_child() {
+        let (db, board) = setup();
+        let parent = board
+            .create(&CreateTask {
+                title: "Legacy parent".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(parent.project_id.is_none());
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO projects (id, name) VALUES ('one', 'One');
+                 INSERT INTO agents (id, name, backend, config, project_id)
+                 VALUES ('atlas', 'Atlas', 'native', '{}', 'one');",
+            )
+        })
+        .unwrap();
+
+        let error = board
+            .create(&CreateTask {
+                title: "Scoped child".into(),
+                agent_id: Some("atlas".into()),
+                parent_task_id: Some(parent.id.clone()),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("projectless parent task"));
+        assert!(board.list_subtasks(&parent.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn agent_assignment_adopts_the_complete_projectless_hierarchy() {
+        let (db, board) = setup();
+        let parent = board
+            .create(&CreateTask {
+                title: "Legacy parent".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let child = board
+            .create(&CreateTask {
+                title: "Legacy child".into(),
+                parent_task_id: Some(parent.id.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        let grandchild = board
+            .create(&CreateTask {
+                title: "Legacy grandchild".into(),
+                parent_task_id: Some(child.id.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        let unrelated = board
+            .create(&CreateTask {
+                title: "Unrelated".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO projects (id, name) VALUES ('one', 'One');
+                 INSERT INTO agents (id, name, backend, config, project_id)
+                 VALUES ('atlas', 'Atlas', 'native', '{}', 'one');",
+            )
+        })
+        .unwrap();
+
+        board
+            .update(
+                &child.id,
+                &UpdateTask {
+                    title: None,
+                    description: None,
+                    agent_id: Some("atlas".into()),
+                    priority: None,
+                },
+            )
+            .unwrap();
+
+        for task_id in [&parent.id, &child.id, &grandchild.id] {
+            assert_eq!(
+                board.get(task_id).unwrap().project_id.as_deref(),
+                Some("one")
+            );
+        }
+        assert!(board.get(&unrelated.id).unwrap().project_id.is_none());
+    }
+
+    #[test]
+    fn agent_assignment_rejects_a_conflicting_hierarchy_atomically() {
+        let (db, board) = setup();
+        let parent = board
+            .create(&CreateTask {
+                title: "Legacy parent".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let child = board
+            .create(&CreateTask {
+                title: "Legacy child".into(),
+                parent_task_id: Some(parent.id.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO projects (id, name) VALUES ('one', 'One'), ('two', 'Two');
+                 INSERT INTO agents (id, name, backend, config, project_id)
+                 VALUES ('atlas', 'Atlas', 'native', '{}', 'one');",
+            )?;
+            conn.execute(
+                "UPDATE tasks SET project_id = 'two' WHERE id = ?1",
+                [&child.id],
+            )
+        })
+        .unwrap();
+
+        let error = board
+            .update_status(&parent.id, "in_progress", Some("atlas"))
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("part of it belongs to another project"));
+        let parent = board.get(&parent.id).unwrap();
+        assert_eq!(parent.status, TaskStatus::Pending);
+        assert!(parent.agent_id.is_none());
+        assert!(parent.project_id.is_none());
+        assert_eq!(
+            board.get(&child.id).unwrap().project_id.as_deref(),
+            Some("two")
+        );
+    }
+
+    #[test]
+    fn test_update_status() {
+        let (db, board) = setup();
+        add_test_agents(&db, &["atlas"]);
+        let task = board
+            .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "Status test".to_string(),
                 description: None,
                 agent_id: None,
@@ -966,10 +2686,275 @@ mod tests {
     }
 
     #[test]
+    fn task_reassignment_transfers_active_pull_request_monitoring() {
+        let (db, board) = setup();
+        add_test_agents(
+            &db,
+            &[
+                "project-codex",
+                "unverified-codex",
+                "other-project-codex",
+                "reviewer-codex",
+                "final-codex",
+                "late-codex",
+            ],
+        );
+        let task = board
+            .create(&CreateTask {
+                title: "Review ownership".to_string(),
+                agent_id: Some("project-codex".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO task_pull_requests
+                    (task_id, agent_id, owner, repo, number, url, status,
+                     started_at, expires_at, next_poll_at, poll_interval_seconds)
+                 VALUES (?1, 'project-codex', 'XpressAI', 'xpressclaw', 151,
+                         'https://github.com/XpressAI/xpressclaw/pull/151', 'waiting',
+                         '2026-08-10T00:00:00Z', '2026-08-24T00:00:00Z',
+                         '2026-08-10T00:00:00Z', 15)",
+                [&task.id],
+            )
+            .unwrap();
+        });
+        let queue = crate::tasks::queue::TaskQueue::new(db.clone());
+        let queued = queue
+            .enqueue_continuation(&task.id, "project-codex")
+            .unwrap()
+            .unwrap();
+        let attempt_id = queued.attempt_id.clone().unwrap();
+
+        let unavailable_error = board
+            .update(
+                &task.id,
+                &UpdateTask {
+                    title: None,
+                    description: None,
+                    agent_id: Some("unverified-codex".to_string()),
+                    priority: None,
+                },
+            )
+            .unwrap_err();
+        assert!(unavailable_error
+            .to_string()
+            .contains("could not be verified"));
+        assert_eq!(
+            board.get(&task.id).unwrap().agent_id.as_deref(),
+            Some("project-codex")
+        );
+
+        let incompatible_error = board
+            .update_with_agent_repository(
+                &task.id,
+                &UpdateTask {
+                    title: None,
+                    description: None,
+                    agent_id: Some("other-project-codex".to_string()),
+                    priority: None,
+                },
+                Some(("XpressAI", "different-repository")),
+            )
+            .unwrap_err();
+        assert!(incompatible_error
+            .to_string()
+            .contains("different GitHub repository"));
+        assert_eq!(
+            board.get(&task.id).unwrap().agent_id.as_deref(),
+            Some("project-codex")
+        );
+
+        let destination_task = board
+            .create(&CreateTask {
+                title: "Existing destination review".to_string(),
+                agent_id: Some("reviewer-codex".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO task_pull_requests
+                    (task_id, agent_id, owner, repo, number, url, status,
+                     started_at, expires_at, next_poll_at, poll_interval_seconds)
+                 VALUES (?1, 'reviewer-codex', 'XpressAI', 'xpressclaw', 152,
+                         'https://github.com/XpressAI/xpressclaw/pull/152', 'waiting',
+                         '2026-08-10T00:00:00Z', '2026-08-24T00:00:00Z',
+                         '2026-08-10T00:00:00Z', 15)",
+                [&destination_task.id],
+            )
+            .unwrap();
+        });
+        let reserved_error = board
+            .update_with_agent_repository(
+                &task.id,
+                &UpdateTask {
+                    title: None,
+                    description: None,
+                    agent_id: Some("reviewer-codex".to_string()),
+                    priority: None,
+                },
+                Some(("XpressAI", "xpressclaw")),
+            )
+            .unwrap_err();
+        assert!(reserved_error
+            .to_string()
+            .contains("already reserved by another active pull-request review task"));
+        assert_eq!(
+            board.get(&task.id).unwrap().agent_id.as_deref(),
+            Some("project-codex")
+        );
+        board
+            .update_status(&destination_task.id, "cancelled", None)
+            .unwrap();
+
+        let reassigned = board
+            .update_with_agent_repository(
+                &task.id,
+                &UpdateTask {
+                    title: None,
+                    description: None,
+                    agent_id: Some("reviewer-codex".to_string()),
+                    priority: None,
+                },
+                Some(("xpressai", "XPRESSCLAW")),
+            )
+            .unwrap();
+        assert_eq!(reassigned.agent_id.as_deref(), Some("reviewer-codex"));
+        let monitored_agent = || {
+            db.with_conn(|conn| {
+                conn.query_row(
+                    "SELECT agent_id FROM task_pull_requests WHERE task_id = ?1",
+                    [&task.id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap()
+            })
+        };
+        assert_eq!(monitored_agent(), "reviewer-codex");
+        assert_eq!(queue.get(queued.id).unwrap().agent_id, "reviewer-codex");
+        assert_eq!(
+            crate::sessions::SessionManager::new(db.clone())
+                .get_attempt(&attempt_id)
+                .unwrap()
+                .session_id,
+            "reviewer-codex"
+        );
+        assert!(queue
+            .enqueue_continuation(&task.id, "reviewer-codex")
+            .unwrap()
+            .is_none());
+        let (task_session, event_session, previous_status, current_status): (
+            String,
+            String,
+            String,
+            String,
+        ) = db
+            .with_conn(|conn| {
+                let task_session = conn.query_row(
+                    "SELECT session_id FROM tasks WHERE id = ?1",
+                    [&task.id],
+                    |row| row.get(0),
+                )?;
+                let event_session = conn.query_row(
+                    "SELECT session_id FROM session_events WHERE attempt_id = ?1",
+                    [&attempt_id],
+                    |row| row.get(0),
+                )?;
+                let previous_status = conn.query_row(
+                    "SELECT status FROM logical_sessions WHERE id = 'project-codex'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let current_status = conn.query_row(
+                    "SELECT status FROM logical_sessions WHERE id = 'reviewer-codex'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                Ok::<_, rusqlite::Error>((
+                    task_session,
+                    event_session,
+                    previous_status,
+                    current_status,
+                ))
+            })
+            .unwrap();
+        assert_eq!(task_session, "reviewer-codex");
+        assert_eq!(event_session, "reviewer-codex");
+        assert_eq!(previous_status, "idle");
+        assert_eq!(current_status, "queued");
+
+        board
+            .update_status_with_agent_repository(
+                &task.id,
+                "in_progress",
+                Some("final-codex"),
+                Some(("XpressAI", "xpressclaw")),
+            )
+            .unwrap();
+        assert_eq!(monitored_agent(), "final-codex");
+        assert_eq!(queue.get(queued.id).unwrap().agent_id, "final-codex");
+        assert_eq!(
+            crate::sessions::SessionManager::new(db.clone())
+                .get_attempt(&attempt_id)
+                .unwrap()
+                .session_id,
+            "final-codex"
+        );
+
+        let error = board
+            .update(
+                &task.id,
+                &UpdateTask {
+                    title: None,
+                    description: None,
+                    agent_id: Some(String::new()),
+                    priority: None,
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("cannot unassign"));
+        assert_eq!(
+            board.get(&task.id).unwrap().agent_id.as_deref(),
+            Some("final-codex")
+        );
+        assert_eq!(monitored_agent(), "final-codex");
+
+        assert_eq!(queue.claim("final-codex").unwrap().unwrap().id, queued.id);
+        let error = board
+            .update(
+                &task.id,
+                &UpdateTask {
+                    title: None,
+                    description: None,
+                    agent_id: Some("late-codex".to_string()),
+                    priority: None,
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("turn is running"));
+        assert_eq!(
+            board.get(&task.id).unwrap().agent_id.as_deref(),
+            Some("final-codex")
+        );
+        assert_eq!(monitored_agent(), "final-codex");
+    }
+
+    #[test]
     fn syncs_native_plan_steps_and_rolls_up_completion() {
-        let (_, board) = setup();
+        let (db, board) = setup();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO projects (id, name) VALUES ('one', 'One');
+                 INSERT INTO agents (id, name, backend, config, project_id)
+                 VALUES ('developer', 'Developer', 'native', '{}', 'one');",
+            )
+        })
+        .unwrap();
         let parent = board
             .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "Implement feature".to_string(),
                 description: None,
                 agent_id: Some("developer".to_string()),
@@ -998,7 +2983,19 @@ mod tests {
             )
             .unwrap();
         assert_eq!(initial.len(), 2);
-        assert!(!board.subtasks_complete(&parent.id).unwrap());
+        assert!(initial
+            .iter()
+            .all(|task| task.project_id.as_deref() == Some("one")));
+        assert!(initial.iter().all(Task::is_native_plan_item));
+        assert!(initial.iter().all(|task| !task.blocks_parent));
+        assert!(board.subtasks_complete(&parent.id).unwrap());
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE tasks SET project_id = NULL WHERE id = ?1",
+                [&initial[0].id],
+            )
+        })
+        .unwrap();
 
         let updated = board
             .sync_reported_subtasks(
@@ -1018,6 +3015,9 @@ mod tests {
             .unwrap();
         assert_eq!(updated.len(), 2);
         assert_eq!(updated[1].title, "Run the full test suite");
+        assert!(updated
+            .iter()
+            .all(|task| task.project_id.as_deref() == Some("one")));
         assert!(board.subtasks_complete(&parent.id).unwrap());
 
         let completed = board
@@ -1028,10 +3028,413 @@ mod tests {
     }
 
     #[test]
+    fn successful_turn_defers_future_plan_items_without_completing_them() {
+        let (_, board) = setup();
+        let parent = board
+            .create(&CreateTask {
+                title: "Revise pull request".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        board
+            .sync_reported_subtasks(
+                &parent.id,
+                "attempt-1",
+                &[
+                    ReportedSubtask {
+                        title: "Address current review feedback".to_string(),
+                        status: TaskStatus::Completed,
+                    },
+                    ReportedSubtask {
+                        title: "Address any further review feedback through approval or merge"
+                            .to_string(),
+                        status: TaskStatus::InProgress,
+                    },
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(
+            board
+                .defer_reported_subtasks(&parent.id, "successful_attempt_completed")
+                .unwrap(),
+            1
+        );
+        let steps = board.list_subtasks(&parent.id).unwrap();
+        assert_eq!(steps[0].status, TaskStatus::Completed);
+        assert_eq!(steps[1].status, TaskStatus::Cancelled);
+        assert_eq!(
+            steps[1]
+                .context
+                .as_ref()
+                .and_then(|context| context.get("plan_disposition"))
+                .and_then(serde_json::Value::as_str),
+            Some("deferred")
+        );
+        assert!(board.subtasks_complete(&parent.id).unwrap());
+        assert_eq!(
+            board.complete_and_roll_up(&parent.id, None).unwrap().len(),
+            1
+        );
+        assert_eq!(board.get(&parent.id).unwrap().status, TaskStatus::Completed);
+    }
+
+    #[test]
+    fn manual_completion_atomically_defers_unfinished_plan_items() {
+        let (_, board) = setup();
+        let parent = board
+            .create(&CreateTask {
+                title: "Manually completed work".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        board
+            .sync_reported_subtasks(
+                &parent.id,
+                "attempt-1",
+                &[
+                    ReportedSubtask {
+                        title: "Finished current work".to_string(),
+                        status: TaskStatus::Completed,
+                    },
+                    ReportedSubtask {
+                        title: "Future follow-up".to_string(),
+                        status: TaskStatus::InProgress,
+                    },
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(
+            board.complete_and_roll_up(&parent.id, None).unwrap().len(),
+            1
+        );
+        assert_eq!(board.get(&parent.id).unwrap().status, TaskStatus::Completed);
+        let steps = board.list_subtasks(&parent.id).unwrap();
+        assert_eq!(steps[0].status, TaskStatus::Completed);
+        assert_eq!(steps[1].status, TaskStatus::Cancelled);
+        assert_eq!(
+            steps[1]
+                .context
+                .as_ref()
+                .and_then(|context| context.get("plan_disposition"))
+                .and_then(serde_json::Value::as_str),
+            Some("deferred")
+        );
+        assert_eq!(
+            steps[1]
+                .context
+                .as_ref()
+                .and_then(|context| context.get("resolved_reason"))
+                .and_then(serde_json::Value::as_str),
+            Some("task_completed")
+        );
+    }
+
+    #[test]
+    fn durable_delegated_subtask_still_blocks_parent_completion() {
+        let (_, board) = setup();
+        let parent = board
+            .create(&CreateTask {
+                title: "Parent".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        let delegated = board
+            .create(&CreateTask {
+                title: "Durable delegated work".to_string(),
+                parent_task_id: Some(parent.id.clone()),
+                context: Some(serde_json::json!({ "origin": "delegated" })),
+                ..Default::default()
+            })
+            .unwrap();
+        board
+            .sync_reported_subtasks(
+                &parent.id,
+                "attempt-1",
+                &[ReportedSubtask {
+                    title: "Future aspiration".to_string(),
+                    status: TaskStatus::InProgress,
+                }],
+            )
+            .unwrap();
+
+        assert_eq!(delegated.provenance, "delegated");
+        assert!(delegated.blocks_parent);
+        assert!(!board.subtasks_complete(&parent.id).unwrap());
+        assert!(board
+            .complete_and_roll_up(&parent.id, None)
+            .unwrap()
+            .is_empty());
+        assert_eq!(board.get(&parent.id).unwrap().status, TaskStatus::Pending);
+        let plan = board
+            .list_subtasks(&parent.id)
+            .unwrap()
+            .into_iter()
+            .find(Task::is_native_plan_item)
+            .unwrap();
+        assert_eq!(plan.status, TaskStatus::InProgress);
+        assert!(plan
+            .context
+            .as_ref()
+            .and_then(|context| context.get("plan_disposition"))
+            .is_none());
+    }
+
+    #[test]
+    fn explicit_task_creation_cannot_impersonate_an_ephemeral_plan_item() {
+        let (_, board) = setup();
+        let parent = board
+            .create(&CreateTask {
+                title: "Parent".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        let child = board
+            .create(&CreateTask {
+                title: "Explicit work with copied context".to_string(),
+                parent_task_id: Some(parent.id.clone()),
+                context: Some(serde_json::json!({ "origin": "native_plan" })),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(child.provenance, "durable");
+        assert!(child.blocks_parent);
+        assert!(!board.subtasks_complete(&parent.id).unwrap());
+    }
+
+    #[test]
+    fn reconciles_legacy_plan_blocker_after_a_successful_idle_attempt() {
+        let (db, board) = setup();
+        let parent = board
+            .create(&CreateTask {
+                title: "Previously stranded work".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        board
+            .sync_reported_subtasks(
+                &parent.id,
+                "attempt-1",
+                &[ReportedSubtask {
+                    title: "Follow approval or merge".to_string(),
+                    status: TaskStatus::InProgress,
+                }],
+            )
+            .unwrap();
+        let queued = crate::tasks::queue::TaskQueue::new(db.clone())
+            .enqueue(&parent.id, "developer")
+            .unwrap();
+        board
+            .update_status(&parent.id, "in_progress", None)
+            .unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE task_queue SET status = 'completed', completed_at = CURRENT_TIMESTAMP
+                 WHERE id = ?1",
+                [queued.id],
+            )?;
+            conn.execute(
+                "UPDATE work_attempts SET status = 'completed', completed_at = CURRENT_TIMESTAMP,
+                    result = 'The requested revision is complete.' WHERE id = ?1",
+                [queued.attempt_id.as_deref().unwrap()],
+            )?;
+            Ok::<_, rusqlite::Error>(())
+        })
+        .unwrap();
+
+        assert_eq!(
+            board
+                .activity_status(&board.get(&parent.id).unwrap())
+                .unwrap(),
+            "idle"
+        );
+        let reconciliation = board.reconcile_finished_reported_plans().unwrap();
+        assert_eq!(reconciliation.deferred_items, 1);
+        assert_eq!(reconciliation.completed_tasks.len(), 1);
+        assert_eq!(board.get(&parent.id).unwrap().status, TaskStatus::Completed);
+        assert_eq!(
+            board.list_subtasks(&parent.id).unwrap()[0].status,
+            TaskStatus::Cancelled
+        );
+    }
+
+    #[test]
+    fn activity_status_explains_unmet_dependencies_without_releasing_queued_guidance() {
+        let (db, board) = setup();
+        add_test_agents(&db, &["developer"]);
+        let prerequisite = board
+            .create(&CreateTask {
+                title: "Approve prerequisite".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let task = board
+            .create(&CreateTask {
+                title: "Dependent work".into(),
+                agent_id: Some("developer".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        board.add_dependency(&task.id, &prerequisite.id).unwrap();
+        crate::tasks::conversation::TaskConversation::new(db.clone())
+            .add_user_message_with_attachments_and_enqueue(
+                &task.id,
+                Some("developer"),
+                "Please continue",
+                &[],
+            )
+            .unwrap();
+        let queue = crate::tasks::queue::TaskQueue::new(db.clone());
+        for status in ["pending", "in_progress"] {
+            board.update_status(&task.id, status, None).unwrap();
+            assert_eq!(
+                board
+                    .activity_status(&board.get(&task.id).unwrap())
+                    .unwrap(),
+                "waiting_for_dependencies"
+            );
+            assert!(queue.claim("developer").unwrap().is_none());
+        }
+        assert_eq!(
+            board.get_blockers(&task.id).unwrap(),
+            vec![prerequisite.id.clone()]
+        );
+        board
+            .update_status(&prerequisite.id, "completed", None)
+            .unwrap();
+        assert_eq!(queue.claim("developer").unwrap().unwrap().task_id, task.id);
+        board
+            .update_status(&prerequisite.id, "pending", None)
+            .unwrap();
+        assert_eq!(
+            board
+                .activity_status(&board.get(&task.id).unwrap())
+                .unwrap(),
+            "in_progress",
+            "an active dispatch remains visible as active"
+        );
+    }
+
+    #[test]
+    fn activity_status_only_reports_working_for_real_active_work() {
+        let (db, board) = setup();
+        let parent = board
+            .create(&CreateTask {
+                title: "Parent".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        board
+            .update_status(&parent.id, "in_progress", None)
+            .unwrap();
+        assert_eq!(
+            board
+                .activity_status(&board.get(&parent.id).unwrap())
+                .unwrap(),
+            "idle"
+        );
+
+        let child = board
+            .create(&CreateTask {
+                title: "Explicit delegated child".to_string(),
+                parent_task_id: Some(parent.id.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            board
+                .activity_status(&board.get(&parent.id).unwrap())
+                .unwrap(),
+            "waiting_for_subtasks"
+        );
+
+        crate::tasks::queue::TaskQueue::new(db.clone())
+            .enqueue(&child.id, "developer")
+            .unwrap();
+        assert_eq!(
+            board
+                .activity_status(&board.get(&parent.id).unwrap())
+                .unwrap(),
+            "waiting_for_subtasks"
+        );
+        let own = crate::tasks::queue::TaskQueue::new(db.clone())
+            .enqueue(&parent.id, "developer")
+            .unwrap();
+        assert_eq!(
+            board
+                .activity_status(&board.get(&parent.id).unwrap())
+                .unwrap(),
+            "waiting_for_subtasks"
+        );
+        for (attempt_status, expected) in [
+            ("running", "in_progress"),
+            ("waiting_for_input", "waiting_for_input"),
+            ("review", "awaiting_review"),
+        ] {
+            db.conn()
+                .execute(
+                    "UPDATE work_attempts SET status=?1 WHERE id=?2",
+                    rusqlite::params![attempt_status, own.attempt_id],
+                )
+                .unwrap();
+            assert_eq!(
+                board
+                    .activity_status(&board.get(&parent.id).unwrap())
+                    .unwrap(),
+                expected
+            );
+        }
+        db.conn()
+            .execute(
+                "UPDATE work_attempts SET status='queued' WHERE id=?1",
+                [own.attempt_id],
+            )
+            .unwrap();
+        board.update_status(&parent.id, "pending", None).unwrap();
+        assert_eq!(
+            board
+                .activity_status(&board.get(&parent.id).unwrap())
+                .unwrap(),
+            "waiting_for_subtasks"
+        );
+    }
+
+    #[test]
+    fn roll_up_never_overwrites_a_cancelled_task() {
+        let (db, board) = setup();
+        add_test_agents(&db, &["developer"]);
+        let task = board
+            .create(&CreateTask {
+                backlog: false,
+                start_after: None,
+                title: "Cancelled work".to_string(),
+                description: None,
+                agent_id: Some("developer".to_string()),
+                parent_task_id: None,
+                sop_id: None,
+                conversation_id: None,
+                priority: None,
+                context: None,
+            })
+            .unwrap();
+        board.update_status(&task.id, "cancelled", None).unwrap();
+
+        assert!(board
+            .complete_and_roll_up(&task.id, Some("developer"))
+            .unwrap()
+            .is_empty());
+        assert_eq!(board.get(&task.id).unwrap().status, TaskStatus::Cancelled);
+    }
+
+    #[test]
     fn completing_the_last_child_completes_its_parent() {
         let (_, board) = setup();
         let parent = board
             .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "Parent".to_string(),
                 description: None,
                 agent_id: None,
@@ -1045,6 +3448,8 @@ mod tests {
         let make_child = |title: &str| {
             board
                 .create(&CreateTask {
+                    backlog: false,
+                    start_after: None,
                     title: title.to_string(),
                     description: None,
                     agent_id: None,
@@ -1069,10 +3474,45 @@ mod tests {
     }
 
     #[test]
-    fn test_list_and_counts() {
+    fn reopening_a_completed_child_stops_parent_roll_up() {
         let (_, board) = setup();
+        let parent = board
+            .create(&CreateTask {
+                title: "Parent".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let child = board
+            .create(&CreateTask {
+                title: "Child".into(),
+                parent_task_id: Some(parent.id.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let transitions = board
+            .complete_and_roll_up_with(&child.id, None, |completed| {
+                if completed.id == child.id {
+                    board.update_status(&child.id, "pending", None)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(board.get(&child.id).unwrap().status, TaskStatus::Pending);
+        assert_eq!(board.get(&parent.id).unwrap().status, TaskStatus::Pending);
+        assert!(!board.subtasks_complete(&parent.id).unwrap());
+    }
+
+    #[test]
+    fn test_list_and_counts() {
+        let (db, board) = setup();
+        add_test_agents(&db, &["atlas"]);
         let first = board
             .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "Task 1".to_string(),
                 description: None,
                 agent_id: Some("atlas".to_string()),
@@ -1085,6 +3525,8 @@ mod tests {
             .unwrap();
         board
             .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "Task 2".to_string(),
                 description: None,
                 agent_id: Some("atlas".to_string()),
@@ -1104,13 +3546,271 @@ mod tests {
             .unwrap();
 
         let all = board.list(None, None, 100).unwrap();
-        assert_eq!(all.len(), 2);
+        assert_eq!(all.len(), 3);
 
         let by_agent = board.list(None, Some("atlas"), 100).unwrap();
         assert_eq!(by_agent.len(), 2);
 
         let counts = board.counts().unwrap();
+        assert_eq!(counts.pending, 3);
+    }
+
+    #[test]
+    fn task_search_matches_all_terms_across_task_conversations() {
+        let (db, board) = setup();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO agents (id, name, backend, config)
+                 VALUES ('developer', 'Developer', 'native', '{}');
+                 INSERT INTO agents (id, name, backend, config)
+                 VALUES ('search-session', 'Search session', 'native', '{}');",
+            )
+        })
+        .unwrap();
+        let described = board
+            .create(&CreateTask {
+                title: "Review connection handling".to_string(),
+                description: Some("Preserve the mobile draft during reconnects".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        let discussed = board
+            .create(&CreateTask {
+                title: "Investigate the integration".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        crate::tasks::conversation::TaskConversation::new(db.clone())
+            .add_message(
+                &discussed.id,
+                "user",
+                "The JIRA connector cannot authenticate",
+            )
+            .unwrap();
+        let sessions = crate::sessions::SessionManager::new(db.clone());
+        sessions
+            .ensure("search-session", Some("Search test"))
+            .unwrap();
+        sessions
+            .append_event(
+                "search-session",
+                crate::sessions::NewEvent {
+                    attempt_id: None,
+                    task_id: Some(&discussed.id),
+                    source_type: "acp",
+                    source_id: Some("codex"),
+                    event_type: "runner_progress",
+                    summary: "Checking the OAuth callback",
+                    payload: serde_json::json!({}),
+                },
+            )
+            .unwrap();
+
+        let parent = board
+            .create(&CreateTask {
+                title: "Parent".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        board
+            .create(&CreateTask {
+                title: "JIRA callback subtask".to_string(),
+                parent_task_id: Some(parent.id),
+                ..Default::default()
+            })
+            .unwrap();
+        board
+            .create_idle_task("developer", "JIRA callback maintenance")
+            .unwrap();
+
+        let description_matches = board
+            .list_page(&[], None, Some("MOBILE draft"), 100, 0)
+            .unwrap();
+        assert_eq!(description_matches.len(), 1);
+        assert_eq!(description_matches[0].id, described.id);
+
+        let conversation_matches = board
+            .list_recent_page(&[], None, &[], Some("jira CALLBACK"), 100, 0)
+            .unwrap();
+        assert_eq!(conversation_matches.len(), 2);
+        assert!(conversation_matches
+            .iter()
+            .any(|task| task.id == discussed.id));
+
+        let counts = board.counts_for_search(Some("jira callback")).unwrap();
         assert_eq!(counts.pending, 2);
+    }
+
+    #[test]
+    fn idle_task_creation_rejects_an_agent_deleted_after_reconciliation() {
+        let (db, board) = setup();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO projects (id, name) VALUES ('project-one', 'Project One');
+                 INSERT INTO agents (id, name, backend, config, status, project_id)
+                 VALUES ('atlas', 'Atlas', 'native', '{}', 'running', 'project-one');",
+            )
+        })
+        .unwrap();
+
+        // Simulate the desired-state reconciler reading the running Agent
+        // before a confirmed cascade wins the writer and removes it.
+        let was_running = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT status = 'running' FROM agents WHERE id = 'atlas'",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+            })
+            .unwrap();
+        assert!(was_running);
+        let projects = crate::projects::ProjectManager::new(db.clone());
+        projects.begin_cascade("project-one").unwrap();
+        projects.finish_cascade("project-one").unwrap();
+
+        let error = board
+            .create_idle_task("atlas", "Look for proactive work")
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::AgentNotFound { ref name } if name == "atlas"
+        ));
+        let idle_tasks = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM tasks WHERE task_type = 'IDLE'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(idle_tasks, 0);
+    }
+
+    #[test]
+    fn task_creation_rejects_an_agent_deleted_after_a_stale_request_read() {
+        let (db, board) = setup();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO projects (id, name) VALUES ('project-one', 'Project One');
+                 INSERT INTO agents (id, name, backend, config, status, project_id)
+                 VALUES ('atlas', 'Atlas', 'native', '{}', 'running', 'project-one');",
+            )
+        })
+        .unwrap();
+
+        // Simulate an API request that resolved the Agent before a confirmed
+        // cascade won the writer lock and removed it.
+        let request = CreateTask {
+            title: "Stale task request".to_string(),
+            agent_id: Some("atlas".to_string()),
+            ..Default::default()
+        };
+        let agent_existed = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM agents WHERE id = 'atlas')",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+            })
+            .unwrap();
+        assert!(agent_existed);
+
+        let projects = crate::projects::ProjectManager::new(db.clone());
+        projects.begin_cascade("project-one").unwrap();
+        projects.finish_cascade("project-one").unwrap();
+
+        let error = board.create(&request).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::AgentNotFound { ref name } if name == "atlas"
+        ));
+        let task_count = db
+            .with_conn(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get::<_, i64>(0))
+            })
+            .unwrap();
+        assert_eq!(task_count, 0);
+    }
+
+    #[test]
+    fn task_assignment_rejects_missing_agents() {
+        let (_, board) = setup();
+        let task = board
+            .create(&CreateTask {
+                title: "Unassigned task".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let update_error = board
+            .update(
+                &task.id,
+                &UpdateTask {
+                    title: None,
+                    description: None,
+                    agent_id: Some("missing-agent".to_string()),
+                    priority: None,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            update_error,
+            Error::AgentNotFound { ref name } if name == "missing-agent"
+        ));
+
+        let status_error = board
+            .update_status(&task.id, "in_progress", Some("missing-agent"))
+            .unwrap_err();
+        assert!(matches!(
+            status_error,
+            Error::AgentNotFound { ref name } if name == "missing-agent"
+        ));
+
+        let unchanged = board.get(&task.id).unwrap();
+        assert_eq!(unchanged.status, TaskStatus::Pending);
+        assert_eq!(unchanged.agent_id, None);
+    }
+
+    #[test]
+    fn task_search_normalizes_unicode_and_keeps_every_term() {
+        let (_, board) = setup();
+        let international = board
+            .create(&CreateTask {
+                title: "CAFÉ と ﾌﾟﾛｼﾞｪｸﾄ".to_string(),
+                description: Some("Straße か\u{3099}く".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let unicode_matches = board
+            .list_page(&[], None, Some("café プロジェクト STRASSE がく"), 100, 0)
+            .unwrap();
+        assert_eq!(unicode_matches.len(), 1);
+        assert_eq!(unicode_matches[0].id, international.id);
+
+        let terms = (1..=21).map(|index| format!("語{index}"));
+        let all_terms = terms.clone().collect::<Vec<_>>().join(" ");
+        let complete = board
+            .create(&CreateTask {
+                title: all_terms.clone(),
+                ..Default::default()
+            })
+            .unwrap();
+        board
+            .create(&CreateTask {
+                title: terms.take(20).collect::<Vec<_>>().join(" "),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let every_term_matches = board
+            .list_page(&[], None, Some(&all_terms), 100, 0)
+            .unwrap();
+        assert_eq!(every_term_matches.len(), 1);
+        assert_eq!(every_term_matches[0].id, complete.id);
     }
 
     #[test]
@@ -1118,6 +3818,8 @@ mod tests {
         let (_, board) = setup();
         let task = board
             .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "To delete".to_string(),
                 description: None,
                 agent_id: None,
@@ -1185,12 +3887,70 @@ mod tests {
     }
 
     #[test]
+    fn batch_schedules_are_validated_before_creating_any_children() {
+        let (db, board) = setup();
+        add_test_agents(&db, &["atlas"]);
+        let parent = board
+            .create(&CreateTask {
+                title: "Existing parent".into(),
+                agent_id: Some("atlas".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let mut inputs: Vec<BatchTaskInput> = serde_json::from_value(serde_json::json!([
+            {"ref":"build", "title":"Build", "agent_id":"atlas"},
+            {"title":"Test", "agent_id":"atlas", "depends_on":["build"],
+             "start_after":"2100-01-01T09:00:00.0001+09:00", "new_session":true},
+            {"title":"Idea", "agent_id":"atlas", "backlog":true}
+        ]))
+        .unwrap();
+
+        for invalid in [
+            "not-a-date",
+            "2100-01-01T00:00:00",
+            "9999-12-31T23:59:59-01:00",
+        ] {
+            for index in 0..inputs.len() {
+                let original = inputs[index].start_after.replace(invalid.into());
+                assert!(board.create_batch(&inputs, Some(&parent.id)).is_err());
+                assert!(
+                    board.list_subtasks(&parent.id).unwrap().is_empty(),
+                    "invalid schedule {invalid} at index {index} left partial children"
+                );
+                assert!(board.subtasks_complete(&parent.id).unwrap());
+                assert_eq!(board.get(&parent.id).unwrap().revision, parent.revision);
+                inputs[index].start_after = original;
+            }
+        }
+
+        // Correcting the request creates the intended children once and retains
+        // normalization, dependency refs, Backlog, and session-mode semantics.
+        let tasks = board.create_batch(&inputs, Some(&parent.id)).unwrap();
+        assert_eq!(tasks.len(), 3);
+        assert_eq!(board.list_subtasks(&parent.id).unwrap().len(), 3);
+        assert!(tasks[0].start_after.is_none());
+        assert!(!tasks[0].backlog);
+        assert_eq!(
+            tasks[1].start_after.as_deref(),
+            Some("2100-01-01T00:00:00.001Z")
+        );
+        assert_eq!(
+            board.get_dependencies(&tasks[1].id).unwrap(),
+            vec![tasks[0].id.clone()]
+        );
+        assert_eq!(tasks[1].context.as_ref().unwrap()["session_mode"], "new");
+        assert!(tasks[2].backlog);
+    }
+
+    #[test]
     fn test_batch_create() {
         let (_, board) = setup();
         let tasks = board
             .create_batch(
                 &[
                     BatchTaskInput {
+                        backlog: false,
+                        start_after: None,
                         ref_name: Some("build".into()),
                         title: "Build".into(),
                         description: None,
@@ -1200,6 +3960,8 @@ mod tests {
                         depends_on: None,
                     },
                     BatchTaskInput {
+                        backlog: false,
+                        start_after: None,
                         ref_name: Some("test".into()),
                         title: "Test".into(),
                         description: None,
@@ -1209,6 +3971,8 @@ mod tests {
                         depends_on: Some(vec!["build".into()]),
                     },
                     BatchTaskInput {
+                        backlog: false,
+                        start_after: None,
                         ref_name: Some("deploy".into()),
                         title: "Deploy".into(),
                         description: None,

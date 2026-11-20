@@ -1,10 +1,13 @@
 <script lang="ts">
-	import type { Agent, Task } from '$lib/api';
+	import type { Agent, Conversation, Project, Task } from '$lib/api';
+	import { serverTimestampMs } from '$lib/serverTime';
 	import { timeAgo } from '$lib/utils';
 
 	const TASKS_PER_PROJECT = 5;
 
 	let {
+		projectList,
+		conversationList,
 		agentList,
 		taskList,
 		activeTaskId = null,
@@ -12,6 +15,8 @@
 		showHeading = true,
 		onnavigate,
 	}: {
+		projectList: Project[];
+		conversationList: Conversation[];
 		agentList: Agent[];
 		taskList: Task[];
 		activeTaskId?: string | null;
@@ -22,15 +27,18 @@
 
 	let sortedTasks = $derived([...taskList].sort(compareTaskRecency));
 	let taskGroups = $derived((() => {
-		const projectIds = new Set(agentList.map((agent) => agent.id));
-		const groups = agentList.map((agent) => ({
-			id: agent.id,
-			label: agent.title || agent.name,
-			href: `/agents/${agent.id}`,
-			tasks: sortedTasks.filter((task) => task.agent_id === agent.id).slice(0, TASKS_PER_PROJECT),
+		const projectIds = new Set(projectList.map((project) => project.id));
+		const groups = projectList.map((project) => ({
+			id: project.id,
+			label: project.name,
+			href: `/projects/${project.id}`,
+			tasks: sortedTasks.filter((task) => taskProjectId(task) === project.id).slice(0, TASKS_PER_PROJECT),
 		}));
 		const unassigned = sortedTasks
-			.filter((task) => !task.agent_id || !projectIds.has(task.agent_id))
+			.filter((task) => {
+				const projectId = taskProjectId(task);
+				return !projectId || !projectIds.has(projectId);
+			})
 			.slice(0, TASKS_PER_PROJECT);
 		return unassigned.length > 0
 			? [...groups, { id: 'unassigned', label: 'Unassigned', href: null, tasks: unassigned }]
@@ -39,9 +47,18 @@
 	let compactTasks = $derived(sortedTasks.slice(0, TASKS_PER_PROJECT));
 
 	function compareTaskRecency(left: Task, right: Task): number {
-		return Date.parse(right.updated_at) - Date.parse(left.updated_at)
-			|| Date.parse(right.created_at) - Date.parse(left.created_at)
+		return (serverTimestampMs(right.updated_at) ?? 0) - (serverTimestampMs(left.updated_at) ?? 0)
+			|| (serverTimestampMs(right.created_at) ?? 0) - (serverTimestampMs(left.created_at) ?? 0)
 			|| right.id.localeCompare(left.id);
+	}
+
+	function taskProjectId(task: Task): string | null {
+		if (task.project_id) return task.project_id;
+		if (task.conversation_id) {
+			const conversation = conversationList.find((candidate) => candidate.id === task.conversation_id);
+			if (conversation?.project_id) return conversation.project_id;
+		}
+		return agentList.find((agent) => agent.id === task.agent_id)?.project_id ?? null;
 	}
 
 	function statusDot(status: string): string {
@@ -49,6 +66,11 @@
 		if (status === 'waiting_for_input') return 'bg-orange-500 animate-pulse';
 		if (status === 'running' || status === 'in_progress' || status === 'preparing' || status === 'review') return 'bg-blue-500 animate-pulse';
 		if (status === 'queued' || status === 'pending') return 'bg-amber-400';
+		if (['awaiting_review', 'awaiting_parent_review'].includes(status)) return 'bg-violet-400';
+		if (status === 'waiting_for_subtasks' || status === 'waiting_for_dependencies') return 'bg-amber-400';
+		if (status === 'scheduled') return 'bg-sky-500';
+		if (status === 'backlog') return 'bg-stone-400';
+		if (status === 'idle') return 'bg-muted-foreground';
 		if (status === 'cancelled') return 'bg-muted-foreground';
 		return 'bg-emerald-500';
 	}
@@ -59,12 +81,28 @@
 		if (status === 'waiting_for_input') return 'Waiting for you';
 		if (status === 'running' || status === 'in_progress' || status === 'preparing') return 'Working';
 		if (status === 'review') return 'Ready for review';
-		if (status === 'queued' || status === 'pending') return 'Queued';
+		if (status === 'queued' || status === 'pending') return 'To do';
+		if (status === 'awaiting_review') return 'Awaiting review';
+		if (status === 'awaiting_parent_review') return 'Awaiting parent review';
+		if (status === 'waiting_for_subtasks') return 'Waiting for delegated work';
+		if (status === 'waiting_for_dependencies') return 'Waiting for dependencies';
+		if (status === 'scheduled') return 'Scheduled';
+		if (status === 'backlog') return 'Backlog';
+		if (status === 'idle') return 'Not running';
 		if (status === 'cancelled') return 'Cancelled';
 		return 'Completed';
 	}
+
+	function activityStatus(task: Task): string {
+		return task.activity_status ?? task.status;
+	}
 </script>
 
+{#if !compact}
+ <div class="mb-3 flex gap-2 px-2 text-[11px] text-muted-foreground" aria-label="Task planning views">
+  <a href="/tasks?view=board" onclick={onnavigate}>Board</a><a href="/tasks?view=timeline" onclick={onnavigate}>Timeline</a><a href="/tasks?view=list" onclick={onnavigate}>List</a>
+ </div>
+{/if}
 {#if compact}
 	<div data-sidebar-mode="tasks" class="flex flex-col items-center gap-1">
 		{#each compactTasks as task (task.id)}
@@ -73,10 +111,10 @@
 				onclick={onnavigate}
 				aria-current={activeTaskId === task.id ? 'page' : undefined}
 				class="relative flex h-9 w-9 items-center justify-center rounded-lg text-xs font-semibold {activeTaskId === task.id ? 'bg-[hsl(var(--sidebar-active))]' : 'bg-muted/60 hover:bg-accent'}"
-				title="{task.title} — {statusLabel(task.status)}"
+				title="{task.title} — {statusLabel(activityStatus(task))}"
 			>
 				T
-				<span data-task-status={task.status} class="absolute bottom-0 right-0 h-2.5 w-2.5 rounded-full border-2 border-[hsl(var(--sidebar))] {statusDot(task.status)}"></span>
+				<span data-task-status={activityStatus(task)} class="absolute bottom-0 right-0 h-2.5 w-2.5 rounded-full border-2 border-[hsl(var(--sidebar))] {statusDot(activityStatus(task))}"></span>
 			</a>
 		{/each}
 	</div>
@@ -90,7 +128,7 @@
 		{/if}
 
 		{#if taskGroups.length === 0}
-			<div class="px-2 py-4 text-xs text-muted-foreground">Create a project to start adding tasks.</div>
+			<div class="px-2 py-4 text-xs text-muted-foreground">Create an agent to start adding tasks.</div>
 		{:else}
 			<div class="space-y-3">
 				{#each taskGroups as group (group.id)}
@@ -112,12 +150,12 @@
 									>
 										<span class="min-w-0 flex-1">
 											<span class="block truncate text-xs">{task.title}</span>
-											<span class="mt-0.5 block truncate text-[10px] font-normal text-muted-foreground">{statusLabel(task.status)} · {timeAgo(task.updated_at)}</span>
+											<span class="mt-0.5 block truncate text-[10px] font-normal text-muted-foreground">{statusLabel(activityStatus(task))} · {timeAgo(task.updated_at)}</span>
 										</span>
 										<span
-											data-task-status={task.status}
-											aria-label={statusLabel(task.status)}
-											class="mt-1.5 h-2 w-2 shrink-0 rounded-full {statusDot(task.status)}"
+											data-task-status={activityStatus(task)}
+											aria-label={statusLabel(activityStatus(task))}
+											class="mt-1.5 h-2 w-2 shrink-0 rounded-full {statusDot(activityStatus(task))}"
 										></span>
 									</a>
 								{/each}

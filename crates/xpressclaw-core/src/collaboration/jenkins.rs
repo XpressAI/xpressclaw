@@ -1,0 +1,705 @@
+use std::time::Duration;
+
+use async_trait::async_trait;
+use bytes::Bytes;
+use futures_util::{pin_mut, Stream, StreamExt};
+use serde::Deserialize;
+use url::Url;
+
+use super::{
+    local_http_client_builder, Build, BuildCapabilities, BuildProvider, BuildRequest,
+    GITBUCKET_INTERNAL_URL,
+};
+use crate::error::{Error, Result};
+
+const JOB: &str = "xpressclaw-local-build";
+const MAX_LOG_BYTES: usize = 1_000_000;
+const MAX_LOG_TAIL_ATTEMPTS: usize = 4;
+
+#[derive(Clone)]
+pub struct JenkinsProvider {
+    client: reqwest::Client,
+    base_url: String,
+    username: String,
+    password: String,
+}
+
+impl JenkinsProvider {
+    pub fn new(base_url: &str, username: &str, password: &str) -> Result<Self> {
+        Ok(Self {
+            client: local_http_client_builder().build().map_err(|error| {
+                Error::Config(format!("failed to build Jenkins HTTP client: {error}"))
+            })?,
+            base_url: base_url.trim_end_matches('/').to_string(),
+            username: username.to_string(),
+            password: password.to_string(),
+        })
+    }
+
+    fn authenticated(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        request.basic_auth(&self.username, Some(&self.password))
+    }
+
+    /// Reject overlapping managed builds before the control plane replaces the
+    /// disposable Jenkins Agent container. The job itself also disables
+    /// concurrency, but an explicit preflight avoids terminating a build that
+    /// is already using the Agent.
+    pub async fn ensure_idle(&self) -> Result<()> {
+        let response = self
+            .authenticated(self.client.get(format!(
+                "{}/job/{JOB}/api/json?tree=inQueue,lastBuild[building]",
+                self.base_url
+            )))
+            .send()
+            .await
+            .map_err(|error| Error::ToolExecution(format!("Jenkins request failed: {error}")))?;
+        if !response.status().is_success() {
+            return Err(Error::ToolExecution(format!(
+                "Jenkins returned HTTP {} while checking build availability",
+                response.status()
+            )));
+        }
+        let activity = response
+            .json::<JenkinsJobActivity>()
+            .await
+            .map_err(|error| {
+                Error::ToolExecution(format!("invalid Jenkins job response: {error}"))
+            })?;
+        if activity.is_busy() {
+            return Err(Error::ToolExecution(
+                "another managed Jenkins build is queued or running; wait for it to finish before triggering the next build"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn crumb(&self) -> Result<Option<(String, String, Option<String>)>> {
+        let response = self
+            .authenticated(
+                self.client
+                    .get(format!("{}/crumbIssuer/api/json", self.base_url)),
+            )
+            .send()
+            .await
+            .map_err(|error| Error::ToolExecution(format!("Jenkins request failed: {error}")))?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            return Err(Error::ToolExecution(format!(
+                "Jenkins crumb request returned HTTP {}",
+                response.status()
+            )));
+        }
+        let cookies = response
+            .headers()
+            .get_all(reqwest::header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .filter_map(|value| value.split(';').next())
+            .collect::<Vec<_>>();
+        let session_cookie = (!cookies.is_empty()).then(|| cookies.join("; "));
+        let crumb: Crumb = response.json().await.map_err(|error| {
+            Error::ToolExecution(format!("Jenkins returned an invalid crumb: {error}"))
+        })?;
+        Ok(Some((
+            crumb.crumb_request_field,
+            crumb.crumb,
+            session_cookie,
+        )))
+    }
+
+    async fn post(&self, url: String) -> Result<reqwest::Response> {
+        let mut request = self.authenticated(self.client.post(url));
+        if let Some((field, crumb, session_cookie)) = self.crumb().await? {
+            request = request.header(field, crumb);
+            if let Some(cookie) = session_cookie {
+                request = request.header(reqwest::header::COOKIE, cookie);
+            }
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|error| Error::ToolExecution(format!("Jenkins request failed: {error}")))?;
+        if !response.status().is_success() {
+            return Err(Error::ToolExecution(format!(
+                "Jenkins returned HTTP {}",
+                response.status()
+            )));
+        }
+        Ok(response)
+    }
+
+    fn validate_request(request: &BuildRequest) -> Result<()> {
+        let denied = || {
+            Error::ToolPermission(
+                "Jenkins builds may only clone repositories owned by the managed local forge account"
+                    .to_string(),
+            )
+        };
+        let managed_forge = Url::parse(GITBUCKET_INTERNAL_URL)
+            .expect("the managed GitBucket URL must be a valid absolute URL");
+        let repository = Url::parse(&request.repository).map_err(|_| denied())?;
+        let segments = repository
+            .path_segments()
+            .ok_or_else(&denied)?
+            .collect::<Vec<_>>();
+        let repository_name = segments
+            .as_slice()
+            .strip_prefix(&["xpressclaw-agent"])
+            .and_then(|segments| (segments.len() == 1).then_some(segments[0]))
+            .and_then(|name| name.strip_suffix(".git"));
+        if repository.scheme() != managed_forge.scheme()
+            || repository.host_str() != managed_forge.host_str()
+            || repository.port_or_known_default() != managed_forge.port_or_known_default()
+            || !repository.username().is_empty()
+            || repository.password().is_some()
+            || repository.query().is_some()
+            || repository.fragment().is_some()
+            || repository_name.is_none_or(|name| {
+                name.is_empty()
+                    || matches!(name, "." | "..")
+                    || !name.chars().all(|character| {
+                        character.is_ascii_alphanumeric() || "-_.".contains(character)
+                    })
+            })
+        {
+            return Err(denied());
+        }
+        if request.git_ref.is_empty()
+            || request.git_ref.len() > 200
+            || request
+                .git_ref
+                .contains(|character: char| character.is_control())
+        {
+            return Err(Error::ToolExecution("invalid Git ref".to_string()));
+        }
+        Ok(())
+    }
+
+    async fn progressive_log_response(
+        &self,
+        progressive_url: &str,
+        start: usize,
+    ) -> Result<reqwest::Response> {
+        let response = self
+            .authenticated(self.client.get(progressive_url).query(&[("start", start)]))
+            .send()
+            .await
+            .map_err(|error| Error::ToolExecution(format!("Jenkins request failed: {error}")))?;
+        if !response.status().is_success() {
+            return Err(Error::ToolExecution(format!(
+                "Jenkins returned HTTP {} for build logs",
+                response.status()
+            )));
+        }
+        Ok(response)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Crumb {
+    crumb_request_field: String,
+    crumb: String,
+}
+
+#[derive(Deserialize)]
+struct QueueItem {
+    executable: Option<QueueExecutable>,
+    cancelled: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct QueueExecutable {
+    number: u64,
+    url: String,
+}
+
+#[derive(Deserialize)]
+struct JenkinsBuild {
+    number: u64,
+    url: String,
+    building: bool,
+    result: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JenkinsJobActivity {
+    #[serde(default)]
+    in_queue: bool,
+    last_build: Option<JenkinsBuildActivity>,
+}
+
+impl JenkinsJobActivity {
+    fn is_busy(&self) -> bool {
+        self.in_queue || self.last_build.as_ref().is_some_and(|build| build.building)
+    }
+}
+
+#[derive(Deserialize)]
+struct JenkinsBuildActivity {
+    building: bool,
+}
+
+impl From<JenkinsBuild> for Build {
+    fn from(build: JenkinsBuild) -> Self {
+        Self {
+            number: build.number,
+            state: if build.building {
+                "running".to_string()
+            } else {
+                build
+                    .result
+                    .unwrap_or_else(|| "queued".to_string())
+                    .to_lowercase()
+            },
+            url: build.url,
+        }
+    }
+}
+
+#[async_trait]
+impl BuildProvider for JenkinsProvider {
+    fn name(&self) -> &'static str {
+        "jenkins"
+    }
+
+    fn capabilities(&self) -> BuildCapabilities {
+        BuildCapabilities {
+            trigger: true,
+            logs: true,
+            artifacts: false,
+            cancel: true,
+            retry: false,
+        }
+    }
+
+    async fn trigger(&self, request: &BuildRequest) -> Result<Build> {
+        Self::validate_request(request)?;
+        let query = serde_urlencoded::to_string([
+            ("REPOSITORY_URL", request.repository.as_str()),
+            ("GIT_REF", request.git_ref.as_str()),
+        ])
+        .map_err(|error| Error::ToolExecution(format!("invalid build request: {error}")))?;
+        let response = self
+            .post(format!(
+                "{}/job/{JOB}/buildWithParameters?{query}",
+                self.base_url
+            ))
+            .await?;
+        let queue_location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.trim_end_matches('/'))
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| {
+                Error::ToolExecution("Jenkins did not return a queue URL".to_string())
+            })?;
+        let queue_url =
+            if queue_location.starts_with("http://") || queue_location.starts_with("https://") {
+                queue_location
+            } else {
+                format!("{}{}", self.base_url, queue_location)
+            };
+
+        for _ in 0..30 {
+            let item: QueueItem = self
+                .authenticated(self.client.get(format!("{queue_url}/api/json")))
+                .send()
+                .await
+                .map_err(|error| Error::ToolExecution(format!("Jenkins request failed: {error}")))?
+                .json()
+                .await
+                .map_err(|error| {
+                    Error::ToolExecution(format!("invalid Jenkins queue response: {error}"))
+                })?;
+            if item.cancelled.unwrap_or(false) {
+                return Err(Error::ToolExecution(
+                    "Jenkins cancelled the queued build".to_string(),
+                ));
+            }
+            if let Some(executable) = item.executable {
+                return Ok(Build {
+                    number: executable.number,
+                    state: "running".to_string(),
+                    url: executable.url,
+                });
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        Err(Error::ToolExecution(
+            "Jenkins accepted the build but did not start it within 15 seconds".to_string(),
+        ))
+    }
+
+    async fn get(&self, number: u64) -> Result<Build> {
+        let response = self
+            .authenticated(
+                self.client
+                    .get(format!("{}/job/{JOB}/{number}/api/json", self.base_url)),
+            )
+            .send()
+            .await
+            .map_err(|error| Error::ToolExecution(format!("Jenkins request failed: {error}")))?;
+        if !response.status().is_success() {
+            return Err(Error::ToolExecution(format!(
+                "Jenkins returned HTTP {} for build {number}",
+                response.status()
+            )));
+        }
+        response
+            .json::<JenkinsBuild>()
+            .await
+            .map(Into::into)
+            .map_err(|error| {
+                Error::ToolExecution(format!("invalid Jenkins build response: {error}"))
+            })
+    }
+
+    async fn logs(&self, number: u64, max_bytes: usize) -> Result<String> {
+        let limit = max_bytes.min(MAX_LOG_BYTES);
+        if limit == 0 {
+            return Ok(String::new());
+        }
+        let progressive_url = format!(
+            "{}/job/{JOB}/{number}/logText/progressiveText",
+            self.base_url
+        );
+        // Jenkins exposes the current byte offset in the response headers.
+        // Drop this body immediately, then request only the bounded tail.
+        let probe = self.progressive_log_response(&progressive_url, 0).await?;
+        let (mut observed_size, _) = progressive_log_metadata(&probe)?;
+        drop(probe);
+
+        for attempt in 0..MAX_LOG_TAIL_ATTEMPTS {
+            let start = observed_size.saturating_sub(limit);
+            let response = self
+                .progressive_log_response(&progressive_url, start)
+                .await?;
+            let (response_size, more_data) = progressive_log_metadata(&response)?;
+            if response_size < start {
+                return Err(Error::ToolExecution(
+                    "Jenkins returned an invalid progressive-log offset".to_string(),
+                ));
+            }
+
+            // If the log grew by more than the remaining window before this
+            // response started, reposition from the newly announced end. Do
+            // not read a known-stale prefix and present it as the tail.
+            if response_size - start > limit {
+                observed_size = response_size;
+                drop(response);
+                if attempt + 1 == MAX_LOG_TAIL_ATTEMPTS {
+                    return Err(log_growing_too_quickly(limit));
+                }
+                continue;
+            }
+
+            let (bytes, reached_limit) = read_bounded(response.bytes_stream(), limit)
+                .await
+                .map_err(|error| {
+                    Error::ToolExecution(format!("failed to read Jenkins logs: {error}"))
+                })?;
+
+            // A running build can append after the response headers were
+            // produced. Re-probe from the announced end and retry if Jenkins
+            // reports newer bytes, so a stale window is never called "last".
+            if more_data {
+                let verification = self
+                    .progressive_log_response(&progressive_url, response_size)
+                    .await?;
+                let (latest_size, _) = progressive_log_metadata(&verification)?;
+                drop(verification);
+                if latest_size > response_size {
+                    observed_size = latest_size;
+                    if attempt + 1 == MAX_LOG_TAIL_ATTEMPTS {
+                        return Err(log_growing_too_quickly(limit));
+                    }
+                    continue;
+                }
+            }
+
+            let mut logs = String::from_utf8_lossy(&bytes).to_string();
+            if start > 0 || (reached_limit && more_data) {
+                logs.insert_str(
+                    0,
+                    &format!("[log truncated; showing at most the last {limit} bytes]\n"),
+                );
+            }
+            return Ok(logs);
+        }
+
+        Err(log_growing_too_quickly(limit))
+    }
+
+    async fn cancel(&self, number: u64) -> Result<()> {
+        self.post(format!("{}/job/{JOB}/{number}/stop", self.base_url))
+            .await?;
+        Ok(())
+    }
+
+    async fn retry(&self, _number: u64) -> Result<Build> {
+        Err(Error::ToolExecution(
+            "Jenkins retry is not supported by the pinned minimal plugin set; trigger a new build with the same repository and ref"
+                .to_string(),
+        ))
+    }
+}
+
+fn progressive_log_metadata(response: &reqwest::Response) -> Result<(usize, bool)> {
+    let size = response
+        .headers()
+        .get("x-text-size")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .ok_or_else(|| {
+            Error::ToolExecution("Jenkins omitted the bounded progressive-log offset".to_string())
+        })?;
+    let more_data = response
+        .headers()
+        .get("x-more-data")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+    Ok((size, more_data))
+}
+
+fn log_growing_too_quickly(limit: usize) -> Error {
+    Error::ToolExecution(format!(
+        "Jenkins logs are growing too quickly to return a reliable last {limit} bytes; retry after the build slows or completes"
+    ))
+}
+
+async fn read_bounded<S, E>(stream: S, limit: usize) -> std::result::Result<(Vec<u8>, bool), E>
+where
+    S: Stream<Item = std::result::Result<Bytes, E>>,
+{
+    pin_mut!(stream);
+    let mut bytes = Vec::with_capacity(limit.min(64 * 1024));
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        let remaining = limit.saturating_sub(bytes.len());
+        if chunk.len() >= remaining {
+            bytes.extend_from_slice(&chunk[..remaining]);
+            return Ok((bytes, true));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok((bytes, false))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::convert::Infallible;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    struct ProgressiveResponse {
+        expected_start: usize,
+        size: usize,
+        more_data: bool,
+        body: &'static str,
+    }
+
+    async fn serve_progressive_logs(
+        responses: Vec<ProgressiveResponse>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for response in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut chunk = [0_u8; 1024];
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8(request).unwrap();
+                assert!(
+                    request.starts_with(&format!(
+                        "GET /job/{JOB}/42/logText/progressiveText?start={} HTTP/1.1\r\n",
+                        response.expected_start
+                    )),
+                    "unexpected progressive-log request: {request}"
+                );
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nX-Text-Size: {}\r\nX-More-Data: {}\r\nConnection: close\r\n\r\n",
+                    response.body.len(),
+                    response.size,
+                    response.more_data
+                );
+                stream.write_all(headers.as_bytes()).await.unwrap();
+                stream.write_all(response.body.as_bytes()).await.unwrap();
+            }
+        });
+        (base_url, server)
+    }
+
+    #[test]
+    fn build_requests_are_limited_to_managed_gitbucket_repositories() {
+        assert!(JenkinsProvider::validate_request(&BuildRequest {
+            repository: "http://gitbucket:8080/xpressclaw-agent/demo.git".to_string(),
+            git_ref: "feature/demo".to_string(),
+        })
+        .is_ok());
+        assert!(JenkinsProvider::validate_request(&BuildRequest {
+            repository: "https://example.com/owner/demo.git".to_string(),
+            git_ref: "main".to_string(),
+        })
+        .is_err());
+
+        for repository in [
+            "http://gitbucket:8080/xpressclaw-agent/../root/demo.git",
+            "http://gitbucket:8080/xpressclaw-agent/%2e%2e/root/demo.git",
+            "http://gitbucket:8080/xpressclaw-agent/nested/demo.git",
+            "http://gitbucket:8080/xpressclaw-agent/demo%2fgraft.git",
+            "http://gitbucket:8080/xpressclaw-agent/demo.git?mirror=1",
+            "http://user@gitbucket:8080/xpressclaw-agent/demo.git",
+        ] {
+            assert!(
+                JenkinsProvider::validate_request(&BuildRequest {
+                    repository: repository.to_string(),
+                    git_ref: "main".to_string(),
+                })
+                .is_err(),
+                "unexpectedly accepted {repository}"
+            );
+        }
+    }
+
+    #[test]
+    fn capabilities_make_minimal_plugin_limitations_explicit() {
+        let provider = JenkinsProvider::new("http://jenkins:8080", "xpressclaw", "secret").unwrap();
+        let capabilities = provider.capabilities();
+        assert!(capabilities.trigger);
+        assert!(capabilities.logs);
+        assert!(capabilities.cancel);
+        assert!(!capabilities.artifacts);
+        assert!(!capabilities.retry);
+    }
+
+    #[test]
+    fn build_activity_distinguishes_idle_queued_and_running_jobs() {
+        let idle: JenkinsJobActivity =
+            serde_json::from_str(r#"{"inQueue":false,"lastBuild":{"building":false}}"#).unwrap();
+        assert!(!idle.is_busy());
+
+        let queued: JenkinsJobActivity =
+            serde_json::from_str(r#"{"inQueue":true,"lastBuild":null}"#).unwrap();
+        assert!(queued.is_busy());
+
+        let running: JenkinsJobActivity =
+            serde_json::from_str(r#"{"inQueue":false,"lastBuild":{"building":true}}"#).unwrap();
+        assert!(running.is_busy());
+    }
+
+    #[tokio::test]
+    async fn verbose_logs_stop_streaming_at_the_server_side_limit() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&polls);
+        let stream = futures_util::stream::poll_fn(move |_| {
+            let poll = observed.fetch_add(1, Ordering::SeqCst);
+            assert!(poll < 16, "the response was polled after reaching the cap");
+            std::task::Poll::Ready(Some(Ok::<_, Infallible>(Bytes::from(vec![
+                b'x';
+                64 * 1024
+            ]))))
+        });
+        let (bytes, truncated) = read_bounded(stream, MAX_LOG_BYTES).await.unwrap();
+        assert_eq!(bytes.len(), MAX_LOG_BYTES);
+        assert!(truncated);
+        assert_eq!(polls.load(Ordering::SeqCst), 16);
+    }
+
+    #[tokio::test]
+    async fn bounded_logs_handle_a_multibyte_boundary_safely() {
+        let stream = futures_util::stream::iter([Ok::<_, Infallible>(Bytes::from_static(
+            "ab日本語".as_bytes(),
+        ))]);
+        let (bytes, truncated) = read_bounded(stream, 4).await.unwrap();
+        assert!(truncated);
+        assert_eq!(String::from_utf8_lossy(&bytes), "ab�");
+    }
+
+    #[tokio::test]
+    async fn growing_logs_reposition_before_reading_a_stale_window() {
+        let (base_url, server) = serve_progressive_logs(vec![
+            ProgressiveResponse {
+                expected_start: 0,
+                size: 10,
+                more_data: true,
+                body: "0123456789",
+            },
+            ProgressiveResponse {
+                expected_start: 6,
+                size: 14,
+                more_data: true,
+                body: "6789ABCD",
+            },
+            ProgressiveResponse {
+                expected_start: 10,
+                size: 14,
+                more_data: false,
+                body: "ABCD",
+            },
+        ])
+        .await;
+        let provider = JenkinsProvider::new(&base_url, "xpressclaw", "secret").unwrap();
+
+        let logs = provider.logs(42, 4).await.unwrap();
+
+        assert!(logs.ends_with("ABCD"), "{logs}");
+        assert!(!logs.contains("6789"), "{logs}");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn running_logs_are_reprobed_before_returning_the_tail() {
+        let (base_url, server) = serve_progressive_logs(vec![
+            ProgressiveResponse {
+                expected_start: 0,
+                size: 10,
+                more_data: true,
+                body: "0123456789",
+            },
+            ProgressiveResponse {
+                expected_start: 6,
+                size: 10,
+                more_data: true,
+                body: "6789",
+            },
+            ProgressiveResponse {
+                expected_start: 10,
+                size: 14,
+                more_data: true,
+                body: "ABCD",
+            },
+            ProgressiveResponse {
+                expected_start: 10,
+                size: 14,
+                more_data: false,
+                body: "ABCD",
+            },
+        ])
+        .await;
+        let provider = JenkinsProvider::new(&base_url, "xpressclaw", "secret").unwrap();
+
+        let logs = provider.logs(42, 4).await.unwrap();
+
+        assert!(logs.ends_with("ABCD"), "{logs}");
+        assert!(!logs.contains("6789"), "{logs}");
+        server.await.unwrap();
+    }
+}

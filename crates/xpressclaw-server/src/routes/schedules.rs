@@ -5,8 +5,11 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use xpressclaw_core::conversations::event_bus::ConversationEvent;
 use xpressclaw_core::tasks::board::TaskBoard;
-use xpressclaw_core::tasks::scheduler::{CreateOneShotSchedule, CreateSchedule, ScheduleManager};
+use xpressclaw_core::tasks::scheduler::{
+    CreateOneShotSchedule, CreateSchedule, ScheduleManager, ScheduleTrigger,
+};
 
 use crate::state::AppState;
 
@@ -14,6 +17,7 @@ use crate::state::AppState;
 pub struct ListParams {
     pub agent_id: Option<String>,
     pub enabled: Option<bool>,
+    pub include_completed_once: Option<bool>,
 }
 
 pub fn routes() -> Router<AppState> {
@@ -32,8 +36,13 @@ async fn list_schedules(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let mgr = ScheduleManager::new(state.db.clone());
     let enabled_only = params.enabled.unwrap_or(false);
+    let include_completed_once = params.include_completed_once.unwrap_or(false);
     let schedules = mgr
-        .list(params.agent_id.as_deref(), enabled_only)
+        .list_filtered(
+            params.agent_id.as_deref(),
+            enabled_only,
+            include_completed_once,
+        )
         .map_err(internal_error)?;
     Ok(Json(json!(schedules)))
 }
@@ -43,7 +52,7 @@ async fn create_schedule(
     Json(req): Json<CreateSchedule>,
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
     let mgr = ScheduleManager::new(state.db.clone());
-    let schedule = mgr.create(&req).map_err(internal_error)?;
+    let schedule = mgr.create(&req).map_err(schedule_write_error)?;
     Ok((StatusCode::CREATED, Json(json!(schedule))))
 }
 
@@ -52,10 +61,7 @@ async fn create_one_shot_schedule(
     Json(req): Json<CreateOneShotSchedule>,
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
     let mgr = ScheduleManager::new(state.db.clone());
-    let schedule = mgr.create_one_shot(&req).map_err(|error| match &error {
-        xpressclaw_core::error::Error::Schedule(_) => bad_request(&error),
-        _ => internal_error(error),
-    })?;
+    let schedule = mgr.create_one_shot(&req).map_err(schedule_write_error)?;
     Ok((StatusCode::CREATED, Json(json!(schedule))))
 }
 
@@ -114,12 +120,25 @@ async fn trigger_schedule(
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
     let mgr = ScheduleManager::new(state.db.clone());
     let board = TaskBoard::new(state.db.clone());
-    let task = mgr.trigger(&id, &board).map_err(|e| match &e {
+    let triggered = mgr.trigger(&id, &board).map_err(|e| match &e {
         xpressclaw_core::error::Error::ScheduleNotFound { .. } => not_found(&e),
         xpressclaw_core::error::Error::Schedule(_) => bad_request(&e),
         _ => internal_error(e),
     })?;
-    Ok((StatusCode::CREATED, Json(json!(task))))
+    if let ScheduleTrigger::Conversation {
+        ref conversation_id,
+        ref message,
+        ..
+    } = triggered
+    {
+        state.event_bus.send(
+            conversation_id,
+            ConversationEvent::Message {
+                message: json!(message),
+            },
+        );
+    }
+    Ok((StatusCode::CREATED, Json(json!(triggered))))
 }
 
 fn internal_error(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
@@ -143,6 +162,19 @@ fn bad_request(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
     )
 }
 
+fn schedule_write_error(error: xpressclaw_core::error::Error) -> (StatusCode, Json<Value>) {
+    match &error {
+        xpressclaw_core::error::Error::AgentNotFound { .. }
+        | xpressclaw_core::error::Error::ProjectNotFound { .. } => not_found(&error),
+        xpressclaw_core::error::Error::Project(_) => (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": error.to_string() })),
+        ),
+        xpressclaw_core::error::Error::Schedule(_) => bad_request(&error),
+        _ => internal_error(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -159,6 +191,14 @@ mod tests {
 
     fn test_app() -> Router {
         let db = Arc::new(Database::open_memory().unwrap());
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO agents (id, name, backend, config)
+                 VALUES ('atlas', 'Atlas', 'native', '{}')",
+                [],
+            )
+        })
+        .unwrap();
         let config = Arc::new(Config::load_default().unwrap());
         let state = AppState::new(
             config,
@@ -289,6 +329,41 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_schedule_creation_rejects_missing_agent() {
+        let app = test_app();
+        for uri in ["/schedules", "/schedules/once"] {
+            let payload = if uri.ends_with("once") {
+                json!({
+                    "name": "Stale wake-up",
+                    "delay_seconds": 60,
+                    "agent_id": "deleted-agent",
+                    "title": "Resume"
+                })
+            } else {
+                json!({
+                    "name": "Stale schedule",
+                    "cron": "0 9 * * *",
+                    "agent_id": "deleted-agent",
+                    "title": "Run"
+                })
+            };
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(payload.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
     }
 
     #[tokio::test]
@@ -445,5 +520,47 @@ mod tests {
         let schedule = body_json(resp.into_body()).await;
         assert_eq!(schedule["enabled"], false);
         assert_eq!(schedule["run_count"], 1);
+
+        // Completed one-shot wake-ups are hidden from default list responses
+        // unless include_completed_once=true is explicitly requested.
+        let default_list = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/schedules")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(default_list.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(default_list.into_body())
+                .await
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+
+        let full_list = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/schedules?include_completed_once=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(full_list.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(full_list.into_body())
+                .await
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

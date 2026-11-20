@@ -17,9 +17,8 @@ use crate::db::Database;
 /// Route a connector event to conversations (direct binding) or to the
 /// connector_events table (for workflow matching).
 ///
-/// Returns `Some((conv_id, agent_id))` if the message was injected into
-/// a conversation (direct agent binding), so the caller can spawn the
-/// conversation processor.
+/// Returns `Some((conv_id, agent_id))` if the message was injected into a
+/// conversation. Message storage also queues its durable Conversation turn.
 pub fn route_event(db: &Arc<Database>, event: &ConnectorEvent) -> Option<(String, String)> {
     let mgr = ConnectorManager::new(db.clone());
 
@@ -61,7 +60,8 @@ pub fn route_event(db: &Arc<Database>, event: &ConnectorEvent) -> Option<(String
 }
 
 /// Find or create a conversation for this channel+agent and inject the message.
-/// Returns (conv_id, agent_id) on success so the caller can spawn the processor.
+/// Returns (conv_id, agent_id) on success for compatibility with connector
+/// callers that track the bound Agent.
 fn inject_into_conversation(
     db: &Arc<Database>,
     event: &ConnectorEvent,
@@ -101,7 +101,21 @@ fn inject_into_conversation(
             }) {
                 Ok(conv) => {
                     // Tag conversation with channel metadata so we can find it later
-                    tag_conversation_channel(db, &conv.id, &event.channel_id, agent_id);
+                    if let Err(e) = connector_mgr.bind_channel_conversation(
+                        &conv.id,
+                        &event.channel_id,
+                        agent_id,
+                    ) {
+                        error!(
+                            conv_id = conv.id.as_str(),
+                            agent_id,
+                            channel_id = event.channel_id.as_str(),
+                            error = %e,
+                            "failed to bind connector channel conversation"
+                        );
+                        let _ = conv_mgr.delete(&conv.id);
+                        return None;
+                    }
                     info!(
                         conv_id = conv.id.as_str(),
                         agent_id,
@@ -118,8 +132,7 @@ fn inject_into_conversation(
         }
     };
 
-    // Send the message into the conversation (must use send_user_message
-    // which sets processed=0 so the processor picks it up)
+    // Store the message and its addressed Agent turn atomically.
     match conv_mgr.send_user_message(
         &conv_id,
         &SendMessage {
@@ -214,17 +227,4 @@ fn find_channel_conversation(
         )
         .ok()
     })
-}
-
-/// Tag a conversation with its channel binding for future lookup.
-fn tag_conversation_channel(db: &Arc<Database>, conv_id: &str, channel_id: &str, agent_id: &str) {
-    let _ = db.with_conn(|conn| {
-        conn.execute(
-            "INSERT OR REPLACE INTO conversation_channel_bindings
-             (conversation_id, channel_id, agent_id)
-             VALUES (?1, ?2, ?3)",
-            rusqlite::params![conv_id, channel_id, agent_id],
-        )
-        .map_err(|e| crate::error::Error::Database(e.to_string()))
-    });
 }

@@ -1,34 +1,142 @@
 # Configuration Reference
 
 Xpressclaw stores local control-plane configuration in `xpressclaw.yaml`.
-Create and edit project-context sessions through the web UI. Xpressclaw does
-not define identities, personas, system prompts, tools, or subagents for ACP
-agents.
+Create and edit durable Agents through the web UI. An Agent owns work history,
+memory, and workspace configuration while its replaceable ACP harness owns
+reasoning, tools, and subagents. Xpressclaw does not define a persona or system
+prompt for the harness.
 
-`xpressclaw init` writes an empty starting point:
+The packaged Desktop app uses the default local **instance** at
+`~/.xpressclaw` and starts its bundled server automatically. The CLI discovers
+the same instance, so ordinary use is simply `xpressclaw up`. An instance is
+an installation-level control plane that can manage many Projects and Agent
+workspaces; it is not a requirement to place XpressClaw configuration in every
+source repository. The default instance keeps its configuration, database,
+managed workspaces, background log, and PID file under the same root.
+
+This local `xpressclaw.yaml` is distinct from the optional
+`.xpressclaw.yml` Project synchronization manifest. The latter is a small,
+portable pointer to a separate Git store and must never contain credentials or
+machine-specific runner settings. See [Git-backed Project
+synchronization](project-sync.md).
+
+`xpressclaw init` is optional. It provisions the default instance ahead of
+time, or an explicitly named advanced instance:
+
+```bash
+xpressclaw init
+xpressclaw init /srv/xpressclaw/staging
+```
+
+A newly initialized instance writes an empty starting point with explicit
+instance-local data paths:
 
 ```yaml
 system:
   isolation: docker
-  workspace_dir: .
+  data_dir: /home/me/.xpressclaw
+  workspace_dir: /home/me/.xpressclaw/workspaces
 
 agents: []
 ```
 
-## ACP project representation
+## Listener and optional authentication
+
+The migration-safe defaults are loopback port 8935 with application
+authentication off. **Settings → Instance** edits this instance-local block:
+
+```yaml
+instance:
+  bind: 127.0.0.1
+  port: 8935
+  authentication_enabled: false
+  allow_unauthenticated_remote: false
+```
+
+`allow_unauthenticated_remote` is an explicit acknowledgement, not an access
+control or encryption setting. The UI sets it only after warning about a
+non-loopback listener with authentication off. `xpressclaw up --bind` and
+`--port` override saved values for one start; the existing
+`--allow-insecure-remote` flag acknowledges an explicit CLI no-auth remote
+bind. Saved bind/port/authentication-mode edits take effect on restart, and the
+UI shows saved and effective values separately.
+
+Passwords are never represented in YAML. XpressClaw writes only a memory-hard
+Argon2id verifier to `instance-auth.json` under `system.data_dir`, with
+restricted file permissions. The long-lived Ed25519 private key used to prove
+instance identity is stored separately in restricted `instance-identity.json`;
+Desktop profiles retain only its public key. Browser sessions and no-password
+startup tokens are process-local and disappear on restart. These secret files,
+Desktop profile data, and sessions are outside Project synchronization. Desktop
+stores remote profile credentials in the operating-system keychain; its JSON
+profile file contains only non-secret connection metadata. Automatic keychain
+login is limited to the exact local HTTP identity announced by the sidecar
+whose listeners Desktop started. Desktop opens a one-use encrypted channel
+authenticated by that identity; browser-session material returns through the
+same channel and is installed as an HttpOnly cookie by native Desktop, so web
+content receives no credential, session value, or redeemable bearer ticket.
+Remote profiles use the normal browser login, even over HTTPS, because native
+code cannot bind the browser's cookie-bearing connection to the separately
+proved XpressClaw identity. The channel protects native secrets but does not
+replace TLS for the subsequent browser session.
+
+Application authentication does not provide TLS. See [Remote
+access](remote-access.md) before selecting a non-loopback address.
+
+## Speech
+
+**Settings → Speech** configures an optional OpenAI-compatible audio endpoint,
+API key, transcription model, speech model, and voice for dictation and read-aloud
+across harnesses. Credentials stay on the instance server. See
+[Speech](speech.md) for setup, usage, and provider requirements.
+
+## Project lifecycle and configuration
+
+One control-plane instance can contain many Projects. Deleting a Project from
+**Project settings** removes that Project's Agent entries from
+`xpressclaw.yaml` and removes those Agents from local collaboration-service
+access assignments. Reusable workflow definitions, connectors, source
+repositories, and host workspace folders are preserved. XpressClaw marks the
+Project as deleting before it rewrites configuration, so a write or runtime
+cleanup failure remains visible and can be retried safely. See [Projects and
+deletion](projects.md) for the complete cascade and API contract.
+
+## Optional local collaboration services
+
+GitBucket and Jenkins remain disabled until a person explicitly enables,
+installs, and starts them in **Settings → Local collaboration**. The
+non-secret instance configuration is:
+
+    collaboration:
+      enabled: false
+      bind_address: 127.0.0.1
+      gitbucket_port: 8088
+      jenkins_port: 8089
+      gitbucket_image: ghcr.io/gitbucket/gitbucket:4.46.1
+      jenkins_image: jenkins/jenkins:2.568.1-jdk21
+      authorized_agents: []
+
+Credentials never appear in YAML. See [Local collaboration
+services](local-collaboration.md) for lifecycle, backup, resource, security,
+and capability details. `bind_address` must be a connectable IP address;
+wildcard listener addresses (`0.0.0.0` and `::`) are rejected.
+
+## Agent and ACP harness representation
 
 Internally, durable sessions remain in the `agents` array for file and API
 compatibility. New entries use only the ACP runner fields:
 
 ```yaml
 agents:
-  - name: site-codex # internal ID derived from project + harness
+  - name: site-codex # stable internal ID
     backend: codex
     runner:
       kind: codex
       image: ghcr.io/xpressai/xpressclaw-runner-codex:latest
       workspace: /home/me/projects/site
+      project_name: Site maintainer # user-facing Agent name
       subscription_auth: true
+      ssh_agent_forwarding: false
       container_engine: none
     volumes: []
 ```
@@ -37,28 +145,46 @@ agents:
 
 | Field | Description |
 |---|---|
-| `kind` | `codex`, `claude`, `opencode`, or `custom` |
+| `kind` | Built-in catalog ID such as `codex`, `claude`, `deepseek-harness`, or `opencode`; otherwise `custom` |
 | `image` | Product-specific ACP server image or compatible derivative |
-| `workspace` | Host project mounted read-write at `/workspace`, or at the same absolute path in host-engine mode |
+| `workspace` | Host writable bootstrap boundary mounted at `/workspace`, or at the same absolute path in host-engine mode. The active Git repository may be this folder or one selected checkout beneath it. |
+| `project_name` | User-facing Agent name; falls back to the workspace folder when omitted |
 | `model` | Optional model value ID applied through ACP session configuration |
 | `subscription_auth` | Reuse the built-in product's host login directory |
+| `ssh_agent_forwarding` | Share host `~/.ssh` and forward a detected SSH agent when available (default `false`) |
+| `proxy` | `inherit` (default) uses the instance proxy; `direct` skips its domain and header rules |
 | `container_engine` | `none` (default) or trusted `host` Docker/Podman socket access |
-| `command` | ACP server argument list; required for custom agents and supports `{workspace}` |
+| `command` | ACP server argument list; required for custom harnesses and supports `{workspace}` |
 
-Additional `volumes` use `host:container` or `host:container:ro` syntax.
+Additional `volumes` use Docker-style `host:container[:options]` syntax. Options
+may combine `ro` or `rw` with `z` (a shared SELinux label) or `Z` (a private
+label), for example `/srv/shared:/workspace/shared:ro,z`. Xpressclaw
+automatically requests a shared label for the managed workspace and built-in
+harness login/configuration mounts when the Docker-compatible runtime reports
+SELinux support. Explicit mounts are never relabeled unless they include `z` or
+`Z`; in particular, Xpressclaw never relabels the Docker or Podman socket.
 
-The UI label is derived from the workspace folder (`site` above). The `name`
-field is only a stable internal reference used by tasks, schedules, and
-workflows. Codex and Claude receive no Xpressclaw profile or identity prompt;
+The UI label uses `runner.project_name`, falling back to the workspace folder.
+The top-level `name` field is only a stable internal reference used by tasks,
+schedules, and workflows. Codex and Claude receive no Xpressclaw profile or identity prompt;
 they retain ownership of their own instructions, tools, and subagents. The
 control plane sends task text as an ACP `session/prompt` and records standard
 ACP updates. Older profile fields are removed automatically when a
 configuration is loaded.
 
-For another agent, set `kind: custom`, provide an image, and enter the command
+For another harness, set `kind: custom`, provide an image, and enter the command
 that starts its ACP server over stdin/stdout. Authentication and credential
-mounts for custom agents are explicit volumes because Xpressclaw does not know
+mounts for custom harnesses are explicit volumes because Xpressclaw does not know
 their host directory conventions.
+
+## Agent network proxy
+
+**Settings → Proxy** configures web domain allow/block lists, inspection
+exemptions, header rules, and direct TCP/UDP destination and port permissions.
+SSH on port 22 is permitted by default. Agents inherit the instance setting;
+**Connect directly** in an Agent's runner settings bypasses the proxy for that
+Agent. Existing installations enable the new service explicitly in Settings.
+See [Agent network proxy](proxy.md) for matching rules, runtime behavior, and tests.
 
 ## Built-in images
 
@@ -66,6 +192,7 @@ their host directory conventions.
 |---|---|---|
 | Codex | `ghcr.io/xpressai/xpressclaw-runner-codex:latest` | `ghcr.io/xpressai/xpressclaw-runner-codex-docker:latest` |
 | Claude Code | `ghcr.io/xpressai/xpressclaw-runner-claude:latest` | `ghcr.io/xpressai/xpressclaw-runner-claude-docker:latest` |
+| DeepSeek Harness | `ghcr.io/xpressai/xpressclaw-runner-deepseek-harness:latest` | `ghcr.io/xpressai/xpressclaw-runner-deepseek-harness-docker:latest` |
 | OpenCode | `ghcr.io/xpressai/xpressclaw-runner-opencode:latest` | `ghcr.io/xpressai/xpressclaw-runner-opencode-docker:latest` |
 
 The host-engine variants add Docker CLI, Compose, and Buildx. When
@@ -89,9 +216,95 @@ agent and runner image are trusted. It is not a security boundary.
 The retired `xpressclaw-native-runner:latest` tag is migrated to the image for
 the configured product when an older file is loaded.
 
-## Multiple projects
+The DeepSeek Harness catalog entry starts `dsh-acp`, supplied by the maintained
+openma-ai adapter, and mounts host `~/.dsh` at `/home/node/.dsh` only when
+`subscription_auth` is enabled. The mount is writable because DSH stores
+credentials, settings, and durable session logs there. `dsh`, `dsh-acp`, and
+`deepseek-harness-acp` backend aliases normalize to the stable
+`deepseek-harness` kind; existing custom runner kinds are unchanged. See
+[DeepSeek Harness](deepseek-harness.md).
 
-Use a separate working directory and `xpressclaw.yaml` for each independent
-control plane, or create multiple sessions with different project workspaces in
-one control plane. Select the server working directory with
-`xpressclaw up --workdir /path/to/control-plane`.
+Codex starts in its `agent-full-access` mode by default. This disables Codex's
+nested filesystem sandbox and approval prompts **inside the Agent's retained
+container**; Docker or Podman remains the security boundary, and the
+host container engine remains unavailable unless `container_engine: host` is
+explicitly selected. Set `runner.environment.INITIAL_AGENT_MODE` to another
+Codex ACP mode (for example, `agent`) when a project needs the additional inner
+sandbox. A mode selected through the Agent or task controls remains
+authoritative for that session.
+
+## Existing repositories and SSH remotes
+
+An existing workspace is mounted read-write, including its `.git` directory.
+For an Agent created without a path, XpressClaw creates
+`<data-dir>/workspaces/<agent-id>` and never reuses the instance root. A local
+SQLite selection records an active repository relative to that workspace; it
+is runtime state, not portable `xpressclaw.yaml` configuration. Existing
+explicit workspaces and legacy files are not moved during migration.
+
+Repository discovery occurs at safe turn boundaries and through explicit
+GitHub-tool `cwd` resolution. It is bounded, does not follow symlinks, and stays
+inside the configured writable workspace. A root
+repository wins; exactly one nested repository is adopted; multiple nested
+repositories require an explicit choice in **Agent → Environment**. If the
+bounded scan reaches its safety limit, XpressClaw also requires an explicit
+selection rather than assuming the partial candidate list is complete. Changing
+or clearing the active repository recreates the Agent's retained ACP session
+on the next turn while preserving Tasks, Conversations, and managed review
+state. Files, Git status, the ACP working directory, and the bundled GitHub MCP
+then use the active repository. The workspace remains the outer mount and
+authorization boundary.
+
+For GitHub repositories, XpressClaw prefers its project-scoped HTTPS credential
+helper and rewrites the standard `git@github.com:` remote forms when a GitHub
+connector is available. No SSH key is needed for that path.
+
+For GitLab, self-hosted Git servers, SSH host aliases, or a GitHub repository
+without connector access, enable `runner.ssh_agent_forwarding`. XpressClaw
+mounts host `~/.ssh` read-write at the runner user's normal SSH location and
+forwards a live SSH-agent socket when one is available. When an agent is
+forwarded, new host keys accepted by the runner are also kept in private,
+Agent-scoped storage under XpressClaw's data directory, so changed-key checks
+survive retained-container recreation. Mounted SSH files reflect host changes
+directly. When an agent is forwarded, a runner-only config overlay points all
+SSH client commands at that socket even if the host config names a host-only
+`IdentityAgent` path; config changes refresh that overlay on the next turn.
+Replacing a forwarded agent socket changes its mount. Existing environments are
+preserved; rebuild explicitly from Agent settings > Harness to apply that change.
+
+On macOS, when the selected daemon identifies itself as Docker Desktop,
+XpressClaw uses Docker Desktop's `/run/host-services/ssh-auth.sock` bridge
+instead of trying to bind-mount the native macOS socket through its Linux VM.
+Other Docker-compatible runtimes continue to mount the detected host socket.
+
+The setting is deliberately opt-in: every process in that Agent's retained
+container can read and change files in host `~/.ssh` and can request signatures
+from every key currently loaded in a forwarded host agent. A missing agent
+socket does not block the runner; file-based SSH access remains available.
+
+## Advanced independent instances
+
+Most people should use one default instance and create several Projects and
+Agents inside it. A separate instance is useful only when configuration,
+SQLite state, credentials, managed workspaces, logs, and runtime policy need
+an independent boundary—for example production versus testing, separate
+security contexts, or different remote hosts.
+
+Create and run an alternate instance on its own port:
+
+```bash
+xpressclaw init /srv/xpressclaw/staging
+xpressclaw up --instance /srv/xpressclaw/staging --port 9001
+```
+
+`--workdir` remains a deprecated alias for `--instance`. Existing CLI
+installations that have `xpressclaw.yaml` in the current directory remain
+discoverable when the default instance has not yet been configured. Existing
+YAML files also retain their configured/default data paths; XpressClaw does
+not silently move databases. To turn an older directory into a truly isolated
+instance, set `system.data_dir` explicitly before starting it. The former bare
+`xpressclaw init` current-directory behavior remains available as the explicit
+`xpressclaw init .` spelling.
+
+The word **profile** is reserved for a future client-side saved connection to
+an instance. It is not another name for the server's configuration directory.

@@ -3,12 +3,19 @@ use std::sync::{Arc, RwLock};
 
 use xpressclaw_core::budget::rate_limiter::RateLimiter;
 use xpressclaw_core::config::Config;
+use xpressclaw_core::config::InstanceConfig;
 use xpressclaw_core::conversations::event_bus::ConversationEventBus;
 use xpressclaw_core::db::Database;
 use xpressclaw_core::docker::manager::DockerManager;
 use xpressclaw_core::llm::router::LlmRouter;
 use xpressclaw_core::tools::mcp_manager::McpManager;
 use xpressclaw_core::workers::acp::{AcpElicitationBroker, AcpInterruptMode, AcpTurnControlBroker};
+use xpressclaw_core::workers::native::{
+    ConversationAcpProcesses, NativeRuntimeLifecycle, ProjectAcpProcesses,
+};
+use zeroize::Zeroizing;
+
+use crate::auth::InstanceAuth;
 
 /// Shared application state passed to all Axum handlers.
 ///
@@ -28,12 +35,43 @@ pub struct AppState {
     pub mcp_manager: Arc<McpManager>,
     /// Per-conversation event broadcast channels (ADR-019).
     pub event_bus: Arc<ConversationEventBus>,
+    /// Shared, cached host resource sampler. Only dashboard requests use it.
+    pub resource_monitor:
+        Arc<std::sync::Mutex<xpressclaw_core::system::resources::ResourceMonitor>>,
     /// Shared Docker connection (reused across all requests).
     pub docker: Arc<RwLock<Option<Arc<DockerManager>>>>,
     /// Live ACP forms waiting for a response from the task UI.
     pub elicitations: Arc<AcpElicitationBroker>,
     /// Live signals that let queued user guidance interrupt an ACP prompt.
     pub turn_controls: Arc<AcpTurnControlBroker>,
+    /// Retained per-Conversation ACP lanes shared with the native dispatcher.
+    pub conversation_processes: Arc<ConversationAcpProcesses>,
+    /// Retained task ACP connections, also used by prompt-free model controls.
+    pub project_processes: Arc<ProjectAcpProcesses>,
+    /// Bound runner callback port, also needed when sign-in prepares a new container.
+    pub runner_callback_port: Arc<std::sync::atomic::AtomicU16>,
+    /// Serialize explicit picker edits/CAS across browser clients, not turns.
+    pub task_controls_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Per-Agent barrier shared by native dispatchers and destructive Project
+    /// lifecycle operations.
+    pub native_runtime_lifecycle: Arc<NativeRuntimeLifecycle>,
+    /// Serialize writes that replace the file-backed and in-memory
+    /// configuration so handlers cannot persist and apply stale snapshots.
+    pub config_write_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serialize project storage scans, retention updates, and cleanup.
+    pub storage_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serialize explicit Git-backed Project sync operations so fetch and
+    /// publish cannot race through the same temporary Git store state.
+    pub project_sync_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serialize Docker lifecycle reconciliation for the local collaboration
+    /// stack. Every clone shares this lock, so fixed container, network, and
+    /// volume names cannot be concurrently recreated or removed.
+    pub collaboration_lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Listener/authentication values effective for this running process.
+    /// Saved configuration may differ until the next restart.
+    pub effective_instance: Arc<InstanceConfig>,
+    /// Process-local browser sessions and credential verifier/token.
+    pub auth: Arc<InstanceAuth>,
 }
 
 impl AppState {
@@ -45,6 +83,60 @@ impl AppState {
         config_path: PathBuf,
         setup_complete: bool,
     ) -> Self {
+        let effective_instance = config.instance.clone();
+        let instance_id = db
+            .installation_id()
+            .unwrap_or_else(|_| "unknown-instance".to_string());
+        let auth = Arc::new(InstanceAuth::disabled(instance_id));
+        Self::new_inner(
+            config,
+            db,
+            llm_router,
+            config_path,
+            setup_complete,
+            effective_instance,
+            auth,
+        )
+    }
+
+    /// Production constructor with the listener/auth settings selected by the
+    /// CLI and an optional token supplied by the detached launcher.
+    pub fn new_with_instance(
+        config: Arc<Config>,
+        db: Arc<Database>,
+        llm_router: Option<Arc<LlmRouter>>,
+        config_path: PathBuf,
+        setup_complete: bool,
+        effective_instance: InstanceConfig,
+        supplied_startup_token: Option<Zeroizing<String>>,
+    ) -> anyhow::Result<Self> {
+        let instance_id = db.installation_id()?;
+        let auth = Arc::new(InstanceAuth::load(
+            &config.system.data_dir,
+            instance_id,
+            effective_instance.authentication_enabled,
+            supplied_startup_token,
+        )?);
+        Ok(Self::new_inner(
+            config,
+            db,
+            llm_router,
+            config_path,
+            setup_complete,
+            effective_instance,
+            auth,
+        ))
+    }
+
+    fn new_inner(
+        config: Arc<Config>,
+        db: Arc<Database>,
+        llm_router: Option<Arc<LlmRouter>>,
+        config_path: PathBuf,
+        setup_complete: bool,
+        effective_instance: InstanceConfig,
+        auth: Arc<InstanceAuth>,
+    ) -> Self {
         let rate_limiter = Arc::new(RateLimiter::new(config.clone()));
         Self {
             config: Arc::new(RwLock::new(config)),
@@ -55,9 +147,21 @@ impl AppState {
             setup_complete: Arc::new(RwLock::new(setup_complete)),
             mcp_manager: Arc::new(McpManager::new()),
             event_bus: Arc::new(ConversationEventBus::new()),
+            resource_monitor: Arc::new(std::sync::Mutex::new(Default::default())),
             docker: Arc::new(RwLock::new(None)),
             elicitations: Arc::new(AcpElicitationBroker::new()),
             turn_controls: Arc::new(AcpTurnControlBroker::new()),
+            conversation_processes: Arc::new(ConversationAcpProcesses::default()),
+            project_processes: Arc::new(ProjectAcpProcesses::default()),
+            runner_callback_port: Arc::new(std::sync::atomic::AtomicU16::new(0)),
+            task_controls_lock: Arc::new(tokio::sync::Mutex::new(())),
+            native_runtime_lifecycle: Arc::new(NativeRuntimeLifecycle::default()),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            storage_lock: Arc::new(tokio::sync::Mutex::new(())),
+            project_sync_lock: Arc::new(tokio::sync::Mutex::new(())),
+            collaboration_lifecycle_lock: Arc::new(tokio::sync::Mutex::new(())),
+            effective_instance: Arc::new(effective_instance),
+            auth,
         }
     }
 
@@ -87,7 +191,8 @@ impl AppState {
             }
         }
         // Slow path: try to connect
-        match DockerManager::connect().await {
+        let installation_id = self.db.installation_id().ok()?;
+        match DockerManager::connect_for_installation(&installation_id).await {
             Ok(d) => {
                 let d = Arc::new(d);
                 *self.docker.write().unwrap() = Some(d.clone());
@@ -109,6 +214,66 @@ impl AppState {
         *self.llm_router.write().unwrap() = llm_router;
         *self.rate_limiter.write().unwrap() = rate_limiter;
         *self.setup_complete.write().unwrap() = true;
+        self.db.bump_ui_domains(
+            xpressclaw_core::db::ui_domains::AGENTS
+                | xpressclaw_core::db::ui_domains::PROJECTS
+                | xpressclaw_core::db::ui_domains::SESSIONS
+                | xpressclaw_core::db::ui_domains::WORKFLOWS,
+        );
+    }
+
+    /// Recover a harness that ignores cooperative cancellation after its tools
+    /// finish. Reuse explicit interruption so the queued guidance is preserved.
+    pub fn monitor_guidance_interrupt(&self, attempt_id: String) {
+        let state = self.clone();
+        tokio::spawn(async move {
+            if !state
+                .turn_controls
+                .interruption_timed_out(&attempt_id, std::time::Duration::from_secs(30))
+                .await
+            {
+                return;
+            }
+            let sessions = xpressclaw_core::sessions::SessionManager::new(state.db.clone());
+            let Ok(attempt) = sessions.get_attempt(&attempt_id) else {
+                return;
+            };
+            if !matches!(
+                attempt.status.as_str(),
+                "preparing" | "running" | "waiting_for_input" | "review"
+            ) {
+                return;
+            }
+            let Some(task_id) = attempt.task_id.as_deref() else {
+                return;
+            };
+            if !xpressclaw_core::tasks::queue::TaskQueue::new(state.db.clone())
+                .has_queued_for_task(task_id)
+                .unwrap_or(false)
+            {
+                return;
+            }
+            tracing::warn!(
+                attempt_id,
+                task_id,
+                "harness did not acknowledge cancellation; interrupting for queued user guidance"
+            );
+            let _ = sessions.append_event(
+                &attempt.session_id,
+                xpressclaw_core::sessions::NewEvent {
+                    attempt_id: Some(&attempt_id),
+                    task_id: Some(task_id),
+                    source_type: "acp",
+                    source_id: Some(&attempt.runner),
+                    event_type: "interruption_timeout",
+                    summary: "Agent did not acknowledge interruption; recovering queued guidance",
+                    payload: serde_json::json!({"grace_seconds":30}),
+                },
+            );
+            if let Err(error) = state.interrupt_attempt(&attempt_id).await {
+                tracing::warn!(attempt_id, %error, "failed to interrupt unresponsive harness");
+            }
+        });
     }
 
     /// Stop one worker attempt without cancelling its task. Any queued user
@@ -150,10 +315,10 @@ impl AppState {
                     "cannot stop the active agent container".to_string(),
                 )
             })?;
-            let workload_id = format!("attempt-{attempt_id}");
-            if docker.is_running(&workload_id).await {
-                docker.stop(&workload_id).await?;
+            if docker.is_running(&current.session_id).await {
+                docker.stop_preserving(&current.session_id).await?;
             }
+            sessions.clear_container(attempt_id)?;
         }
 
         // The worker may have completed while its container was stopping.
@@ -192,5 +357,36 @@ impl AppState {
         }
         sessions.refresh_status(&current.session_id)?;
         Ok(interrupted)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cloned_state_serializes_collaboration_lifecycle_operations() {
+        let state = AppState::new(
+            Arc::new(Config::default()),
+            Arc::new(Database::open_memory().unwrap()),
+            None,
+            PathBuf::from("test.yaml"),
+            true,
+        );
+        let concurrent_request = state.clone();
+        let first = state.collaboration_lifecycle_lock.lock().await;
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            concurrent_request.collaboration_lifecycle_lock.lock(),
+        )
+        .await
+        .is_err());
+        drop(first);
+        let _second = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            concurrent_request.collaboration_lifecycle_lock.lock(),
+        )
+        .await
+        .expect("the next lifecycle operation should proceed after release");
     }
 }

@@ -1,0 +1,965 @@
+use crate::state::AppState;
+#[path = "project_planning.rs"]
+mod planning;
+use axum::{
+    body::Body,
+    extract::{Path, Query, State},
+    http::{header, HeaderMap, StatusCode},
+    response::Response,
+    routing::{delete, get, post},
+    Json, Router,
+};
+use base64::{engine::general_purpose::STANDARD, Engine};
+use serde::Deserialize;
+use serde_json::{json, Value};
+use xpressclaw_core::{
+    docker::{
+        environment::{
+            check_forward_reservations, save_forwards, saved_forwards, ForwardDirection,
+            PortForward,
+        },
+        manager::DockerManager,
+    },
+    tasks::{
+        attachments::DecodedImageAttachment, board::TaskBoard, conversation::TaskConversation,
+    },
+};
+
+type ApiError = (StatusCode, Json<Value>);
+type ApiResult<T> = Result<T, ApiError>;
+fn bad(error: impl std::fmt::Display) -> ApiError {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"error":error.to_string()})),
+    )
+}
+fn conflict(error: impl std::fmt::Display) -> ApiError {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({"error":error.to_string()})),
+    )
+}
+fn forbidden() -> ApiError {
+    (
+        StatusCode::FORBIDDEN,
+        Json(
+            json!({"error":"This operation must target the calling Agent and its current project"}),
+        ),
+    )
+}
+
+pub fn routes() -> Router<AppState> {
+    Router::new()
+        .route("/{agent_id}/ports", get(list_ports).post(add_port))
+        .route("/{agent_id}/ports/{id}", delete(remove_port))
+        .route("/{agent_id}/tree", get(tree))
+        .route("/{agent_id}/file", get(read_file).put(write_file))
+        .route("/{agent_id}/download", get(download))
+        .route("/{agent_id}/terminal-sessions", get(terminal_sessions))
+}
+
+pub fn internal_routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/{agent_id}/tasks",
+            get(planning::list_tasks).post(planning::create_task),
+        )
+        .merge(planning::routes())
+        .route(
+            "/{agent_id}/tasks/{task_id}/files",
+            post(publish_task_files),
+        )
+}
+
+fn authorize(state: &AppState, agent_id: &str, headers: &HeaderMap) -> ApiResult<()> {
+    super::workspace::require_same_origin(headers)?;
+    if headers
+        .get("x-xpressclaw-agent-id")
+        .is_some_and(|value| value.to_str().ok() != Some(agent_id))
+    {
+        return Err(forbidden());
+    }
+    if !state
+        .config()
+        .agents
+        .iter()
+        .any(|agent| agent.name == agent_id)
+    {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error":"Agent not found"})),
+        ));
+    }
+    Ok(())
+}
+
+fn require_agent(headers: &HeaderMap, agent_id: &str) -> ApiResult<()> {
+    if headers
+        .get("x-xpressclaw-agent-id")
+        .and_then(|value| value.to_str().ok())
+        != Some(agent_id)
+    {
+        return Err(forbidden());
+    }
+    Ok(())
+}
+
+async fn docker(state: &AppState) -> ApiResult<std::sync::Arc<DockerManager>> {
+    state.docker().await.ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error":"Docker or Podman is not available"})),
+        )
+    })
+}
+
+async fn active_docker(
+    state: &AppState,
+    agent_id: &str,
+) -> ApiResult<std::sync::Arc<DockerManager>> {
+    let docker = docker(state).await?;
+    docker
+        .start_project_environment(agent_id)
+        .await
+        .map_err(bad)?;
+    docker.restore_forwards(&state.db, agent_id).await;
+    Ok(docker)
+}
+
+#[derive(Deserialize)]
+struct PortInput {
+    direction: ForwardDirection,
+    host_port: u16,
+    container_port: u16,
+}
+
+async fn list_ports(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    authorize(&state, &agent_id, &headers)?;
+    let docker = state.docker().await;
+    let mut ports = vec![];
+    for spec in saved_forwards(&state.db, &agent_id).map_err(bad)? {
+        let active = match &docker {
+            Some(docker) => docker.forward_active(&agent_id, &spec.id).await,
+            None => false,
+        };
+        let mut value = json!(spec);
+        value["active"] = json!(active);
+        ports.push(value);
+    }
+    Ok(Json(json!({"ports":ports})))
+}
+
+async fn add_port(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<PortInput>,
+) -> ApiResult<Json<Value>> {
+    authorize(&state, &agent_id, &headers)?;
+    let spec = PortForward {
+        id: uuid::Uuid::new_v4().to_string(),
+        direction: input.direction,
+        host_port: input.host_port,
+        container_port: input.container_port,
+    };
+    spec.validate().map_err(bad)?;
+    check_forward_reservations(&state.db, &agent_id, std::slice::from_ref(&spec))
+        .map_err(conflict)?;
+    let docker = docker(&state).await?;
+    let _forwards_lock = docker.lock_agent_forwards(&agent_id).await;
+    let mut ports = saved_forwards(&state.db, &agent_id).map_err(bad)?;
+    if let Some(existing) = ports.iter().find(|port| {
+        port.direction == spec.direction
+            && port.host_port == spec.host_port
+            && port.container_port == spec.container_port
+    }) {
+        save_forwards(&state.db, &agent_id, &ports).map_err(conflict)?;
+        if docker.is_running(&agent_id).await {
+            docker
+                .start_forward(&agent_id, existing)
+                .await
+                .map_err(conflict)?;
+        }
+        return Ok(forward_result(
+            existing,
+            docker.forward_active(&agent_id, &existing.id).await,
+        ));
+    }
+    if ports.len() >= 16 {
+        return Err(bad("An environment can have at most 16 port forwards"));
+    }
+    if ports.iter().any(|port| {
+        port.direction == spec.direction
+            && match spec.direction {
+                ForwardDirection::HostToContainer => port.container_port == spec.container_port,
+                ForwardDirection::ContainerToHost => port.host_port == spec.host_port,
+            }
+    }) {
+        return Err(bad("This listening port already has a mapping"));
+    }
+    let active = docker.is_running(&agent_id).await;
+    if !active && spec.direction == ForwardDirection::ContainerToHost {
+        // Detect occupied host listeners even when the container is stopped.
+        tokio::net::TcpListener::bind(("127.0.0.1", spec.host_port))
+            .await
+            .map_err(|error| {
+                conflict(format!("Cannot bind host port {}: {error}", spec.host_port))
+            })?;
+    }
+    let previous = ports.clone();
+    ports.push(spec.clone());
+    // Reserve host ports atomically before doing Docker I/O. Other Agents can
+    // save independent mappings without waiting for this bridge's readiness.
+    save_forwards(&state.db, &agent_id, &ports).map_err(conflict)?;
+    if active {
+        if let Err(error) = docker.start_forward(&agent_id, &spec).await {
+            save_forwards(&state.db, &agent_id, &previous).map_err(bad)?;
+            return Err(conflict(error));
+        }
+    }
+    Ok(forward_result(&spec, active))
+}
+
+fn forward_result(spec: &PortForward, active: bool) -> Json<Value> {
+    Json(
+        json!({"id":spec.id, "direction":spec.direction, "host_port":spec.host_port, "container_port":spec.container_port, "active":active,
+        "host_address":format!("127.0.0.1:{}", spec.host_port), "container_address":format!("127.0.0.1:{}", spec.container_port),
+        "message":if active { "Port forward is active. Host addresses refer to the machine running XpressClaw." } else { "Saved. The forward starts when this Agent's container starts." }}),
+    )
+}
+
+async fn remove_port(
+    State(state): State<AppState>,
+    Path((agent_id, id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    authorize(&state, &agent_id, &headers)?;
+    let docker = state.docker().await;
+    let _forwards_lock = match docker.as_ref() {
+        Some(docker) => Some(docker.lock_agent_forwards(&agent_id).await),
+        None => None,
+    };
+    let mut ports = saved_forwards(&state.db, &agent_id).map_err(bad)?;
+    ports.retain(|port| port.id != id);
+    if let Some(docker) = docker.as_ref() {
+        docker.stop_forward(&agent_id, &id).await;
+    }
+    save_forwards(&state.db, &agent_id, &ports).map_err(bad)?;
+    Ok(Json(json!({"removed":true})))
+}
+
+#[derive(Deserialize)]
+struct FileQuery {
+    #[serde(default = "root_path")]
+    path: String,
+}
+fn root_path() -> String {
+    "/".into()
+}
+
+async fn tree(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+    Query(query): Query<FileQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    authorize(&state, &agent_id, &headers)?;
+    Ok(Json(
+        active_docker(&state, &agent_id)
+            .await?
+            .container_files(&agent_id, json!({"operation":"tree", "path":query.path}))
+            .await
+            .map_err(bad)?,
+    ))
+}
+async fn read_file(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+    Query(query): Query<FileQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    authorize(&state, &agent_id, &headers)?;
+    Ok(Json(
+        active_docker(&state, &agent_id)
+            .await?
+            .container_files(&agent_id, json!({"operation":"read", "path":query.path}))
+            .await
+            .map_err(bad)?,
+    ))
+}
+#[derive(Deserialize)]
+struct SaveFile {
+    path: String,
+    content: String,
+    expected_revision: String,
+}
+async fn write_file(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<SaveFile>,
+) -> ApiResult<Json<Value>> {
+    authorize(&state, &agent_id, &headers)?;
+    Ok(Json(docker(&state).await?.container_files(&agent_id, json!({"operation":"write", "path":input.path, "content":input.content, "expected_revision":input.expected_revision})).await.map_err(bad)?))
+}
+
+async fn download(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+    Query(query): Query<FileQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    authorize(&state, &agent_id, &headers)?;
+    let value = active_docker(&state, &agent_id)
+        .await?
+        .container_files(
+            &agent_id,
+            json!({"operation":"download", "path":query.path}),
+        )
+        .await
+        .map_err(bad)?;
+    file_download_response(value)
+}
+
+fn file_download_response(value: Value) -> ApiResult<Response> {
+    let data = STANDARD
+        .decode(value["data"].as_str().unwrap_or(""))
+        .map_err(bad)?;
+    let filename: String = value["name"]
+        .as_str()
+        .unwrap_or("download")
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ".-_ ".contains(ch) {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    // RFC 6266/8187: keep an ASCII fallback and send the UTF-8 name separately.
+    // Percent-encoding every byte also keeps quotes and CR/LF out of the header.
+    let encoded_filename: String = value["name"]
+        .as_str()
+        .unwrap_or("download")
+        .chars()
+        .map(|ch| {
+            if ch.is_control() || matches!(ch, '/' | '\\') {
+                '_'
+            } else {
+                ch
+            }
+        })
+        .collect::<String>()
+        .bytes()
+        .map(|byte| format!("%{byte:02X}"))
+        .collect();
+    Response::builder()
+        .header(
+            header::CONTENT_TYPE,
+            value["mime_type"]
+                .as_str()
+                .unwrap_or("application/octet-stream"),
+        )
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{filename}\"; filename*=UTF-8''{encoded_filename}"),
+        )
+        .header(header::CACHE_CONTROL, "no-store")
+        .header("x-content-type-options", "nosniff")
+        .body(Body::from(data))
+        .map_err(bad)
+}
+
+async fn terminal_sessions(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    authorize(&state, &agent_id, &headers)?;
+    Ok(Json(
+        active_docker(&state, &agent_id)
+            .await?
+            .container_files(&agent_id, json!({"operation":"sessions"}))
+            .await
+            .map_err(bad)?,
+    ))
+}
+
+#[derive(Deserialize)]
+struct PublishInput {
+    #[serde(default)]
+    content: String,
+    files: Vec<String>,
+}
+async fn publish_task_files(
+    State(state): State<AppState>,
+    Path((agent_id, task_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(input): Json<PublishInput>,
+) -> ApiResult<Json<Value>> {
+    authorize(&state, &agent_id, &headers)?;
+    require_agent(&headers, &agent_id)?;
+    let task = TaskBoard::new(state.db.clone())
+        .get(&task_id)
+        .map_err(bad)?;
+    if task.agent_id.as_deref() != Some(&agent_id) {
+        return Err(forbidden());
+    }
+    if input.files.is_empty() || input.files.len() > 8 {
+        return Err(bad("Publish between 1 and 8 files or folders"));
+    }
+    let docker = docker(&state).await?;
+    let files = collect_published_files(&input.files, |request| {
+        docker.container_files(&agent_id, request)
+    })
+    .await?;
+    let message = TaskConversation::new(state.db.clone())
+        .add_message_with_attachments(&task_id, "assistant", &input.content, &files)
+        .map_err(bad)?;
+    Ok(Json(json!(message)))
+}
+
+async fn collect_published_files<F, Fut>(
+    paths: &[String],
+    mut read: F,
+) -> ApiResult<Vec<DecodedImageAttachment>>
+where
+    F: FnMut(Value) -> Fut,
+    Fut: std::future::Future<Output = xpressclaw_core::error::Result<Value>>,
+{
+    const LIMIT: usize = 20 * 1024 * 1024;
+    const TOO_LARGE: &str =
+        "Published files cannot exceed 20 MiB per message; download larger folders from Files";
+    let mut remaining = LIMIT;
+    // Preflight the whole request before materializing even its first file.
+    for path in paths {
+        let info = read(json!({"operation":"stat", "path":path, "max_bytes":remaining}))
+            .await
+            .map_err(bad)?;
+        let size = info["size"]
+            .as_u64()
+            .ok_or_else(|| bad("Container did not return the file size"))?;
+        if size > remaining as u64 {
+            return Err(bad(TOO_LARGE));
+        }
+        remaining -= size as usize;
+    }
+    let mut files = vec![];
+    remaining = LIMIT;
+    for path in paths {
+        // Recheck and bound reads/tar in the container as files can grow after
+        // preflight. The host JSON response limit uses this same byte budget.
+        let value = read(json!({"operation":"download", "path":path, "max_bytes":remaining}))
+            .await
+            .map_err(bad)?;
+        let encoded = value["data"]
+            .as_str()
+            .ok_or_else(|| bad("Container did not return file data"))?;
+        if encoded.len() > remaining.div_ceil(3) * 4 {
+            return Err(bad(TOO_LARGE));
+        }
+        let data = STANDARD.decode(encoded).map_err(bad)?;
+        if data.len() > remaining {
+            return Err(bad(TOO_LARGE));
+        }
+        remaining -= data.len();
+        files.push(DecodedImageAttachment {
+            name: value["name"].as_str().unwrap_or("file").into(),
+            mime_type: value["mime_type"]
+                .as_str()
+                .unwrap_or("application/octet-stream")
+                .into(),
+            data,
+        });
+    }
+    Ok(files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::Request;
+    use http_body_util::BodyExt;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+    use xpressclaw_core::{
+        agents::registry::AgentRegistry,
+        config::{AgentConfig, Config},
+        db::Database,
+        tasks::board::CreateTask,
+        tasks::queue::TaskQueue,
+    };
+
+    async fn planning_request(
+        app: &Router,
+        method: &str,
+        path: &str,
+        agent: &str,
+        body: Value,
+    ) -> (StatusCode, Value) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("x-xpressclaw-agent-id", agent)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn only_parent_agent_can_accept_the_current_delegated_result() {
+        let (app, db) = app();
+        let board = TaskBoard::new(db.clone());
+        let parent = board
+            .create(&CreateTask {
+                title: "Coordinate rollout".into(),
+                agent_id: Some("atlas".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let child = board
+            .create(&CreateTask {
+                title: "Deploy".into(),
+                agent_id: Some("helper".into()),
+                parent_task_id: Some(parent.id.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        let queue = TaskQueue::new(db.clone());
+        queue.enqueue(&child.id, "helper").unwrap();
+        let work = queue.claim("helper").unwrap().unwrap();
+        xpressclaw_core::sessions::SessionManager::new(db.clone())
+            .transition_attempt(
+                work.attempt_id.as_deref().unwrap(),
+                "completed",
+                "Worker response",
+                Some("Deployment checked"),
+                None,
+            )
+            .unwrap();
+        queue.complete(work.id, "Deployment checked").unwrap();
+        board.complete_and_roll_up(&child.id, None).unwrap();
+        let (status, detail) = planning_request(
+            &app,
+            "GET",
+            &format!("/atlas/tasks/{}", child.id),
+            "atlas",
+            json!(null),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(detail["task"]["parent_review_required"], true);
+        assert_eq!(
+            detail["latest_attempt"]["id"],
+            work.attempt_id.as_deref().unwrap()
+        );
+        let review = json!({"parent_task_id":parent.id,"expected_attempt_id":work.attempt_id,"expected_revision":detail["task"]["revision"],"decision":"accept"});
+        for caller in ["helper", "outsider"] {
+            let (status, _) = planning_request(
+                &app,
+                "POST",
+                &format!("/{caller}/tasks/{}/review", child.id),
+                caller,
+                review.clone(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+        }
+        let (status, accepted) = planning_request(
+            &app,
+            "POST",
+            &format!("/atlas/tasks/{}/review", child.id),
+            "atlas",
+            review,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{accepted}");
+        assert_eq!(accepted["status"], "completed");
+        assert_eq!(accepted["parent_review_required"], false);
+    }
+
+    #[tokio::test]
+    async fn manager_discovers_agents_creates_a_plan_and_releases_future_work() {
+        let (app, db) = app();
+        let (status, roster) =
+            planning_request(&app, "GET", "/atlas/agents", "atlas", json!(null)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(roster["total"], 2);
+        assert_eq!(roster["project_id"], "shared");
+        assert!(roster["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|agent| agent["title"].is_string() && agent["config"].is_null()));
+        assert!(!roster.to_string().contains("outsider"));
+        let (status,created)=planning_request(&app,"POST","/atlas/tasks/batch","atlas",json!({
+            "parent_task_id":null,"tasks":[
+                {"ref":"read","title":"Read","agent_id":"helper","backlog":true},
+                {"title":"Implement","agent_id":"atlas","depends_on":["read"],"start_after":"2099-01-01T00:00:00Z"}
+            ]
+        })).await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        let id = created["refs"]["read"].as_str().unwrap();
+        assert_eq!(created["tasks"][0]["project_id"], "shared");
+        assert!(created["tasks"][0]["parent_task_id"].is_null());
+        assert!(TaskQueue::new(db.clone()).claim("atlas").unwrap().is_none());
+        assert!(TaskQueue::new(db.clone())
+            .claim("helper")
+            .unwrap()
+            .is_none());
+        let (status, page) = planning_request(
+            &app,
+            "GET",
+            "/atlas/tasks?project_id=other&status=all",
+            "atlas",
+            json!(null),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(page["total"], 2);
+        let (status, detail) = planning_request(
+            &app,
+            "GET",
+            &format!("/atlas/tasks/{id}"),
+            "atlas",
+            json!(null),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let revision = detail["task"]["revision"].as_i64().unwrap();
+        let (status,updated)=planning_request(&app,"PATCH",&format!("/atlas/tasks/{id}/planning"),"atlas",json!({
+            "expected_revision":revision,"action":"schedule","start_after":"2099-01-02T00:00:00Z","activate":true
+        })).await;
+        assert_eq!(status, StatusCode::OK, "{updated}");
+        assert_eq!(updated["backlog"], false);
+        assert!(TaskQueue::new(db).claim("helper").unwrap().is_none());
+        let (status, _) = planning_request(
+            &app,
+            "PATCH",
+            &format!("/atlas/tasks/{id}/planning"),
+            "atlas",
+            json!({
+                "expected_revision":revision,"action":"queue"
+            }),
+        )
+        .await;
+        assert_ne!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn manager_cannot_read_or_mutate_another_projects_plan() {
+        let (app, db) = app();
+        let outside = TaskBoard::new(db.clone())
+            .create(&CreateTask {
+                title: "Private title".into(),
+                agent_id: Some("outsider".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        for (method, path, body) in [
+            ("GET", format!("/atlas/tasks/{}", outside.id), json!(null)),
+            (
+                "PATCH",
+                format!("/atlas/tasks/{}/planning", outside.id),
+                json!({"expected_revision":outside.revision,"action":"backlog"}),
+            ),
+            (
+                "POST",
+                "/atlas/tasks/batch".into(),
+                json!({"tasks":[{"title":"Would be valid"},{"title":"Bad","agent_id":"outsider"}]}),
+            ),
+        ] {
+            let (status, body) = planning_request(&app, method, &path, "atlas", body).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            assert!(!body.to_string().contains("Private title"));
+        }
+        let count = db
+            .with_conn(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get::<_, i64>(0))
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+        let (status, _) =
+            planning_request(&app, "GET", "/atlas/agents", "outsider", json!(null)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn manager_can_schedule_workflow_copies_and_pause_only_project_owned_workflows() {
+        use xpressclaw_core::workflows::manager::{CreateWorkflow, WorkflowManager};
+        let (app, db) = app();
+        let manager = WorkflowManager::new(db);
+        let template=manager.create(&CreateWorkflow {
+            name:"Template".into(),description:None,
+            yaml_content:"name: Template\ninputs:\n  worker: {type: agent, required: true}\nflows:\n  main:\n    steps:\n      - id: run\n        agent: '@worker'\n        prompt: Audit\n".into()
+        }).unwrap();
+        let (status, catalog) =
+            planning_request(&app, "GET", "/atlas/workflows", "atlas", json!(null)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(catalog["workflows"][0]["id"], template.id);
+        let (status,created)=planning_request(&app,"POST","/atlas/workflows/schedule","atlas",json!({"schedules":[
+            {"workflow_id":template.id,"inputs":{"worker":"helper"},"run_at":"2099-01-01T00:00:00Z"},
+            {"workflow_id":template.id,"inputs":{"worker":"helper"},"cron":"0 9 * * 1","enabled":false}
+        ]})).await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        let id = created["workflows"][0]["id"].as_str().unwrap();
+        assert_eq!(created["workflows"][0]["project_id"], "shared");
+        let (status, paused) = planning_request(
+            &app,
+            "PATCH",
+            &format!("/atlas/workflows/{id}"),
+            "atlas",
+            json!({"expected_revision":0,"enabled":false}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{paused}");
+        assert_eq!(paused["enabled"], false);
+        let (status, _) = planning_request(
+            &app,
+            "GET",
+            &format!("/outsider/workflows/{id}"),
+            "outsider",
+            json!(null),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _) = planning_request(
+            &app,
+            "PATCH",
+            &format!("/atlas/workflows/{}", template.id),
+            "atlas",
+            json!({"expected_revision":0,"enabled":false}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(manager.get(&template.id).unwrap().enabled);
+    }
+
+    #[tokio::test]
+    async fn download_response_preserves_utf8_filename_and_file_bytes() {
+        let response = file_download_response(json!({
+            "name": "report café.txt", "mime_type": "text/plain", "data": STANDARD.encode(b"report bytes"),
+        })).unwrap();
+        assert_eq!(response.headers()[header::CONTENT_DISPOSITION],
+            "attachment; filename=\"report caf_.txt\"; filename*=UTF-8''%72%65%70%6F%72%74%20%63%61%66%C3%A9%2E%74%78%74");
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            &b"report bytes"[..]
+        );
+        let response = file_download_response(json!({
+            "name": "\"/\\\r\n%.txt", "data": "",
+        }))
+        .unwrap();
+        assert_eq!(
+            response.headers()[header::CONTENT_DISPOSITION],
+            "attachment; filename=\"______.txt\"; filename*=UTF-8''%22%5F%5F%5F%5F%25%2E%74%78%74"
+        );
+    }
+
+    fn app() -> (Router, Arc<Database>) {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let mut config = Config::default();
+        for name in ["atlas", "helper", "outsider"] {
+            AgentRegistry::new(db.clone())
+                .ensure(name, "native")
+                .unwrap();
+            config.agents.push(AgentConfig {
+                name: name.into(),
+                ..Default::default()
+            });
+        }
+        db.with_conn(|conn| {
+            conn.execute_batch("INSERT INTO projects (id, name) VALUES ('shared', 'Shared'), ('other', 'Other'); UPDATE agents SET project_id = 'shared' WHERE id IN ('atlas', 'helper'); UPDATE agents SET project_id = 'other' WHERE id = 'outsider';")
+        }).unwrap();
+        let state = AppState::new(
+            Arc::new(config),
+            db.clone(),
+            None,
+            "/tmp/environment-test.yaml".into(),
+            true,
+        );
+        (routes().merge(internal_routes()).with_state(state), db)
+    }
+
+    #[tokio::test]
+    async fn cross_agent_host_port_conflicts_return_an_actionable_http_error() {
+        let (app, db) = app();
+        save_forwards(
+            &db,
+            "helper",
+            &[PortForward {
+                id: "server".into(),
+                direction: ForwardDirection::ContainerToHost,
+                host_port: 3000,
+                container_port: 3001,
+            }],
+        )
+        .unwrap();
+        let response = app.oneshot(Request::post("/atlas/ports")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"direction":"host_to_container", "host_port":3000, "container_port":8080}).to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let value: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert!(value["error"]
+            .as_str()
+            .unwrap()
+            .contains("Host port 3000 is reserved by Agent helper"));
+        assert!(saved_forwards(&db, "atlas").unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn publishing_checks_all_sizes_before_any_download() {
+        let mut operations = vec![];
+        let result = collect_published_files(&["/tmp/small".into(), "/tmp/large".into()], |request| {
+            operations.push(request.clone());
+            std::future::ready(Ok(json!({"size":if request["path"] == "/tmp/large" { 21 * 1024 * 1024 } else { 10 }})))
+        }).await;
+        assert_eq!(result.unwrap_err().0, StatusCode::BAD_REQUEST);
+        assert_eq!(operations.len(), 2);
+        assert!(operations
+            .iter()
+            .all(|request| request["operation"] == "stat"));
+        assert_eq!(operations[1]["max_bytes"], 20 * 1024 * 1024 - 10);
+    }
+
+    #[tokio::test]
+    async fn publishing_bounds_downloads_by_the_remaining_message_budget() {
+        let mut operations = vec![];
+        let files = collect_published_files(&["/tmp/a".into(), "/tmp/b".into()], |request| {
+            operations.push(request.clone());
+            std::future::ready(Ok(if request["operation"] == "stat" {
+                json!({"size":2})
+            } else {
+                json!({"name":"file", "data":"YWJj", "mime_type":"text/plain"})
+            }))
+        })
+        .await
+        .unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].data, b"abc");
+        assert_eq!(operations[2]["operation"], "download");
+        assert_eq!(operations[2]["max_bytes"], 20 * 1024 * 1024);
+        assert_eq!(operations[3]["max_bytes"], 20 * 1024 * 1024 - 3);
+    }
+
+    #[tokio::test]
+    async fn creates_and_queues_a_blocking_child_in_the_callers_project() {
+        let (app, db) = app();
+        let parent = TaskBoard::new(db.clone())
+            .create(&CreateTask {
+                title: "Parent".into(),
+                agent_id: Some("atlas".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let response = app
+            .oneshot(
+                Request::post("/atlas/tasks")
+                    .header("x-xpressclaw-agent-id", "atlas")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"title":"Child", "agent_id":"helper", "parent_task_id":parent.id})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(value["project_id"], "shared");
+        assert_eq!(value["parent_task_id"], parent.id);
+        assert_eq!(value["blocks_parent"], true);
+        assert_eq!(value["backlog"], false);
+        xpressclaw_core::tasks::planning::TaskPlanner::new(db.clone())
+            .change(
+                value["id"].as_str().unwrap(),
+                &serde_json::from_value(json!({
+                    "action":"priority", "priority":10, "expected_revision":value["revision"]
+                }))
+                .unwrap(),
+            )
+            .expect("Agent task creation must return the revision after enqueueing");
+        assert!(TaskQueue::new(db.clone())
+            .claim("helper")
+            .unwrap()
+            .is_some());
+        assert_eq!(value["agent_id"], "helper");
+        let queued: i64 = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM task_queue WHERE task_id = ?1",
+                    [value["id"].as_str().unwrap()],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(queued, 1);
+    }
+
+    #[tokio::test]
+    async fn rejects_cross_agent_environment_access_and_cross_project_delegation() {
+        let (app, db) = app();
+        for url in [
+            "/helper/ports",
+            "/helper/tree?path=/tmp",
+            "/helper/download?path=/tmp",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get(url)
+                        .header("x-xpressclaw-agent-id", "atlas")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+        let parent = TaskBoard::new(db)
+            .create(&CreateTask {
+                title: "Other parent".into(),
+                agent_id: Some("outsider".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        for input in [
+            json!({"title":"Wrong assignee", "agent_id":"outsider"}),
+            json!({"title":"Wrong parent", "parent_task_id":parent.id}),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/atlas/tasks")
+                        .header("x-xpressclaw-agent-id", "atlas")
+                        .header("content-type", "application/json")
+                        .body(Body::from(input.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+    }
+}

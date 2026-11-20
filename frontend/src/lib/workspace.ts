@@ -1,15 +1,25 @@
 export type WorkspaceTabKind =
 	| 'home'
+	| 'dashboard'
 	| 'projects'
 	| 'project'
+	| 'agents'
+	| 'agent'
+	| 'conversation'
 	| 'tasks'
 	| 'task'
+	| 'automations'
 	| 'schedules'
 	| 'workflows'
 	| 'workflow'
 	| 'workflow-new'
 	| 'settings'
+	| 'settings-collaboration'
+	| 'settings-proxy'
 	| 'settings-mcp'
+	| 'settings-sync'
+	| 'settings-speech'
+	| 'settings-connect'
 	| 'settings-server';
 
 export interface WorkspaceTab {
@@ -19,6 +29,7 @@ export interface WorkspaceTab {
 	title: string;
 	resourceId: string | null;
 	status: string | null;
+	lastActiveAt: number;
 }
 
 export interface WorkspacePaneState {
@@ -28,7 +39,14 @@ export interface WorkspacePaneState {
 	width: number;
 }
 
-export const projectSections = ['session', 'tasks', 'schedules', 'runner', 'workspace'] as const;
+export const WORKSPACE_OPEN_SPLIT_EVENT = 'xpressclaw:workspace-open-split';
+export const TASK_FILE_SPLIT_MIN_PANE_WIDTH = 480;
+
+export interface WorkspaceOpenSplitDetail {
+	path: string;
+}
+
+export const projectSections = ['session', 'tasks', 'schedules', 'files', 'runner', 'workspace'] as const;
 export type ProjectSection = typeof projectSections[number];
 
 let idCounter = 0;
@@ -52,6 +70,14 @@ export function projectPath(projectId: string, section: ProjectSection = 'sessio
 	return section === 'session' ? base : `${base}?tab=${section}`;
 }
 
+export function collaborationProjectPath(projectId: string): string {
+	return `/projects/${encodeURIComponent(projectId)}`;
+}
+
+export function conversationPath(conversationId: string): string {
+	return `/conversations/${encodeURIComponent(conversationId)}`;
+}
+
 export function projectSection(route: string): ProjectSection {
 	const queryIndex = route.indexOf('?');
 	if (queryIndex < 0) return 'session';
@@ -64,10 +90,16 @@ export function projectSection(route: string): ProjectSection {
 export function workspacePath(route: string): boolean {
 	const pathname = pathnameFromRoute(route);
 	return pathname === '/'
+		|| pathname === '/dashboard'
+		|| pathname === '/projects'
+		|| pathname.startsWith('/projects/')
+		|| pathname === '/conversations'
+		|| pathname.startsWith('/conversations/')
 		|| pathname === '/agents'
 		|| pathname.startsWith('/agents/')
 		|| pathname === '/tasks'
 		|| pathname.startsWith('/tasks/')
+		|| pathname === '/automations'
 		|| pathname === '/schedules'
 		|| pathname === '/workflows'
 		|| pathname.startsWith('/workflows/')
@@ -75,32 +107,45 @@ export function workspacePath(route: string): boolean {
 		|| pathname.startsWith('/settings/');
 }
 
-export function describeWorkspacePath(route: string): Omit<WorkspaceTab, 'id' | 'status'> {
+export function describeWorkspacePath(route: string): Omit<WorkspaceTab, 'id' | 'status' | 'lastActiveAt'> {
 	const pathname = pathnameFromRoute(route);
 	if (pathname === '/') return { path: route, kind: 'home', title: 'New work', resourceId: null };
-	if (pathname === '/agents') return { path: route, kind: 'projects', title: 'Projects', resourceId: null };
-	if (pathname.startsWith('/agents/')) return { path: route, kind: 'project', title: 'Project', resourceId: pathname.slice('/agents/'.length) };
+	if (pathname === '/dashboard') return { path: route, kind: 'dashboard', title: 'Control center', resourceId: null };
+	if (pathname === '/projects') return { path: route, kind: 'projects', title: 'Projects', resourceId: null };
+	if (pathname.startsWith('/projects/')) return { path: route, kind: 'project', title: 'Project', resourceId: decodeURIComponent(pathname.slice('/projects/'.length)) };
+	if (pathname === '/conversations') return { path: route, kind: 'projects', title: 'Conversations', resourceId: null };
+	if (pathname.startsWith('/conversations/')) return { path: route, kind: 'conversation', title: 'Conversation', resourceId: decodeURIComponent(pathname.slice('/conversations/'.length)) };
+	if (pathname === '/agents') return { path: route, kind: 'agents', title: 'Agents', resourceId: null };
+	if (pathname.startsWith('/agents/')) return { path: route, kind: 'agent', title: 'Agent', resourceId: decodeURIComponent(pathname.slice('/agents/'.length)) };
 	if (pathname === '/tasks') return { path: route, kind: 'tasks', title: 'Tasks', resourceId: null };
 	if (pathname.startsWith('/tasks/')) return { path: route, kind: 'task', title: 'Task', resourceId: pathname.slice('/tasks/'.length) };
-	if (pathname === '/schedules') return { path: route, kind: 'schedules', title: 'Schedules', resourceId: null };
-	if (pathname === '/workflows') return { path: route, kind: 'workflows', title: 'Workflows', resourceId: null };
+	if (pathname === '/automations' || pathname === '/schedules' || pathname === '/workflows') return { path: route, kind: 'automations', title: 'Automations', resourceId: null };
 	if (pathname === '/workflows/new') return { path: route, kind: 'workflow-new', title: 'New workflow', resourceId: null };
 	if (pathname.startsWith('/workflows/')) return { path: route, kind: 'workflow', title: 'Workflow', resourceId: pathname.slice('/workflows/'.length) };
 	if (pathname === '/settings/server') return { path: route, kind: 'settings-server', title: 'Settings', resourceId: null };
+	if (pathname === '/settings/collaboration') return { path: route, kind: 'settings-collaboration', title: 'Settings', resourceId: null };
+	if (pathname === '/settings/proxy') return { path: route, kind: 'settings-proxy', title: 'Settings', resourceId: null };
 	if (pathname === '/settings/mcp') return { path: route, kind: 'settings-mcp', title: 'Settings', resourceId: null };
+	if (pathname === '/settings/sync') return { path: route, kind: 'settings-sync', title: 'Settings', resourceId: null };
+	if (pathname === '/settings/speech') return { path: route, kind: 'settings-speech', title: 'Settings', resourceId: null };
+	if (pathname === '/settings/connect') return { path: route, kind: 'settings-connect', title: 'Settings', resourceId: null };
 	return { path: '/settings', kind: 'settings', title: 'Settings', resourceId: null };
 }
 
 export function sameWorkspaceTab(tab: WorkspaceTab, route: string): boolean {
 	const next = describeWorkspacePath(route);
-	const settingsKinds: WorkspaceTabKind[] = ['settings', 'settings-mcp', 'settings-server'];
+	const settingsKinds: WorkspaceTabKind[] = ['settings', 'settings-proxy', 'settings-collaboration', 'settings-mcp', 'settings-sync', 'settings-speech', 'settings-connect', 'settings-server'];
+	const automationKinds: WorkspaceTabKind[] = ['automations', 'schedules', 'workflows'];
 	if (settingsKinds.includes(tab.kind) && settingsKinds.includes(next.kind)) return true;
+	if (automationKinds.includes(tab.kind) && automationKinds.includes(next.kind)) return true;
 	if (tab.kind === 'project' && next.kind === 'project') return tab.resourceId === next.resourceId;
+	if (tab.kind === 'agent' && next.kind === 'agent') return tab.resourceId === next.resourceId;
+	if (tab.kind === 'conversation' && next.kind === 'conversation') return tab.resourceId === next.resourceId;
 	return tab.path === route;
 }
 
 export function createWorkspaceTab(route: string): WorkspaceTab {
-	return { id: workspaceId('tab'), status: null, ...describeWorkspacePath(route) };
+	return { id: workspaceId('tab'), status: null, lastActiveAt: Date.now(), ...describeWorkspacePath(route) };
 }
 
 export function validWorkspacePane(value: unknown): value is WorkspacePaneState {

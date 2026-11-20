@@ -3,90 +3,160 @@
 	import { goto } from '$app/navigation';
 	import { sessions, tasks } from '$lib/api';
 	import type { ImageAttachmentUpload, SessionOverview, RunnerReadiness, Task } from '$lib/api';
+	import { isTransientRefreshError, subscribeLiveUpdates, usePaneActive } from '$lib/liveUpdates';
 	import ImageAttachmentPreviews from '$lib/components/ImageAttachmentPreviews.svelte';
+	import DictationButton from '$lib/components/DictationButton.svelte';
 	import { clearComposerDraft, loadComposerDraft, saveComposerDraft } from '$lib/composerDrafts';
 	import { appendImageFiles, imageDataUrl, IMAGE_FILE_ACCEPT, MAX_IMAGE_ATTACHMENTS, pastedImageFiles, shouldHandleImagePaste } from '$lib/imageAttachments';
 	import { timeAgo } from '$lib/utils';
+	import { projectPath } from '$lib/workspace';
 
 	let { agentId }: { agentId: string } = $props();
 	const messageDraftScope = () => `session.${agentId}`;
 	let overview = $state<SessionOverview | null>(null);
 	let readiness = $state<RunnerReadiness | null>(null);
-	let taskList = $state<Task[]>([]);
 	let error = $state<string | null>(null);
+	let readinessError = $state<string | null>(null);
+	let prepareError = $state<string | null>(null);
+	let prepareNotice = $state<string | null>(null);
 	let message = $state('');
 	let messageDraftReady = $state(false);
 	let sending = $state(false);
 	let preparing = $state(false);
+	let preparationSeconds = $state(0);
 	let startFresh = $state(false);
 	let imageAttachments = $state<ImageAttachmentUpload[]>([]);
 	let imageInput = $state<HTMLInputElement>();
+	let composerInput = $state<HTMLTextAreaElement>();
 	let imagePreviews = $derived(imageAttachments.map((attachment) => ({
 		name: attachment.name,
 		src: imageDataUrl(attachment),
 	})));
-	let pollTimer: ReturnType<typeof setInterval> | null = null;
+	const paneActive = usePaneActive();
+	let unsubscribeLiveUpdates: (() => void) | null = null;
+	let readinessTimer: ReturnType<typeof setInterval> | null = null;
+	let preparationTimer: ReturnType<typeof setInterval> | null = null;
+	let readinessRequest = 0;
+	let loadingReadiness = false;
+	let lastReadinessCheck = 0;
+	let loadGeneration = 0;
+	let appliedGeneration = 0;
 
 	const RECENT_WORK_LIMIT = 5;
 	const ATTENTION_STATUSES = ['waiting_for_input', 'blocked'];
-	let attentionTasks = $derived(taskList.filter((task) => ATTENTION_STATUSES.includes(task.status)));
-	let activeTasks = $derived(taskList.filter((task) => ['pending', 'in_progress'].includes(task.status)));
+	let attentionTasks = $state<Task[]>([]);
 	let recentWorkTasks = $state<Task[]>([]);
+	let activeTaskCount = $derived(
+		typeof overview?.active_task_count === 'number'
+			? overview.active_task_count
+			: new Set(
+					[...recentWorkTasks, ...attentionTasks]
+						.filter((task) => ['pending', 'in_progress'].includes(task.status))
+						.map((task) => task.id)
+				).size
+	);
 
 	$effect(() => {
 		if (messageDraftReady) saveComposerDraft(messageDraftScope(), message);
 	});
 
+	function handleVisibilityChange() {
+		if (!document.hidden && paneActive() && (!readiness?.ready || Date.now() - lastReadinessCheck >= 60_000)) {
+			void loadReadiness();
+		}
+	}
+
 	onMount(() => {
 		message = loadComposerDraft(messageDraftScope());
 		messageDraftReady = true;
-		load();
-		loadReadiness();
-		pollTimer = setInterval(load, 2500);
+		void load();
+		void loadReadiness();
+		unsubscribeLiveUpdates = subscribeLiveUpdates(
+			['sessions', 'tasks', 'agents'],
+			() => load(true),
+			{ active: paneActive, fallbackIntervalMs: 2500 }
+		);
+		document.addEventListener('visibilitychange', handleVisibilityChange);
+		readinessTimer = setInterval(() => {
+			if (document.hidden || !paneActive()) return;
+			if (!readiness?.ready || Date.now() - lastReadinessCheck >= 60_000) void loadReadiness();
+		}, 10_000);
 	});
 
 	onDestroy(() => {
-		if (pollTimer) clearInterval(pollTimer);
+		unsubscribeLiveUpdates?.();
+		unsubscribeLiveUpdates = null;
+		document.removeEventListener('visibilitychange', handleVisibilityChange);
+		if (readinessTimer) clearInterval(readinessTimer);
+		if (preparationTimer) clearInterval(preparationTimer);
+		readinessRequest++;
 	});
 
-	async function load() {
+	async function load(rethrowTransient = false) {
+		const gen = ++loadGeneration;
 		try {
-			const [nextOverview, result, recentWork] = await Promise.all([
+			const [nextOverview, recentWork, attention] = await Promise.all([
 				sessions.get(agentId),
-				tasks.list(undefined, agentId),
 				tasks.list(undefined, agentId, {
 					limit: RECENT_WORK_LIMIT,
 					sort: 'recent',
 					excludeStatuses: ATTENTION_STATUSES,
 				}),
+				tasks.attention(agentId),
 			]);
+			if (gen < appliedGeneration) return;
+			appliedGeneration = gen;
 			overview = nextOverview;
-			taskList = result.tasks;
-			recentWorkTasks = recentWork.tasks;
+			recentWorkTasks = recentWork.tasks.filter(task => !ATTENTION_STATUSES.includes(task.activity_status ?? task.status));
+			attentionTasks = attention.tasks ?? [];
 			error = null;
 		} catch (e) {
-			error = e instanceof Error ? e.message : String(e);
+			if (gen >= appliedGeneration) error = e instanceof Error ? e.message : String(e);
+			if (rethrowTransient && isTransientRefreshError(e)) throw e;
 		}
 	}
 
 	async function loadReadiness() {
+		if (preparing || loadingReadiness) return;
+		loadingReadiness = true;
+		lastReadinessCheck = Date.now();
+		const request = ++readinessRequest;
 		try {
-			readiness = await sessions.readiness(agentId);
+			const next = await sessions.readiness(agentId);
+			if (request !== readinessRequest) return;
+			readiness = next;
+			readinessError = null;
+			if (next.ready) prepareError = null;
 		} catch (e) {
-			error = e instanceof Error ? e.message : String(e);
+			if (request === readinessRequest) readinessError = e instanceof Error ? e.message : String(e);
+		} finally {
+			loadingReadiness = false;
 		}
 	}
 
 	async function prepareRunner() {
 		if (preparing) return;
+		const request = ++readinessRequest;
 		preparing = true;
+		prepareError = null;
+		prepareNotice = null;
+		preparationSeconds = 0;
+		const started = Date.now();
+		preparationTimer = setInterval(() => {
+			preparationSeconds = Math.floor((Date.now() - started) / 1000);
+		}, 1000);
 		try {
-			readiness = await sessions.prepare(agentId);
-			error = null;
+			const next = await sessions.prepare(agentId);
+			if (request !== readinessRequest) return;
+			readiness = next;
+			readinessError = null;
+			prepareNotice = next.ready ? 'Runner is ready.' : next.image_present ? 'Runner image is ready. Resolve the remaining issues above.' : null;
 		} catch (e) {
-			error = e instanceof Error ? e.message : String(e);
+			if (request === readinessRequest) prepareError = e instanceof Error ? e.message : String(e);
 		} finally {
 			preparing = false;
+			if (preparationTimer) clearInterval(preparationTimer);
+			preparationTimer = null;
 		}
 	}
 
@@ -163,12 +233,15 @@
 	{#if error}
 		<div class="rounded-xl border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive">{error}</div>
 	{/if}
+	{#if readinessError}
+		<div role="alert" class="rounded-xl border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive">Could not check runner readiness: {readinessError}</div>
+	{/if}
 
 	{#if readiness && !readiness.ready}
 		<div class="rounded-xl border border-amber-500/30 bg-amber-500/5 p-4">
 			<div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
 				<div>
-					<h2 class="text-sm font-semibold text-amber-600">This project is not ready to run</h2>
+					<h2 class="text-sm font-semibold text-amber-600">This agent is not ready to run</h2>
 					<ul class="mt-2 space-y-1 text-xs text-muted-foreground">
 						{#each readiness.issues as issue}<li>• {issue}</li>{/each}
 					</ul>
@@ -176,13 +249,28 @@
 						<p class="mt-2 text-xs text-foreground">Run <code>{readiness.kind} login</code> on this computer, then refresh.</p>
 					{/if}
 				</div>
-				{#if readiness.docker_available && !readiness.image_present}
+				{#if readiness.docker_available && !readiness.image_present && readiness.can_prepare !== false}
 					<button onclick={prepareRunner} disabled={preparing} class="shrink-0 rounded-lg bg-primary px-3 py-2 text-xs font-medium text-primary-foreground disabled:opacity-50">
-						{preparing ? 'Preparing…' : 'Prepare runner'}
+						{preparing ? 'Downloading…' : 'Prepare runner'}
 					</button>
 				{/if}
 			</div>
 		</div>
+	{/if}
+	{#if preparing}
+		<p role="status" class="text-sm text-muted-foreground">Downloading runner image… {preparationSeconds}s elapsed. Agents using this runner will share the download.</p>
+	{:else if prepareError}
+		<div role="alert" class="rounded-xl border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive">Could not prepare runner: {prepareError}</div>
+	{:else if prepareNotice}
+		<p role="status" class="text-sm text-emerald-600">{prepareNotice}</p>
+	{/if}
+
+	{#if readiness?.runner_update}
+		<p data-runner-upgrade class="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
+			<span class="inline-flex items-center gap-1.5"><span class="h-1.5 w-1.5 rounded-full bg-primary/60" aria-hidden="true"></span>Harness update available</span>
+			<span>{readiness.runner_update.current_version} → {readiness.runner_update.available_version} downloaded</span>
+			<a href={projectPath(agentId, 'runner')} class="underline underline-offset-2 hover:text-foreground">Review update</a>
+		</p>
 	{/if}
 
 	{#if overview}
@@ -194,14 +282,14 @@
 					{projectStatus.label}
 				</div>
 				<div class="text-xs text-muted-foreground">
-					{#if activeTasks.length > 0}{activeTasks.length} active{:else}No active tasks{/if}
+					{#if activeTaskCount > 0}{activeTaskCount} active{:else}No active tasks{/if}
 					{#if overview.queued_attempts.length > 0} · {overview.queued_attempts.length} queued{/if}
 				</div>
 			</div>
-			<textarea bind:value={message} onkeydown={handleKeydown} onpaste={handlePaste} rows="4" placeholder="Send work or ask a question…" class="w-full resize-y bg-transparent px-5 pb-3 pt-5 text-sm leading-relaxed outline-none placeholder:text-muted-foreground"></textarea>
+			<textarea bind:this={composerInput} bind:value={message} onkeydown={handleKeydown} onpaste={handlePaste} rows="4" placeholder="Send work or ask a question…" class="w-full resize-y bg-transparent px-5 pb-3 pt-5 text-sm leading-relaxed outline-none placeholder:text-muted-foreground"></textarea>
 			<ImageAttachmentPreviews attachments={imagePreviews} onremove={(index) => (imageAttachments = imageAttachments.filter((_, itemIndex) => itemIndex !== index))} />
 			<div class="flex flex-col gap-3 px-4 pb-4 sm:flex-row sm:items-center sm:justify-between">
-				<label class="flex cursor-pointer items-center gap-2 text-xs text-muted-foreground" title="By default, this task continues the project's active agent conversation">
+				<label class="flex cursor-pointer items-center gap-2 text-xs text-muted-foreground" title="By default, this task branches from the agent's active conversation">
 					<input type="checkbox" bind:checked={startFresh} class="h-3.5 w-3.5 rounded border-border accent-primary" />
 					Start a fresh conversation
 				</label>
@@ -212,28 +300,31 @@
 						<svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" /></svg>
 					</button>
 					<span class="text-[11px] text-muted-foreground">⌘/Ctrl + Enter</span>
+					{#key agentId}<DictationButton disabled={sending} ontranscript={(text) => { message = message.trimEnd() ? `${message.trimEnd()} ${text}` : text; composerInput?.focus(); }} />{/key}
 					<button onclick={send} disabled={sending || (!message.trim() && imageAttachments.length === 0)} class="rounded-lg bg-primary px-5 py-2 text-sm font-medium text-primary-foreground disabled:opacity-40">
 						{sending ? 'Sending…' : 'Send'}
 					</button>
 				</div>
 			</div>
 			<div class="border-t border-border/70 bg-secondary/20 px-4 py-2.5 text-[11px] text-muted-foreground">
-				Tasks continue this project’s active {readiness?.kind ?? 'agent'} conversation. Dependent tasks continue the conversation they depend on.
+				New tasks branch from this agent’s active {readiness?.kind ?? 'harness'} conversation when supported. Follow-ups stay with their task, and dependent tasks branch from the conversation they depend on.
 			</div>
 		</section>
 
 		{#if attentionTasks.length > 0}
 			<section class="space-y-2">
 				<div class="flex items-center justify-between px-1">
-					<h2 class="text-sm font-semibold text-orange-500">Needs you</h2>
+					<h2 class="text-sm font-semibold text-orange-500">Needs attention</h2>
 					<span class="text-xs text-muted-foreground">{attentionTasks.length}</span>
 				</div>
 				{#each attentionTasks as task (task.id)}
-					<a href="/tasks/{task.id}" class="flex items-center gap-3 rounded-xl border p-4 transition-colors hover:border-primary/40 {taskTone(task.status)}">
+					<a href="/tasks/{task.id}" class="flex items-center gap-3 rounded-xl border p-4 transition-colors hover:border-primary/40 {taskTone(task.activity_status ?? task.status)}">
 						<span class="h-2.5 w-2.5 shrink-0 rounded-full bg-orange-500 animate-pulse"></span>
 						<div class="min-w-0 flex-1">
-							<div class="truncate text-sm font-medium">{task.title}</div>
-							<div class="mt-0.5 text-xs text-muted-foreground">{task.status === 'waiting_for_input' ? 'Waiting for your reply' : 'Blocked'} · {timeAgo(task.updated_at)}</div>
+							<div class="break-words text-sm font-medium">{task.title}</div>
+							{#if task.parent_task_id}<div class="text-xs text-muted-foreground">Delegated from {task.parent_title || 'another task'}</div>{/if}
+							{#if task.error_message}<p class="mt-1 whitespace-pre-wrap break-words text-xs text-destructive">{task.error_message}</p>{/if}
+							<div class="mt-0.5 text-xs text-muted-foreground">{(task.activity_status ?? task.status) === 'waiting_for_input' ? 'Waiting for your reply' : 'Blocked'} · {timeAgo(task.updated_at)}</div>
 						</div>
 						<span class="text-muted-foreground">→</span>
 					</a>
@@ -247,10 +338,10 @@
 					<h2 class="text-sm font-semibold">Work</h2>
 					<p class="mt-0.5 text-xs text-muted-foreground">Open a task to see its conversation and every technical step.</p>
 				</div>
-				<a href="/tasks" class="text-xs text-muted-foreground hover:text-foreground">All tasks</a>
+				<a href={`/tasks?view=list&agent=${encodeURIComponent(agentId)}&status=all&sort=newest`} class="text-xs text-muted-foreground hover:text-foreground">All tasks</a>
 			</div>
 			{#if recentWorkTasks.length === 0}
-				<div class="px-4 py-12 text-center text-sm text-muted-foreground">{attentionTasks.length > 0 ? 'No other work in this project.' : 'No work yet. Send the first task above.'}</div>
+				<div class="px-4 py-12 text-center text-sm text-muted-foreground">{attentionTasks.length > 0 ? 'No other work for this agent.' : 'No work yet. Send the first task above.'}</div>
 			{:else}
 				<div data-project-work-list class="divide-y divide-border">
 					{#each recentWorkTasks as task (task.id)}
@@ -268,6 +359,6 @@
 			{/if}
 		</section>
 	{:else if !error}
-		<div class="flex min-h-64 items-center justify-center text-sm text-muted-foreground">Loading project…</div>
+		<div class="flex min-h-64 items-center justify-center text-sm text-muted-foreground">Loading agent…</div>
 	{/if}
 </div>

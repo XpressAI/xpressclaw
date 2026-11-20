@@ -1,6 +1,6 @@
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
@@ -8,15 +8,22 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use xpressclaw_core::sessions::SessionManager;
-use xpressclaw_core::tasks::attachments::{decode_image_attachments, ImageAttachmentInput};
-use xpressclaw_core::tasks::board::{CreateTask, Task, TaskBoard, TaskStatus, UpdateTask};
+use xpressclaw_core::tasks::attachments::{
+    decode_attachments, is_prompt_image, ImageAttachmentInput,
+};
+use xpressclaw_core::tasks::board::{CreateTask, Task, TaskBoard, UpdateTask};
 use xpressclaw_core::tasks::conversation::TaskConversation;
 use xpressclaw_core::tasks::queue::TaskQueue;
+use xpressclaw_core::visualizations::VisualizationManager;
 use xpressclaw_core::workers::acp::{
     AcpElicitationResponseError, AcpInterruptMode, CreateElicitationResponse,
 };
+use xpressclaw_core::workers::{github, github_review::GithubReviewManager, native};
+use xpressclaw_core::workflows::engine::WorkflowEngine;
 
 use crate::state::AppState;
+
+use super::visualizations;
 
 #[derive(Deserialize)]
 pub struct ListParams {
@@ -29,6 +36,7 @@ pub struct ListParams {
     #[serde(default)]
     pub sort: TaskListSort,
     pub exclude_statuses: Option<String>,
+    pub search: Option<String>,
 }
 
 #[derive(Clone, Copy, Default, Deserialize)]
@@ -42,6 +50,12 @@ pub enum TaskListSort {
 #[derive(Deserialize)]
 pub struct RecentByAgentParams {
     pub limit: Option<i64>,
+    pub include_details: Option<bool>,
+}
+
+#[derive(Deserialize)]
+pub struct MessagesParams {
+    pub after_id: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -84,12 +98,34 @@ pub struct ElicitationResponseInput {
     pub message: Option<String>,
 }
 
+#[derive(Deserialize)]
+pub struct PullRequestInput {
+    pub url: Option<String>,
+    pub agent_id: String,
+    pub registration_id: Option<String>,
+    pub registration_key: Option<String>,
+    #[serde(default)]
+    pub phase: PullRequestRegistrationPhase,
+}
+
+#[derive(Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PullRequestRegistrationPhase {
+    Begin,
+    #[default]
+    Register,
+    Cancel,
+}
+
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/", get(list_tasks).post(create_task))
         .route("/batch", axum::routing::post(create_tasks_batch))
         .route("/counts", get(task_counts))
+        .route("/planning", get(list_planning))
+        .route("/{id}/planning", get(get_planning).patch(change_planning))
         .route("/recent-by-agent", get(list_recent_tasks_by_agent))
+        .route("/attention", get(list_attention_tasks))
         .route(
             "/{id}",
             get(get_task).patch(update_task).delete(delete_task),
@@ -100,12 +136,197 @@ pub fn routes() -> Router<AppState> {
             "/{id}/messages/{message_id}/attachments/{attachment_id}",
             get(get_message_attachment),
         )
+        .route(
+            "/{id}/messages/{message_id}/visualizations/{artifact_id}",
+            get(get_message_visualization),
+        )
         .route("/{id}/activity", get(get_activity))
+        .route(
+            "/{id}/config",
+            get(super::task_controls::get).post(super::task_controls::set),
+        )
+        .route("/{id}/pull-requests", post(register_pull_request))
         .route(
             "/{id}/elicitations/{elicitation_id}/response",
             post(respond_to_elicitation),
         )
         .route("/{id}/dependencies", axum::routing::post(add_dependency))
+}
+
+async fn register_pull_request(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<PullRequestInput>,
+) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
+    TaskBoard::new(state.db.clone())
+        .ensure_locally_managed(&id)
+        .map_err(task_write_error)?;
+    if headers
+        .get("x-xpressclaw-agent-id")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|agent_id| agent_id != request.agent_id)
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "pull-request registration must target the calling Agent" })),
+        ));
+    }
+    let config = state.config();
+    let agent = config
+        .agents
+        .iter()
+        .find(|agent| agent.name == request.agent_id)
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "the assigned agent is not configured" })),
+            )
+        })?;
+    let workspace = native::resolved_workspace(&config, agent);
+    let access = github_access_for_workspace(&state, agent.name.clone(), workspace)
+        .await?
+        .ok_or_else(|| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "project-scoped GitHub access is unavailable" })),
+            )
+        })?;
+    let manager = GithubReviewManager::new(state.db.clone());
+    match request.phase {
+        PullRequestRegistrationPhase::Begin => {
+            let registration_id = registration_id(&request)?;
+            let registration_key = registration_key(&request)?;
+            let (registration_id, reused) = manager
+                .begin_registration(
+                    &id,
+                    &request.agent_id,
+                    &access.repository(),
+                    registration_id,
+                    registration_key,
+                )
+                .map_err(pull_request_registration_error)?;
+            Ok((
+                StatusCode::CREATED,
+                Json(json!({
+                    "status": "registration_pending",
+                    "registration_id": registration_id,
+                    "reused": reused,
+                })),
+            ))
+        }
+        PullRequestRegistrationPhase::Register => {
+            let registration_id = registration_id(&request)?;
+            let registration_key = registration_key(&request)?;
+            let url = request.url.as_deref().ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "pull-request registration requires a URL" })),
+                )
+            })?;
+            let pull_request = manager
+                .register_pending(
+                    &id,
+                    &request.agent_id,
+                    &access.repository(),
+                    url,
+                    registration_id,
+                    registration_key,
+                )
+                .map_err(pull_request_registration_error)?;
+            Ok((StatusCode::CREATED, Json(json!(pull_request))))
+        }
+        PullRequestRegistrationPhase::Cancel => {
+            let registration_id = registration_id(&request)?;
+            let registration_key = registration_key(&request)?;
+            manager
+                .cancel_registration(
+                    &id,
+                    &request.agent_id,
+                    &access.repository(),
+                    registration_id,
+                    registration_key,
+                )
+                .map_err(pull_request_registration_error)?;
+            Ok((
+                StatusCode::OK,
+                Json(json!({ "status": "registration_cancelled" })),
+            ))
+        }
+    }
+}
+
+fn registration_id(request: &PullRequestInput) -> Result<&str, (StatusCode, Json<Value>)> {
+    request.registration_id.as_deref().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "this registration phase requires a registration ID" })),
+        )
+    })
+}
+
+fn registration_key(request: &PullRequestInput) -> Result<&str, (StatusCode, Json<Value>)> {
+    request.registration_key.as_deref().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "this registration phase requires a registration key" })),
+        )
+    })
+}
+
+fn pull_request_registration_error(
+    error: xpressclaw_core::error::Error,
+) -> (StatusCode, Json<Value>) {
+    match error {
+        xpressclaw_core::error::Error::TaskNotFound { .. } => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": error.to_string() })),
+        ),
+        xpressclaw_core::error::Error::Task(_) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": error.to_string() })),
+        ),
+        _ => internal_error(error),
+    }
+}
+
+fn planning_error(error: xpressclaw_core::error::Error) -> (StatusCode, Json<Value>) {
+    let status = match &error {
+        xpressclaw_core::error::Error::TaskNotFound { .. } => StatusCode::NOT_FOUND,
+        xpressclaw_core::error::Error::Task(_) => StatusCode::CONFLICT,
+        _ => StatusCode::BAD_REQUEST,
+    };
+    (status, Json(json!({"error":error.to_string()})))
+}
+async fn list_planning(
+    State(state): State<AppState>,
+    Query(filter): Query<xpressclaw_core::tasks::planning::PlanningFilter>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let page = xpressclaw_core::tasks::planning::TaskPlanner::new(state.db.clone())
+        .list(&filter)
+        .map_err(planning_error)?;
+    Ok(Json(json!(page)))
+}
+async fn get_planning(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    Ok(Json(json!(
+        xpressclaw_core::tasks::planning::TaskPlanner::new(state.db.clone())
+            .get(&id)
+            .map_err(planning_error)?
+    )))
+}
+async fn change_planning(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(change): Json<xpressclaw_core::tasks::planning::PlanningChange>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    Ok(Json(json!(
+        xpressclaw_core::tasks::planning::TaskPlanner::new(state.db.clone())
+            .change(&id, &change)
+            .map_err(planning_error)?
+    )))
 }
 
 async fn list_tasks(
@@ -115,6 +336,17 @@ async fn list_tasks(
     let board = TaskBoard::new(state.db.clone());
     let limit = params.limit.unwrap_or(100).clamp(1, 100);
     let offset = params.offset.unwrap_or(0).max(0);
+    let search = params
+        .search
+        .as_deref()
+        .map(str::trim)
+        .filter(|search| !search.is_empty());
+    if search.is_some_and(|search| search.chars().count() > 200) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "task search must be 200 characters or fewer" })),
+        ));
+    }
 
     let tasks = if let Some(ref parent_id) = params.parent_task_id {
         board.list_subtasks(parent_id).map_err(internal_error)?
@@ -124,31 +356,37 @@ async fn list_tasks(
             .as_deref()
             .map(|status| vec![status])
             .unwrap_or_else(|| parse_comma_separated(params.statuses.as_deref()));
+        let excluded_statuses = parse_comma_separated(params.exclude_statuses.as_deref());
         match params.sort {
             TaskListSort::Scheduler => board
-                .list_page(
+                .list_page_excluding(
                     &included_statuses,
                     params.agent_id.as_deref(),
+                    &excluded_statuses,
+                    search,
                     limit,
                     offset,
                 )
                 .map_err(internal_error)?,
-            TaskListSort::Recent => {
-                let excluded_statuses = parse_comma_separated(params.exclude_statuses.as_deref());
-                board
-                    .list_recent_page(
-                        &included_statuses,
-                        params.agent_id.as_deref(),
-                        &excluded_statuses,
-                        limit,
-                        offset,
-                    )
-                    .map_err(internal_error)?
-            }
+            TaskListSort::Recent => board
+                .list_recent_page(
+                    &included_statuses,
+                    params.agent_id.as_deref(),
+                    &excluded_statuses,
+                    search,
+                    limit,
+                    offset,
+                )
+                .map_err(internal_error)?,
         }
     };
 
-    let counts = board.counts().map_err(internal_error)?;
+    let counts = if params.parent_task_id.is_some() {
+        board.counts()
+    } else {
+        board.counts_for_search(search)
+    }
+    .map_err(internal_error)?;
 
     Ok(Json(json!({
         "tasks": enrich_tasks(&board, &tasks),
@@ -168,6 +406,17 @@ fn parse_comma_separated(value: Option<&str>) -> Vec<&str> {
         .unwrap_or_default()
 }
 
+async fn list_attention_tasks(
+    State(state): State<AppState>,
+    Query(params): Query<ListParams>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let board = TaskBoard::new(state.db.clone());
+    let tasks = board
+        .list_attention(params.agent_id.as_deref())
+        .map_err(internal_error)?;
+    Ok(Json(json!({ "tasks": enrich_tasks(&board, &tasks) })))
+}
+
 async fn list_recent_tasks_by_agent(
     State(state): State<AppState>,
     Query(params): Query<RecentByAgentParams>,
@@ -175,18 +424,34 @@ async fn list_recent_tasks_by_agent(
     let board = TaskBoard::new(state.db.clone());
     let limit = params.limit.unwrap_or(5).clamp(1, 100);
     let tasks = board.list_recent_per_agent(limit).map_err(internal_error)?;
+    let mut enriched = enrich_tasks(&board, &tasks);
+    if !params.include_details.unwrap_or(false) {
+        for item in &mut enriched {
+            item["description"] = Value::Null;
+            item["context"] = json!({});
+        }
+    }
 
-    Ok(Json(json!({ "tasks": enrich_tasks(&board, &tasks) })))
+    Ok(Json(json!({ "tasks": enriched })))
 }
 
-fn enrich_tasks(board: &TaskBoard, tasks: &[Task]) -> Vec<Value> {
+pub(super) fn enrich_tasks(board: &TaskBoard, tasks: &[Task]) -> Vec<Value> {
     tasks
         .iter()
         .map(|t| {
             let mut v = json!(t);
+            v["error_message"] = json!(board.current_error(t).unwrap_or_default());
+            v["parent_title"] = json!(t
+                .parent_task_id
+                .as_deref()
+                .and_then(|id| board.get(id).ok())
+                .map(|parent| parent.title));
             v["depends_on"] = json!(board.get_dependencies(&t.id).unwrap_or_default());
             v["blocked_by"] = json!(board.get_blockers(&t.id).unwrap_or_default());
             v["ready"] = json!(board.is_ready(&t.id).unwrap_or(true));
+            v["activity_status"] = json!(board
+                .activity_status(t)
+                .unwrap_or_else(|_| t.status.as_str().to_string()));
             v
         })
         .collect()
@@ -197,10 +462,10 @@ async fn create_task(
     Json(req): Json<CreateTask>,
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
     let board = TaskBoard::new(state.db.clone());
-    let task = board.create(&req).map_err(internal_error)?;
+    let task = board.create(&req).map_err(task_write_error)?;
 
     // Auto-enqueue for the dispatcher if the task has an assigned agent
-    if let Some(ref agent_id) = task.agent_id {
+    if let Some(agent_id) = task.agent_id.as_ref().filter(|_| !task.backlog) {
         let queue = xpressclaw_core::tasks::queue::TaskQueue::new(state.db.clone());
         if let Err(e) = queue.enqueue(&task.id, agent_id) {
             tracing::warn!(
@@ -212,6 +477,8 @@ async fn create_task(
         }
     }
 
+    // Enqueueing updates session fields and advances the planning revision.
+    let task = board.get(&task.id).map_err(internal_error)?;
     Ok((StatusCode::CREATED, Json(json!(task))))
 }
 
@@ -233,10 +500,19 @@ async fn get_task(
     let blocked_by = board.get_blockers(&id).unwrap_or_default();
     let ready = board.is_ready(&id).unwrap_or(true);
     let mut result = json!(task);
+    result["error_message"] = json!(board.current_error(&task).map_err(internal_error)?);
+    result["parent_title"] = json!(task
+        .parent_task_id
+        .as_deref()
+        .and_then(|id| board.get(id).ok())
+        .map(|parent| parent.title));
     result["depends_on"] = json!(depends_on);
     result["dependents"] = json!(dependents);
     result["blocked_by"] = json!(blocked_by);
     result["ready"] = json!(ready);
+    result["activity_status"] = json!(board
+        .activity_status(&task)
+        .unwrap_or_else(|_| task.status.as_str().to_string()));
     Ok(Json(result))
 }
 
@@ -249,18 +525,37 @@ async fn update_task(
 
     // Check if agent is being assigned — we may need to enqueue
     let new_agent = req.agent_id.clone();
+    let agent_repository = if let Some(agent_id) = new_agent.as_deref() {
+        github_access_for_agent(&state, agent_id).await
+    } else {
+        None
+    };
 
-    let task = board.update(&id, &req).map_err(|e| match &e {
-        xpressclaw_core::error::Error::TaskNotFound { .. } => (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": e.to_string() })),
-        ),
-        _ => internal_error(e),
-    })?;
+    let task = board
+        .update_with_agent_repository(
+            &id,
+            &req,
+            agent_repository
+                .as_ref()
+                .map(|access| (access.owner.as_str(), access.repo.as_str())),
+        )
+        .map_err(|e| match &e {
+            xpressclaw_core::error::Error::TaskNotFound { .. }
+            | xpressclaw_core::error::Error::AgentNotFound { .. } => (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": e.to_string() })),
+            ),
+            xpressclaw_core::error::Error::Task(_) => (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": e.to_string() })),
+            ),
+            _ => internal_error(e),
+        })?;
 
     // If agent was assigned and task is actionable, enqueue for dispatcher
     if let Some(ref agent_id) = new_agent {
         if !agent_id.is_empty()
+            && !task.backlog
             && (task.status == xpressclaw_core::tasks::board::TaskStatus::Pending
                 || task.status == xpressclaw_core::tasks::board::TaskStatus::InProgress)
         {
@@ -282,8 +577,11 @@ async fn delete_task(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<Value>)> {
-    state.elicitations.cancel_task(&id);
     let board = TaskBoard::new(state.db.clone());
+    board
+        .ensure_locally_managed(&id)
+        .map_err(task_write_error)?;
+    state.elicitations.cancel_task(&id);
     board.delete(&id).map_err(internal_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -294,75 +592,172 @@ async fn update_task_status(
     Json(req): Json<StatusUpdate>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let board = TaskBoard::new(state.db.clone());
+    // Reject local lifecycle changes before cancelling attempts, interrupting
+    // parked workers, or applying any task/queue transition.
+    board
+        .ensure_locally_managed(&id)
+        .map_err(task_write_error)?;
+    if req.status == "completed"
+        && board
+            .get(&id)
+            .map_err(internal_error)?
+            .parent_review_required
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(
+                json!({"error":"The parent Agent must review and accept this delegated result before completion"}),
+            ),
+        ));
+    }
     if req.status == "completed" && !board.subtasks_complete(&id).map_err(internal_error)? {
         return Err((
             StatusCode::CONFLICT,
             Json(json!({ "error": "all subtasks must be completed first" })),
         ));
     }
-    if req.status == "cancelled" {
-        let active_attempt_id = state
-            .db
-            .with_conn(|conn| {
-                let attempt_id = conn.query_row(
-                    "SELECT active_attempt_id FROM tasks WHERE id = ?1",
-                    [&id],
-                    |row| row.get::<_, Option<String>>(0),
-                )?;
-                Ok::<_, xpressclaw_core::error::Error>(attempt_id)
-            })
-            .map_err(internal_error)?;
-        if let Some(attempt_id) = active_attempt_id {
-            let sessions = SessionManager::new(state.db.clone());
-            if sessions.get_attempt(&attempt_id).is_ok() {
-                let cancelled = sessions
-                    .transition_attempt(
-                        &attempt_id,
-                        "cancelled",
-                        "Work cancelled by user",
-                        None,
-                        None,
-                    )
-                    .map_err(internal_error)?;
-                if cancelled.status != "cancelled" {
-                    return Ok(Json(json!(board.get(&id).map_err(internal_error)?)));
-                }
-                if let Some(queue_id) = cancelled.queue_id {
-                    state
-                        .db
-                        .with_conn(|conn| {
-                            conn.execute(
-                                "UPDATE task_queue SET status = 'failed', completed_at = CURRENT_TIMESTAMP,
-                                    harness_response = 'cancelled by user' WHERE id = ?1",
-                                [queue_id],
-                            )?;
-                            Ok::<_, xpressclaw_core::error::Error>(())
-                        })
-                        .map_err(internal_error)?;
-                }
-            }
-            state.elicitations.cancel_attempt(&attempt_id);
-            if let Some(docker) = state.docker().await {
-                let _ = docker.stop(&format!("attempt-{attempt_id}")).await;
-            }
-        } else {
-            state.elicitations.cancel_task(&id);
+    if req.status == "completed" {
+        // A task parked on an ACP elicitation still owns a live attempt even
+        // though the user has decided the visible work is done. Release that
+        // attempt before applying the completion transition so it cannot keep
+        // the task (and any attached default workflow) waiting indefinitely.
+        let parked_attempts = SessionManager::new(state.db.clone())
+            .task_activity(&id, None, None, 1, 50)
+            .map_err(internal_error)?
+            .attempts
+            .into_iter()
+            .filter(|attempt| attempt.status == "waiting_for_input")
+            .map(|attempt| attempt.id)
+            .collect::<Vec<_>>();
+        for attempt_id in parked_attempts {
+            state
+                .interrupt_attempt(&attempt_id)
+                .await
+                .map_err(internal_error)?;
         }
     }
+    if req.status == "cancelled" {
+        let sessions = SessionManager::new(state.db.clone());
+        let Some(cancelled) = sessions
+            .cancel_task_attempts(&id, "Work cancelled by user")
+            .map_err(internal_error)?
+        else {
+            return Ok(Json(json!(board.get(&id).map_err(internal_error)?)));
+        };
+        if let Err(error) = WorkflowEngine::new(state.db.clone()).on_task_completed(
+            &id,
+            "cancelled",
+            "Work cancelled by user",
+        ) {
+            tracing::warn!(
+                task_id = id,
+                error = %error,
+                "failed to release workflows attached to cancelled task"
+            );
+        }
+        state.elicitations.cancel_task(&id);
+
+        let mut sessions_to_stop = std::collections::BTreeMap::<String, bool>::new();
+        for attempt in &cancelled {
+            state.elicitations.cancel_attempt(&attempt.id);
+            sessions_to_stop
+                .entry(attempt.session_id.clone())
+                .and_modify(|has_container| {
+                    *has_container |= attempt.container_id.is_some();
+                })
+                .or_insert(attempt.container_id.is_some());
+        }
+        let docker = state.docker().await;
+        let mut stopped_sessions = std::collections::BTreeSet::new();
+        for (session_id, has_container) in sessions_to_stop {
+            let stopped = if !has_container {
+                true
+            } else if let Some(docker) = docker.as_ref() {
+                docker.stop_preserving(&session_id).await.is_ok()
+            } else {
+                false
+            };
+            if stopped {
+                stopped_sessions.insert(session_id);
+            }
+        }
+        for attempt in &cancelled {
+            if stopped_sessions.contains(&attempt.session_id) {
+                let _ = sessions.clear_container(&attempt.id);
+            }
+        }
+        // Running dispatch rows are the lease on a retained project
+        // container. Release them only after every affected session has had
+        // its stop attempt; queued rows were failed in the atomic transition.
+        state
+            .db
+            .with_conn(|conn| {
+                for queue_id in cancelled.iter().filter_map(|attempt| attempt.queue_id) {
+                    conn.execute(
+                        "UPDATE task_queue SET status = 'failed', completed_at = CURRENT_TIMESTAMP,
+                            harness_response = 'cancelled by user'
+                         WHERE id = ?1 AND status = 'running'",
+                        [queue_id],
+                    )?;
+                }
+                Ok::<_, xpressclaw_core::error::Error>(())
+            })
+            .map_err(internal_error)?;
+        return Ok(Json(json!(board.get(&id).map_err(internal_error)?)));
+    }
+    let agent_repository = if req.status == "completed" {
+        None
+    } else if let Some(agent_id) = req.agent_id.as_deref() {
+        github_access_for_agent(&state, agent_id).await
+    } else {
+        None
+    };
     let updated = if req.status == "completed" {
+        let conversation = TaskConversation::new(state.db.clone());
+        let workflows = WorkflowEngine::new(state.db.clone());
         board
-            .complete_and_roll_up(&id, req.agent_id.as_deref())
-            .and_then(|tasks| {
-                tasks
+            .complete_and_roll_up_with(&id, req.agent_id.as_deref(), |completed| {
+                let output = conversation
+                    .get_messages(&completed.id)
+                    .unwrap_or_default()
                     .into_iter()
-                    .next()
-                    .ok_or_else(|| xpressclaw_core::error::Error::Task("task is not ready".into()))
+                    .rev()
+                    .find(|message| message.role == "assistant")
+                    .map(|message| message.content)
+                    .unwrap_or_default();
+                if let Err(error) = workflows.on_task_completed(&completed.id, "completed", &output)
+                {
+                    tracing::warn!(
+                        task_id = completed.id,
+                        error = %error,
+                        "failed to advance workflow after manual task completion"
+                    );
+                }
+                Ok(())
+            })
+            .and_then(|completed_tasks| {
+                if completed_tasks.is_empty() {
+                    return Err(xpressclaw_core::error::Error::Task(
+                        "task is not ready".into(),
+                    ));
+                }
+                // A continue step may have reopened the requested task while
+                // dispatching its fixed prompt, so return its current state.
+                board.get(&id)
             })
     } else {
-        board.update_status(&id, &req.status, req.agent_id.as_deref())
+        board.update_status_with_agent_repository(
+            &id,
+            &req.status,
+            req.agent_id.as_deref(),
+            agent_repository
+                .as_ref()
+                .map(|access| (access.owner.as_str(), access.repo.as_str())),
+        )
     };
     let task = updated.map_err(|e| match &e {
-        xpressclaw_core::error::Error::TaskNotFound { .. } => (
+        xpressclaw_core::error::Error::TaskNotFound { .. }
+        | xpressclaw_core::error::Error::AgentNotFound { .. } => (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": e.to_string() })),
         ),
@@ -373,6 +768,29 @@ async fn update_task_status(
         _ => internal_error(e),
     })?;
     Ok(Json(json!(task)))
+}
+
+async fn github_access_for_agent(
+    state: &AppState,
+    agent_id: &str,
+) -> Option<github::GithubSessionAccess> {
+    let config = state.config();
+    let agent = config.agents.iter().find(|agent| agent.name == agent_id)?;
+    let workspace = native::resolved_workspace(&config, agent);
+    github_access_for_workspace(state, agent.name.clone(), workspace)
+        .await
+        .ok()
+        .flatten()
+}
+
+async fn github_access_for_workspace(
+    state: &AppState,
+    agent_id: String,
+    workspace: std::path::PathBuf,
+) -> Result<Option<github::GithubSessionAccess>, (StatusCode, Json<Value>)> {
+    xpressclaw_core::repositories::discover_active_github_access(&state.db, &agent_id, &workspace)
+        .await
+        .map_err(internal_error)
 }
 
 async fn task_counts(
@@ -386,9 +804,12 @@ async fn task_counts(
 async fn get_messages(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(params): Query<MessagesParams>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let conv = TaskConversation::new(state.db.clone());
-    let messages = conv.get_messages(&id).map_err(internal_error)?;
+    let messages = conv
+        .get_messages_after(&id, params.after_id)
+        .map_err(internal_error)?;
     Ok(Json(json!(messages)))
 }
 
@@ -402,18 +823,64 @@ async fn get_message_attachment(
         .ok_or_else(|| {
             (
                 StatusCode::NOT_FOUND,
-                Json(json!({ "error": "image attachment not found" })),
+                Json(json!({ "error": "attachment not found" })),
             )
         })?;
+    let disposition = if is_prompt_image(&attachment.mime_type) {
+        "inline"
+    } else {
+        "attachment"
+    };
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, attachment.mime_type)
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!(
+                "{disposition}; filename=\"{}\"",
+                safe_attachment_filename(&attachment.name)
+            ),
+        )
+        .header("x-content-type-options", "nosniff")
         .header(
             header::CACHE_CONTROL,
             "private, max-age=31536000, immutable",
         )
         .body(Body::from(attachment.data))
         .map_err(internal_error)
+}
+
+fn safe_attachment_filename(name: &str) -> String {
+    name.chars()
+        .map(|character| match character {
+            '\r' | '\n' | '"' | '\\' => '_',
+            other if other == ' ' || other.is_ascii_graphic() => other,
+            _ => '_',
+        })
+        .collect()
+}
+
+async fn get_message_visualization(
+    State(state): State<AppState>,
+    Path((id, message_id, artifact_id)): Path<(String, i64, String)>,
+    headers: HeaderMap,
+) -> Result<Response<Body>, (StatusCode, Json<Value>)> {
+    let token = visualizations::retrieval_token(&headers).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "visualization not found" })),
+        )
+    })?;
+    let artifact = VisualizationManager::new(state.db.clone())
+        .task_artifact(&id, message_id, &artifact_id, token)
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "visualization not found" })),
+            )
+        })?;
+    visualizations::artifact_response(artifact).map_err(internal_error)
 }
 
 async fn get_activity(
@@ -445,7 +912,10 @@ async fn get_activity(
             20,
         )
         .map_err(internal_error)?;
-    Ok(Json(json!(activity)))
+    let mut result = json!(activity);
+    result["delegated_work"] =
+        json!(xpressclaw_core::tasks::delegation::list(&state.db, &id).map_err(internal_error)?);
+    Ok(Json(result))
 }
 
 async fn respond_to_elicitation(
@@ -500,6 +970,9 @@ async fn respond_to_elicitation(
                 Json(json!({ "error": "this question is no longer awaiting a response" })),
             ),
         })?;
+    state.db.bump_ui_domains(
+        xpressclaw_core::db::ui_domains::TASKS | xpressclaw_core::db::ui_domains::SESSIONS,
+    );
 
     if req.action == "accept" {
         let message = req
@@ -534,10 +1007,10 @@ async fn add_message(
     if content.is_empty() && req.attachments.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "message must include text or an image" })),
+            Json(json!({ "error": "message must include text or a file" })),
         ));
     }
-    let attachments = decode_image_attachments(&req.attachments).map_err(bad_request)?;
+    let attachments = decode_attachments(&req.attachments).map_err(bad_request)?;
 
     let board = TaskBoard::new(state.db.clone());
     let task = board.get(&id).map_err(|error| match &error {
@@ -547,29 +1020,22 @@ async fn add_message(
         ),
         _ => internal_error(error),
     })?;
-    let conv = TaskConversation::new(state.db.clone());
-    let msg = conv
-        .add_message_with_attachments(&id, &req.role, &content, &attachments)
-        .map_err(internal_error)?;
-
     let summary = if content.is_empty() {
         if attachments.len() == 1 {
-            "Sent an image".to_string()
+            "Sent a file".to_string()
         } else {
-            format!("Sent {} images", attachments.len())
+            format!("Sent {} files", attachments.len())
         }
     } else {
         content.clone()
     };
 
-    let mut continuation = None;
-    let mut delivery = "stored";
-    if let Some(ref agent_id) = task.agent_id {
-        let sessions = SessionManager::new(state.db.clone());
+    let sessions = SessionManager::new(state.db.clone());
+    let active_attempt = if let Some(agent_id) = task.agent_id.as_ref().filter(|_| !task.backlog) {
         sessions
             .ensure(agent_id, Some(agent_id))
             .map_err(internal_error)?;
-        let active_attempt = sessions
+        sessions
             .task_activity(&id, None, None, 1, 50)
             .map_err(internal_error)?
             .attempts
@@ -579,7 +1045,25 @@ async fn add_message(
                     attempt.status.as_str(),
                     "preparing" | "running" | "waiting_for_input" | "review"
                 )
-            });
+            })
+    } else {
+        None
+    };
+    let waiting_for_input = active_attempt
+        .as_ref()
+        .is_some_and(|attempt| attempt.status == "waiting_for_input");
+    let conv = TaskConversation::new(state.db.clone());
+    let (msg, continuation) = conv
+        .add_user_message_with_attachments_and_enqueue(
+            &id,
+            task.agent_id.as_deref(),
+            &content,
+            &attachments,
+        )
+        .map_err(internal_error)?;
+
+    let mut delivery = "stored";
+    if let Some(agent_id) = task.agent_id.as_ref().filter(|_| !task.backlog) {
         sessions
             .append_event(
                 agent_id,
@@ -600,12 +1084,10 @@ async fn add_message(
             )
             .map_err(internal_error)?;
 
-        let queue = TaskQueue::new(state.db.clone());
-        continuation = queue
-            .enqueue_continuation(&id, agent_id)
-            .map_err(internal_error)?;
         delivery = if let Some(active_attempt) = active_attempt {
-            if req.delivery == MessageDelivery::Immediate {
+            // A deferred interruption cannot reach a turn parked on an elicitation.
+            // Cancel that request and hand off to the queued guidance immediately.
+            if req.delivery == MessageDelivery::Immediate || waiting_for_input {
                 state
                     .interrupt_attempt(&active_attempt.id)
                     .await
@@ -615,24 +1097,12 @@ async fn add_message(
                 state
                     .turn_controls
                     .request_interrupt(&active_attempt.id, AcpInterruptMode::AfterTool);
+                state.monitor_guidance_interrupt(active_attempt.id.clone());
                 "after_tool"
             }
         } else {
             "queued"
         };
-        if continuation.is_some()
-            && matches!(
-                task.status,
-                TaskStatus::WaitingForInput
-                    | TaskStatus::Blocked
-                    | TaskStatus::Completed
-                    | TaskStatus::Cancelled
-            )
-        {
-            board
-                .update_status(&id, "pending", Some(agent_id))
-                .map_err(internal_error)?;
-        }
         tracing::info!(
             task_id = id,
             agent_id,
@@ -660,16 +1130,23 @@ async fn create_tasks_batch(
     let board = TaskBoard::new(state.db.clone());
     let tasks = board
         .create_batch(&req.tasks, req.parent_task_id.as_deref())
-        .map_err(internal_error)?;
+        .map_err(task_write_error)?;
 
     // Enqueue tasks that have agents assigned
     let queue = xpressclaw_core::tasks::queue::TaskQueue::new(state.db.clone());
     for task in &tasks {
-        if let Some(ref agent_id) = task.agent_id {
+        if let Some(agent_id) = task.agent_id.as_ref().filter(|_| !task.backlog) {
             let _ = queue.enqueue(&task.id, agent_id);
         }
     }
 
+    // Return snapshots after every creation/enqueue mutation so callers can
+    // use these revisions for their first planning edit.
+    let tasks = tasks
+        .iter()
+        .map(|task| board.get(&task.id))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(internal_error)?;
     Ok((StatusCode::CREATED, Json(json!(tasks))))
 }
 
@@ -692,6 +1169,9 @@ async fn add_dependency(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let board = TaskBoard::new(state.db.clone());
     board
+        .ensure_locally_managed(&id)
+        .map_err(task_write_error)?;
+    board
         .add_dependency(&id, &req.depends_on)
         .map_err(internal_error)?;
     Ok(Json(json!({ "task_id": id, "depends_on": req.depends_on })))
@@ -702,6 +1182,22 @@ fn internal_error(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(json!({ "error": e.to_string() })),
     )
+}
+
+fn task_write_error(error: xpressclaw_core::error::Error) -> (StatusCode, Json<Value>) {
+    match &error {
+        xpressclaw_core::error::Error::AgentNotFound { .. }
+        | xpressclaw_core::error::Error::ProjectNotFound { .. } => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": error.to_string() })),
+        ),
+        xpressclaw_core::error::Error::Project(_) => (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": error.to_string() })),
+        ),
+        xpressclaw_core::error::Error::Task(_) => bad_request(error),
+        _ => internal_error(error),
+    }
 }
 
 fn bad_request(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
@@ -722,11 +1218,26 @@ mod tests {
 
     use xpressclaw_core::config::Config;
     use xpressclaw_core::db::Database;
+    use xpressclaw_core::message_artifacts::PublishedFileAttachment;
+    use xpressclaw_core::tasks::board::TaskStatus;
+    use xpressclaw_core::workflows::manager::{CreateWorkflow, WorkflowManager};
 
     use super::*;
 
     fn test_app_with_db() -> (Router, Arc<Database>) {
         let db = Arc::new(Database::open_memory().unwrap());
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO agents (id, name, backend, config) VALUES
+                    ('atlas', 'Atlas', 'native', '{}'),
+                    ('developer', 'Developer', 'native', '{}'),
+                    ('website-codex', 'Website Codex', 'native', '{}'),
+                    ('alpha', 'Alpha', 'native', '{}'),
+                    ('beta', 'Beta', 'native', '{}'),
+                    ('zephyr', 'Zephyr', 'native', '{}');",
+            )
+        })
+        .unwrap();
         let config = Arc::new(Config::load_default().unwrap());
         let state = AppState::new(
             config,
@@ -736,7 +1247,13 @@ mod tests {
             true,
         );
 
-        (Router::new().nest("/tasks", routes()).with_state(state), db)
+        (
+            Router::new()
+                .nest("/tasks", routes())
+                .nest("/sessions", crate::routes::sessions::routes())
+                .with_state(state),
+            db,
+        )
     }
 
     fn test_app() -> Router {
@@ -746,6 +1263,571 @@ mod tests {
     async fn body_json(body: Body) -> Value {
         let bytes = body.collect().await.unwrap().to_bytes();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn connected_task_local_mutations_preserve_platform_dispatch() {
+        use xpressclaw_core::agents::registry::AgentRegistry;
+        use xpressclaw_core::connect::{Binding, Command, ConnectJournal, TurnPayload};
+
+        for phase in ["queued", "running", "waiting_for_input"] {
+            let (app, db) = test_app_with_db();
+            let registry = AgentRegistry::new(db.clone());
+            registry.ensure("connect-agent", "native").unwrap();
+            registry.ensure("connect-helper", "native").unwrap();
+            db.with_conn(|conn| {
+                conn.execute(
+                    "UPDATE agents SET project_id='connect-agent' WHERE id='connect-helper'",
+                    [],
+                )
+            })
+            .unwrap();
+            let journal = ConnectJournal::new(db.clone());
+            let binding = Binding {
+                id: uuid::Uuid::new_v4().to_string(),
+                local_project_id: "connect-agent".into(),
+                local_agent_id: "connect-agent".into(),
+                project_id: "cloud-project".into(),
+                agent_name: "connect-agent".into(),
+                generation: 1,
+                active: true,
+            };
+            journal.bind("instance", &binding).unwrap();
+            let command = Command {
+                version: 1,
+                id: uuid::Uuid::new_v4().to_string(),
+                binding,
+                kind: "task_turn".into(),
+                work_id: "platform-task".into(),
+                source_conversation_id: None,
+                payload: TurnPayload {
+                    text: "Perform the platform assignment".into(),
+                    history: vec![],
+                },
+                expires_at: "2099-01-01T00:00:00Z".into(),
+                cancel_requested: false,
+            };
+            let now = chrono::Utc::now().timestamp();
+            let execution = journal.admit("instance", &command, now + 90, now).unwrap();
+            let task_id = execution.task_id.as_deref().unwrap();
+            let attempt_id = execution.attempt_id.as_deref().unwrap();
+            let queue = TaskQueue::new(db.clone());
+            let sessions = SessionManager::new(db.clone());
+            let board = TaskBoard::new(db.clone());
+            if phase != "queued" {
+                queue.claim("connect-agent").unwrap().unwrap();
+                sessions
+                    .transition_attempt(attempt_id, "running", "Working", None, None)
+                    .unwrap();
+                board
+                    .update_status(task_id, "in_progress", Some("connect-agent"))
+                    .unwrap();
+                if phase == "waiting_for_input" {
+                    sessions
+                        .transition_attempt(attempt_id, phase, "Needs approval", None, None)
+                        .unwrap();
+                    board
+                        .update_status(task_id, phase, Some("connect-agent"))
+                        .unwrap();
+                }
+            }
+            let before_task = json!(board.get(task_id).unwrap());
+            let before_queue = json!(queue.list(None, None, 100).unwrap());
+            let before_attempt = json!(sessions.get_attempt(attempt_id).unwrap());
+            for (suffix, request) in [
+                (
+                    "",
+                    json!({"agent_id":"connect-helper","title":"Local edit","description":"Local description","priority":100}),
+                ),
+                ("", json!({"agent_id":""})),
+                ("", json!({"title":"Local edit"})),
+                (
+                    "/status",
+                    json!({"status":"in_progress","agent_id":"connect-helper"}),
+                ),
+                ("/status", json!({"status":"in_progress","agent_id":""})),
+                (
+                    "/status",
+                    json!({"status":"in_progress","agent_id":"connect-agent"}),
+                ),
+                ("/status", json!({"status":"cancelled"})),
+                ("/status", json!({"status":"completed"})),
+                ("/status", json!({"status":"pending"})),
+                ("/status", json!({"status":"blocked"})),
+                ("/status", json!({"status":"waiting_for_input"})),
+            ] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::patch(format!("/tasks/{task_id}{suffix}"))
+                            .header("content-type", "application/json")
+                            .body(Body::from(request.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{request}");
+                let body = body_json(response.into_body()).await;
+                assert!(body["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("continue it on the platform"));
+                assert_eq!(json!(board.get(task_id).unwrap()), before_task);
+                assert_eq!(json!(queue.list(None, None, 100).unwrap()), before_queue);
+                assert_eq!(
+                    json!(sessions.get_attempt(attempt_id).unwrap()),
+                    before_attempt
+                );
+            }
+            // Alternate lifecycle endpoints must reject before touching dispatch.
+            for request in [
+                Request::post("/tasks")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"title":"Local child","parent_task_id":task_id}).to_string(),
+                    ))
+                    .unwrap(),
+                Request::delete(format!("/tasks/{task_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+                Request::post(format!("/tasks/{task_id}/dependencies"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"depends_on":"another-task"}).to_string()))
+                    .unwrap(),
+                Request::post(format!("/tasks/{task_id}/pull-requests"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"agent_id":"connect-agent","phase":"begin"}).to_string(),
+                    ))
+                    .unwrap(),
+                Request::post(format!(
+                    "/sessions/connect-agent/attempts/{attempt_id}/cancel"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+                Request::post(format!(
+                    "/sessions/connect-agent/attempts/{attempt_id}/interrupt"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+            ] {
+                let response = app.clone().oneshot(request).await.unwrap();
+                let status = response.status();
+                let body = body_json(response.into_body()).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{phase}: {body}");
+                assert!(body["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("continue it on the platform"));
+                assert_eq!(json!(board.get(task_id).unwrap()), before_task);
+                assert_eq!(json!(queue.list(None, None, 100).unwrap()), before_queue);
+                assert_eq!(
+                    json!(sessions.get_attempt(attempt_id).unwrap()),
+                    before_attempt
+                );
+            }
+            // Core callers cannot bypass deletion or dependency ownership either.
+            assert!(board
+                .delete(task_id)
+                .unwrap_err()
+                .to_string()
+                .contains("continue it on the platform"));
+            assert!(board
+                .add_dependency(task_id, "another-task")
+                .unwrap_err()
+                .to_string()
+                .contains("continue it on the platform"));
+            assert_eq!(
+                board
+                    .delete_by_status(before_task["status"].as_str().unwrap())
+                    .unwrap(),
+                0
+            );
+            assert_eq!(json!(board.get(task_id).unwrap()), before_task);
+            journal.collect("instance").unwrap();
+            assert_eq!(
+                journal.pending("instance").unwrap()[0].receipt.status,
+                "accepted"
+            );
+            // Local edits cannot break renewal or divert the accepted work.
+            journal.renew("instance", &command.id, now + 180).unwrap();
+            assert_eq!(
+                journal.pending("instance").unwrap()[0].lease_until,
+                now + 180
+            );
+            assert!(queue.claim("connect-helper").unwrap().is_none());
+            if phase == "queued" {
+                assert_eq!(
+                    queue.claim("connect-agent").unwrap().unwrap().attempt_id,
+                    execution.attempt_id
+                );
+            }
+            // The worker can still update status using the existing owner.
+            board
+                .update_status(task_id, "in_progress", Some("connect-agent"))
+                .unwrap();
+            board
+                .update_status(task_id, "waiting_for_input", Some("connect-agent"))
+                .unwrap();
+            // Cancellation authorized by a platform command remains available.
+            journal.stop_task(&command.id, None).unwrap();
+            journal.collect("instance").unwrap();
+            assert_eq!(
+                sessions.get_attempt(attempt_id).unwrap().status,
+                "cancelled"
+            );
+        }
+    }
+
+    async fn assert_creation_revisions_are_ready_for_planning(batch: bool) {
+        let (app, db) = test_app_with_db();
+        let inputs = vec![
+            json!({"title":"Queued task", "agent_id":"atlas"}),
+            json!({"title":"Backlog task", "agent_id":"atlas", "backlog":true}),
+            json!({"title":"Unassigned task"}),
+        ];
+        let requests = if batch {
+            vec![json!({"tasks":inputs})]
+        } else {
+            inputs
+        };
+        for request in requests {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post(if batch { "/tasks/batch" } else { "/tasks" })
+                        .header("content-type", "application/json")
+                        .body(Body::from(request.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED);
+            let response = body_json(response.into_body()).await;
+            let tasks = if batch {
+                response.as_array().unwrap().clone()
+            } else {
+                vec![response]
+            };
+            assert_eq!(tasks.len(), if batch { 3 } else { 1 });
+            for task in tasks {
+                let id = task["id"].as_str().unwrap();
+                let patch = || {
+                    Request::patch(format!("/tasks/{id}/planning"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"action":"priority", "priority":10, "expected_revision":task["revision"]}).to_string())).unwrap()
+                };
+                // A creation response must be usable immediately, without a GET
+                // to discover mutations performed by creation itself.
+                let response = app.clone().oneshot(patch()).await.unwrap();
+                assert_eq!(
+                    response.status(),
+                    StatusCode::OK,
+                    "Creation of {} returned a stale revision",
+                    task["title"]
+                );
+                let updated = body_json(response.into_body()).await;
+                assert_eq!(updated["priority"], 10);
+                let stored = TaskBoard::new(db.clone()).get(id).unwrap();
+                assert_eq!(updated["revision"], stored.revision);
+                // The same revision must still reject a genuinely stale edit.
+                let response = app.clone().oneshot(patch()).await.unwrap();
+                assert_eq!(response.status(), StatusCode::CONFLICT);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn single_task_creation_returns_current_revision_for_planning() {
+        assert_creation_revisions_are_ready_for_planning(false).await;
+    }
+
+    #[tokio::test]
+    async fn batch_task_creation_returns_current_revisions_for_planning() {
+        assert_creation_revisions_are_ready_for_planning(true).await;
+    }
+
+    #[tokio::test]
+    async fn batch_schedule_errors_leave_no_tasks_or_queue_entries_on_retry() {
+        let (app, db) = test_app_with_db();
+        let mut request = json!({"tasks":[
+            {"title":"Ready", "agent_id":"atlas"},
+            {"title":"Parked", "agent_id":"atlas", "backlog":true},
+            {"title":"Unassigned"},
+            {"title":"Scheduled", "agent_id":"atlas"}
+        ]});
+        let post = |request: &Value| {
+            Request::post("/tasks/batch")
+                .header("content-type", "application/json")
+                .body(Body::from(request.to_string()))
+                .unwrap()
+        };
+        for invalid in ["not-a-date", "9999-12-31T23:59:59-01:00"] {
+            request["tasks"][3]["start_after"] = json!(invalid);
+            for _ in 0..2 {
+                let response = app.clone().oneshot(post(&request)).await.unwrap();
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                assert!(body_json(response.into_body()).await["error"]
+                    .as_str()
+                    .is_some_and(|error| !error.is_empty()));
+                for table in ["tasks", "task_dependencies", "task_queue", "work_attempts"] {
+                    let count: i64 = db
+                        .with_conn(|conn| {
+                            conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                                row.get(0)
+                            })
+                        })
+                        .unwrap();
+                    assert_eq!(count, 0, "rejected batch left rows in {table}");
+                }
+            }
+        }
+
+        request["tasks"][3]["start_after"] = json!("2100-01-01T09:00:00+09:00");
+        let response = app.clone().oneshot(post(&request)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let created = body_json(response.into_body()).await;
+        let tasks = created.as_array().unwrap();
+        assert_eq!(tasks.len(), 4);
+        assert_eq!(TaskBoard::new(db.clone()).counts().unwrap().pending, 4);
+        assert_eq!(tasks[3]["start_after"], "2100-01-01T00:00:00.000Z");
+        let planner = xpressclaw_core::tasks::planning::TaskPlanner::new(db);
+        for (index, lane, queued) in [
+            (0, "queue", true),
+            (1, "backlog", false),
+            (2, "queue", false),
+            (3, "scheduled", true),
+        ] {
+            let task = planner.get(tasks[index]["id"].as_str().unwrap()).unwrap();
+            assert_eq!(task.planning.lane, lane);
+            assert_eq!(task.planning.queued, queued);
+        }
+    }
+
+    #[tokio::test]
+    async fn planning_api_filters_projects_and_enforces_revision_and_execution_boundaries() {
+        let (app, db) = test_app_with_db();
+        db.with_conn(|conn| conn.execute_batch("INSERT INTO projects(id,name) VALUES ('store','Store'),('lab','Lab'); UPDATE agents SET project_id='store' WHERE id='atlas'; UPDATE agents SET project_id='lab' WHERE id='beta';")).unwrap();
+        let create = |agent: &str, title: &str| {
+            Request::post("/tasks")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"title":title,"agent_id":agent,"start_after":"2100-01-01T09:00:00+09:00"}).to_string())).unwrap()
+        };
+        let response = app
+            .clone()
+            .oneshot(create("atlas", "Store integration"))
+            .await
+            .unwrap();
+        let created = body_json(response.into_body()).await;
+        let id = created["id"].as_str().unwrap();
+        app.clone()
+            .oneshot(create("beta", "Lab integration"))
+            .await
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(
+                    "/tasks/planning?project_id=store&status=scheduled&search=integration",
+                )
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let page = body_json(response.into_body()).await;
+        assert_eq!(page["total"], 1);
+        assert_eq!(page["counts"]["scheduled"], 1);
+        assert_eq!(page["tasks"][0]["start_after"], "2100-01-01T00:00:00.000Z");
+        assert!(TaskQueue::new(db.clone()).claim_next().unwrap().is_none());
+        let revision = page["tasks"][0]["revision"].as_i64().unwrap();
+        let patch = |revision, action: Value| {
+            let mut value = action;
+            value["expected_revision"] = json!(revision);
+            Request::patch(format!("/tasks/{id}/planning"))
+                .header("content-type", "application/json")
+                .body(Body::from(value.to_string()))
+                .unwrap()
+        };
+        let response = app
+            .clone()
+            .oneshot(patch(revision, json!({"action":"priority","priority":10})))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let changed = body_json(response.into_body()).await;
+        let response = app
+            .clone()
+            .oneshot(patch(
+                revision,
+                json!({"action":"schedule","start_after":null}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let response = app
+            .clone()
+            .oneshot(patch(
+                changed["revision"].as_i64().unwrap(),
+                json!({"action":"schedule","start_after":null}),
+            ))
+            .await
+            .unwrap();
+        let changed = body_json(response.into_body()).await;
+        let item = TaskQueue::new(db.clone()).claim_next().unwrap().unwrap();
+        assert_eq!(item.task_id, id);
+        let response = app
+            .oneshot(patch(
+                changed["revision"].as_i64().unwrap(),
+                json!({"action":"schedule","start_after":"2100-01-01T00:00:00Z"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(TaskBoard::new(db).get(id).unwrap().start_after.is_none());
+    }
+
+    #[tokio::test]
+    async fn planning_history_filters_and_orders_before_paginating() {
+        let (app, db) = test_app_with_db();
+        db.with_conn(|conn| conn.execute_batch(
+            "INSERT INTO projects(id,name) VALUES ('store','Store'),('lab','Lab');
+             UPDATE agents SET project_id='store' WHERE id IN ('atlas','beta');
+             UPDATE agents SET project_id='lab' WHERE id='zephyr';
+             INSERT INTO tasks(id,title,project_id,agent_id,status,priority,position,created_at,updated_at) VALUES
+             ('oldest','Old urgent task','store','atlas','pending',10,0,'2026-11-10 10:00:00','2026-11-20 10:00:00'),
+             ('middle','Finished task','store','atlas','completed',0,1,'2026-11-10T12:00:00Z','2026-11-10 12:00:00'),
+             ('newest','New task','store','beta','pending',0,2,'2026-11-10 13:00:00','2026-11-10 13:00:00'),
+             ('unassigned','Unassigned task','store',NULL,'pending',0,3,'2026-11-10T12:00:00+01:00','2026-11-10 11:00:00'),
+             ('other','Other project','lab','zephyr','pending',0,4,'2026-11-10 14:00:00','2026-11-10 14:00:00');"
+        )).unwrap();
+
+        for (query, expected, total) in [
+            (
+                "project_id=store&sort=newest&limit=2",
+                vec!["newest", "middle"],
+                4,
+            ),
+            (
+                "project_id=store&sort=newest&limit=2&offset=2",
+                vec!["unassigned", "oldest"],
+                4,
+            ),
+            ("agent_id=atlas&sort=newest&limit=1", vec!["middle"], 2),
+            (
+                "agent_id=atlas&sort=newest&limit=1&offset=1",
+                vec!["oldest"],
+                2,
+            ),
+            (
+                "project_id=store&agent_id=beta&sort=newest",
+                vec!["newest"],
+                1,
+            ),
+            ("project_id=lab&agent_id=atlas&sort=newest", vec![], 0),
+            ("project_id=store&limit=2", vec!["oldest", "middle"], 4),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get(format!("/tasks/planning?status=all&{query}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{query}");
+            let page = body_json(response.into_body()).await;
+            let ids: Vec<_> = page["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|task| task["id"].as_str().unwrap())
+                .collect();
+            assert_eq!(ids, expected, "{query}");
+            assert_eq!(page["total"], total, "{query}");
+            assert_eq!(
+                page["counts"]
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .map(|count| count.as_i64().unwrap())
+                    .sum::<i64>(),
+                total,
+                "{query}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn backlog_creation_never_dispatches_and_default_creation_remains_to_do() {
+        let (app, db) = test_app_with_db();
+        for batch in [false, true] {
+            let payload = json!({"title":"Backlog idea", "agent_id":"atlas", "backlog":true});
+            let request = Request::post(if batch { "/tasks/batch" } else { "/tasks" })
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    if batch {
+                        json!({"tasks":[payload]})
+                    } else {
+                        payload
+                    }
+                    .to_string(),
+                ))
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED);
+            let created = body_json(response.into_body()).await;
+            let task = if batch { &created[0] } else { &created };
+            assert_eq!(task["backlog"], true);
+            assert_eq!(task["status"], "pending");
+            // Existing detail assignment must not turn a backlog idea into work.
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::patch(format!("/tasks/{}", task["id"].as_str().unwrap()))
+                        .header("content-type", "application/json")
+                        .body(Body::from(json!({"agent_id":"atlas"}).to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(body_json(response.into_body()).await["status"], "pending");
+        }
+        let queue = TaskQueue::new(db.clone());
+        assert!(queue.list(None, Some("queued"), 100).unwrap().is_empty());
+        assert!(queue.claim_next().unwrap().is_none());
+        for batch in [false, true] {
+            let payload = json!({"title":"Ordinary new work", "agent_id":"beta"});
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post(if batch { "/tasks/batch" } else { "/tasks" })
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            if batch {
+                                json!({"tasks":[payload]})
+                            } else {
+                                payload
+                            }
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED);
+            let created = body_json(response.into_body()).await;
+            let task = if batch { &created[0] } else { &created };
+            assert_eq!(task["backlog"], false);
+        }
+        assert_eq!(
+            queue.list(Some("beta"), Some("queued"), 100).unwrap().len(),
+            2
+        );
+        assert!(queue.claim("beta").unwrap().is_some());
     }
 
     #[tokio::test]
@@ -811,6 +1893,141 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["id"], task_id);
+    }
+
+    #[tokio::test]
+    async fn task_create_rejects_an_agent_removed_by_completed_cascade() {
+        let (app, db) = test_app_with_db();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO projects (id, name) VALUES ('project-one', 'Project One');
+                 INSERT INTO agents (id, name, backend, config, status, project_id)
+                 VALUES ('deleted-agent', 'Deleted Agent', 'native', '{}', 'running', 'project-one');",
+            )
+        })
+        .unwrap();
+
+        // Simulate a request that resolved its Agent before the cascade
+        // committed, then reaches task creation after that Agent is gone.
+        let projects = xpressclaw_core::projects::ProjectManager::new(db.clone());
+        projects.begin_cascade("project-one").unwrap();
+        projects.finish_cascade("project-one").unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/tasks")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "title": "Stale task request",
+                            "agent_id": "deleted-agent"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = body_json(response.into_body()).await;
+        assert_eq!(body["error"], "agent not found: deleted-agent");
+        db.with_conn(|conn| {
+            for table in ["tasks", "task_queue", "work_attempts", "logical_sessions"] {
+                let count =
+                    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get::<_, i64>(0)
+                    })?;
+                assert_eq!(count, 0, "{table} must not retain stale work");
+            }
+            Ok::<_, xpressclaw_core::error::Error>(())
+        })
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn delegated_task_attention_is_not_hidden_by_history_or_native_steps() {
+        let (app, db) = test_app_with_db();
+        db.conn().execute_batch("INSERT INTO tasks(id,title,status) VALUES('parent','Benchmark','in_progress');
+            INSERT INTO tasks(id,title,status,agent_id,parent_task_id,provenance) VALUES
+              ('review','Review','blocked','reviewer','parent','durable'),
+              ('plan','Checklist','blocked','reviewer','parent','native_plan');
+            INSERT INTO logical_sessions(id,agent_id) VALUES('reviewer','reviewer');
+            INSERT INTO work_attempts(id,session_id,task_id,runner,status,error_message)
+              VALUES('failed','reviewer','review','codex','failed','Preserved environment needs attention');").unwrap();
+        for path in [
+            "/tasks?agent_id=reviewer",
+            "/tasks?agent_id=reviewer&sort=recent",
+            "/tasks/attention?agent_id=reviewer",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = body_json(response.into_body()).await;
+            assert_eq!(body["tasks"].as_array().unwrap().len(), 1, "{path}");
+            assert_eq!(body["tasks"][0]["id"], "review");
+            assert_eq!(body["tasks"][0]["parent_title"], "Benchmark");
+            assert_eq!(
+                body["tasks"][0]["error_message"],
+                "Preserved environment needs attention"
+            );
+        }
+        // More than a page of old work must not hide the unresolved child.
+        for i in 0..110 {
+            db.conn().execute("INSERT INTO tasks(id,title,status,agent_id) VALUES(?1,'Old work','completed','reviewer')", [format!("old-{i}")]).unwrap();
+        }
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/tasks/attention?agent_id=reviewer")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            body_json(response.into_body()).await["tasks"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        db.conn()
+            .execute("UPDATE tasks SET status='cancelled' WHERE id='review'", [])
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/tasks/review")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(body_json(response.into_body()).await["error_message"].is_null());
+        // Cancellation does not satisfy a required review gate. Surface the
+        // parent that still needs an explicit resolution.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/tasks/attention")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body_json(response.into_body()).await;
+        assert_eq!(body["tasks"].as_array().unwrap().len(), 1);
+        assert_eq!(body["tasks"][0]["id"], "parent");
+        assert_eq!(body["tasks"][0]["status"], "in_progress");
+        assert_eq!(body["tasks"][0]["activity_status"], "blocked");
     }
 
     #[tokio::test]
@@ -1006,6 +2223,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_list_tasks_searches_task_text_and_conversation_history() {
+        let (app, db) = test_app_with_db();
+        let board = TaskBoard::new(db.clone());
+        let conversation_match = board
+            .create(&CreateTask {
+                title: "Investigate the browser".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        TaskConversation::new(db.clone())
+            .add_message(
+                &conversation_match.id,
+                "user",
+                "The MOBILE connection erased my draft",
+            )
+            .unwrap();
+        let completed_match = board
+            .create(&CreateTask {
+                title: "Reconnect safely".to_string(),
+                description: Some("Keep the mobile draft intact".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        board
+            .update_status(&completed_match.id, "completed", None)
+            .unwrap();
+        board
+            .create(&CreateTask {
+                title: "Unrelated task".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/tasks?search=mobile%20DRAFT&statuses=completed&sort=recent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response.into_body()).await;
+        let tasks = body["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["id"], completed_match.id);
+        assert_eq!(body["counts"]["pending"], 1);
+        assert_eq!(body["counts"]["completed"], 1);
+    }
+
+    #[tokio::test]
     async fn test_update_task_status() {
         let app = test_app();
 
@@ -1045,6 +2315,186 @@ mod tests {
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["status"], "in_progress");
         assert_eq!(body["agent_id"], "atlas");
+    }
+
+    #[tokio::test]
+    async fn manual_status_completion_defers_unfinished_plan_items() {
+        let (app, db) = test_app_with_db();
+        let board = TaskBoard::new(db);
+        let task = board
+            .create(&CreateTask {
+                title: "Manual completion".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        board
+            .sync_reported_subtasks(
+                &task.id,
+                "attempt-1",
+                &[xpressclaw_core::tasks::board::ReportedSubtask {
+                    title: "Future follow-up".to_string(),
+                    status: TaskStatus::InProgress,
+                }],
+            )
+            .unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/tasks/{}/status", task.id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({ "status": "completed" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response.into_body()).await;
+        assert_eq!(body["status"], "completed");
+        let plan = board.list_subtasks(&task.id).unwrap().remove(0);
+        assert_eq!(plan.status, TaskStatus::Cancelled);
+        assert_eq!(
+            plan.context
+                .as_ref()
+                .and_then(|context| context.get("plan_disposition"))
+                .and_then(Value::as_str),
+            Some("deferred")
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_completion_releases_parked_attempt_and_advances_default_workflow() {
+        let (app, db) = test_app_with_db();
+        let workflow = WorkflowManager::new(db.clone())
+            .create(&CreateWorkflow {
+                name: "manual-completion-review".into(),
+                description: None,
+                yaml_content: r#"
+name: manual-completion-review
+flows:
+  main:
+    steps:
+      - id: review_ui
+        type: continue
+        prompt: Check the UI for unnecessary messages.
+"#
+                .into(),
+            })
+            .unwrap();
+        WorkflowManager::new(db.clone())
+            .set_default_for_tasks(&workflow.id, true)
+            .unwrap();
+        let board = TaskBoard::new(db.clone());
+        let parent = board
+            .create(&CreateTask {
+                title: "Unassigned parent".into(),
+                agent_id: Some("developer".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let task = board
+            .create(&CreateTask {
+                title: "Parked source task".into(),
+                agent_id: Some("developer".into()),
+                parent_task_id: Some(parent.id.clone()),
+                context: Some(json!({ "origin": "session_message" })),
+                ..Default::default()
+            })
+            .unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE tasks SET agent_id = NULL WHERE id = ?1",
+                [&parent.id],
+            )?;
+            Ok::<_, xpressclaw_core::error::Error>(())
+        })
+        .unwrap();
+        let engine = WorkflowEngine::new(db.clone());
+        let instance_id = engine.attach_default_workflows_to_task(&task.id).unwrap()[0].clone();
+
+        let queue = TaskQueue::new(db.clone());
+        queue.enqueue(&task.id, "developer").unwrap();
+        let original = queue.claim("developer").unwrap().unwrap();
+        let attempt_id = original.attempt_id.as_deref().unwrap().to_string();
+        let sessions = SessionManager::new(db.clone());
+        sessions
+            .transition_attempt(&attempt_id, "running", "Working", None, None)
+            .unwrap();
+        sessions
+            .transition_attempt(
+                &attempt_id,
+                "waiting_for_input",
+                "Waiting for an answer",
+                None,
+                None,
+            )
+            .unwrap();
+        TaskBoard::new(db.clone())
+            .update_status(&task.id, "waiting_for_input", Some("developer"))
+            .unwrap();
+        TaskConversation::new(db.clone())
+            .add_message(&task.id, "assistant", "Do you want me to continue?")
+            .unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/tasks/{}/status", task.id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({ "status": "completed" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response.into_body()).await;
+        assert_eq!(body["status"], "pending");
+        assert_eq!(board.get(&parent.id).unwrap().status, TaskStatus::Pending);
+        assert!(!board.subtasks_complete(&parent.id).unwrap());
+        assert_eq!(
+            sessions.get_attempt(&attempt_id).unwrap().status,
+            "interrupted"
+        );
+        assert_eq!(queue.get(original.id).unwrap().status, "completed");
+        assert_eq!(queue.pending_count("developer").unwrap(), 1);
+
+        let messages = TaskConversation::new(db.clone())
+            .get_messages(&task.id)
+            .unwrap();
+        let fixed_prompts = messages
+            .iter()
+            .filter(|message| message.role == "user")
+            .collect::<Vec<_>>();
+        assert_eq!(fixed_prompts.len(), 1);
+        assert_eq!(
+            fixed_prompts[0].content,
+            "Check the UI for unnecessary messages."
+        );
+        let execution_statuses = db
+            .with_conn(|conn| {
+                let mut statement = conn.prepare(
+                    "SELECT step_id, status FROM workflow_step_executions
+                     WHERE instance_id = ?1 ORDER BY rowid",
+                )?;
+                let rows = statement
+                    .query_map([&instance_id], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                Ok::<_, xpressclaw_core::error::Error>(rows)
+            })
+            .unwrap();
+        assert_eq!(
+            execution_statuses,
+            vec![
+                ("__source_task__".to_string(), "completed".to_string()),
+                ("review_ui".to_string(), "running".to_string()),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -1116,6 +2566,93 @@ mod tests {
             TaskBoard::new(db).get(&task_id).unwrap().status,
             TaskStatus::Completed
         );
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_task_releases_its_default_workflow_source_gate() {
+        let (app, db) = test_app_with_db();
+        let workflow = WorkflowManager::new(db.clone())
+            .create(&CreateWorkflow {
+                name: "cancelled-source".into(),
+                description: None,
+                yaml_content: r#"
+name: cancelled-source
+flows:
+  main:
+    steps:
+      - id: review_ui
+        type: continue
+        prompt: Check the UI for unnecessary messages.
+  on_error:
+    steps:
+      - id: retry_cancelled_task
+        type: continue
+        prompt: This must not revive a task the user cancelled.
+"#
+                .into(),
+            })
+            .unwrap();
+        WorkflowManager::new(db.clone())
+            .set_default_for_tasks(&workflow.id, true)
+            .unwrap();
+        let task = TaskBoard::new(db.clone())
+            .create(&CreateTask {
+                title: "Cancel default workflow source".into(),
+                agent_id: Some("developer".into()),
+                context: Some(json!({ "origin": "session_message" })),
+                ..Default::default()
+            })
+            .unwrap();
+        TaskQueue::new(db.clone())
+            .enqueue(&task.id, "developer")
+            .unwrap();
+        let engine = WorkflowEngine::new(db.clone());
+        let instance_id = engine.attach_default_workflows_to_task(&task.id).unwrap()[0].clone();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/tasks/{}/status", task.id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({ "status": "cancelled" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let (instance_status, step_id, execution_status) = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT instance.status, execution.step_id, execution.status
+                     FROM workflow_instances instance
+                     JOIN workflow_step_executions execution
+                       ON execution.instance_id = instance.id
+                     WHERE instance.id = ?1",
+                    [&instance_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .map_err(xpressclaw_core::error::Error::from)
+            })
+            .unwrap();
+        assert_eq!(instance_status, "cancelled");
+        assert_eq!(step_id, "__source_task__");
+        assert_eq!(execution_status, "cancelled");
+        assert_eq!(
+            TaskBoard::new(db.clone()).get(&task.id).unwrap().status,
+            TaskStatus::Cancelled
+        );
+        assert!(TaskConversation::new(db)
+            .get_messages(&task.id)
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -1345,8 +2882,65 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers()["content-type"], "image/png");
+        assert_eq!(
+            resp.headers()["content-disposition"],
+            "inline; filename=\"screen.png\""
+        );
+        assert_eq!(resp.headers()["x-content-type-options"], "nosniff");
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(bytes.as_ref(), b"\x89PNG\r\n\x1a\nbytes");
+    }
+
+    #[tokio::test]
+    async fn generated_presentation_is_downloaded_without_content_sniffing() {
+        let (app, db) = test_app_with_db();
+        let task = TaskBoard::new(db.clone())
+            .create(&CreateTask {
+                title: "Presentation".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let message = TaskConversation::new(db)
+            .add_final_assistant_message(
+                &task.id,
+                "The checked deck is attached.",
+                "attempt-presentation",
+                &[],
+                &[PublishedFileAttachment {
+                    name: "Résumé \"deck\"\r\n.pptx".into(),
+                    mime_type:
+                        "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                            .into(),
+                    data: b"pptx fixture".to_vec(),
+                }],
+            )
+            .unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/tasks/{}/messages/{}/attachments/{}",
+                        task.id, message.id, message.attachments[0].id
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["content-type"],
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        );
+        assert_eq!(
+            response.headers()["content-disposition"],
+            "attachment; filename=\"R_sum_ _deck___.pptx\""
+        );
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(bytes.as_ref(), b"pptx fixture");
     }
 
     #[tokio::test]
@@ -1441,6 +3035,7 @@ mod tests {
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["continuation_queued"], true);
         assert!(body["attempt_id"].is_string());
+        let continuation_attempt_id = body["attempt_id"].as_str().unwrap().to_string();
         assert_eq!(body["delivery"], "queued");
         let reopened = TaskBoard::new(db.clone()).get(&task_id).unwrap();
         assert_eq!(reopened.status, TaskStatus::Pending);
@@ -1450,6 +3045,22 @@ mod tests {
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["continuation_queued"], false);
         assert_eq!(queue.pending_count("developer").unwrap(), 1);
+        let latest_message = TaskConversation::new(db.clone())
+            .get_messages(&task_id)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let continuation_attempt = SessionManager::new(db)
+            .get_attempt(&continuation_attempt_id)
+            .unwrap();
+        assert_eq!(
+            continuation_attempt.trigger_message_id,
+            Some(latest_message.id)
+        );
+        assert_eq!(
+            continuation_attempt.response_queued_at.as_deref(),
+            Some(latest_message.timestamp.as_str())
+        );
     }
 
     #[tokio::test]
@@ -1506,6 +3117,79 @@ mod tests {
                 .unwrap()
                 .status,
             "running"
+        );
+    }
+
+    #[tokio::test]
+    async fn waiting_task_message_interrupts_the_attempt_and_runs_the_continuation() {
+        let (app, db) = test_app_with_db();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/tasks")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"title": "Answer this", "agent_id": "developer"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body_json(resp.into_body()).await;
+        let task_id = body["id"].as_str().unwrap().to_string();
+        let queue = TaskQueue::new(db.clone());
+        let first = queue.claim("developer").unwrap().unwrap();
+        let attempt_id = first.attempt_id.as_deref().unwrap().to_string();
+        let sessions = SessionManager::new(db.clone());
+        sessions
+            .transition_attempt(&attempt_id, "running", "Working", None, None)
+            .unwrap();
+        sessions
+            .transition_attempt(
+                &attempt_id,
+                "waiting_for_input",
+                "Waiting for your answer",
+                None,
+                None,
+            )
+            .unwrap();
+        TaskBoard::new(db.clone())
+            .update_status(&task_id, "waiting_for_input", Some("developer"))
+            .unwrap();
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/tasks/{task_id}/messages"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "role": "user",
+                            "content": "Continue without that plugin"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["delivery"], "immediate");
+        assert_eq!(body["continuation_queued"], true);
+        assert!(body["attempt_id"].is_string());
+        assert_eq!(
+            sessions.get_attempt(&attempt_id).unwrap().status,
+            "interrupted"
+        );
+        assert_eq!(queue.get(first.id).unwrap().status, "completed");
+        assert_eq!(queue.pending_count("developer").unwrap(), 1);
+        assert_eq!(
+            TaskBoard::new(db).get(&task_id).unwrap().status,
+            TaskStatus::InProgress
         );
     }
 
@@ -1570,6 +3254,161 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn queued_guidance_recovers_when_the_harness_ignores_cancellation() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use xpressclaw_core::docker::manager::{AttachedContainer, ContainerInfo};
+        use xpressclaw_core::workers::acp::{
+            AcpEventRecorder, AcpProcess, AcpSessionStart, AcpTurnOptions, AcpTurnRuntime,
+        };
+
+        let db = Arc::new(Database::open_memory().unwrap());
+        xpressclaw_core::agents::registry::AgentRegistry::new(db.clone())
+            .ensure("developer", "native")
+            .unwrap();
+        let state = AppState::new(
+            Arc::new(Config::default()),
+            db.clone(),
+            None,
+            "test.yaml".into(),
+            true,
+        );
+        let app = Router::new()
+            .nest("/tasks", routes())
+            .with_state(state.clone());
+        let board = TaskBoard::new(db.clone());
+        let task = board
+            .create(&CreateTask {
+                title: "Resume stalled work".into(),
+                agent_id: Some("developer".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let queue = TaskQueue::new(db.clone());
+        queue.enqueue(&task.id, "developer").unwrap();
+        let active = queue.claim("developer").unwrap().unwrap();
+        let attempt = active.attempt_id.clone().unwrap();
+        let sessions = SessionManager::new(db.clone());
+        sessions
+            .transition_attempt(&attempt, "running", "Working", None, None)
+            .unwrap();
+        board.update_status(&task.id, "in_progress", None).unwrap();
+        state.turn_controls.begin_attempt(&attempt);
+
+        let (client_input, agent_input) = tokio::io::duplex(64 * 1024);
+        let (output, input) = tokio::sync::mpsc::channel(8);
+        let (prompt_tx, prompt_rx) = tokio::sync::oneshot::channel();
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+        let mock = tokio::spawn(async move {
+            let mut lines = BufReader::new(agent_input).lines();
+            let mut prompt_tx = Some(prompt_tx);
+            let mut cancel_tx = Some(cancel_tx);
+            while let Some(line) = lines.next_line().await.unwrap() {
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let result = match request["method"].as_str().unwrap() {
+                    "initialize" => json!({"protocolVersion":1,"agentCapabilities":{}}),
+                    "session/new" => json!({"sessionId":"stalled-session"}),
+                    "session/prompt" => {
+                        prompt_tx.take().unwrap().send(()).unwrap();
+                        continue;
+                    }
+                    "session/cancel" => {
+                        cancel_tx.take().unwrap().send(()).unwrap();
+                        continue;
+                    }
+                    method => panic!("unexpected method: {method}"),
+                };
+                let mut bytes = serde_json::to_vec(
+                    &json!({"jsonrpc":"2.0","id":request["id"],"result":result}),
+                )
+                .unwrap();
+                bytes.push(b'\n');
+                output
+                    .send(Ok(bollard::container::LogOutput::StdOut {
+                        message: bytes.into(),
+                    }))
+                    .await
+                    .unwrap();
+            }
+        });
+        let process = AcpProcess::start(AttachedContainer {
+            info: ContainerInfo {
+                container_id: "mock-container".into(),
+                agent_id: "developer".into(),
+                status: "running".into(),
+                host_port: None,
+            },
+            input: Box::pin(client_input),
+            output: Box::pin(tokio_stream::wrappers::ReceiverStream::new(input)),
+        })
+        .await
+        .unwrap();
+        let runner = process.clone();
+        let runtime = AcpTurnRuntime::new(
+            AcpEventRecorder::new(db.clone(), "developer", &attempt, &task.id, "codex"),
+            state.elicitations.clone(),
+            state.turn_controls.clone(),
+        );
+        let work = tokio::spawn(async move {
+            runner
+                .run_turn(
+                    runtime,
+                    AcpSessionStart::New,
+                    std::path::Path::new("/workspace"),
+                    "Original assignment",
+                    AcpTurnOptions::default(),
+                )
+                .await
+        });
+        prompt_rx.await.unwrap();
+        let (_, queued) = TaskConversation::new(db.clone())
+            .add_user_message_with_attachments_and_enqueue(
+                &task.id,
+                Some("developer"),
+                "First queued message",
+                &[],
+            )
+            .unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/tasks/{}/messages", task.id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"role":"user","content":"Please resume with this guidance"})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert_eq!(body_json(resp.into_body()).await["delivery"], "after_tool");
+        cancel_rx.await.unwrap();
+        tokio::time::advance(std::time::Duration::from_secs(29)).await;
+        assert_eq!(sessions.get_attempt(&attempt).unwrap().status, "running");
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            sessions.get_attempt(&attempt).unwrap().status,
+            "interrupted"
+        );
+        assert_eq!(queue.pending_count("developer").unwrap(), 1);
+        assert_eq!(
+            queue.claim("developer").unwrap().unwrap().id,
+            queued.unwrap().id
+        );
+        assert_eq!(board.get(&task.id).unwrap().status, TaskStatus::InProgress);
+        state.turn_controls.finish_attempt(&attempt);
+        mock.abort();
+        let _ = mock.await;
+        process.shutdown();
+        let _ = work.await;
+    }
+
     #[tokio::test]
     async fn task_activity_includes_native_attempt_events() {
         let app = test_app();
@@ -1612,5 +3451,196 @@ mod tests {
             .unwrap()
             .iter()
             .any(|event| event["event_type"] == "attempt_queued"));
+    }
+
+    #[tokio::test]
+    async fn incremental_task_activity_refreshes_delegated_work_without_parent_events() {
+        let (app, db) = test_app_with_db();
+        db.conn().execute_batch("INSERT INTO tasks(id,title,status) VALUES('parent','Parent','in_progress');
+            INSERT INTO tasks(id,title,parent_task_id,status,agent_id) VALUES('child','Review','parent','pending','website-codex');").unwrap();
+        for status in ["pending", "completed"] {
+            db.conn()
+                .execute("UPDATE tasks SET status=?1 WHERE id='child'", [status])
+                .unwrap();
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/tasks/parent/activity?after=99999")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = body_json(response.into_body()).await;
+            assert!(body["events"].as_array().unwrap().is_empty());
+            assert_eq!(body["delegated_work"][0]["task_id"], "child");
+            assert_eq!(body["delegated_work"][0]["agent_id"], "website-codex");
+            assert_eq!(body["delegated_work"][0]["status"], status);
+            assert_eq!(
+                body["delegated_work"][0]["blocks_parent"],
+                status != "completed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn visualization_retrieval_requires_its_message_scoped_capability() {
+        let (app, db) = test_app_with_db();
+        let message_id = db
+            .with_conn(|connection| -> std::result::Result<i64, xpressclaw_core::error::Error> {
+                connection.execute(
+                    "INSERT INTO tasks (id, title) VALUES ('visual-task', 'Visual'), ('other-task', 'Other')",
+                    [],
+                )?;
+                connection.execute(
+                    "INSERT INTO task_messages (task_id, role, content)
+                     VALUES ('visual-task', 'assistant', 'visual')",
+                    [],
+                )?;
+                let message_id = connection.last_insert_rowid();
+                connection.execute(
+                    "INSERT INTO message_visualizations
+                     (id, task_message_id, reference_index, title, display_mode,
+                      status, content, content_sha256, size, retrieval_token)
+                     VALUES ('viz-route', ?1, 0, 'Route test', 'normal',
+                             'ready', '<div data-secret>safe</div>',
+                             '0000000000000000000000000000000000000000000000000000000000000000',
+                             27, 'route-token')",
+                    [message_id],
+                )?;
+                Ok(message_id)
+            })
+            .unwrap();
+
+        let path = format!("/tasks/visual-task/messages/{message_id}/visualizations/viz-route");
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(&path)
+                    .header(visualizations::RETRIEVAL_TOKEN_HEADER, "route-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::REFERRER_POLICY], "no-referrer");
+        assert!(response.headers()["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .contains("connect-src 'none'"));
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!body.contains("<div data-secret>safe</div>"));
+        assert!(body.contains("const encodedDocument ="));
+        assert!(body.contains("child.setAttribute(\"sandbox\", \"allow-scripts\")"));
+
+        for request in [
+            Request::get(&path)
+                .header(visualizations::RETRIEVAL_TOKEN_HEADER, "wrong")
+                .body(Body::empty())
+                .unwrap(),
+            Request::get(format!(
+                "/tasks/other-task/messages/{message_id}/visualizations/viz-route"
+            ))
+            .header(visualizations::RETRIEVAL_TOKEN_HEADER, "route-token")
+            .body(Body::empty())
+            .unwrap(),
+        ] {
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::NOT_FOUND
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn incremental_messages_and_slim_recent_by_agent_payloads() {
+        let (app, db) = test_app_with_db();
+        let board = TaskBoard::new(db.clone());
+        let created = board
+            .create(&CreateTask {
+                backlog: false,
+                start_after: None,
+                title: "Sidebar summary check".to_string(),
+                description: Some("x".repeat(4096)),
+                agent_id: Some("atlas".to_string()),
+                parent_task_id: None,
+                sop_id: None,
+                conversation_id: None,
+                priority: None,
+                context: Some(json!({ "heavy": "y".repeat(4096) })),
+            })
+            .unwrap();
+        let conv = TaskConversation::new(db);
+        let first = conv.add_message(&created.id, "user", "First").unwrap();
+        let second = conv
+            .add_message(&created.id, "assistant", "Second")
+            .unwrap();
+
+        let delta_resp = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/tasks/{}/messages?after_id={}",
+                    created.id, first.id
+                ))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delta_resp.status(), StatusCode::OK);
+        let delta_messages = body_json(delta_resp.into_body()).await;
+        let arr = delta_messages.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["id"], second.id);
+
+        let slim_recent = app
+            .clone()
+            .oneshot(
+                Request::get("/tasks/recent-by-agent?limit=5")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(slim_recent.status(), StatusCode::OK);
+        let slim_body = body_json(slim_recent.into_body()).await;
+        assert!(slim_body["tasks"][0]["description"].is_null());
+        assert_eq!(slim_body["tasks"][0]["context"], json!({}));
+
+        let full_recent = app
+            .clone()
+            .oneshot(
+                Request::get("/tasks/recent-by-agent?limit=5&include_details=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(full_recent.status(), StatusCode::OK);
+        let full_body = body_json(full_recent.into_body()).await;
+        assert_eq!(
+            full_body["tasks"][0]["description"].as_str().unwrap().len(),
+            4096
+        );
+
+        board
+            .update_status(&created.id, "completed", Some("agent-1"))
+            .unwrap();
+        let active_only = app
+            .oneshot(
+                Request::get("/tasks?exclude_statuses=completed,cancelled")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(active_only.status(), StatusCode::OK);
+        let active_body = body_json(active_only.into_body()).await;
+        assert_eq!(active_body["tasks"].as_array().unwrap().len(), 0);
     }
 }

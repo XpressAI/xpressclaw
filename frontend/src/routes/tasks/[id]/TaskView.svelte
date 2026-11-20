@@ -1,15 +1,73 @@
 <script lang="ts">
+	import DictationButton from '$lib/components/DictationButton.svelte';
+	import ReadAloud from '$lib/components/ReadAloud.svelte';
 	import { onMount, onDestroy } from 'svelte';
-	import { tasks, agents, sessions } from '$lib/api';
-	import type { AcpCommand, AcpConfigOption, AcpModeState, Task, TaskMessage, Agent, WorkAttempt, SessionEvent, ImageAttachmentUpload } from '$lib/api';
-	import { timeAgo } from '$lib/utils';
+	import { Check, PanelRightClose, PanelRightOpen, Play, Settings, Square, X } from '@lucide/svelte';
+	import ContextMenu from '$lib/components/ContextMenu.svelte';
+	import TaskPlanningActions from '$lib/components/planning/TaskActions.svelte';
+	import { dateLabel, planningViewport } from '$lib/taskPlanning';
+	import { MIN_DETAILS_WIDTH } from '$lib/workspaceLayout';
+	import { goto } from '$app/navigation';
+	import { tasks, agents, sessions, workspaces, ApiError } from '$lib/api';
+	import { isTransientRefreshError, subscribeLiveUpdates, usePaneActive } from '$lib/liveUpdates';
+	import { selectChoices, isModelOption, isReasoningOption, isAdditionalModelOption, reconcileConfig, duplicatesReasoningMode } from '$lib/acpConfig';
+	import type { TaskControlSnapshot, AcpCommand, AcpConfigOption, AcpModeState, DelegatedWork, Task, TaskMessage, Agent, WorkAttempt, SessionEvent, ImageAttachmentUpload, GitChange, WorkspaceGitStatus, MessageVisualization } from '$lib/api';
+	import { timeAgo, openExternal } from '$lib/utils';
+	import { serverTimestampMs } from '$lib/serverTime';
 	import { renderContent } from '$lib/formatMessage';
+	import { mermaidDiagrams } from '$lib/mermaidDiagrams';
 	import ActivityEventRow from '$lib/components/ActivityEventRow.svelte';
+	import AgentLoading from '$lib/components/AgentLoading.svelte';
+	import AgentSignIn from '$lib/components/AgentSignIn.svelte';
+	import ProjectLink from '$lib/components/ProjectLink.svelte';
+	import DelegatedWorkPanel from '$lib/components/DelegatedWorkPanel.svelte';
+	import AiMessage from '$lib/components/AiMessage.svelte';
 	import ImageAttachmentPreviews from '$lib/components/ImageAttachmentPreviews.svelte';
 	import { clearComposerDraft, loadComposerDraft, saveComposerDraft } from '$lib/composerDrafts';
-	import { appendImageFiles, imageDataUrl, IMAGE_FILE_ACCEPT, MAX_IMAGE_ATTACHMENTS, pastedImageFiles, shouldHandleImagePaste } from '$lib/imageAttachments';
+	import { appendImageFiles, imageDataUrl, MAX_IMAGE_ATTACHMENTS, pastedImageFiles, shouldHandleImagePaste } from '$lib/imageAttachments';
+	import { coalesceAgentMessageFragments } from '$lib/agentMessageFragments';
+	import { WORKSPACE_OPEN_SPLIT_EVENT, type WorkspaceOpenSplitDetail } from '$lib/workspace';
 
 	let { taskId, compact = false }: { taskId: string; compact?: boolean } = $props();
+	let planningTask = $state<Task | null>(null);
+	let planningError = $state('');
+	let planningLoading = $state(false);
+	const viewId = $props.id();
+	let settingsMenu = $state<{ x: number; y: number } | null>(null);
+	let settingsButton = $state<HTMLButtonElement>();
+	let editDialog = $state<HTMLDialogElement>();
+	let editSaving = $state(false);
+	let editError = $state('');
+	let statusUpdating = $state(false);
+	let actionError = $state('');
+	let signInAgentId = $state<string | null>(null);
+	let authenticatedAttemptId = $state<string | null>(null);
+	async function openPlanning() {
+		if (platformManaged) return;
+		planningError = '';
+		planningLoading = true;
+		try {
+			planningTask = await tasks.planningTask(taskId);
+		} catch (error) {
+			planningError = error instanceof Error ? error.message : String(error);
+		} finally {
+			planningLoading = false;
+		}
+	}
+	async function changePlanning(current: Task, action: Parameters<typeof tasks.plan>[1]) {
+		try {
+			const updated = await tasks.plan(current, action);
+			planningTask = updated;
+			if (task?.id === updated.id) {
+				const refreshed = await tasks.get(updated.id).catch(() => updated);
+				if (task?.id === updated.id) task = refreshed;
+			}
+			return updated;
+		} catch (error) {
+			planningTask = await tasks.planningTask(current.id).catch(() => current);
+			throw error;
+		}
+	}
 	const messageDraftScope = () => `task.${taskId}`;
 
 	interface ElicitationOption {
@@ -36,13 +94,34 @@
 		customProperty: ElicitationProperty | null;
 	}
 
-	interface PendingElicitation {
+	interface PendingElicitationBase {
 		id: string;
 		eventId: number;
 		attemptId: string | null;
 		message: string;
+	}
+
+	interface PendingFormElicitation extends PendingElicitationBase {
+		kind: 'form';
 		fields: ElicitationField[];
 	}
+
+	interface PendingUnsupportedElicitation extends PendingElicitationBase {
+		kind: 'unsupported';
+	}
+	interface PendingUrlElicitation extends PendingElicitationBase {
+		kind: 'url';
+		url: string;
+	}
+
+	interface PendingToolInstallElicitation extends PendingElicitationBase {
+		kind: 'tool_install';
+		toolId: string;
+		toolName: string;
+		toolType: 'plugin' | 'connector';
+	}
+
+	type PendingElicitation = PendingFormElicitation | PendingToolInstallElicitation | PendingUnsupportedElicitation | PendingUrlElicitation;
 
 	interface ContextUsage {
 		used: number;
@@ -57,7 +136,10 @@
 			timestamp: string;
 			role: string;
 			content: string;
-			attachments: { id?: string; name: string; src: string }[];
+			messageId?: number;
+			agentId?: string | null;
+			attachments: { id?: string; name: string; src: string; mimeType?: string; size?: number }[];
+			visualizations: MessageVisualization[];
 			sequence: number;
 		}
 		| {
@@ -73,14 +155,21 @@
 	let attempts = $state<WorkAttempt[]>([]);
 	let activityEvents = $state<SessionEvent[]>([]);
 	let subtaskList = $state<Task[]>([]);
+	let delegatedWork = $state<DelegatedWork[]>([]);
+	let planSteps = $derived(subtaskList.filter(item => item.provenance === 'native_plan'));
 	let agentList = $state<Agent[]>([]);
+	let taskProjectId = $derived(task?.project_id || agentList.find((agent) => agent.id === task?.agent_id)?.project_id || null);
 	let allTasks = $state<Task[]>([]);
+	let workspaceGit = $state<WorkspaceGitStatus | null>(null);
 	let error = $state<string | null>(null);
+	let dismissedAttemptErrorKey = $state<string | null>(null);
+	let retryingLoad = $state(false);
 	let loading = $state(true);
 	let editing = $state(false);
 	let editTitle = $state('');
 	let editDesc = $state('');
 	let editAgentId = $state('');
+	let originalEditAgentId = $state('');
 	let editPriority = $state(0);
 	let editDeps = $state<string[]>([]);
 	let messageInput = $state('');
@@ -93,12 +182,21 @@
 	let messageImagePreviews = $derived(messageAttachments.map((attachment) => ({
 		name: attachment.name,
 		src: imageDataUrl(attachment),
+		mimeType: attachment.mime_type,
 	})));
 	let sessionEvents = $state<SessionEvent[]>([]);
 	let configOptions = $state<AcpConfigOption[]>([]);
 	let selectedConfig = $state<Record<string, string | boolean>>({});
 	let availableCommands = $state<AcpCommand[]>([]);
 	let modelMenuOpen = $state(false);
+	let modelSearch = $state('');
+	let configUpdating = $state(false);
+	let configNotice = $state('');
+	let controlSnapshot = $state<TaskControlSnapshot | null>(null);
+	let configRequestVersion = 0;
+	let configRefreshVersion: number | null = null;
+	let configRefreshPromise: Promise<void> | null = null;
+	let configRefreshPendingAfterUpdate = false;
 	let messageInputFocused = $state(false);
 	let slashMenuDismissed = $state(false);
 	let selectedCommandIndex = $state(0);
@@ -108,17 +206,33 @@
 	let locallyResolvedElicitations = $state<Record<string, boolean>>({});
 	let controlsInitializedFor = '';
 	let composing = $state(false);
-	let pollTimer: ReturnType<typeof setInterval> | null = null;
+	const paneActive = usePaneActive();
+	let unsubscribeLiveUpdates: (() => void) | null = null;
 	let messagesEl = $state<HTMLDivElement>();
 	let composerEl = $state<HTMLDivElement>();
+	let taskViewEl = $state<HTMLDivElement>();
+	let taskViewResizeObserver: ResizeObserver | null = null;
+	const detailsPreferenceKey = 'xpressclaw.task.details.collapsed';
+	let detailsCollapsed = $state(false);
+	let detailsSidebarFits = $state(false);
+	let detailsSheetOpen = $state(false);
+	let detailsDialog = $state<HTMLDialogElement>();
+	let showDetailsSidebar = $derived(detailsSidebarFits && !detailsCollapsed && !detailsSheetOpen);
 	let prevMessageCount = 0;
 	let lastActivityEventId = 0;
+	let lastCommandsEventId = 0;
+	let allTasksLoaded = false;
+	let allTasksLoading = false;
 	let hasEarlierActivity = $state(false);
 	let loadingEarlierActivity = $state(false);
 	let initialLoad = true;
 	let followLatest = $state(true);
 	let showJumpToLatest = $state(false);
 	let lastTranscriptScrollTop = 0;
+	let lastWorkspaceGitRefresh = 0;
+	let workspaceGitRequest: AbortController | null = null;
+	let pollPromise: Promise<void> | null = null;
+	let disposed = false;
 
 	$effect(() => {
 		if (messageDraftReady) saveComposerDraft(messageDraftScope(), messageInput);
@@ -127,19 +241,24 @@
 	let availableDeps = $derived(
 		allTasks.filter(t => t.id !== task?.id && t.status !== 'completed' && t.status !== 'cancelled')
 	);
-	let collapsedActivityEvents = $derived(collapseToolActivity(activityEvents));
+	let mirroredActivityEventIds = $derived(new Set(activityEvents.filter(event => {
+		const mirrorsTaskReply = event.payload?.item_type === 'agent_message' && messages.some(message =>
+			message.role === 'assistant' && (
+				message.content === event.summary ||
+				(event.summary.length >= 200 && message.content.startsWith(event.summary.slice(0, 180)))
+			)
+		);
+		return mirrorsTaskReply;
+	}).map(event => event.id)));
+	let collapsedActivityEvents = $derived(collapseToolActivity(
+		coalesceAgentMessageFragments(activityEvents, messages, mirroredActivityEventIds)
+	));
 	let primaryActivityEvents = $derived(
-		collapsedActivityEvents.filter(event => {
-			const mirrorsTaskReply = event.payload?.item_type === 'agent_message' && messages.some(message =>
-				message.role === 'assistant' && (
-					message.content === event.summary ||
-					(event.summary.length >= 200 && message.content.startsWith(event.summary.slice(0, 180)))
-				)
-			);
-			return !['artifact_created', 'attempt_completed', 'elicitation_pending', 'elicitation_resolved', 'usage'].includes(event.event_type) &&
-				(event.event_type !== 'runner_progress' || event.payload?.item_type === 'agent_message') &&
-				!mirrorsTaskReply;
-		})
+		collapsedActivityEvents.filter(event =>
+			!['artifact_created', 'attempt_completed', 'elicitation_pending', 'elicitation_resolved', 'usage'].includes(event.event_type) &&
+			(event.event_type !== 'runner_progress' || event.payload?.item_type === 'agent_message') &&
+			!mirroredActivityEventIds.has(event.id)
+		)
 	);
 	let technicalActivityEvents = $derived(
 		collapsedActivityEvents.filter(event =>
@@ -164,6 +283,7 @@
 				role: 'user',
 				content: taskPrompt,
 				attachments: [],
+				visualizations: [],
 				sequence: -1,
 			});
 		}
@@ -173,11 +293,16 @@
 			timestamp: message.timestamp,
 			role: message.role,
 			content: message.content,
+			messageId: message.id,
+			agentId: message.agent_id,
 			attachments: (message.attachments ?? []).map((attachment) => ({
 				id: attachment.id,
 				name: attachment.name,
 				src: `/api/tasks/${encodeURIComponent(taskId)}/messages/${message.id}/attachments/${encodeURIComponent(attachment.id)}`,
+				mimeType: attachment.mime_type,
+				size: attachment.size,
 			})),
+			visualizations: message.visualizations ?? [],
 			sequence: message.id,
 		})));
 		items.push(...activityTimelineEvents.map((event): TranscriptItem => ({
@@ -209,14 +334,21 @@
 			.filter((item): item is PendingElicitation => item !== null);
 	})());
 	let pendingElicitation = $derived(pendingElicitations.at(-1) ?? null);
+	let composerBlockedByElicitation = $derived(
+		pendingElicitation?.kind === 'form' || pendingElicitation?.kind === 'tool_install' || pendingElicitation?.kind === 'url'
+	);
 	let runningAttempt = $derived(
 		attempts.find(attempt => ['preparing', 'running', 'waiting_for_input', 'review'].includes(attempt.status)) ?? null
+	);
+	let workingAttempt = $derived(
+		attempts.find(attempt => attempt.status === 'preparing' || attempt.status === 'running') ?? null
 	);
 	let queuedAttempt = $derived(attempts.find(attempt => attempt.status === 'queued') ?? null);
 	let activeAttempt = $derived(runningAttempt ?? queuedAttempt);
 	let usageAttempt = $derived(activeAttempt ?? attempts[0] ?? null);
 	let contextUsage = $derived(contextUsageFor(usageAttempt, activityEvents));
-	let latestAttemptResult = $derived(attempts.find(attempt => attempt.result)?.result ?? null);
+	let latestResultAttempt = $derived(attempts.find(attempt => attempt.result));
+	let latestAttemptResult = $derived(latestResultAttempt?.result ?? null);
 	let latestResult = $derived(
 		latestAttemptResult && !messages.some(message =>
 			message.role === 'assistant' && message.content === latestAttemptResult
@@ -224,12 +356,43 @@
 			? latestAttemptResult
 			: null
 	);
-	let latestError = $derived(attempts.find(attempt => attempt.error_message)?.error_message ?? null);
+	let latestErrorAttempt = $derived(attempts.find(attempt => attempt.error_message) ?? null);
+	let authenticationRequired = $derived(Boolean(latestErrorAttempt && latestErrorAttempt.id === attempts[0]?.id && (
+		activityEvents.some(event => event.attempt_id === latestErrorAttempt.id && event.event_type === 'authentication_required')
+		|| latestErrorAttempt.error_message?.startsWith('backend error: ACP turn failed: Authentication required')
+	)));
+	let latestErrorKey = $derived(
+		latestErrorAttempt?.error_message
+			? `${latestErrorAttempt.id}:${latestErrorAttempt.error_message}`
+			: null
+	);
+	let latestError = $derived(
+		latestErrorKey && latestErrorKey !== dismissedAttemptErrorKey
+			? latestErrorAttempt?.error_message ?? null
+			: null
+	);
+	let platformManaged = $derived(task?.provenance === 'xpress_ai_connect');
+	let blockingDelegates = $derived(delegatedWork.filter(item => item.blocks_parent));
+	let failedDelegates = $derived(blockingDelegates.filter(item => ['blocked', 'failed', 'cancelled', 'interrupted', 'waiting_for_input'].includes(item.activity_status)));
+	let waitingForDelegation = $derived(
+		blockingDelegates.length > 0 && !runningAttempt && !pendingElicitation
+		&& ['pending', 'in_progress'].includes(task?.status ?? '')
+		&& !['awaiting_review', 'awaiting_parent_review', 'waiting_for_dependencies', 'backlog', 'scheduled', 'queued'].includes(task?.activity_status ?? '')
+	);
+	let taskActivityStatus = $derived(waitingForDelegation ? (failedDelegates.length ? 'blocked' : 'waiting_for_subtasks') : task?.activity_status ?? task?.status ?? '');
+	function delegatedAgentName(item: DelegatedWork): string {
+		const agent = agentList.find(agent => agent.id === item.agent_id);
+		return agent?.title || agent?.name || item.agent_id || 'an assigned Agent';
+	}
 	let messagePlaceholder = $derived(
 		!task?.agent_id
-			? 'Assign a project to chat about this task'
-			: pendingElicitation
-				? 'Answer the agent’s question above...'
+			? 'Assign an agent to chat about this task'
+			: composerBlockedByElicitation
+				? pendingElicitation?.kind === 'tool_install'
+					? 'Choose whether to install the suggested tool above...'
+					: 'Answer the agent’s question above...'
+			: pendingElicitation?.kind === 'unsupported'
+				? 'Reply to continue with different guidance...'
 			: task.status === 'waiting_for_input'
 				? 'Reply to the worker...'
 				: ['completed', 'blocked', 'cancelled'].includes(task.status)
@@ -251,17 +414,19 @@
 		messageInputFocused && !slashMenuDismissed && slashCommandQuery !== null && availableCommands.length > 0
 	);
 	let modelOption = $derived(configOptions.find(isModelOption) ?? null);
-	let reasoningOption = $derived(configOptions.find(isReasoningOption) ?? null);
-	let modelConfigOptions = $derived(configOptions.filter(isAdditionalModelOption));
-	let hasModelMenu = $derived(Boolean(modelOption || reasoningOption || modelConfigOptions.length > 0));
+	let modelControlsPending = $derived(controlSnapshot?.model_pending ?? false);
+	let reasoningOption = $derived(modelControlsPending ? null : configOptions.find(isReasoningOption) ?? null);
+	let modelConfigOptions = $derived(modelControlsPending ? [] : configOptions.filter(isAdditionalModelOption));
+	let filteredModels = $derived(modelOption ? selectChoices(modelOption).filter((choice) =>
+		`${choice.name} ${choice.value} ${choice.description ?? ''}`.toLowerCase().includes(modelSearch.toLowerCase())
+	) : []);
+	// selectedConfig is presentation only. Chat messages never echo this map.
 	let otherConfigOptions = $derived(
 		configOptions.filter((option) => !isModelOption(option) && !isReasoningOption(option) && !isAdditionalModelOption(option))
 	);
 
 	function transcriptTimestamp(value: string): number {
-		const normalized = value.includes('T') ? value : `${value.replace(' ', 'T')}Z`;
-		const parsed = Date.parse(normalized);
-		return Number.isNaN(parsed) ? 0 : parsed;
+		return serverTimestampMs(value) ?? 0;
 	}
 
 	function transcriptRank(item: TranscriptItem): number {
@@ -370,25 +535,6 @@
 		return new Intl.NumberFormat('en-US').format(value);
 	}
 
-	function selectChoices(option: AcpConfigOption): { value: string; name: string; description?: string | null }[] {
-		if (!Array.isArray(option.options)) return [];
-		return option.options.flatMap((entry) => 'options' in entry ? entry.options : [entry]);
-	}
-
-	function isModelOption(option: AcpConfigOption): boolean {
-		return option.id === 'model' || option.category === 'model';
-	}
-
-	function isReasoningOption(option: AcpConfigOption): boolean {
-		return option.category === 'thought_level'
-			|| option.id === 'reasoning_effort'
-			|| option.id === 'thought_level';
-	}
-
-	function isAdditionalModelOption(option: AcpConfigOption): boolean {
-		return option.category === 'model_config' && !isModelOption(option) && !isReasoningOption(option);
-	}
-
 	function selectedValue(option: AcpConfigOption): string | boolean {
 		return selectedConfig[option.id] ?? option.currentValue;
 	}
@@ -398,12 +544,166 @@
 		return selectChoices(option).find((choice) => choice.value === value)?.name ?? value;
 	}
 
-	function setConfigOption(option: AcpConfigOption, value: string | boolean) {
-		selectedConfig = { ...selectedConfig, [option.id]: value };
+	function applySnapshot(snapshot: TaskControlSnapshot) {
+		if (snapshot.context && snapshot.context.agent_id !== task?.agent_id) return;
+		controlSnapshot = snapshot;
+		const options = validConfigOptions(snapshot.config_options);
+		const mode = legacyModeOption(snapshot.modes);
+		if (mode && !options.some((option) => option.category === 'mode' || option.id === 'mode')
+			&& !duplicatesReasoningMode(mode, options)) options.unshift(mode);
+		configOptions = options;
+		selectedConfig = reconcileConfig(options, snapshot.pending);
+		configNotice = snapshot.notice;
+	}
+
+	async function toggleModelMenu() {
+		modelMenuOpen = !modelMenuOpen;
+		if (!modelMenuOpen || !task || configUpdating) return;
+		modelSearch = '';
+		configNotice = '';
+		++configRequestVersion;
+		await refreshModelMenu(true);
+	}
+
+	async function refreshModelMenu(showErrors = false, rethrowTransient = false) {
+		if (!task?.agent_id || disposed) return;
+		if (configUpdating) {
+			configRefreshPendingAfterUpdate = true;
+			return;
+		}
+		while (configRefreshPromise) {
+			const inflight = configRefreshPromise;
+			try {
+				await inflight;
+			} catch {
+				// Run a fresh config snapshot below regardless of the prior caller's outcome.
+			}
+			if (!task?.agent_id || configUpdating || disposed) {
+				if (configUpdating) configRefreshPendingAfterUpdate = true;
+				return;
+			}
+		}
+		let run: Promise<void>;
+		run = runRefreshModelMenuOnce(showErrors, rethrowTransient).finally(() => {
+			if (configRefreshPromise === run) configRefreshPromise = null;
+		});
+		configRefreshPromise = run;
+		await run;
+	}
+
+	async function runRefreshModelMenuOnce(showErrors: boolean, rethrowTransient: boolean) {
+		if (!task?.agent_id) return;
+		const version = configRequestVersion;
+		configRefreshVersion = version;
+		const id = task.id;
+		try {
+			const controls = await tasks.config(id);
+			if (version === configRequestVersion && task?.id === id) {
+				applySnapshot(controls);
+			}
+		} catch (e) {
+			if (showErrors && version === configRequestVersion && task?.id === id) {
+				configNotice = e instanceof Error ? e.message : String(e);
+			}
+			if (rethrowTransient && isTransientRefreshError(e)) {
+				throw e;
+			}
+		} finally {
+			if (configRefreshVersion === version) configRefreshVersion = null;
+		}
+	}
+
+	async function setConfigOption(option: AcpConfigOption | null, value: string | boolean) {
+		if (!task || configUpdating || !controlSnapshot?.context) return;
+		const id = task.id;
+		const version = ++configRequestVersion;
+		configNotice = '';
+		configUpdating = true;
+		let conflict = false;
+		let failure = '';
+		try {
+			const controls = await tasks.setConfig(id, option?.id ?? null, value, controlSnapshot.context, controlSnapshot.revision);
+			if (version !== configRequestVersion || task?.id !== id) return;
+			applySnapshot(controls);
+		} catch (e) {
+			if (version !== configRequestVersion || task?.id !== id) return;
+			conflict = e instanceof ApiError && e.status === 409;
+			failure = e instanceof Error ? e.message : String(e);
+		} finally {
+			if (version === configRequestVersion) configUpdating = false;
+		}
+		if (version !== configRequestVersion || task?.id !== id) return;
+		const pendingRefresh = configRefreshPendingAfterUpdate;
+		configRefreshPendingAfterUpdate = false;
+		if (conflict || pendingRefresh) await refreshModelMenu();
+		if (failure) configNotice = failure;
 	}
 
 	function isRecord(value: unknown): value is Record<string, unknown> {
 		return typeof value === 'object' && value !== null && !Array.isArray(value);
+	}
+
+	function isElicitationOption(value: unknown): value is ElicitationOption {
+		return isRecord(value)
+			&& typeof value.const === 'string'
+			&& typeof value.title === 'string'
+			&& (value.description === undefined || typeof value.description === 'string');
+	}
+
+	function isElicitationOptionList(value: unknown): value is ElicitationOption[] {
+		return Array.isArray(value) && value.length > 0 && value.every(isElicitationOption);
+	}
+
+	function isElicitationEnum(value: unknown): value is string[] {
+		return Array.isArray(value) && value.length > 0 && value.every(item => typeof item === 'string');
+	}
+
+	function isSupportedElicitationProperty(property: ElicitationProperty): boolean {
+		if (property.type === 'string') {
+			if (property.oneOf !== undefined) return isElicitationOptionList(property.oneOf);
+			if (property.enum !== undefined) return isElicitationEnum(property.enum);
+			return true;
+		}
+		if (['number', 'integer', 'boolean'].includes(property.type ?? '')) return true;
+		if (property.type !== 'array' || !isRecord(property.items)) return false;
+		if (property.items.anyOf !== undefined) return isElicitationOptionList(property.items.anyOf);
+		if (property.items.enum !== undefined) return isElicitationEnum(property.items.enum);
+		return false;
+	}
+
+	function parseToolInstallElicitation(
+		event: SessionEvent,
+		id: string,
+		message: string,
+		properties: Record<string, unknown> | null,
+	): PendingToolInstallElicitation | null {
+		const meta = isRecord(event.payload._meta) ? event.payload._meta : null;
+		const toolType = meta?.tool_type;
+		const toolId = meta?.tool_id;
+		const toolName = meta?.tool_name;
+		if (
+			event.payload.mode !== 'form'
+			|| !properties
+			|| Object.keys(properties).length !== 0
+			|| meta?.codex_approval_kind !== 'tool_suggestion'
+			|| meta?.suggest_type !== 'install'
+			|| (toolType !== 'plugin' && toolType !== 'connector')
+			|| typeof toolId !== 'string'
+			|| !toolId.trim()
+			|| typeof toolName !== 'string'
+			|| !toolName.trim()
+		) return null;
+
+		return {
+			kind: 'tool_install',
+			id,
+			eventId: event.id,
+			attemptId: event.attempt_id,
+			message,
+			toolId: toolId.trim(),
+			toolName: toolName.trim(),
+			toolType,
+		};
 	}
 
 	function parsePendingElicitation(event: SessionEvent): PendingElicitation | null {
@@ -411,11 +711,30 @@
 		const message = typeof event.payload.message === 'string' ? event.payload.message : 'The agent needs your input.';
 		const schema = isRecord(event.payload.requestedSchema) ? event.payload.requestedSchema : null;
 		const properties = schema && isRecord(schema.properties) ? schema.properties : null;
-		if (!id || event.payload.mode !== 'form' || !properties) return null;
+		if (!id) return null;
+		const fallback: PendingUnsupportedElicitation = {
+			kind: 'unsupported', id, eventId: event.id, attemptId: event.attempt_id, message,
+		};
+		const toolInstall = parseToolInstallElicitation(event, id, message, properties);
+		if (toolInstall) return toolInstall;
+		if (event.payload.mode === 'url' && typeof event.payload.url === 'string') {
+			try {
+				const url = new URL(event.payload.url);
+				if (url.protocol === 'https:' || url.protocol === 'http:') return { kind: 'url', id, eventId: event.id, attemptId: event.attempt_id, message, url: url.href };
+			} catch { /* Unsupported URLs use the existing decline/cancel flow. */ }
+			return fallback;
+		}
+		if (event.payload.mode !== 'form' || !properties) return fallback;
 
-		const entries = Object.entries(properties)
-			.filter((entry): entry is [string, Record<string, unknown>] => isRecord(entry[1]));
+		const rawEntries = Object.entries(properties);
+		if (rawEntries.length === 0 || !rawEntries.every(([, property]) => isRecord(property))) return fallback;
+		const entries = rawEntries as [string, Record<string, unknown>][];
 		const propertyMap = Object.fromEntries(entries) as Record<string, ElicitationProperty>;
+		if (entries.some(([key, property]) => {
+			const typedProperty = property as ElicitationProperty;
+			const pairedCustomField = key.endsWith('_custom') && propertyMap[key.slice(0, -'_custom'.length)];
+			return pairedCustomField ? typedProperty.type !== 'string' : !isSupportedElicitationProperty(typedProperty);
+		})) return fallback;
 		const mainEntries = entries.filter(([key]) => {
 			if (!key.endsWith('_custom')) return true;
 			return !propertyMap[key.slice(0, -'_custom'.length)];
@@ -434,8 +753,8 @@
 				customProperty: customKey ? propertyMap[customKey] : null,
 			};
 		});
-		if (fields.length === 0) return null;
-		return { id, eventId: event.id, attemptId: event.attempt_id, message, fields };
+		if (fields.length === 0) return fallback;
+		return { kind: 'form', id, eventId: event.id, attemptId: event.attempt_id, message, fields };
 	}
 
 	function optionsFor(field: ElicitationField): { value: unknown; title: string; description?: string }[] {
@@ -488,7 +807,7 @@
 				: [...selected, value]);
 	}
 
-	function displayElicitationAnswer(elicitation: PendingElicitation, field: ElicitationField): string {
+	function displayElicitationAnswer(elicitation: PendingFormElicitation, field: ElicitationField): string {
 		const answers = answersFor(elicitation.id);
 		const custom = field.customKey ? answers[field.customKey] : undefined;
 		if (typeof custom === 'string' && custom.trim()) return custom.trim();
@@ -498,21 +817,28 @@
 		return String(value);
 	}
 
-	function elicitationResponseMessage(elicitation: PendingElicitation): string {
+	function elicitationResponseMessage(elicitation: PendingFormElicitation): string {
 		return elicitation.fields
 			.map(field => `${field.question}\n${displayElicitationAnswer(elicitation, field)}`)
 			.join('\n\n');
 	}
 
+	function toolInstallResponseMessage(elicitation: PendingToolInstallElicitation): string {
+		return `Approved installing the ${elicitation.toolName} ${elicitation.toolType}.`;
+	}
+
 	async function respondToElicitation(elicitation: PendingElicitation, action: 'accept' | 'decline' | 'cancel') {
-		if (!task || elicitationSending) return;
+		if (!task || elicitationSending || (action === 'accept' && elicitation.kind === 'unsupported')) return;
 		elicitationSending = true;
 		try {
 			await tasks.respondToElicitation(task.id, elicitation.id, {
 				action,
-				...(action === 'accept' ? {
+				...(action === 'accept' && elicitation.kind === 'form' ? {
 					content: answersFor(elicitation.id),
 					message: elicitationResponseMessage(elicitation),
+				} : action === 'accept' && elicitation.kind === 'tool_install' ? {
+					content: {},
+					message: toolInstallResponseMessage(elicitation),
 				} : {}),
 			});
 			locallyResolvedElicitations = { ...locallyResolvedElicitations, [elicitation.id]: true };
@@ -544,34 +870,41 @@
 		};
 	}
 
+	function resetHarnessControls(agentId: string | null) {
+		const controlsScope = `${taskId}:${agentId ?? ''}`;
+		if (controlsInitializedFor === controlsScope) return;
+		// Invalidate in-flight reads/writes even when only the assignment, not
+		// the task ID, changed. An unadvertised agent starts with no controls.
+		++configRequestVersion;
+		controlSnapshot = null;
+		configRefreshVersion = null;
+		configRefreshPromise = null;
+		configRefreshPendingAfterUpdate = false;
+		controlsInitializedFor = controlsScope;
+		workspaceGitRequest?.abort();
+		workspaceGitRequest = null;
+		workspaceGit = null;
+		lastWorkspaceGitRefresh = 0;
+		lastCommandsEventId = 0;
+		sessionEvents = [];
+		configOptions = [];
+		selectedConfig = {};
+		availableCommands = [];
+		configNotice = '';
+		configUpdating = false;
+		modelMenuOpen = false;
+		modelSearch = '';
+	}
+
 	function refreshHarnessControls(events: SessionEvent[], agentId: string) {
-		const advertised = [...events].reverse().find((event) => event.event_type === 'session_config_options');
-		const options = validConfigOptions(advertised?.payload.config_options);
-		if (!options.some((option) => option.category === 'mode' || option.id === 'mode')) {
-			const mode = legacyModeOption(advertised?.payload.modes);
-			if (mode) options.unshift(mode);
-		}
-		const latestMode = [...events].reverse().find((event) => event.event_type === 'session_mode');
-		const latestModeId = typeof latestMode?.payload.modeId === 'string'
-			? latestMode.payload.modeId
-			: typeof latestMode?.payload.mode_id === 'string' ? latestMode.payload.mode_id : null;
-		if (latestModeId) {
-			const mode = options.find((option) => option.category === 'mode' || option.id === 'mode');
-			if (mode) mode.currentValue = latestModeId;
-		}
-		configOptions = options;
+		resetHarnessControls(agentId);
+		// Activity is not a second catalog. Only the task snapshot supplies controls.
 
 		const commandsEvent = [...events].reverse().find((event) => event.event_type === 'available_commands');
 		const commands = commandsEvent?.payload.available_commands;
 		availableCommands = Array.isArray(commands)
 			? commands.filter((command): command is AcpCommand => typeof command === 'object' && command !== null && typeof (command as Record<string, unknown>).name === 'string' && typeof (command as Record<string, unknown>).description === 'string')
 			: [];
-
-		if (controlsInitializedFor !== agentId) {
-			const configured = agentList.find((agent) => agent.id === agentId)?.config?.runner?.session_config ?? {};
-			selectedConfig = { ...Object.fromEntries(options.map((option) => [option.id, option.currentValue])), ...configured };
-			controlsInitializedFor = agentId;
-		}
 	}
 
 	function chooseCommand(command: AcpCommand) {
@@ -581,62 +914,249 @@
 		setTimeout(() => composerEl?.querySelector<HTMLTextAreaElement>('textarea')?.focus(), 0);
 	}
 
+	function handleSelectionAction(action: string, selection: string) {
+		const prompts: Record<string, string> = {
+			Explain: 'Explain this passage',
+			Improve: 'Improve this passage',
+			Shorten: 'Shorten this passage',
+			Tone: 'Adjust the tone of this passage',
+			Grammar: 'Correct the grammar in this passage',
+		};
+		const selectionPrompt = `${prompts[action] ?? action}:\n\n> ${selection.replaceAll('\n', '\n> ')}`;
+		messageInput = messageInput.trim() ? `${messageInput.trimEnd()}\n\n${selectionPrompt}` : selectionPrompt;
+		setTimeout(() => composerEl?.querySelector<HTMLTextAreaElement>('textarea')?.focus(), 0);
+	}
+
 	function handleComposerPointerDown(event: PointerEvent) {
 		if (modelMenuOpen && composerEl && !composerEl.contains(event.target as Node)) {
 			modelMenuOpen = false;
 		}
 	}
 
-	onMount(async () => {
+	function updateDetailsSidebarVisibility() {
+		detailsSidebarFits = (taskViewEl?.clientWidth ?? 0) >= MIN_DETAILS_WIDTH;
+	}
+
+	function toggleDetailsSidebar() {
+		if (detailsSidebarFits) {
+			detailsCollapsed = !detailsCollapsed;
+			try { localStorage.setItem(detailsPreferenceKey, String(detailsCollapsed)); } catch { /* Storage may be unavailable. */ }
+		} else {
+			detailsSheetOpen = true;
+		}
+	}
+
+	function openSettings(event: MouseEvent) {
+		const button = event.currentTarget as HTMLButtonElement;
+		const bounds = button.getBoundingClientRect();
+		settingsMenu = settingsMenu ? null : { x: bounds.right - 208, y: bounds.bottom + 6 };
+	}
+
+	function chooseSetting(action: string) {
+		settingsMenu = null;
+		if (action === 'edit') startEditing();
+		else void openPlanning();
+	}
+
+	$effect(() => {
+		if (editing && editDialog && !editDialog.open) editDialog.showModal();
+	});
+	$effect(() => {
+		if (detailsSheetOpen && detailsDialog && !detailsDialog.open) detailsDialog.showModal();
+	});
+
+	$effect(() => {
+		compact;
+		taskViewEl;
+		updateDetailsSidebarVisibility();
+	});
+
+	function isTaskOrDelegatesActive(): boolean {
+		return Boolean(
+			task && (
+				['in_progress', 'pending', 'waiting_for_input'].includes(task.status)
+				|| delegatedWork.some((item) => !['completed', 'cancelled'].includes(item.status))
+			)
+		);
+	}
+
+	function hasPendingControls(): boolean {
+		return Boolean(controlSnapshot && Object.keys(controlSnapshot.pending ?? {}).length > 0);
+	}
+
+	function incrementalMessagePivot(existing: TaskMessage[]): number | undefined {
+		if (existing.length < 2) return undefined;
+		let earliestMutableIdx = existing.length - 1;
+		for (let idx = existing.length - 1; idx >= 0; idx -= 1) {
+			if (existing[idx].role === 'assistant') {
+				earliestMutableIdx = idx;
+				break;
+			}
+		}
+		return earliestMutableIdx > 0 ? existing[earliestMutableIdx - 1].id : undefined;
+	}
+
+	function messagesEqual(left: TaskMessage, right: TaskMessage | undefined): boolean {
+		if (!right) return false;
+		return (
+			left.id === right.id
+			&& left.role === right.role
+			&& left.content === right.content
+			&& left.agent_id === right.agent_id
+			&& (left.attachments?.length ?? 0) === (right.attachments?.length ?? 0)
+			&& JSON.stringify(left.visualizations ?? []) === JSON.stringify(right.visualizations ?? [])
+		);
+	}
+
+	function mergeTaskMessages(
+		existing: TaskMessage[],
+		incoming: TaskMessage[],
+		afterMessageId: number | undefined,
+	): { merged: TaskMessage[]; changed: boolean; shouldScroll: boolean } {
+		const isFullSnapshot =
+			afterMessageId === undefined
+			|| existing.length === 0
+			|| incoming.some((msg) => msg.id <= afterMessageId);
+		const merged = isFullSnapshot
+			? incoming
+			: [
+				...existing.filter((msg) => msg.id <= afterMessageId),
+				...[...incoming].sort((a, b) => a.id - b.id),
+			];
+		const changed =
+			merged.length !== existing.length
+			|| merged.some((msg, idx) => !messagesEqual(msg, existing[idx]));
+		if (!changed) {
+			return { merged: existing, changed: false, shouldScroll: false };
+		}
+		const prevLast = existing.at(-1);
+		const nextLast = merged.at(-1);
+		const shouldScroll =
+			merged.length > existing.length
+			|| Boolean(prevLast && nextLast && prevLast.id === nextLast.id && nextLast.content.length > prevLast.content.length);
+		return { merged, changed: true, shouldScroll };
+	}
+
+	async function ensureAllTasksLoaded() {
+		if (allTasksLoaded || allTasksLoading || disposed) return;
+		allTasksLoading = true;
+		try {
+			const all = await tasks.list();
+			if (!disposed) {
+				allTasks = all.tasks;
+				allTasksLoaded = true;
+			}
+		} catch {
+			if (!disposed) allTasks = [];
+		} finally {
+			allTasksLoading = false;
+		}
+	}
+
+	onMount(() => {
+		try { detailsCollapsed = localStorage.getItem(detailsPreferenceKey) === 'true'; } catch { /* Use the default when storage is unavailable. */ }
 		document.addEventListener('pointerdown', handleComposerPointerDown);
+		taskViewResizeObserver = new ResizeObserver(updateDetailsSidebarVisibility);
+		if (taskViewEl) taskViewResizeObserver.observe(taskViewEl);
+		updateDetailsSidebarVisibility();
 		messageInput = loadComposerDraft(messageDraftScope());
 		messageDraftReady = true;
-		await load();
-		loading = false;
-		// Auto-poll while task is in progress
-		pollTimer = setInterval(async () => {
-			if (task && (task.status === 'in_progress' || task.status === 'pending' || task.status === 'waiting_for_input')) {
-				await poll();
-			}
-		}, 3000);
+
+		const initialLoadPromise = load().finally(() => {
+			if (pollPromise === initialLoadPromise) pollPromise = null;
+			if (!disposed) loading = false;
+		});
+		pollPromise = initialLoadPromise;
+
+		unsubscribeLiveUpdates = subscribeLiveUpdates(
+			['tasks', 'sessions', 'agents'],
+			async (_revisions, ctx) => {
+				if (ctx.source === 'fallback') {
+					await initialLoadPromise.catch(() => {});
+					if (disposed) return;
+					if (isTaskOrDelegatesActive()) {
+						await poll(true);
+					}
+					if (modelMenuOpen || hasPendingControls() || isTaskOrDelegatesActive()) {
+						await refreshModelMenu(false, true);
+					}
+					return;
+				}
+				// Live SSE / revision push (including updates arriving during initial load or scheduled wake-ups!):
+				await poll(true);
+				if (
+					!controlSnapshot
+					|| modelMenuOpen
+					|| hasPendingControls()
+					|| ctx.changedDomains.has('sessions')
+					|| ctx.changedDomains.has('agents')
+				) {
+					await refreshModelMenu(false, true);
+				}
+			},
+			{
+				active: paneActive,
+				fallbackIntervalMs: 3000,
+				fallbackActive: () => isTaskOrDelegatesActive() || modelMenuOpen || hasPendingControls(),
+			},
+		);
 	});
 
 	onDestroy(() => {
-		if (pollTimer) clearInterval(pollTimer);
+		disposed = true;
+		workspaceGitRequest?.abort();
+		++configRequestVersion;
+		unsubscribeLiveUpdates?.();
+		unsubscribeLiveUpdates = null;
+		taskViewResizeObserver?.disconnect();
 		document.removeEventListener('pointerdown', handleComposerPointerDown);
 	});
 
 	async function load() {
 		try {
 			const id = taskId;
-			const [loadedTask, loadedAgents, loadedMessages, activity] = await Promise.all([
+			const [loadedTask, loadedAgents, loadedMessages, activity, subResult] = await Promise.all([
 				tasks.get(id),
 				agents.list().catch(() => []),
 				tasks.messages(id),
 				tasks.activity(id),
+				tasks.subtasks(id).catch(() => ({ tasks: [] as Task[] })),
 			]);
+			if (disposed || taskId !== id) return;
 			task = loadedTask;
+			resetHarnessControls(loadedTask.agent_id);
+			void refreshModelMenu(true);
 			agentList = loadedAgents;
 			messages = loadedMessages;
 			attempts = activity.attempts;
+			delegatedWork = activity.delegated_work ?? [];
 			activityEvents = activity.events;
 			hasEarlierActivity = activity.has_more_before;
+			subtaskList = subResult.tasks;
 			prevMessageCount = messages.length;
 			lastActivityEventId = activityEvents.at(-1)?.id ?? 0;
 			if (loadedTask.agent_id) {
-				sessionEvents = await sessions.events(loadedTask.agent_id).catch(() => []);
+				void refreshWorkspaceGit(loadedTask.agent_id);
+				const events = await sessions.events(loadedTask.agent_id, {
+					eventType: 'available_commands',
+					limit: 1,
+				}).catch(() => []);
+				if (task?.id !== id || task.agent_id !== loadedTask.agent_id) return;
+				sessionEvents = events;
+				lastCommandsEventId = events.at(-1)?.id ?? 0;
 				refreshHarnessControls(sessionEvents, loadedTask.agent_id);
 			} else {
-				sessionEvents = []; configOptions = []; availableCommands = [];
+				sessionEvents = []; configOptions = []; availableCommands = []; workspaceGit = null;
 			}
-			try {
-				const sub = await tasks.subtasks(id);
-				subtaskList = sub.tasks;
-			} catch { subtaskList = []; }
-			try {
-				const all = await tasks.list();
-				allTasks = all.tasks;
-			} catch { allTasks = []; }
+			if (
+				(loadedTask.depends_on?.length ?? 0) > 0
+				|| (loadedTask.dependents?.length ?? 0) > 0
+				|| (loadedTask.blocked_by?.length ?? 0) > 0
+				|| Boolean(loadedTask.parent_task_id)
+				|| editing
+			) {
+				void ensureAllTasksLoaded();
+			}
 			if (initialLoad) {
 				initialLoad = false;
 				scrollToBottom(true);
@@ -646,47 +1166,153 @@
 		}
 	}
 
+	async function retryTaskLoad() {
+		if (retryingLoad) return;
+		retryingLoad = true;
+		loading = true;
+		error = null;
+		while (pollPromise) {
+			const inflight = pollPromise;
+			try {
+				await inflight;
+			} catch {
+				// Proceed with explicit retry below.
+			}
+		}
+		let retryPromise: Promise<void>;
+		retryPromise = load().finally(() => {
+			if (pollPromise === retryPromise) pollPromise = null;
+		});
+		pollPromise = retryPromise;
+		try {
+			await retryPromise;
+		} finally {
+			loading = false;
+			retryingLoad = false;
+		}
+	}
+
+	function dismissTaskError() {
+		if (task) {
+			error = null;
+			return;
+		}
+		void goto('/tasks');
+	}
+
+	function dismissAttemptError() {
+		dismissedAttemptErrorKey = latestErrorKey;
+		requestAnimationFrame(() => messagesEl?.focus({ preventScroll: true }));
+	}
+
+	// Git is auxiliary metadata. A slow repository must not delay the task,
+	// its saved messages, or terminal attempt state, or accumulate requests.
+	async function refreshWorkspaceGit(agentId: string) {
+		if (disposed || workspaceGitRequest || Date.now() - lastWorkspaceGitRefresh < 10_000) return;
+		const id = taskId;
+		const controller = new AbortController();
+		workspaceGitRequest = controller;
+		lastWorkspaceGitRefresh = Date.now();
+		const timeout = setTimeout(() => controller.abort(), 10_000);
+		try {
+			const git = await workspaces.gitStatus(agentId, controller.signal);
+			if (!disposed && workspaceGitRequest === controller && task?.id === id && task.agent_id === agentId) workspaceGit = git;
+		} catch { /* Preserve the last Git snapshot; task polling continues. */ }
+		finally {
+			clearTimeout(timeout);
+			if (workspaceGitRequest === controller) workspaceGitRequest = null;
+		}
+	}
+
 	/** Poll semantic task activity without exposing the runner's terminal. */
-	async function poll() {
+	async function poll(rethrowTransient = false) {
+		if (disposed) return;
+		while (pollPromise) {
+			const inflight = pollPromise;
+			try {
+				await inflight;
+			} catch {
+				// Run a fresh snapshot below regardless of the prior caller's outcome.
+			}
+			if (disposed) return;
+		}
+		let currentRun: Promise<void>;
+		currentRun = runPollOnce(rethrowTransient).finally(() => {
+			if (pollPromise === currentRun) pollPromise = null;
+		});
+		pollPromise = currentRun;
+		await currentRun;
+	}
+
+	async function runPollOnce(rethrowTransient: boolean) {
 		try {
 			const id = taskId;
-			const [newTask, newMessages, newActivity] = await Promise.all([
+			const hadActivityCursor = Boolean(lastActivityEventId);
+			const afterMessageId = incrementalMessagePivot(messages);
+			const [newTask, incomingMessages, newActivity, subResult] = await Promise.all([
 				tasks.get(id),
-				tasks.messages(id),
+				tasks.messages(id, afterMessageId),
 				tasks.activity(id, { after: lastActivityEventId || undefined }),
+				tasks.subtasks(id).catch((err) => {
+					if (isTransientRefreshError(err)) throw err;
+					return { tasks: subtaskList };
+				}),
 			]);
+			if (disposed || taskId !== id) return;
 			// Update task status/details in-place
 			task = newTask;
+			error = null;
+			if (!hadActivityCursor) hasEarlierActivity = newActivity.has_more_before;
+			resetHarnessControls(newTask.agent_id);
 			attempts = newActivity.attempts;
+			delegatedWork = newActivity.delegated_work ?? [];
+			subtaskList = subResult.tasks;
 			let shouldScroll = false;
-			// Only update messages and scroll if count changed
-			if (newMessages.length !== prevMessageCount) {
-				messages = newMessages;
-				prevMessageCount = newMessages.length;
+			if (initialLoad) {
+				initialLoad = false;
 				shouldScroll = true;
 			}
-			if (newActivity.events.length > 0) {
+			const mergedResult = mergeTaskMessages(messages, incomingMessages, afterMessageId);
+			if (mergedResult.changed) {
+				messages = mergedResult.merged;
+				prevMessageCount = messages.length;
+				if (mergedResult.shouldScroll) shouldScroll = true;
+			}
+			let activityPage = newActivity;
+			while (activityPage.events.length > 0) {
 				const known = new Set(activityEvents.map(event => event.id));
 				activityEvents = [
 					...activityEvents,
-					...newActivity.events.filter(event => !known.has(event.id)),
+					...activityPage.events.filter(event => !known.has(event.id)),
 				];
 				lastActivityEventId = activityEvents.at(-1)?.id ?? lastActivityEventId;
 				shouldScroll = true;
+				if (!activityPage.has_more_after || !lastActivityEventId || disposed || taskId !== id) break;
+				activityPage = await tasks.activity(id, { after: lastActivityEventId });
 			}
 			if (newTask.agent_id) {
-				const latestSessionEvents = await sessions.events(newTask.agent_id).catch(() => sessionEvents);
-				if (latestSessionEvents.length !== sessionEvents.length || latestSessionEvents.at(-1)?.id !== sessionEvents.at(-1)?.id) {
-					sessionEvents = latestSessionEvents;
+				void refreshWorkspaceGit(newTask.agent_id);
+				const latestCommandEvents = await sessions.events(newTask.agent_id, {
+					eventType: 'available_commands',
+					limit: 1,
+				}).catch((err) => {
+					if (isTransientRefreshError(err)) throw err;
+					return [];
+				});
+				if (task?.id !== id || task.agent_id !== newTask.agent_id) return;
+				const newestCommandId = latestCommandEvents.at(-1)?.id ?? 0;
+				if (latestCommandEvents.length > 0 && newestCommandId !== lastCommandsEventId) {
+					sessionEvents = latestCommandEvents;
+					lastCommandsEventId = newestCommandId;
 					refreshHarnessControls(sessionEvents, newTask.agent_id);
 				}
 			}
 			if (shouldScroll) scrollToBottom();
-			try {
-				const sub = await tasks.subtasks(id);
-				subtaskList = sub.tasks;
-			} catch { subtaskList = []; }
-		} catch { /* ignore poll errors */ }
+		} catch (err) {
+			if (rethrowTransient && isTransientRefreshError(err)) {
+				throw err;
+			}
+		}
 	}
 
 	async function loadEarlierActivity() {
@@ -747,7 +1373,7 @@
 	}
 
 	async function sendTaskMessage(immediate = false) {
-		if ((!messageInput.trim() && messageAttachments.length === 0) || !task || pendingElicitation) return;
+		if ((!messageInput.trim() && messageAttachments.length === 0) || !task || platformManaged || configUpdating || composerBlockedByElicitation) return;
 		const content = messageInput.trim();
 		const attachments = messageAttachments;
 		messageAttachmentError = '';
@@ -758,10 +1384,11 @@
 		showJumpToLatest = false;
 		try {
 			await tasks.addMessage(task.id, 'user', content, {
-				configOptions: selectedConfig,
 				attachments,
 				delivery: immediate ? 'immediate' : 'after_tool',
 			});
+			// A queued message has not applied its configuration yet. Keep staged
+			// values through pre-configuration snapshots until the agent confirms.
 			messageInput = '';
 			messageAttachments = [];
 			clearComposerDraft(messageDraftScope());
@@ -774,9 +1401,22 @@
 		}
 	}
 
+	async function sendVisualizationFollowUp(prompt: string): Promise<void> {
+		if (!task) throw new Error('This task is no longer available.');
+		if (platformManaged) throw new Error('Continue this task in Xpress AI.');
+		if (configUpdating) throw new Error('Wait for the model settings to finish updating.');
+		followLatest = true;
+		showJumpToLatest = false;
+		await tasks.addMessage(task.id, 'user', prompt, {
+			delivery: 'after_tool',
+		});
+		await poll();
+		scrollToBottom(true);
+	}
+
 	async function interruptAgent() {
-		if (!task?.agent_id || !runningAttempt || interrupting || messageSending) return;
-		if (!pendingElicitation && (messageInput.trim() || messageAttachments.length > 0)) {
+		if (!task?.agent_id || platformManaged || !runningAttempt || interrupting || messageSending) return;
+		if (!composerBlockedByElicitation && (messageInput.trim() || messageAttachments.length > 0)) {
 			await sendTaskMessage(true);
 			return;
 		}
@@ -793,7 +1433,7 @@
 
 	async function addMessageImages(files: File[]) {
 		try {
-			messageAttachments = await appendImageFiles(messageAttachments, files);
+			messageAttachments = await appendImageFiles(messageAttachments, files, true);
 			messageAttachmentError = '';
 		} catch (e) {
 			messageAttachmentError = e instanceof Error ? e.message : String(e);
@@ -854,20 +1494,27 @@
 	}
 
 	async function updateStatus(status: string) {
-		if (!task) return;
+		if (!task || platformManaged || statusUpdating) return;
+		statusUpdating = true;
+		actionError = '';
 		try {
 			task = await tasks.updateStatus(task.id, status);
 			await load();
 		} catch (e) {
-			alert(String(e));
+			actionError = e instanceof Error ? e.message : String(e);
+		} finally {
+			statusUpdating = false;
 		}
 	}
 
 	function startEditing() {
-		if (!task) return;
+		if (!task || platformManaged) return;
+		void ensureAllTasksLoaded();
+		editError = '';
 		editTitle = task.title;
 		editDesc = task.description || '';
 		editAgentId = task.agent_id || '';
+		originalEditAgentId = editAgentId;
 		editPriority = task.priority;
 		editDeps = task.depends_on ? [...task.depends_on] : [];
 		editing = true;
@@ -882,26 +1529,35 @@
 	}
 
 	async function saveEdit() {
-		if (!task) return;
+		if (!task || platformManaged || editSaving) return;
+		editSaving = true;
+		editError = '';
 		try {
+			if (originalEditAgentId && !editAgentId) {
+				throw new Error('Use Plan / schedule → Backlog to keep queued work from starting.');
+			}
 			// Update task fields
 			await tasks.update(task.id, {
 				title: editTitle,
 				description: editDesc || undefined,
-				agent_id: editAgentId || undefined,
+				// Unchanged assignments can enqueue another turn; this endpoint
+				// also cannot retire queued work when clearing an assignment.
+				...(editAgentId && editAgentId !== originalEditAgentId ? { agent_id: editAgentId } : {}),
 				priority: editPriority,
 			});
 			// Add new dependencies
 			const currentDeps = task.depends_on || [];
 			for (const depId of editDeps) {
 				if (!currentDeps.includes(depId)) {
-					await tasks.addDependency(task.id, depId).catch(() => {});
+					await tasks.addDependency(task.id, depId);
 				}
 			}
-			editing = false;
 			await load();
+			editDialog?.close();
 		} catch (e) {
-			console.error('Save failed:', e);
+			editError = e instanceof Error ? e.message : String(e);
+		} finally {
+			editSaving = false;
 		}
 	}
 
@@ -909,12 +1565,38 @@
 		switch (status) {
 			case 'completed': return 'text-emerald-400';
 			case 'in_progress': return 'text-blue-400';
+			case 'awaiting_review': case 'awaiting_parent_review': return 'text-violet-400';
+			case 'waiting_for_subtasks': case 'waiting_for_dependencies': return 'text-amber-400';
+			case 'idle': return 'text-muted-foreground';
 			case 'pending': return 'text-amber-400';
 			case 'blocked': return 'text-red-400';
 			case 'waiting_for_input': return 'text-orange-400';
 			case 'cancelled': return 'text-muted-foreground';
 			default: return 'text-muted-foreground';
 		}
+	}
+
+	function statusLabel(status: string): string {
+		if (status === 'pending') return 'to do';
+		if (status === 'in_progress') return 'working';
+		if (status === 'awaiting_review') return 'awaiting review';
+		if (status === 'awaiting_parent_review') return 'awaiting parent review';
+		if (status === 'waiting_for_subtasks') return 'waiting for delegated work';
+		if (status === 'waiting_for_dependencies') return 'waiting for dependencies';
+		if (status === 'idle') return 'not running';
+		return status.replaceAll('_', ' ');
+	}
+
+	function isDeferredPlanItem(subtask: Task): boolean {
+		return subtask.provenance === 'native_plan' && subtask.status === 'cancelled';
+	}
+
+	function completedStepCount(): number {
+		return planSteps.filter((step) => step.status === 'completed').length;
+	}
+
+	function deferredStepCount(): number {
+		return planSteps.filter(isDeferredPlanItem).length;
 	}
 
 	function statusBg(status: string): string {
@@ -929,9 +1611,9 @@
 	}
 
 	function priorityLabel(p: number): string {
-		if (p >= 3) return 'Urgent';
-		if (p >= 2) return 'High';
-		if (p >= 1) return 'Normal';
+		if (p >= 10) return 'Urgent';
+		if (p >= 5) return 'High';
+		if (p >= 0) return 'Normal';
 		return 'Low';
 	}
 
@@ -944,6 +1626,30 @@
 		return allTasks.find((candidate) => candidate.id === id)?.title ?? id;
 	}
 
+	function changedFileStatus(change: GitChange): string {
+		if (change.status === '??') return 'U';
+		if (change.status.includes('R')) return 'R';
+		if (change.status.includes('A')) return 'A';
+		if (change.status.includes('D')) return 'D';
+		if (change.status.includes('C')) return 'C';
+		return 'M';
+	}
+
+	function workspaceFileUrl(agentId: string, path?: string): string {
+		const base = `/agents/${encodeURIComponent(agentId)}?tab=files`;
+		return path ? `${base}&path=${encodeURIComponent(path)}` : base;
+	}
+
+	function openChangedFile(event: MouseEvent, agentId: string, path: string) {
+		if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+		event.preventDefault();
+		detailsDialog?.close();
+		const route = `${workspaceFileUrl(agentId, path)}&tree=collapsed`;
+		window.dispatchEvent(new CustomEvent<WorkspaceOpenSplitDetail>(WORKSPACE_OPEN_SPLIT_EVENT, {
+			detail: { path: route },
+		}));
+	}
+
 	function startsFreshConversation(): boolean {
 		if (!task?.context || typeof task.context !== 'object') return false;
 		return (task.context as Record<string, unknown>).session_mode === 'new';
@@ -951,31 +1657,234 @@
 
 </script>
 
-<div class="flex min-h-0 h-full flex-col">
+{#if signInAgentId}
+	<AgentSignIn agentId={signInAgentId} onclose={() => signInAgentId = null}
+		onauthenticated={() => authenticatedAttemptId = latestErrorAttempt?.id ?? null}
+		onretry={platformManaged ? undefined : async () => { await updateStatus('in_progress'); if (actionError) throw new Error(actionError); }} />
+{/if}
+
+{#snippet taskDetails(current: Task)}
+				<!-- Details -->
+				<div class="space-y-2">
+					<h3 class="text-xs font-medium text-muted-foreground uppercase tracking-wide">Details</h3>
+					<dl class="space-y-1.5 text-sm">
+						<div class="flex justify-between">
+							<dt class="text-muted-foreground">ID</dt>
+							<dd class="font-mono text-xs truncate max-w-[140px]">{current.id}</dd>
+						</div>
+						<div class="flex justify-between">
+							<dt class="text-muted-foreground">Status</dt>
+							<dd class="{statusColor(taskActivityStatus)}">{statusLabel(taskActivityStatus)}</dd>
+						</div>
+						<div class="flex justify-between">
+							<dt class="text-muted-foreground">Priority</dt>
+							<dd>{priorityLabel(current.priority)}</dd>
+						</div>
+						{#if current.agent_id}
+							<div class="flex justify-between">
+								<dt class="text-muted-foreground">Agent</dt>
+								<dd><a href="/agents/{current.agent_id}" class="underline hover:text-foreground">{sessionLabel(current.agent_id)}</a></dd>
+							</div>
+						{/if}
+						<div class="flex justify-between">
+							<dt class="text-muted-foreground">Created</dt>
+							<dd class="text-xs">{timeAgo(current.created_at)}</dd>
+						</div>
+						{#if current.completed_at}
+							<div class="flex justify-between">
+								<dt class="text-muted-foreground">Completed</dt>
+								<dd class="text-xs">{timeAgo(current.completed_at)}</dd>
+							</div>
+						{/if}
+					</dl>
+				</div>
+
+				{#if contextUsage}
+					<div class="space-y-2" data-context-usage>
+						<div class="flex items-center justify-between">
+							<h3 class="text-xs font-medium uppercase tracking-wide text-muted-foreground">Context window</h3>
+							<span class="text-xs tabular-nums text-muted-foreground">{contextUsage.percent.toFixed(1)}%</span>
+						</div>
+						<div class="h-1.5 overflow-hidden rounded-full bg-secondary">
+							<div class="h-full rounded-full bg-blue-500 transition-[width] duration-300" style:width={`${contextUsage.percent}%`}></div>
+						</div>
+						<div class="text-right text-xs tabular-nums text-muted-foreground">
+							<span class="text-foreground">{formatTokens(contextUsage.used)}</span>
+							<span> / {formatTokens(contextUsage.size)} tokens</span>
+						</div>
+					</div>
+				{/if}
+
+				{#if current.agent_id && workspaceGit}
+					<div class="space-y-2" data-task-changed-files>
+						<div class="flex items-center justify-between gap-2">
+							<h3 class="text-xs font-medium uppercase tracking-wide text-muted-foreground">Changed files</h3>
+							<a href={workspaceFileUrl(current.agent_id)} class="text-[11px] text-muted-foreground hover:text-foreground">Open files</a>
+						</div>
+						{#if workspaceGit.repository && workspaceGit.files.length > 0}
+							<div class="space-y-0.5">
+								{#each workspaceGit.files.slice(0, 12) as change (change.path)}
+									<a
+										href={workspaceFileUrl(current.agent_id, change.path)}
+										onclick={(event) => openChangedFile(event, current.agent_id ?? '', change.path)}
+										title={change.path}
+										class="flex items-center gap-2 rounded px-1.5 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-foreground"
+									>
+										<span class="w-3 shrink-0 font-mono text-[10px] text-amber-500">{changedFileStatus(change)}</span>
+										<span class="truncate">{change.path}</span>
+									</a>
+								{/each}
+								{#if workspaceGit.files.length > 12}
+									<a href={workspaceFileUrl(current.agent_id)} class="block px-1.5 pt-1 text-[11px] text-muted-foreground hover:text-foreground">
+										+{workspaceGit.files.length - 12} more
+									</a>
+								{/if}
+							</div>
+						{:else if workspaceGit.repository}
+							<p class="text-xs text-muted-foreground">Working tree clean</p>
+						{:else}
+							<p class="text-xs text-muted-foreground">{workspaceGit.repository_status?.message || 'No active Git repository'}</p>
+						{/if}
+					</div>
+				{/if}
+
+				<!-- Task plan and delegated work share the details sidebar/sheet. -->
+				{#if planSteps.length > 0}
+					<div class="space-y-2">
+						<h3 class="text-xs font-medium text-muted-foreground uppercase tracking-wide">
+							Steps ({completedStepCount()} complete{deferredStepCount() ? `, ${deferredStepCount()} deferred` : ''})
+						</h3>
+						<div class="space-y-1.5">
+							{#each planSteps as sub}
+								{@const deferred = isDeferredPlanItem(sub)}
+								<div class="flex items-start gap-2 rounded p-1.5 text-sm">
+									<span class="mt-0.5 flex-shrink-0 h-4 w-4 rounded border flex items-center justify-center
+										{sub.status === 'completed'
+											? 'bg-emerald-500/20 border-emerald-500 text-emerald-400'
+											: sub.status === 'in_progress'
+											? 'border-blue-400 text-blue-400'
+											: 'border-muted-foreground/30'}">
+										{#if sub.status === 'completed'}
+											<svg class="h-3 w-3" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+												<path stroke-linecap="round" stroke-linejoin="round" d="M5 13l4 4L19 7" />
+											</svg>
+										{:else if sub.status === 'in_progress'}
+											<span class="h-1.5 w-1.5 rounded-full bg-blue-400 animate-pulse"></span>
+										{:else if deferred}
+											<span class="text-[10px] text-muted-foreground">↳</span>
+										{/if}
+									</span>
+									<div class="flex-1 min-w-0">
+										<span class="block truncate {sub.status === 'completed' ? 'line-through text-muted-foreground' : deferred ? 'italic text-muted-foreground' : ''}">{sub.title}</span>
+										{#if deferred}<span class="mt-0.5 block text-[10px] font-medium uppercase tracking-wide text-muted-foreground">Deferred · does not block completion</span>{/if}
+										{#if sub.description}
+											<span class="block text-xs text-muted-foreground mt-0.5 line-clamp-2">{sub.description}</span>
+										{/if}
+									</div>
+								</div>
+							{/each}
+						</div>
+					</div>
+				{/if}
+
+				<DelegatedWorkPanel items={delegatedWork} agents={agentList} />
+
+				{#if current.parent_task_id}
+					<div class="space-y-2">
+						<h3 class="text-xs font-medium uppercase tracking-wide text-muted-foreground">Parent task</h3>
+						<a href="/tasks/{current.parent_task_id}" class="text-sm underline hover:text-foreground">{current.parent_title || 'Open parent task'}</a>
+					</div>
+				{/if}
+
+				{#if current.agent_id}
+					<div class="space-y-2">
+						<h3 class="text-xs font-medium text-muted-foreground uppercase tracking-wide">Agent</h3>
+						<a href="/agents/{current.agent_id}" class="text-sm underline hover:text-foreground">Open agent</a>
+					</div>
+				{/if}
+				{#if current.conversation_id}
+					<div class="space-y-2">
+						<h3 class="text-xs font-medium uppercase tracking-wide text-muted-foreground">Conversation</h3>
+						<a href="/conversations/{current.conversation_id}" class="text-sm underline hover:text-foreground">Open conversation</a>
+					</div>
+				{/if}
+{/snippet}
+
+{#if settingsMenu}
+	<div class="task-settings-menu">
+		<ContextMenu x={settingsMenu.x} y={settingsMenu.y} anchor={settingsButton} label="Task settings"
+			items={[
+				{ id: 'edit', label: 'Edit details', disabled: !task || ['completed', 'cancelled'].includes(task.status) },
+				{ id: 'plan', label: 'Plan / schedule' },
+			]}
+			onselect={chooseSetting} onclose={() => settingsMenu = null} />
+	</div>
+{/if}
+{#if detailsSheetOpen && task}
+	<dialog bind:this={detailsDialog} id={viewId + '-details-dialog'} use:planningViewport class="task-sheet" aria-label="Task details" onclose={() => detailsSheetOpen = false}>
+		<header class="task-sheet-header">
+			<h2>Task details</h2>
+			<button type="button" class="task-action" aria-label="Close task details" title="Close task details" onclick={() => detailsDialog?.close()}><X size={18} aria-hidden="true" /></button>
+		</header>
+		<div class="task-sheet-content space-y-4">{@render taskDetails(task)}</div>
+	</dialog>
+{/if}
+{#if planningTask}
+	<TaskPlanningActions task={planningTask} {agentList} onclose={() => { planningTask = null; settingsButton?.focus({ preventScroll: true }); }} onchange={changePlanning} />
+{/if}
+
+<div bind:this={taskViewEl} class="flex min-h-0 h-full flex-col">
 	<!-- Header -->
-	<div class="shrink-0 border-b border-border px-3 py-3 sm:px-6 sm:py-4">
-		<div class="flex items-center gap-2 text-sm text-muted-foreground mb-2">
-			<a href="/tasks" class="hover:text-foreground">Tasks</a>
+	<div class="task-header shrink-0 border-b border-border px-3 py-3 sm:px-6 sm:py-4">
+		<div class="task-breadcrumbs flex items-center gap-2 text-sm text-muted-foreground mb-2">
+			{#if taskProjectId}<ProjectLink projectId={taskProjectId} separator />{/if}
+			<a href={taskProjectId ? `/tasks?project=${encodeURIComponent(taskProjectId)}` : '/tasks'} class="hover:text-foreground">Tasks</a>
 			<span>/</span>
 			<span class="text-foreground truncate">{task?.title ?? '...'}</span>
 		</div>
 
 		{#if error}
-			<div class="rounded-lg border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">{error}</div>
+			<div role="alert" class="flex items-start gap-3 rounded-lg border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">
+				<span class="min-w-0 flex-1 whitespace-pre-wrap">{error}</span>
+				{#if !task}
+					<button
+						type="button"
+						onclick={retryTaskLoad}
+						disabled={retryingLoad}
+						class="shrink-0 rounded-md border border-destructive/30 px-2.5 py-1 text-xs font-medium hover:bg-destructive/10 disabled:opacity-50"
+					>{retryingLoad ? 'Retrying…' : 'Retry'}</button>
+				{/if}
+				<button
+					type="button"
+					onclick={dismissTaskError}
+					aria-label={task ? 'Dismiss task error' : 'Dismiss task error and return to tasks'}
+					class="flex h-6 w-6 shrink-0 items-center justify-center rounded text-lg leading-none text-destructive/70 hover:bg-destructive/10 hover:text-destructive"
+				>&times;</button>
+			</div>
 		{:else if task}
-			<div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+			<div class="task-title-row flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
 				<div class="min-w-0">
-					<h1 class="text-lg font-bold sm:text-xl">{task.title}</h1>
-					<div class="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs sm:text-sm">
+					<div class="task-title-line flex min-w-0 items-baseline gap-1.5">
+						{#if taskProjectId}<span class="task-compact-project hidden min-w-0 max-w-[45%] shrink-0 items-baseline gap-1.5 text-sm text-muted-foreground"><ProjectLink projectId={taskProjectId} separator /></span>{/if}
+						<h1 class="min-w-0 text-lg font-bold sm:text-xl">{task.title}</h1>
+					</div>
+					{#if task.start_after || task.backlog}
+						<div class="task-header-schedule mt-1 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+							{#if task.start_after}<span>Start no earlier than {dateLabel(task.start_after)}</span>{/if}
+							{#if task.backlog}<span>Backlog</span>{/if}
+						</div>
+					{/if}
+					<div class="task-header-metadata mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs sm:text-sm">
 						<span class="flex items-center gap-1.5">
-							<span class="h-2 w-2 rounded-full {task.status === 'in_progress' ? 'animate-pulse' : ''}
-								{task.status === 'completed' ? 'bg-emerald-400' :
-								 task.status === 'in_progress' ? 'bg-blue-400' :
-								 task.status === 'pending' ? 'bg-amber-400' :
-								 task.status === 'waiting_for_input' ? 'bg-orange-400' :
-								 task.status === 'blocked' ? 'bg-red-400' :
+							<span data-task-activity-status={taskActivityStatus} class="h-2 w-2 rounded-full {taskActivityStatus === 'in_progress' ? 'animate-pulse' : ''}
+								{taskActivityStatus === 'completed' ? 'bg-emerald-400' :
+								 taskActivityStatus === 'in_progress' ? 'bg-blue-400' :
+								 ['awaiting_review', 'awaiting_parent_review'].includes(taskActivityStatus) ? 'bg-violet-400' :
+								 ['pending', 'waiting_for_subtasks', 'waiting_for_dependencies'].includes(taskActivityStatus) ? 'bg-amber-400' :
+								 taskActivityStatus === 'waiting_for_input' ? 'bg-orange-400' :
+								 taskActivityStatus === 'blocked' ? 'bg-red-400' :
 								 'bg-muted-foreground'}"></span>
-							<span class="{statusColor(task.status)}">{task.status.replaceAll('_', ' ')}</span>
+							<span class="{statusColor(taskActivityStatus)}">{statusLabel(taskActivityStatus)}</span>
 						</span>
 						{#if task.agent_id}
 							<span class="text-muted-foreground">{sessionLabel(task.agent_id)}</span>
@@ -984,54 +1893,60 @@
 						<span class="text-xs text-muted-foreground">{timeAgo(task.created_at)}</span>
 					</div>
 				</div>
-				<div class="flex shrink-0 gap-2 overflow-x-auto">
-					{#if task.status !== 'completed' && task.status !== 'cancelled'}
-						<button onclick={startEditing}
-							class="rounded-md border border-border px-3 py-1.5 text-xs font-medium hover:bg-accent">
-							Edit
+				<div class="flex shrink-0 items-center gap-1" data-task-header-actions>
+					{#if !platformManaged}
+						<button bind:this={settingsButton} type="button" class="task-action" aria-label="Task settings" title="Edit task and schedule" aria-haspopup="menu" aria-expanded={!!settingsMenu} disabled={planningLoading || statusUpdating} onclick={openSettings}>
+							<Settings size={17} aria-hidden="true" />
 						</button>
+						{#if task.status === 'pending'}
+							<button type="button" class="task-action text-primary" aria-label="Start task" title="Start task when eligible" disabled={statusUpdating} onclick={() => updateStatus('in_progress')}><Play size={17} aria-hidden="true" /></button>
+						{/if}
+						{#if ['in_progress', 'pending', 'waiting_for_input', 'blocked'].includes(task.status)}
+							<button type="button" class="task-action text-emerald-600 dark:text-emerald-400" aria-label="Complete task" title={task.parent_review_required ? 'The parent Agent must accept this result' : 'Complete task'} disabled={statusUpdating || task.parent_review_required} onclick={() => updateStatus('completed')}><Check size={18} aria-hidden="true" /></button>
+							<button type="button" class="task-action" aria-label={task.status === 'in_progress' ? 'Stop and cancel task' : 'Cancel task'} title={task.status === 'in_progress' ? 'Stop and cancel task' : 'Cancel task'} disabled={statusUpdating} onclick={() => updateStatus('cancelled')}>
+								{#if task.status === 'in_progress'}<Square size={14} aria-hidden="true" />{:else}<X size={18} aria-hidden="true" />{/if}
+							</button>
+						{/if}
 					{/if}
-					{#if task.status === 'pending'}
-						<button onclick={() => updateStatus('in_progress')}
-							class="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90">
-							Start
-						</button>
-					{/if}
-					{#if ['in_progress', 'pending', 'waiting_for_input', 'blocked'].includes(task.status)}
-						<button onclick={() => updateStatus('completed')}
-							class="rounded-md border border-emerald-500/50 px-3 py-1.5 text-xs font-medium text-emerald-400 hover:bg-emerald-500/10">
-							Complete
-						</button>
-						<button onclick={() => updateStatus('cancelled')}
-							class="rounded-md border border-border px-3 py-1.5 text-xs font-medium text-muted-foreground hover:bg-accent">
-							Cancel
-						</button>
-					{/if}
+					<button type="button" class="task-action" aria-label={showDetailsSidebar ? 'Hide task details' : 'Show task details'} title={showDetailsSidebar ? 'Hide task details' : 'Show task details'} aria-expanded={showDetailsSidebar || detailsSheetOpen} aria-controls={viewId + (detailsSheetOpen || !detailsSidebarFits ? '-details-dialog' : '-details')} onclick={toggleDetailsSidebar}>
+						{#if showDetailsSidebar}<PanelRightClose size={17} aria-hidden="true" />{:else}<PanelRightOpen size={17} aria-hidden="true" />{/if}
+					</button>
 				</div>
 			</div>
 		{/if}
+		{#if planningError || actionError}<p role="alert" class="mt-2 text-sm text-destructive">{planningError || actionError}</p>{/if}
 	</div>
 
 	{#if editing && task}
-		<div class="shrink-0 space-y-3 overflow-y-auto border-b border-border bg-card/50 px-3 py-3 sm:px-6 sm:py-4">
-			<input type="text" bind:value={editTitle} placeholder="Task title..."
+		<dialog bind:this={editDialog} use:planningViewport class="task-sheet" aria-label="Edit task details" onclose={() => editing = false} oncancel={(event) => { if (editSaving) event.preventDefault(); }}>
+			<header class="task-sheet-header">
+				<h2>Edit task details</h2>
+				<button type="button" class="task-action" aria-label="Close task editor" title="Close task editor" disabled={editSaving} onclick={() => editDialog?.close()}><X size={18} aria-hidden="true" /></button>
+			</header>
+			<form class="task-sheet-content" onsubmit={(event) => { event.preventDefault(); void saveEdit(); }}>
+			{#if editError}<p role="alert" class="mb-3 text-sm text-destructive">{editError}</p>{/if}
+			<fieldset disabled={editSaving} class="min-w-0 space-y-3">
+			<label class="block text-xs text-muted-foreground" for={viewId + '-title'}>Title</label>
+			<input id={viewId + '-title'} type="text" bind:value={editTitle} placeholder="Task title..." required
 				class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring" />
-			<textarea bind:value={editDesc} placeholder="Description..." rows="2"
+			<label class="block text-xs text-muted-foreground" for={viewId + '-description'}>Description</label>
+			<textarea id={viewId + '-description'} bind:value={editDesc} placeholder="Description..." rows="3"
 				class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring resize-none"></textarea>
 			<div class="flex flex-col gap-3 sm:flex-row">
 				<div class="flex-1">
-					<div class="text-xs text-muted-foreground mb-1">Project</div>
-					<select bind:value={editAgentId}
+					<label for={viewId + '-agent'} class="block text-xs text-muted-foreground mb-1">Agent</label>
+					<select id={viewId + '-agent'} bind:value={editAgentId} aria-describedby={originalEditAgentId ? viewId + '-assignment-help' : undefined}
 						class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring">
-						<option value="">Unassigned</option>
+						<option value="" disabled={!!originalEditAgentId}>Unassigned</option>
 						{#each agentList as agent}
 							<option value={agent.id}>{agent.title || agent.name}</option>
 						{/each}
 					</select>
+					{#if originalEditAgentId}<p id={viewId + '-assignment-help'} class="mt-1 text-xs text-muted-foreground">Use Plan / schedule → Backlog to park work.</p>{/if}
 				</div>
 				<div class="w-24">
-					<div class="text-xs text-muted-foreground mb-1">Priority</div>
-					<select bind:value={editPriority}
+					<label for={viewId + '-priority'} class="block text-xs text-muted-foreground mb-1">Priority</label>
+					<select id={viewId + '-priority'} bind:value={editPriority}
 						class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring">
 						<option value={0}>Normal</option>
 						<option value={5}>High</option>
@@ -1056,25 +1971,34 @@
 				</div>
 			{/if}
 			<div class="flex gap-2">
-				<button onclick={saveEdit}
+				<button type="submit"
 					class="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90">
-					Save
+					{editSaving ? 'Saving…' : 'Save'}
 				</button>
-				<button onclick={() => (editing = false)}
+				<button type="button" onclick={() => editDialog?.close()}
 					class="rounded-md border border-border px-3 py-1.5 text-xs font-medium hover:bg-accent">
 					Cancel
 				</button>
 			</div>
-		</div>
+			</fieldset>
+			</form>
+		</dialog>
 	{/if}
 
 	{#if loading}
-		<div class="flex-1 flex items-center justify-center text-muted-foreground text-sm">Loading...</div>
+		<div class="flex flex-1 items-center justify-center"><AgentLoading label="Loading task" phase="loading" /></div>
 	{:else if task}
 		<div class="flex min-h-0 flex-1 overflow-hidden">
 			<!-- Left: conversation -->
-			<div class="flex-1 flex flex-col overflow-hidden">
-				<div bind:this={messagesEl} onscroll={handleTranscriptScroll} data-task-transcript-scroll class="flex-1 space-y-4 overflow-y-auto px-3 py-4 sm:px-6 sm:py-5">
+            <div class="flex-1 flex flex-col overflow-hidden">
+                {#if waitingForDelegation && failedDelegates.length > 0}
+                    <div role="alert" data-delegation-blocker class="shrink-0 border-b border-destructive/30 bg-destructive/5 px-3 py-2 text-xs sm:px-6">
+                        <span class="font-semibold text-destructive">Blocked by delegated work.</span>
+                        <a href="/tasks/{failedDelegates[0].task_id}" class="ml-1 text-primary underline">Open {delegatedAgentName(failedDelegates[0])}'s task</a>
+                        {#if failedDelegates.length > 1}<span> · {failedDelegates.length} tasks need attention</span>{/if}
+                    </div>
+                {/if}
+				<div bind:this={messagesEl} onscroll={handleTranscriptScroll} tabindex="-1" aria-label="Task transcript" data-task-transcript-scroll class="flex-1 space-y-4 overflow-y-auto px-3 py-4 sm:px-6 sm:py-5">
 					{#if hasEarlierActivity}
 						<div class="flex justify-center">
 							<button type="button" onclick={loadEarlierActivity} disabled={loadingEarlierActivity}
@@ -1084,7 +2008,8 @@
 						</div>
 					{/if}
 					<div class="flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
-						<span class="rounded-full border border-border bg-secondary/40 px-2 py-1">{startsFreshConversation() ? 'Fresh conversation' : 'Continues project conversation'}</span>
+						<span class="rounded-full border border-border bg-secondary/40 px-2 py-1">{startsFreshConversation() ? 'Fresh Agent session' : 'Continues Agent session'}</span>
+						{#if task.conversation_id}<a href="/conversations/{task.conversation_id}" class="rounded-full border border-primary/30 bg-primary/5 px-2 py-1 text-primary hover:bg-primary/10">Linked conversation</a>{/if}
 						{#if task.depends_on && task.depends_on.length > 0}<span>Continues its dependency</span>{/if}
 					</div>
 
@@ -1118,35 +2043,27 @@
 					{#if transcriptItems.length > 0}
 						<div class="space-y-0.5" data-task-transcript>
 							{#each transcriptItems as item (item.key)}
-								{#if item.kind === 'message'}
+							{#if item.kind === 'message'}
 									{@const isSystem = item.role === 'system'}
 									{@const isAssistant = item.role === 'assistant'}
-									<div
-										class="flex gap-3 py-2 {isSystem ? '' : isAssistant ? '' : 'flex-row-reverse'}"
-										data-transcript-kind="message"
-										data-message-role={item.role}
-										data-transcript-timestamp={item.timestamp}
+									<AiMessage
+										role={item.role}
+										downloadAgentId={item.agentId}
+										sender={isSystem ? 'system' : isAssistant ? 'agent' : 'you'}
+										timestampLabel={timeAgo(item.timestamp)}
+										content={item.content}
+										avatar={isSystem ? 'S' : isAssistant ? 'A' : 'Y'}
+										transcriptTimestamp={item.timestamp}
+										openLinksInNewWindow={isAssistant}
+										selectionActions={isAssistant}
+										onselectionaction={handleSelectionAction}
+										visualizations={item.visualizations}
+										visualizationUrl={item.messageId === undefined ? undefined : (artifact) => tasks.visualizationUrl(taskId, item.messageId!, artifact.id)}
+										visualizationFollowUpTarget="this Task"
+										onvisualizationfollowup={sendVisualizationFollowUp}
 									>
-										<div class="flex-shrink-0 h-7 w-7 rounded-full flex items-center justify-center text-xs font-bold
-											{isSystem ? 'bg-muted text-muted-foreground' :
-											 isAssistant ? 'bg-accent text-accent-foreground' :
-											 'bg-primary text-primary-foreground'}">
-											{#if isSystem}S{:else if isAssistant}A{:else}U{/if}
-										</div>
-										<div class="max-w-[80%]">
-											<div class="flex items-center gap-2 mb-0.5">
-												<span class="text-xs font-medium {isSystem ? 'text-muted-foreground' : ''}">{item.role}</span>
-												<span class="text-xs text-muted-foreground">{timeAgo(item.timestamp)}</span>
-											</div>
-											<div class="rounded-lg px-3 py-2 text-sm prose prose-invert prose-sm max-w-none
-											{isSystem ? 'bg-muted/50 text-muted-foreground text-xs italic' :
-											 isAssistant ? 'bg-accent text-accent-foreground' :
-											 'bg-primary text-primary-foreground'}">
-											{@html renderContent(item.content)}
-											<ImageAttachmentPreviews attachments={item.attachments} message />
-										</div>
-										</div>
-									</div>
+										<ImageAttachmentPreviews attachments={item.attachments} message />
+									</AiMessage>
 								{:else}
 									<div data-transcript-kind="activity" data-transcript-timestamp={item.timestamp}>
 										<ActivityEventRow event={item.event} />
@@ -1156,29 +2073,58 @@
 						</div>
 					{/if}
 
-					{#if subtaskList.length > 0}
-					<section class="rounded-lg border border-border/60 bg-card/30 p-3 {compact ? '' : 'lg:hidden'}">
-							<div class="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">Steps ({subtaskList.filter((step) => step.status === 'completed').length}/{subtaskList.length})</div>
+					{#if planSteps.length > 0}
+					<section class="rounded-lg border border-border/60 bg-card/30 p-3" hidden={showDetailsSidebar}>
+							<div class="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+								Steps ({completedStepCount()} complete{deferredStepCount() ? `, ${deferredStepCount()} deferred` : ''})
+							</div>
 							<div class="space-y-2">
-								{#each subtaskList as subtask}
-									<div class="flex items-start gap-2 text-sm"><span class="mt-0.5 {subtask.status === 'completed' ? 'text-emerald-400' : subtask.status === 'in_progress' ? 'text-blue-400' : 'text-muted-foreground'}">{subtask.status === 'completed' ? '✓' : subtask.status === 'in_progress' ? '●' : '○'}</span><span class={subtask.status === 'completed' ? 'text-muted-foreground line-through' : ''}>{subtask.title}</span></div>
+								{#each planSteps as subtask}
+									{@const deferred = isDeferredPlanItem(subtask)}
+									<div class="flex items-start gap-2 text-sm">
+										<span class="mt-0.5 {subtask.status === 'completed' ? 'text-emerald-400' : subtask.status === 'in_progress' ? 'text-blue-400' : 'text-muted-foreground'}">{subtask.status === 'completed' ? '✓' : subtask.status === 'in_progress' ? '●' : deferred ? '↳' : '○'}</span>
+										<span class={subtask.status === 'completed' ? 'text-muted-foreground line-through' : deferred ? 'text-muted-foreground italic' : ''}>{subtask.title}</span>
+										{#if deferred}<span class="ai-status-pill bg-muted text-muted-foreground">Deferred</span>{/if}
+									</div>
 								{/each}
 							</div>
 						</section>
 					{/if}
 
 					{#if latestResult}
+						{@const resultHtml = renderContent(latestResult, { openLinksInNewWindow: true, renderStructuredAgentMarkup: true, downloadAgentId: latestResultAttempt?.session_id })}
 						<section class="rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-4">
 							<div class="mb-2 flex items-center gap-2 text-xs font-medium uppercase tracking-wide text-emerald-400">
 								<span class="h-2 w-2 rounded-full bg-emerald-400"></span>
 								Result
+								<ReadAloud content={latestResult} />
 							</div>
-							<div class="prose prose-invert prose-sm max-w-none">{@html renderContent(latestResult)}</div>
+							<div use:mermaidDiagrams={resultHtml} data-task-result-content class="prose prose-invert prose-sm max-w-none">{@html resultHtml}</div>
 						</section>
 					{:else if latestError}
-						<section class="rounded-lg border border-red-500/30 bg-red-500/5 p-4">
-							<div class="mb-2 text-xs font-medium uppercase tracking-wide text-red-400">Attempt failed</div>
-							<div class="whitespace-pre-wrap text-sm text-red-200">{latestError}</div>
+						<section role="alert" data-attempt-error class="rounded-lg border border-red-500/30 bg-red-500/5 p-4">
+							<div class="mb-2 flex items-start justify-between gap-3">
+								<div class="text-xs font-medium uppercase tracking-wide {authenticationRequired && authenticatedAttemptId === latestErrorAttempt?.id ? 'text-emerald-600 dark:text-emerald-400' : 'text-red-400'}">{authenticationRequired ? authenticatedAttemptId === latestErrorAttempt?.id ? 'Signed in' : 'Sign-in required' : 'Attempt failed'}</div>
+								<button
+									type="button"
+									onclick={dismissAttemptError}
+									aria-label="Dismiss attempt error"
+									class="flex h-6 w-6 shrink-0 items-center justify-center rounded text-lg leading-none text-red-300/70 hover:bg-red-500/10 hover:text-red-200"
+								>&times;</button>
+							</div>
+							{#if authenticationRequired && authenticatedAttemptId === latestErrorAttempt?.id}
+								<p class="text-sm text-foreground">Retry this task to continue.</p>
+							{:else}<div class="whitespace-pre-wrap text-sm text-red-200">{latestError}</div>{/if}
+							{#if authenticationRequired && task?.agent_id}
+								<div class="mt-3 flex items-center gap-3">
+									{#if authenticatedAttemptId === latestErrorAttempt?.id}
+										<span class="text-sm text-emerald-600 dark:text-emerald-400">Signed in.</span>
+										{#if !platformManaged}<button type="button" onclick={() => updateStatus('in_progress')} disabled={statusUpdating} class="rounded bg-primary px-3 py-1.5 text-sm text-primary-foreground">Retry task</button>{/if}
+									{:else}
+										<button type="button" onclick={() => signInAgentId = task?.agent_id ?? null} class="rounded bg-primary px-3 py-1.5 text-sm text-primary-foreground">Sign in</button>
+									{/if}
+								</div>
+							{/if}
 						</section>
 					{/if}
 
@@ -1191,18 +2137,82 @@
 						</div>
 					{/if}
 
-					{#if pendingElicitation}
+					{#if pendingElicitation?.kind === 'tool_install'}
+						{@const request = pendingElicitation}
+						<section class="ai-card mx-auto w-full max-w-lg overflow-hidden" data-tool-install-elicitation aria-live="polite">
+							<div class="flex items-center gap-2 border-b border-border bg-[hsl(var(--inset))] px-4 py-3">
+								<span class="h-2 w-2 shrink-0 animate-pulse rounded-full bg-orange-400"></span>
+								<span class="truncate text-xs font-semibold text-foreground">{request.toolType === 'plugin' ? 'Plugin' : 'Connector'} installation requested</span>
+							</div>
+							<div class="space-y-3 p-4">
+								<div>
+									<h3 class="text-sm font-semibold text-foreground">Install {request.toolName}?</h3>
+									<p class="mt-2 whitespace-pre-wrap text-sm leading-relaxed text-foreground">{request.message}</p>
+								</div>
+								<p class="text-xs leading-relaxed text-muted-foreground">
+									Accepting lets Codex install this {request.toolType}. It may ask you to sign in or authorize connected services.
+								</p>
+								<div class="flex flex-wrap items-center gap-2 pt-1">
+									<button type="button" onclick={() => respondToElicitation(request, 'decline')} disabled={elicitationSending}
+										class="rounded-lg border border-border px-3 py-2 text-xs font-medium text-muted-foreground hover:bg-accent disabled:opacity-50">Not now</button>
+									<button type="button" onclick={() => respondToElicitation(request, 'accept')} disabled={elicitationSending}
+										class="ml-auto rounded-lg bg-primary px-4 py-2 text-xs font-semibold text-primary-foreground hover:bg-primary/90 disabled:opacity-50">
+										{elicitationSending ? 'Installing…' : `Install ${request.toolType}`}
+									</button>
+								</div>
+							</div>
+						</section>
+					{/if}
+
+					{#if pendingElicitation?.kind === 'url'}
+						{@const question = pendingElicitation}
+						<section class="ai-card mx-auto w-full max-w-lg space-y-3 p-4" data-url-elicitation>
+							<p class="whitespace-pre-wrap text-sm">{question.message}</p>
+							<div class="flex flex-wrap gap-2">
+								<button type="button" onclick={() => void openExternal(question.url).catch(cause => actionError = String(cause))} class="rounded bg-primary px-3 py-2 text-sm text-primary-foreground">Open sign-in page</button>
+								<button type="button" onclick={() => respondToElicitation(question, 'accept')} disabled={elicitationSending} class="rounded border border-border px-3 py-2 text-sm">I've completed sign-in</button>
+								<button type="button" onclick={() => respondToElicitation(question, 'cancel')} disabled={elicitationSending} class="rounded border border-border px-3 py-2 text-sm">Cancel request</button>
+							</div>
+						</section>
+					{/if}
+					{#if pendingElicitation?.kind === 'unsupported'}
+						{@const question = pendingElicitation}
+						<section class="ai-card mx-auto w-full max-w-lg overflow-hidden" data-unsupported-elicitation aria-live="polite">
+							<div class="flex items-center gap-2 border-b border-border bg-[hsl(var(--inset))] px-4 py-3">
+								<span class="h-2 w-2 shrink-0 animate-pulse rounded-full bg-orange-400"></span>
+								<span class="truncate text-xs font-semibold text-foreground">Agent action required</span>
+							</div>
+							<div class="space-y-3 p-4">
+								<div class="whitespace-pre-wrap text-sm font-medium leading-relaxed text-foreground">{question.message}</div>
+								<p class="text-xs leading-relaxed text-muted-foreground">
+									This request uses a prompt format XpressClaw cannot display safely. Decline or cancel it, or reply below to restart the agent with different guidance.
+								</p>
+								<div class="flex flex-wrap items-center gap-2 pt-1">
+									<button type="button" onclick={() => respondToElicitation(question, 'cancel')} disabled={elicitationSending}
+										class="rounded-lg border border-border px-3 py-2 text-xs font-medium text-muted-foreground hover:bg-accent disabled:opacity-50">Cancel request</button>
+									<button type="button" onclick={() => respondToElicitation(question, 'decline')} disabled={elicitationSending}
+										class="ml-auto rounded-lg bg-primary px-4 py-2 text-xs font-semibold text-primary-foreground hover:bg-primary/90 disabled:opacity-50">
+										{elicitationSending ? 'Responding…' : 'Decline request'}
+									</button>
+								</div>
+							</div>
+						</section>
+					{/if}
+
+					{#if pendingElicitation?.kind === 'form'}
 						{@const question = pendingElicitation}
 						{@const questionPage = elicitationPage[question.id] ?? 0}
 						{@const isReviewPage = questionPage >= question.fields.length}
-						<section class="rounded-xl border border-orange-500/35 bg-orange-500/5 shadow-sm">
-							<div class="flex items-center justify-between gap-3 border-b border-orange-500/20 px-4 py-3">
+						<section class="ai-card mx-auto w-full max-w-lg overflow-hidden" data-approval-card style:animation="ai-fade-up 350ms cubic-bezier(0.23,1,0.32,1) both">
+							<div class="flex items-center justify-between gap-3 border-b border-border bg-[hsl(var(--inset))] px-4 py-3">
 								<div class="flex min-w-0 items-center gap-2">
 									<span class="h-2 w-2 shrink-0 animate-pulse rounded-full bg-orange-400"></span>
-									<span class="truncate text-xs font-semibold uppercase tracking-wide text-orange-300">Agent question</span>
+									<span class="truncate text-xs font-semibold text-foreground">Agent question</span>
 								</div>
-								<span class="shrink-0 text-xs text-muted-foreground">
-									{isReviewPage ? 'Review' : `${questionPage + 1} / ${question.fields.length}`}
+								<span class="flex shrink-0 items-center gap-1" aria-label={isReviewPage ? 'Review answers' : `Question ${questionPage + 1} of ${question.fields.length}`}>
+									{#each question.fields as _, index}
+										<span class="rounded-full transition-all {index === questionPage ? 'h-2 w-2 border-2 border-foreground' : index < questionPage || isReviewPage ? 'h-1.5 w-1.5 bg-muted-foreground' : 'h-1.5 w-1.5 border border-muted-foreground'}"></span>
+									{/each}
 								</span>
 							</div>
 
@@ -1214,7 +2224,7 @@
 									</div>
 									<div class="space-y-2">
 										{#each question.fields as field}
-											<div class="rounded-lg border border-border/70 bg-background/50 px-3 py-2.5">
+											<div class="rounded-lg bg-[hsl(var(--inset))] px-3 py-2.5 shadow-[var(--shadow-hairline)]">
 												<div class="text-xs text-muted-foreground">{field.property.title || field.question}</div>
 												<div class="mt-1 whitespace-pre-wrap text-sm font-medium text-foreground">{displayElicitationAnswer(question, field)}</div>
 											</div>
@@ -1234,30 +2244,30 @@
 									{@const field = question.fields[questionPage]}
 									{@const fieldOptions = optionsFor(field)}
 									<div>
-										{#if field.property.title}
-											<div class="mb-1 text-xs font-semibold uppercase tracking-wide text-orange-300">{field.property.title}</div>
+									{#if field.property.title}
+										<div class="mb-1 text-xs font-semibold uppercase tracking-wide text-[hsl(var(--warning))]">{field.property.title}</div>
 										{/if}
 										<div class="whitespace-pre-wrap text-sm font-medium leading-relaxed text-foreground">{field.question}</div>
 									</div>
 
 									{#if fieldOptions.length > 0}
 										<div class="grid gap-2">
-											{#each fieldOptions as option}
-												{@const selected = optionSelected(question.id, field, option.value)}
-												<button type="button" onclick={() => toggleElicitationOption(question.id, field, option.value)}
-													class="flex w-full items-start gap-3 rounded-lg border px-3 py-2.5 text-left transition-colors {selected ? 'border-primary/60 bg-primary/15' : 'border-border/70 bg-background/50 hover:border-primary/35 hover:bg-accent/50'}">
-													<span class="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center border {field.property.type === 'array' ? 'rounded' : 'rounded-full'} {selected ? 'border-primary bg-primary text-primary-foreground' : 'border-muted-foreground/50'}">
-														{#if selected}<span class="text-[10px] leading-none">✓</span>{/if}
-													</span>
-													<span class="min-w-0">
-														<span class="block text-sm font-medium text-foreground">{option.title}</span>
-														{#if option.description}<span class="mt-0.5 block text-xs leading-relaxed text-muted-foreground">{option.description}</span>{/if}
-													</span>
-												</button>
-											{/each}
-										</div>
-									{:else if field.property.type === 'boolean'}
-										<label class="flex items-center gap-3 rounded-lg border border-border/70 bg-background/50 px-3 py-3 text-sm">
+										{#each fieldOptions as option}
+											{@const selected = optionSelected(question.id, field, option.value)}
+											<button type="button" onclick={() => toggleElicitationOption(question.id, field, option.value)}
+												class="-mx-1.5 flex w-[calc(100%+0.75rem)] items-start gap-3 rounded-lg px-2 py-2 text-left transition-colors {selected ? 'bg-accent text-foreground' : 'text-muted-foreground hover:bg-[hsl(var(--hover))] hover:text-foreground'}">
+												<span class="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center {field.property.type === 'array' ? 'rounded-[5px]' : 'rounded-full'} {selected ? 'bg-foreground text-background' : 'shadow-[inset_0_0_0_1.5px_hsl(var(--border-strong))]'}">
+													{#if selected}<span class="text-[10px] leading-none">✓</span>{/if}
+												</span>
+												<span class="min-w-0">
+													<span class="block text-sm font-medium">{option.title}</span>
+													{#if option.description}<span class="mt-0.5 block text-xs leading-relaxed text-muted-foreground">{option.description}</span>{/if}
+												</span>
+											</button>
+										{/each}
+									</div>
+								{:else if field.property.type === 'boolean'}
+									<label class="flex items-center gap-3 rounded-lg bg-[hsl(var(--inset))] px-3 py-3 text-sm shadow-[var(--shadow-hairline)]">
 											<input type="checkbox" checked={Boolean(answersFor(question.id)[field.key] ?? field.property.default ?? false)}
 												onchange={(event) => setElicitationAnswer(question.id, field.key, event.currentTarget.checked)} />
 											<span>{field.property.title || 'Yes'}</span>
@@ -1302,27 +2312,69 @@
 					{/if}
 
 					<!-- Live indicator -->
-					{#if runningAttempt}
-						<div class="flex items-center gap-2 text-xs text-muted-foreground">
-							<span class="h-2 w-2 rounded-full bg-blue-400 animate-pulse"></span>
-							{queuedAttempt
-								? 'New guidance queued; switching at the next safe break...'
-								: 'The agent is working on this task...'}
+					{#if workingAttempt}
+						<div class="space-y-2 py-2 pl-10">
+							<AgentLoading
+								label={workingAttempt.status === 'preparing' ? 'Preparing the agent' : 'The agent is responding'}
+								phase={workingAttempt.status === 'preparing' ? 'preparing' : 'active'}
+								startedAt={workingAttempt.status === 'preparing'
+									? workingAttempt.started_at
+									: workingAttempt.response_started_at ?? workingAttempt.started_at}
+							/>
+							{#if queuedAttempt}
+								<AgentLoading
+									label="New guidance is queued for the next safe break"
+									phase="queued"
+									startedAt={queuedAttempt.response_queued_at ?? queuedAttempt.created_at}
+								/>
+							{/if}
+						</div>
+					{:else if waitingForDelegation}
+						<div role="status" class="space-y-1 py-2 text-sm text-amber-600 dark:text-amber-400" data-delegation-wait>
+							{#if failedDelegates.length > 0}
+                                <p class="font-medium text-destructive">Delegated work needs attention before this task can complete.</p>
+                                {#each failedDelegates as item}<p><a class="underline" href="/tasks/{item.task_id}">{delegatedAgentName(item)}: {item.title}</a> — {item.activity_status.replaceAll('_', ' ')}</p>{/each}
+                            {:else if blockingDelegates.length === 1}
+								<p>Waiting for {delegatedAgentName(blockingDelegates[0])}: <a class="underline" href="/tasks/{blockingDelegates[0].task_id}">{blockingDelegates[0].title}</a>.</p>
+							{:else}
+								<p>Waiting for {blockingDelegates.length} required delegated tasks.</p>
+							{/if}
+							{#if queuedAttempt}<p class="text-xs text-muted-foreground">Queued work will run when its prerequisites are resolved.</p>
+							{:else}<p class="text-xs text-muted-foreground">Coordination messages and scheduled checks can run while delegated work continues.</p>{/if}
+						</div>
+					{:else if taskActivityStatus === 'waiting_for_dependencies'}
+						<div role="status" class="space-y-1 py-2 text-sm text-amber-600 dark:text-amber-400" data-dependency-wait>
+							<p>Waiting for prerequisite tasks to complete.</p>
+							{#each task.blocked_by ?? [] as blockerId}
+								<p><a class="underline" href="/tasks/{blockerId}">{taskLabel(blockerId)}</a></p>
+							{/each}
+							{#if queuedAttempt}<p class="text-xs text-muted-foreground">Your message is saved and will run when these prerequisites are complete.</p>{/if}
 						</div>
 					{:else if queuedAttempt}
-						<div class="flex items-center gap-2 text-xs text-muted-foreground">
-							<span class="h-2 w-2 rounded-full bg-amber-400 animate-pulse"></span>
-							The next worker turn is queued...
-						</div>
+						<div class="py-2 pl-10"><AgentLoading label="The agent is queued to respond" phase="queued" startedAt={queuedAttempt.response_queued_at ?? queuedAttempt.created_at} /></div>
 					{:else if task.status === 'waiting_for_input'}
 						<div class="flex items-center gap-2 text-xs text-orange-400">
 							<span class="h-2 w-2 rounded-full bg-orange-400 animate-pulse"></span>
 							Waiting for your response...
 						</div>
-					{:else if task.status === 'in_progress' && subtaskList.some(subtask => subtask.status !== 'completed')}
+					{:else if taskActivityStatus === 'awaiting_parent_review'}
+						<p role="status" class="py-2 text-sm text-violet-500" data-parent-review-wait>
+							The worker response is finished. Waiting for the parent Agent to review and accept the result.
+						</p>
+					{:else if taskActivityStatus === 'awaiting_review'}
+						<div class="flex items-center gap-2 text-xs text-violet-400">
+							<span class="h-2 w-2 rounded-full bg-violet-400"></span>
+							The implementation is awaiting review; no worker is running.
+						</div>
+					{:else if taskActivityStatus === 'waiting_for_subtasks'}
 						<div class="flex items-center gap-2 text-xs text-amber-400">
 							<span class="h-2 w-2 rounded-full bg-amber-400"></span>
-							This task still has unfinished steps.
+							This task is waiting on explicitly delegated subtasks.
+						</div>
+					{:else if taskActivityStatus === 'idle'}
+						<div class="flex items-center gap-2 text-xs text-muted-foreground">
+							<span class="h-2 w-2 rounded-full bg-muted-foreground"></span>
+							No worker or required subtask is currently running.
 						</div>
 					{/if}
 				</div>
@@ -1339,265 +2391,243 @@
 					</div>
 				{/if}
 
-				<!-- Message input -->
-				<div class="shrink-0 border-t border-border bg-background px-3 pb-4 pt-3 sm:px-6 sm:pb-5 sm:pt-4">
-					{#if task.status === 'waiting_for_input'}
-						<div class="text-xs text-orange-400 mb-2">The agent needs additional input</div>
-					{:else if !task.agent_id}
-						<div class="text-xs text-muted-foreground mb-2">Assign a project before sending a message</div>
-					{/if}
-					<div bind:this={composerEl} class="relative rounded-xl border border-border bg-secondary/35 transition-all focus-within:border-primary/45 focus-within:ring-1 focus-within:ring-primary/20">
-						{#if slashMenuOpen}
-							<div class="absolute bottom-full left-0 right-0 z-40 mb-2 max-h-72 overflow-y-auto rounded-xl border border-border bg-card p-1.5 shadow-2xl sm:right-auto sm:w-96">
-								{#if filteredCommands.length > 0}
-									{#each filteredCommands as command, index}
-										<button
-											type="button"
-											onpointerenter={() => (selectedCommandIndex = index)}
-											onclick={() => chooseCommand(command)}
-											class="block w-full rounded-lg px-3 py-2 text-left transition-colors {index === selectedCommandIndex ? 'bg-accent' : 'hover:bg-accent/60'}"
-										>
-											<span class="block font-mono text-xs text-foreground">{command.name.startsWith('/') ? command.name : `/${command.name}`}</span>
-											<span class="mt-0.5 block text-[11px] leading-snug text-muted-foreground">{command.description}</span>
-										</button>
-									{/each}
-								{:else}
-									<div class="px-3 py-3 text-xs text-muted-foreground">No matching commands</div>
-								{/if}
-							</div>
+				{#if platformManaged}
+					<p class="shrink-0 border-t border-border px-3 py-4 text-sm text-muted-foreground sm:px-6">This task is managed in Xpress AI. Continue or cancel it there.</p>
+				{:else}
+					<!-- Message input -->
+					<div class="shrink-0 border-t border-border bg-background px-3 pb-4 pt-3 sm:px-6 sm:pb-5 sm:pt-4">
+						{#if task.status === 'waiting_for_input'}
+							<div class="text-xs text-orange-400 mb-2">The agent needs additional input</div>
+						{:else if !task.agent_id}
+							<div class="text-xs text-muted-foreground mb-2">Assign an agent before sending a message</div>
 						{/if}
-
-						{#if modelMenuOpen && hasModelMenu}
-							<div class="absolute bottom-full left-0 right-0 z-30 mb-2 max-h-[65vh] overflow-y-auto rounded-xl border border-border bg-card p-2 shadow-2xl sm:right-auto sm:w-80">
-								{#if modelOption}
-									<div class="px-2 pb-1 pt-1 text-[10px] font-medium uppercase tracking-[0.14em] text-muted-foreground/60">Model</div>
-									<div class="space-y-0.5">
-										{#each selectChoices(modelOption) as choice}
-											<button type="button" onclick={() => setConfigOption(modelOption!, choice.value)}
-												class="flex w-full items-start gap-2 rounded-lg px-2 py-2 text-left transition-colors {String(selectedValue(modelOption!)) === choice.value ? 'bg-accent' : 'hover:bg-accent/60'}">
-												<span class="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full border {String(selectedValue(modelOption!)) === choice.value ? 'border-primary' : 'border-muted-foreground/35'}">
-													{#if String(selectedValue(modelOption!)) === choice.value}<span class="h-2 w-2 rounded-full bg-primary"></span>{/if}
-												</span>
-												<span class="min-w-0"><span class="block text-xs text-foreground">{choice.name}</span>{#if choice.description}<span class="mt-0.5 block text-[11px] leading-snug text-muted-foreground">{choice.description}</span>{/if}</span>
+						<div bind:this={composerEl} class="ai-card relative transition-all focus-within:ring-1 focus-within:ring-primary/35">
+							{#if slashMenuOpen}
+								<div class="ai-raised absolute bottom-full left-0 right-0 z-40 mb-2 max-h-72 overflow-y-auto p-1.5 sm:right-auto sm:w-96">
+									{#if filteredCommands.length > 0}
+										{#each filteredCommands as command, index}
+											<button
+												type="button"
+												onpointerenter={() => (selectedCommandIndex = index)}
+												onclick={() => chooseCommand(command)}
+												class="block w-full rounded-lg px-3 py-2 text-left transition-colors {index === selectedCommandIndex ? 'bg-accent' : 'hover:bg-accent/60'}"
+											>
+												<span class="block font-mono text-xs text-foreground">{command.name.startsWith('/') ? command.name : `/${command.name}`}</span>
+												<span class="mt-0.5 block text-[11px] leading-snug text-muted-foreground">{command.description}</span>
 											</button>
 										{/each}
-									</div>
-								{/if}
-
-								{#if reasoningOption}
-									<div class="mx-2 my-2 border-t border-border/60"></div>
-									<div class="px-2 pb-1 text-[10px] font-medium uppercase tracking-[0.14em] text-muted-foreground/60">Reasoning effort</div>
-									<div class="flex flex-wrap gap-1 px-2 pb-1">
-										{#each selectChoices(reasoningOption) as choice}
-											<button type="button" onclick={() => setConfigOption(reasoningOption!, choice.value)} title={choice.description || choice.name}
-												class="rounded-md px-2 py-1 text-[11px] transition-colors {String(selectedValue(reasoningOption!)) === choice.value ? 'bg-accent text-foreground' : 'text-muted-foreground hover:bg-accent/60 hover:text-foreground'}">
-												{choice.name}
-											</button>
-										{/each}
-									</div>
-								{/if}
-
-								{#each modelConfigOptions as option}
-									<div class="mx-2 my-2 border-t border-border/60"></div>
-									{#if option.type === 'boolean'}
-										<button type="button" onclick={() => setConfigOption(option, !Boolean(selectedValue(option)))} class="flex w-full items-center justify-between rounded-lg px-2 py-2 text-left hover:bg-accent/60">
-											<span><span class="block text-xs text-foreground">{option.name}</span>{#if option.description}<span class="mt-0.5 block text-[11px] text-muted-foreground">{option.description}</span>{/if}</span>
-											<span class="relative h-4 w-7 rounded-full transition-colors {Boolean(selectedValue(option)) ? 'bg-primary' : 'bg-muted'}"><span class="absolute top-0.5 h-3 w-3 rounded-full bg-white transition-transform {Boolean(selectedValue(option)) ? 'translate-x-3.5' : 'translate-x-0.5'}"></span></span>
-										</button>
 									{:else}
-										<div class="px-2 pb-1 text-[10px] font-medium uppercase tracking-[0.14em] text-muted-foreground/60">{option.name}</div>
-										<div class="flex flex-wrap gap-1 px-2">
-											{#each selectChoices(option) as choice}
-												<button type="button" onclick={() => setConfigOption(option, choice.value)} class="rounded-md px-2 py-1 text-[11px] {String(selectedValue(option)) === choice.value ? 'bg-accent text-foreground' : 'text-muted-foreground hover:bg-accent/60'}">{choice.name}</button>
+										<div class="px-3 py-3 text-xs text-muted-foreground">No matching commands</div>
+									{/if}
+								</div>
+							{/if}
+
+							{#if modelMenuOpen && task.agent_id}
+								<div class="ai-raised absolute bottom-full left-0 right-0 z-30 mb-2 max-h-[65vh] overflow-y-auto p-2 sm:right-auto sm:w-80" data-model-picker aria-busy={configUpdating}>
+									{#if configUpdating}<div class="px-2 py-1 text-xs text-muted-foreground" role="status">Updating model settings…</div>{/if}
+									{#if configNotice}<div class="px-2 py-1 text-xs text-muted-foreground" role="status">{configNotice}</div>{/if}
+									{#if controlSnapshot?.has_preferences}<button type="button" disabled={configUpdating} onclick={() => setConfigOption(null, false)} class="px-2 py-1 text-xs text-muted-foreground hover:text-foreground">Clear task preferences</button>{/if}
+									{#if !controlSnapshot}<div class="px-2 py-1 text-xs text-muted-foreground">Loading model controls…</div>{/if}
+									{#each Object.entries(controlSnapshot?.pending ?? {}) as [id, value]}<div class="px-2 py-1 text-xs text-muted-foreground">Pending: {id} = {String(value)}</div>{/each}
+									{#if modelControlsPending}<div class="px-2 py-1 text-xs text-muted-foreground">Reasoning choices will refresh when the selected model connects.</div>{/if}
+									{#if modelOption}
+										<input type="search" bind:value={modelSearch} aria-label="Search models" placeholder="Search models…" class="mb-2 w-full rounded-lg border border-border bg-transparent px-2 py-1.5 text-xs outline-none focus:border-primary" />
+										<div class="px-2 pb-1 pt-1 text-[10px] font-medium uppercase tracking-[0.14em] text-muted-foreground/60">Model</div>
+										<div class="space-y-0.5">
+											{#each filteredModels as choice}
+												<button type="button" disabled={configUpdating} onclick={() => setConfigOption(modelOption!, choice.value)}
+													class="flex w-full items-start gap-2 rounded-lg px-2 py-2 text-left transition-colors {String(selectedValue(modelOption!)) === choice.value ? 'bg-accent' : 'hover:bg-accent/60'}">
+													<span class="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full border {String(selectedValue(modelOption!)) === choice.value ? 'border-primary' : 'border-muted-foreground/35'}">
+														{#if String(selectedValue(modelOption!)) === choice.value}<span class="h-2 w-2 rounded-full bg-primary"></span>{/if}
+													</span>
+													<span class="min-w-0"><span class="block text-xs text-foreground">{choice.name}</span>{#if choice.description}<span class="mt-0.5 block text-[11px] leading-snug text-muted-foreground">{choice.description}</span>{/if}</span>
+												</button>
+											{/each}
+											{#if filteredModels.length === 0}<div class="px-2 py-2 text-xs text-muted-foreground">No matching models</div>{/if}
+										</div>
+									{/if}
+
+									{#if reasoningOption}
+										<div class="mx-2 my-2 border-t border-border/60"></div>
+										<div class="px-2 pb-1 text-[10px] font-medium uppercase tracking-[0.14em] text-muted-foreground/60">Reasoning effort</div>
+										<div class="flex flex-wrap gap-1 px-2 pb-1">
+											{#each selectChoices(reasoningOption) as choice}
+												<button type="button" disabled={configUpdating} onclick={() => setConfigOption(reasoningOption!, choice.value)} title={choice.description || choice.name}
+													class="rounded-md px-2 py-1 text-[11px] transition-colors {String(selectedValue(reasoningOption!)) === choice.value ? 'bg-accent text-foreground' : 'text-muted-foreground hover:bg-accent/60 hover:text-foreground'}">
+													{choice.name}
+												</button>
 											{/each}
 										</div>
 									{/if}
-								{/each}
-							</div>
-						{/if}
 
-						<ImageAttachmentPreviews attachments={messageImagePreviews} onremove={(index) => (messageAttachments = messageAttachments.filter((_, itemIndex) => itemIndex !== index))} />
-
-						<textarea
-							id="task-message-input-{taskId}"
-							bind:value={messageInput}
-							oninput={handleMessageInput}
-							onfocus={() => (messageInputFocused = true)}
-							onblur={() => setTimeout(() => (messageInputFocused = false), 150)}
-							onkeydown={handleMessageKeydown}
-							onpaste={handleMessagePaste}
-							oncompositionstart={() => (composing = true)}
-							oncompositionend={() => setTimeout(() => (composing = false), 0)}
-							placeholder={messagePlaceholder}
-							rows={2}
-							class="max-h-32 w-full resize-none rounded-xl bg-transparent px-4 pb-1 pt-3 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none"
-							disabled={messageSending || interrupting || !task.agent_id || Boolean(pendingElicitation)}
-						></textarea>
-						{#if messageAttachmentError}<div class="px-4 pb-1 text-xs text-destructive">{messageAttachmentError}</div>{/if}
-
-						<div class="flex min-h-9 items-center gap-2 px-3 pb-2">
-							<input bind:this={messageImageInput} type="file" accept={IMAGE_FILE_ACCEPT} multiple onchange={handleMessageImageInput} class="hidden" />
-							<button type="button" onclick={() => messageImageInput?.click()}
-								disabled={messageSending || interrupting || !task.agent_id || Boolean(pendingElicitation) || messageAttachments.length >= MAX_IMAGE_ATTACHMENTS}
-								aria-label="Attach images" title="Attach images (you can also paste)"
-								class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-30">
-								<svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" /></svg>
-							</button>
-							{#if task.agent_id && (otherConfigOptions.length > 0 || hasModelMenu)}
-								<div class="flex min-w-0 flex-1 items-center gap-3 overflow-x-auto scrollbar-hide">
-									{#each otherConfigOptions as option}
+									{#each modelConfigOptions as option}
+										<div class="mx-2 my-2 border-t border-border/60"></div>
 										{#if option.type === 'boolean'}
-											<button type="button" onclick={() => setConfigOption(option, !Boolean(selectedValue(option)))} title={option.description || option.name}
-												class="shrink-0 text-xs transition-colors {Boolean(selectedValue(option)) ? 'text-foreground' : 'text-muted-foreground/60'} hover:text-foreground">
-												{option.name}
+											<button type="button" onclick={() => setConfigOption(option, !Boolean(selectedValue(option)))} class="flex w-full items-center justify-between rounded-lg px-2 py-2 text-left hover:bg-accent/60">
+												<span><span class="block text-xs text-foreground">{option.name}</span>{#if option.description}<span class="mt-0.5 block text-[11px] text-muted-foreground">{option.description}</span>{/if}</span>
+												<span class="relative h-4 w-7 rounded-full transition-colors {Boolean(selectedValue(option)) ? 'bg-primary' : 'bg-muted'}"><span class="absolute top-0.5 h-3 w-3 rounded-full bg-white transition-transform {Boolean(selectedValue(option)) ? 'translate-x-3.5' : 'translate-x-0.5'}"></span></span>
 											</button>
 										{:else}
-											<label class="relative shrink-0" title={option.description || option.name}>
-												<span class="sr-only">{option.name}</span>
-												<select value={String(selectedValue(option))} onchange={(event) => setConfigOption(option, event.currentTarget.value)}
-											class="composer-value-select max-w-36 cursor-pointer appearance-none bg-transparent py-1 pl-0 pr-4 text-xs text-muted-foreground outline-none transition-colors hover:text-foreground">
-													{#each selectChoices(option) as choice}<option value={choice.value}>{choice.name}</option>{/each}
-												</select>
-												<svg class="pointer-events-none absolute right-0 top-1/2 h-3 w-3 -translate-y-1/2 text-muted-foreground/50" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="m6 9 6 6 6-6" /></svg>
-											</label>
+											<div class="px-2 pb-1 text-[10px] font-medium uppercase tracking-[0.14em] text-muted-foreground/60">{option.name}</div>
+											<div class="flex flex-wrap gap-1 px-2">
+												{#each selectChoices(option) as choice}
+													<button type="button" onclick={() => setConfigOption(option, choice.value)} class="rounded-md px-2 py-1 text-[11px] {String(selectedValue(option)) === choice.value ? 'bg-accent text-foreground' : 'text-muted-foreground hover:bg-accent/60'}">{choice.name}</button>
+												{/each}
+											</div>
 										{/if}
 									{/each}
-
-									{#if hasModelMenu}
-										<button type="button" onclick={() => (modelMenuOpen = !modelMenuOpen)} aria-expanded={modelMenuOpen} title="Model and reasoning effort"
-											class="flex shrink-0 items-center gap-1 py-1 text-xs text-muted-foreground transition-colors hover:text-foreground">
-											<span>{modelOption ? selectedChoiceName(modelOption) : 'Model settings'}</span>
-											<svg class="h-3 w-3 text-muted-foreground/50" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="m6 9 6 6 6-6" /></svg>
-										</button>
-									{/if}
 								</div>
-							{:else}
-								<div class="flex-1"></div>
 							{/if}
-							{#if runningAttempt}
-								<button
-									type="button"
-									onclick={interruptAgent}
-									aria-label={!pendingElicitation && (messageInput.trim() || messageAttachments.length > 0) ? 'Interrupt and send now' : 'Interrupt agent now'}
-									title={!pendingElicitation && (messageInput.trim() || messageAttachments.length > 0) ? 'Interrupt the current work and send this message now' : 'Interrupt the current work now'}
-									disabled={messageSending || interrupting}
-									class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-border text-muted-foreground transition-colors hover:border-destructive/50 hover:bg-destructive/10 hover:text-destructive disabled:cursor-not-allowed disabled:opacity-30"
-								>
-									{#if interrupting}
-										<svg class="h-4 w-4 animate-spin" fill="none" viewBox="0 0 24 24" aria-hidden="true"><circle class="opacity-25" cx="12" cy="12" r="9" stroke="currentColor" stroke-width="3"/><path class="opacity-75" fill="currentColor" d="M21 12a9 9 0 0 0-9-9v3a6 6 0 0 1 6 6z"/></svg>
-									{:else}
-										<svg class="h-3.5 w-3.5" fill="currentColor" viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="5" width="14" height="14" rx="1.5"/></svg>
-									{/if}
+
+							<ImageAttachmentPreviews attachments={messageImagePreviews} onremove={(index) => (messageAttachments = messageAttachments.filter((_, itemIndex) => itemIndex !== index))} />
+
+							<textarea
+								id="task-message-input-{taskId}"
+								bind:value={messageInput}
+								oninput={handleMessageInput}
+								onfocus={() => (messageInputFocused = true)}
+								onblur={() => setTimeout(() => (messageInputFocused = false), 150)}
+								onkeydown={handleMessageKeydown}
+								onpaste={handleMessagePaste}
+								oncompositionstart={() => (composing = true)}
+								oncompositionend={() => setTimeout(() => (composing = false), 0)}
+								placeholder={messagePlaceholder}
+								rows={2}
+								class="max-h-32 w-full resize-none rounded-xl bg-transparent px-4 pb-1 pt-3 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none"
+								disabled={messageSending || interrupting || !task.agent_id || composerBlockedByElicitation}
+							></textarea>
+							{#if messageAttachmentError}<div class="px-4 pb-1 text-xs text-destructive">{messageAttachmentError}</div>{/if}
+
+							<div class="flex min-h-9 items-center gap-2 px-3 pb-2">
+								<input bind:this={messageImageInput} type="file" multiple onchange={handleMessageImageInput} class="hidden" />
+								<button type="button" onclick={() => messageImageInput?.click()}
+									disabled={messageSending || interrupting || !task.agent_id || composerBlockedByElicitation || messageAttachments.length >= MAX_IMAGE_ATTACHMENTS}
+									aria-label="Attach files" title="Attach files (you can also paste images)"
+									class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-30">
+									<svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" /></svg>
 								</button>
-							{/if}
-							<button
-								onclick={() => sendTaskMessage()}
-								aria-label="Send message"
-								disabled={(!messageInput.trim() && messageAttachments.length === 0) || messageSending || interrupting || !task.agent_id || Boolean(pendingElicitation)}
-								class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground transition-colors hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-30"
-							>
-								<svg class="h-4 w-4" fill="currentColor" viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
-							</button>
-						</div>
-					</div>
-				</div>
-			</div>
+								{#key taskId}<DictationButton disabled={messageSending || interrupting || !task.agent_id || composerBlockedByElicitation} ontranscript={(text) => { messageInput = messageInput.trimEnd() ? `${messageInput.trimEnd()} ${text}` : text; composerEl?.querySelector<HTMLTextAreaElement>('textarea')?.focus(); }} />{/key}
+								{#if task.agent_id}
+									<div class="flex min-w-0 flex-1 items-center gap-3 overflow-x-auto scrollbar-hide">
+										{#each otherConfigOptions as option}
+											{#if option.type === 'boolean'}
+												<button type="button" onclick={() => setConfigOption(option, !Boolean(selectedValue(option)))} title={option.description || option.name}
+													class="shrink-0 text-xs transition-colors {Boolean(selectedValue(option)) ? 'text-foreground' : 'text-muted-foreground/60'} hover:text-foreground">
+													{option.name}
+												</button>
+											{:else}
+												<label class="relative shrink-0" title={option.description || option.name}>
+													<span class="sr-only">{option.name}</span>
+													<select value={String(selectedValue(option))} onchange={(event) => setConfigOption(option, event.currentTarget.value)}
+												class="composer-value-select max-w-36 cursor-pointer appearance-none bg-transparent py-1 pl-0 pr-4 text-xs text-muted-foreground outline-none transition-colors hover:text-foreground">
+														{#each selectChoices(option) as choice}<option value={choice.value}>{choice.name}</option>{/each}
+													</select>
+													<svg class="pointer-events-none absolute right-0 top-1/2 h-3 w-3 -translate-y-1/2 text-muted-foreground/50" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="m6 9 6 6 6-6" /></svg>
+												</label>
+											{/if}
+										{/each}
 
-			<!-- Right: details sidebar -->
-			<div class="w-72 shrink-0 space-y-4 overflow-y-auto border-l border-border p-4 {compact ? 'hidden' : 'hidden lg:block'}">
-				<!-- Details -->
-				<div class="space-y-2">
-					<h3 class="text-xs font-medium text-muted-foreground uppercase tracking-wide">Details</h3>
-					<dl class="space-y-1.5 text-sm">
-						<div class="flex justify-between">
-							<dt class="text-muted-foreground">ID</dt>
-							<dd class="font-mono text-xs truncate max-w-[140px]">{task.id}</dd>
-						</div>
-						<div class="flex justify-between">
-							<dt class="text-muted-foreground">Status</dt>
-							<dd class="{statusColor(task.status)}">{task.status.replaceAll('_', ' ')}</dd>
-						</div>
-						<div class="flex justify-between">
-							<dt class="text-muted-foreground">Priority</dt>
-							<dd>{priorityLabel(task.priority)}</dd>
-						</div>
-						{#if task.agent_id}
-							<div class="flex justify-between">
-								<dt class="text-muted-foreground">Project</dt>
-								<dd><a href="/agents/{task.agent_id}" class="underline hover:text-foreground">{sessionLabel(task.agent_id)}</a></dd>
-							</div>
-						{/if}
-						<div class="flex justify-between">
-							<dt class="text-muted-foreground">Created</dt>
-							<dd class="text-xs">{timeAgo(task.created_at)}</dd>
-						</div>
-						{#if task.completed_at}
-							<div class="flex justify-between">
-								<dt class="text-muted-foreground">Completed</dt>
-								<dd class="text-xs">{timeAgo(task.completed_at)}</dd>
-							</div>
-						{/if}
-					</dl>
-				</div>
-
-				{#if contextUsage}
-					<div class="space-y-2" data-context-usage>
-						<div class="flex items-center justify-between">
-							<h3 class="text-xs font-medium uppercase tracking-wide text-muted-foreground">Context window</h3>
-							<span class="text-xs tabular-nums text-muted-foreground">{contextUsage.percent.toFixed(1)}%</span>
-						</div>
-						<div class="h-1.5 overflow-hidden rounded-full bg-secondary">
-							<div class="h-full rounded-full bg-blue-500 transition-[width] duration-300" style:width={`${contextUsage.percent}%`}></div>
-						</div>
-						<div class="text-right text-xs tabular-nums text-muted-foreground">
-							<span class="text-foreground">{formatTokens(contextUsage.used)}</span>
-							<span> / {formatTokens(contextUsage.size)} tokens</span>
-						</div>
-					</div>
-				{/if}
-
-				<!-- Subtasks -->
-				{#if subtaskList.length > 0}
-					<div class="space-y-2">
-						<h3 class="text-xs font-medium text-muted-foreground uppercase tracking-wide">
-							Steps ({subtaskList.filter(s => s.status === 'completed').length}/{subtaskList.length})
-						</h3>
-						<div class="space-y-1.5">
-							{#each subtaskList as sub}
-								<div class="flex items-start gap-2 rounded p-1.5 text-sm">
-									<span class="mt-0.5 flex-shrink-0 h-4 w-4 rounded border flex items-center justify-center
-										{sub.status === 'completed'
-											? 'bg-emerald-500/20 border-emerald-500 text-emerald-400'
-											: sub.status === 'in_progress'
-											? 'border-blue-400 text-blue-400'
-											: 'border-muted-foreground/30'}">
-										{#if sub.status === 'completed'}
-											<svg class="h-3 w-3" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-												<path stroke-linecap="round" stroke-linejoin="round" d="M5 13l4 4L19 7" />
-											</svg>
-										{:else if sub.status === 'in_progress'}
-											<span class="h-1.5 w-1.5 rounded-full bg-blue-400 animate-pulse"></span>
-										{/if}
-									</span>
-									<div class="flex-1 min-w-0">
-										<span class="block truncate {sub.status === 'completed' ? 'line-through text-muted-foreground' : ''}">{sub.title}</span>
-										{#if sub.description}
-											<span class="block text-xs text-muted-foreground mt-0.5 line-clamp-2">{sub.description}</span>
+										{#if task.agent_id}
+											<button type="button" onclick={toggleModelMenu} aria-expanded={modelMenuOpen} title="Model and reasoning effort"
+												class="flex shrink-0 items-center gap-1 py-1 text-xs text-muted-foreground transition-colors hover:text-foreground">
+												<span>{modelOption ? selectedChoiceName(modelOption) : 'Model settings'}{Object.keys(controlSnapshot?.pending ?? {}).length ? ' (pending)' : ''}</span>
+												<svg class="h-3 w-3 text-muted-foreground/50" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="m6 9 6 6 6-6" /></svg>
+											</button>
 										{/if}
 									</div>
-								</div>
-							{/each}
+								{:else}
+									<div class="flex-1"></div>
+								{/if}
+								{#if runningAttempt}
+									<button
+										type="button"
+										onclick={interruptAgent}
+										aria-label={!composerBlockedByElicitation && (messageInput.trim() || messageAttachments.length > 0) ? 'Interrupt and send now' : 'Interrupt agent now'}
+										title={!composerBlockedByElicitation && (messageInput.trim() || messageAttachments.length > 0) ? 'Interrupt the current work and send this message now' : 'Interrupt the current work now'}
+										disabled={messageSending || interrupting}
+									class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground shadow-[var(--shadow-control)] transition-colors hover:bg-destructive/10 hover:text-destructive disabled:cursor-not-allowed disabled:opacity-30"
+									>
+										{#if interrupting}
+											<svg class="h-4 w-4 animate-spin" fill="none" viewBox="0 0 24 24" aria-hidden="true"><circle class="opacity-25" cx="12" cy="12" r="9" stroke="currentColor" stroke-width="3"/><path class="opacity-75" fill="currentColor" d="M21 12a9 9 0 0 0-9-9v3a6 6 0 0 1 6 6z"/></svg>
+										{:else}
+											<svg class="h-3.5 w-3.5" fill="currentColor" viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="5" width="14" height="14" rx="1.5"/></svg>
+										{/if}
+									</button>
+								{/if}
+								<button
+									onclick={() => sendTaskMessage()}
+									aria-label="Send message"
+									disabled={(!messageInput.trim() && messageAttachments.length === 0) || messageSending || interrupting || configUpdating || !task.agent_id || composerBlockedByElicitation}
+								class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground transition-[background-color,transform] hover:bg-primary/90 enabled:active:scale-95 disabled:cursor-not-allowed disabled:opacity-30"
+							>
+								<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M12 19V5M5 12l7-7 7 7" /></svg>
+								</button>
+							</div>
 						</div>
 					</div>
 				{/if}
-
-				{#if task.agent_id}
-					<div class="space-y-2">
-						<h3 class="text-xs font-medium text-muted-foreground uppercase tracking-wide">Project</h3>
-						<a href="/agents/{task.agent_id}" class="text-sm underline hover:text-foreground">Open project</a>
-					</div>
-				{/if}
 			</div>
+
+			<aside id={viewId + '-details'} data-task-details-sidebar aria-label="Task details" hidden={!showDetailsSidebar} class="w-72 shrink-0 space-y-4 overflow-y-auto border-l border-border p-4">
+				{@render taskDetails(task)}
+			</aside>
 		</div>
 	{/if}
 </div>
+
+<style>
+	[data-task-transcript-scroll] { overflow-anchor: none; }
+	/* Short and phone-width panes fold the breadcrumbs into the title line. */
+	:global([data-short-pane]) .task-header,
+	:global([data-narrow-pane]) .task-header { padding: 6px 12px; }
+	:global([data-short-pane]) .task-breadcrumbs,
+	:global([data-narrow-pane]) .task-breadcrumbs,
+	:global([data-short-pane]) .task-header-schedule,
+	:global([data-short-pane]) .task-header-metadata { display: none; }
+	:global([data-short-pane]) .task-compact-project,
+	:global([data-narrow-pane]) .task-compact-project { display: flex; }
+	:global([data-short-pane]) .task-title-row,
+	:global([data-narrow-pane]) .task-title-row { flex-direction: row; align-items: center; justify-content: space-between; gap: 8px; }
+	:global([data-short-pane]) .task-title-row h1,
+	:global([data-narrow-pane]) .task-title-row h1 { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 16px; }
+	:global([data-narrow-pane]) .task-header-metadata { flex-wrap: nowrap; overflow: hidden; white-space: nowrap; margin-top: 2px; }
+	.task-action {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		width: 34px;
+		height: 34px;
+		flex-shrink: 0;
+		border-radius: 7px;
+	}
+	.task-action:hover { background: hsl(var(--accent)); }
+	.task-action:focus-visible { outline: 2px solid hsl(var(--ring)); outline-offset: 2px; }
+	.task-action:disabled { opacity: .45; cursor: wait; }
+	.task-settings-menu :global([role='menuitem']) { min-height: 40px; }
+	.task-sheet {
+		width: min(560px, calc(100vw - 24px));
+		max-height: calc(var(--planning-viewport-height, 100dvh) - 32px);
+		margin: auto;
+		padding: 0;
+		border: 1px solid hsl(var(--border));
+		border-radius: 16px;
+		background: hsl(var(--background));
+		color: hsl(var(--foreground));
+		box-shadow: 0 22px 80px #0003;
+	}
+	.task-sheet[open] { display: flex; flex-direction: column; }
+	.task-sheet::backdrop { background: #0006; }
+	.task-sheet-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 20px; border-bottom: 1px solid hsl(var(--border)); flex-shrink: 0; }
+	.task-sheet-header h2 { font-size: 16px; font-weight: 600; }
+	.task-sheet-content { min-height: 0; padding: 16px 20px; overflow-y: auto; overscroll-behavior: contain; }
+	@media (max-width: 639px), (pointer: coarse) {
+		.task-action { width: 44px; height: 44px; }
+		.task-sheet button { min-height: 44px; }
+		.task-settings-menu :global([role='menuitem']) { min-height: 44px; }
+		.task-sheet :global(input), .task-sheet :global(textarea), .task-sheet :global(select) { font-size: 16px; }
+	}
+	@media (max-width: 639px) {
+		.task-sheet { position: fixed; inset: auto 0; top: calc(var(--planning-viewport-top, 0px) + var(--planning-viewport-height, 100dvh)); transform: translateY(-100%); width: 100%; max-width: none; max-height: calc(var(--planning-viewport-height, 100dvh) - 12px); margin: 0; border-radius: 16px 16px 0 0; }
+		.task-sheet-content { padding-bottom: max(20px, env(safe-area-inset-bottom)); }
+	}
+</style>

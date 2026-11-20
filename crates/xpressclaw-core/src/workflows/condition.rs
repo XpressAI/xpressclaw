@@ -149,6 +149,44 @@ pub fn evaluate_match(match_value: &str, actual_value: &str) -> bool {
     match_value == actual_value
 }
 
+/// Resolve a workflow switch, including numeric comparisons of step outputs.
+pub(super) fn switch_value(
+    expression: &str,
+    context: &serde_json::Value,
+) -> Result<Option<serde_json::Value>> {
+    let tokens: Vec<_> = expression.split_whitespace().collect();
+    if let [left, operator @ (">" | ">=" | "<" | "<="), right] = tokens.as_slice() {
+        if left.starts_with('@') {
+            let operand = |token: &str| -> Result<f64> {
+                let value = if token.starts_with('@') {
+                    super::context::resolve_variable(token, context)
+                } else {
+                    serde_json::from_str::<serde_json::Value>(token).ok()
+                };
+                value
+                    .and_then(|value| value.as_f64())
+                    .filter(|value| value.is_finite())
+                    .ok_or_else(|| {
+                        Error::Workflow(format!(
+                            "numeric switch '{expression}' requires a finite number at '{token}'"
+                        ))
+                    })
+            };
+            let left = operand(left)?;
+            let right = operand(right)?;
+            let result = match *operator {
+                ">" => left > right,
+                ">=" => left >= right,
+                "<" => left < right,
+                "<=" => left <= right,
+                _ => unreachable!(),
+            };
+            return Ok(Some(serde_json::Value::Bool(result)));
+        }
+    }
+    Ok(super::context::resolve_variable(expression, context))
+}
+
 /// Resolve a dotted path against the task output.
 ///
 /// If the output is valid JSON, traverse the path starting from the root.
@@ -201,6 +239,38 @@ fn resolve_path(path: &[String], task_output: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn workflow_switch_compares_scores_without_coercing_missing_or_text_values() {
+        use serde_json::json;
+        let context = json!({"before":{"score":80},"after":{"score":85.5},"text":{"score":"90"}});
+        assert_eq!(
+            super::switch_value("@after.score > @before.score", &context).unwrap(),
+            Some(json!(true))
+        );
+        assert_eq!(
+            super::switch_value("@before.score > @before.score", &context).unwrap(),
+            Some(json!(false))
+        );
+        assert_eq!(
+            super::switch_value("@before.score >= 80", &context).unwrap(),
+            Some(json!(true))
+        );
+        assert_eq!(
+            super::switch_value("@before.score < 0", &context).unwrap(),
+            Some(json!(false))
+        );
+        assert_eq!(
+            super::switch_value("@before.score <= 80", &context).unwrap(),
+            Some(json!(true))
+        );
+        assert!(super::switch_value("@after.score > @missing.score", &context).is_err());
+        assert!(super::switch_value("@text.score > 80", &context).is_err());
+        assert_eq!(
+            super::switch_value("@text.score", &context).unwrap(),
+            Some(json!("90"))
+        );
+    }
+
     use super::*;
 
     // -- parse tests --

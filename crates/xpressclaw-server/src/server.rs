@@ -1,38 +1,298 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 
-use axum::extract::DefaultBodyLimit;
+use axum::extract::{DefaultBodyLimit, MatchedPath, Request, State};
+use axum::http::StatusCode;
+use axum::middleware::{self, Next};
+use axum::response::Response;
 use axum::Router;
-use tower_http::cors::CorsLayer;
+use tower_http::compression::predicate::{DefaultPredicate, NotForContentType};
+use tower_http::compression::{CompressionLayer, Predicate as _};
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
+use crate::auth::{cookie_value, InstanceAuth, CSRF_HEADER};
 use crate::frontend;
 use crate::routes;
 use crate::state::AppState;
 
+// Keep failure logs attributable at the default INFO filter. Route patterns
+// identify the handler without recording query tokens or concrete file paths.
+fn http_request_span(request: &Request) -> tracing::Span {
+    let route = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(MatchedPath::as_str)
+        .unwrap_or("unmatched");
+    tracing::info_span!("http_request", method = %request.method(), route)
+}
+
+fn http_compression_layer(
+) -> CompressionLayer<tower_http::compression::predicate::And<DefaultPredicate, NotForContentType>>
+{
+    CompressionLayer::new()
+        .gzip(true)
+        .br(true)
+        .compress_when(DefaultPredicate::new().and(NotForContentType::new("text/event-stream")))
+}
+
 /// Create the main Axum router with all routes.
 pub fn create_router(state: AppState) -> Router {
+    let api = routes::public_api_routes(&state);
     Router::new()
-        .nest("/api", routes::api_routes())
+        .nest("/api", api)
         // Serve embedded SvelteKit frontend for all other paths
         .fallback(frontend::serve_frontend)
         // Base64 encoding expands image messages beyond Axum's 2 MiB JSON default.
         // Message handlers enforce tighter decoded per-image and aggregate limits.
         .layer(DefaultBodyLimit::max(30 * 1024 * 1024))
-        .layer(CorsLayer::permissive())
-        .layer(TraceLayer::new_for_http())
+        .layer(http_compression_layer())
+        .layer(TraceLayer::new_for_http().make_span_with(http_request_span))
         .with_state(state)
 }
 
-/// Start the HTTP server.
+fn create_unprotected_router(state: AppState) -> Router {
+    let api = routes::api_routes(&state);
+    Router::new()
+        .nest("/api", api)
+        .fallback(frontend::serve_frontend)
+        .layer(DefaultBodyLimit::max(30 * 1024 * 1024))
+        .layer(http_compression_layer())
+        .layer(TraceLayer::new_for_http().make_span_with(http_request_span))
+        .with_state(state)
+}
+
+fn create_internal_router(state: AppState, token: Arc<str>) -> Router {
+    create_unprotected_router(state.clone())
+        .merge(
+            Router::new()
+                .nest("/api", routes::internal_api_routes())
+                .with_state(state),
+        )
+        .layer(middleware::from_fn_with_state(
+            token,
+            require_internal_token,
+        ))
+}
+
+/// Authenticate the complete public user-facing API boundary, including SSE
+/// streams and WebSocket upgrade requests. The runner callback router never
+/// uses this middleware and retains its independent capability.
+pub(crate) async fn require_user_session(
+    State(auth): State<Arc<InstanceAuth>>,
+    request: Request,
+    next: Next,
+) -> Result<Response, Response> {
+    if !auth.enabled() {
+        return Ok(next.run(request).await);
+    }
+
+    let Some(cookie) = cookie_value(request.headers()) else {
+        return Err(routes::auth::unauthorized());
+    };
+    if auth.authenticate(cookie).is_none() {
+        return Err(routes::auth::unauthorized());
+    }
+
+    if !routes::auth::is_safe_method(request.method()) {
+        let Some(csrf) = request
+            .headers()
+            .get(CSRF_HEADER)
+            .and_then(|value| value.to_str().ok())
+        else {
+            return Err(routes::auth::error_response(
+                StatusCode::FORBIDDEN,
+                "CSRF token required",
+            ));
+        };
+        if !auth.verify_csrf(cookie, csrf) {
+            return Err(routes::auth::error_response(
+                StatusCode::FORBIDDEN,
+                "CSRF token is invalid or expired",
+            ));
+        }
+    }
+
+    Ok(next.run(request).await)
+}
+
+async fn require_internal_token(
+    State(token): State<Arc<str>>,
+    request: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let supplied = request
+        .headers()
+        .get("x-xpressclaw-internal-token")
+        .and_then(|value| value.to_str().ok());
+    let supplied_agent = request
+        .headers()
+        .get("x-xpressclaw-agent-id")
+        .and_then(|value| value.to_str().ok());
+    // Git's smart-HTTP client cannot attach the callback header. This one
+    // narrow route authenticates independently with a per-Agent revocable
+    // Basic capability before proxying to GitBucket; every other callback
+    // route still requires the process-scoped internal token.
+    let collaboration_git_proxy = request
+        .uri()
+        .path()
+        .starts_with("/api/settings/collaboration/agent/git/");
+    let callback_path = request.uri().path();
+    let agent_capability_route = (callback_path.starts_with("/api/workspaces/")
+        && callback_path.ends_with("/repository/resolve-github"))
+        || (callback_path.starts_with("/api/tasks/") && callback_path.ends_with("/pull-requests"))
+        || supplied_agent.is_some_and(|agent| {
+            environment_agent_capability_route(request.method(), callback_path, agent)
+        });
+    let agent_capability_matches =
+        supplied_agent
+            .zip(supplied)
+            .is_some_and(|(agent_id, supplied)| {
+                xpressclaw_core::repositories::verify_agent_callback_capability(
+                    token.as_ref(),
+                    agent_id,
+                    supplied,
+                )
+            });
+    let connected_capability_matches =
+        supplied_agent
+            .zip(supplied)
+            .is_some_and(|(agent, supplied)| {
+                xpressclaw_core::connect::verify_callback_capability(
+                    token.as_ref(),
+                    agent,
+                    supplied,
+                ) && connected_capability_route(request.method(), callback_path)
+            });
+    if !(supplied == Some(token.as_ref())
+        || connected_capability_matches
+        || (agent_capability_matches && agent_capability_route)
+        || collaboration_git_proxy)
+    {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(next.run(request).await)
+}
+
+fn connected_capability_route(method: &axum::http::Method, path: &str) -> bool {
+    use axum::http::Method;
+    let parts: Vec<_> = path.split('/').collect();
+    match parts.as_slice() {
+        ["", "api", "settings", "connect", "conversations" | "commands", id, "tools"] => {
+            *method == Method::POST && uuid::Uuid::parse_str(id).is_ok()
+        }
+        ["", "api", "workspaces", _, "repository", "resolve-github"] => *method == Method::POST,
+        _ => false,
+    }
+}
+
+fn environment_agent_capability_route(
+    method: &axum::http::Method,
+    path: &str,
+    agent_id: &str,
+) -> bool {
+    use axum::http::Method;
+    let parts: Vec<_> = path.split('/').collect();
+    match parts.as_slice() {
+        ["", "api", "environments", agent, "ports"] if *agent == agent_id => {
+            matches!(*method, Method::GET | Method::POST)
+        }
+        ["", "api", "environments", agent, "ports", id] if *agent == agent_id && !id.is_empty() => {
+            *method == Method::DELETE
+        }
+        ["", "api", "environments", agent, "tasks"] if *agent == agent_id => {
+            matches!(*method, Method::GET | Method::POST)
+        }
+        ["", "api", "environments", agent, "agents"] if *agent == agent_id => {
+            *method == Method::GET
+        }
+        ["", "api", "environments", agent, "workflows"] if *agent == agent_id => {
+            matches!(*method, Method::GET | Method::POST)
+        }
+        ["", "api", "environments", agent, "workflows", "schedule"] if *agent == agent_id => {
+            *method == Method::POST
+        }
+        ["", "api", "environments", agent, "workflows", workflow]
+            if *agent == agent_id && !workflow.is_empty() =>
+        {
+            matches!(*method, Method::GET | Method::PATCH)
+        }
+        ["", "api", "environments", agent, "tasks", "batch"] if *agent == agent_id => {
+            *method == Method::POST
+        }
+        ["", "api", "environments", agent, "tasks", task]
+            if *agent == agent_id && !task.is_empty() =>
+        {
+            *method == Method::GET
+        }
+        ["", "api", "environments", agent, "tasks", task, "planning"]
+            if *agent == agent_id && !task.is_empty() =>
+        {
+            *method == Method::PATCH
+        }
+        ["", "api", "environments", agent, "tasks", task, "review"]
+            if *agent == agent_id && !task.is_empty() =>
+        {
+            *method == Method::POST
+        }
+        ["", "api", "environments", agent, "tasks", task, "files"]
+            if *agent == agent_id && !task.is_empty() =>
+        {
+            *method == Method::POST
+        }
+        _ => false,
+    }
+}
+
+/// Start the HTTP server on the safe local default.
 pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
+    serve_on(state, IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port).await
+}
+
+/// Start the HTTP server on an explicitly selected client address.
+pub async fn serve_on(state: AppState, bind: IpAddr, port: u16) -> anyhow::Result<()> {
+    serve_on_with_bound_callback(state, bind, port, || Ok(())).await
+}
+
+/// Start the HTTP server and invoke `on_bound` only after both public and
+/// runner-callback listeners are owned by this process. Launchers use this
+/// boundary to publish per-start credentials without announcing a token from
+/// a process that will subsequently lose a port race.
+pub async fn serve_on_with_bound_callback(
+    state: AppState,
+    bind: IpAddr,
+    port: u16,
+    on_bound: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
     // Log frontend embed status (debug diagnostic)
     crate::frontend::log_frontend_status();
 
+    // Browsers use the requested address. Runner containers use a separate,
+    // ephemeral callback listener because Docker/Podman's host gateway cannot
+    // reach a host service bound only to loopback on Linux. Every callback
+    // request requires a per-process capability that is injected into the
+    // bundled MCP processes and never exposed to the browser.
+    let public_addr = SocketAddr::new(bind, port);
+    let public_listener = tokio::net::TcpListener::bind(public_addr).await?;
+    let internal_listener = tokio::net::TcpListener::bind("0.0.0.0:0").await?;
+    let internal_port = internal_listener.local_addr()?.port();
+    state
+        .runner_callback_port
+        .store(internal_port, std::sync::atomic::Ordering::Relaxed);
+    let internal_token: Arc<str> = Arc::from(uuid::Uuid::new_v4().simple().to_string());
     let config = state.config();
+    // Refresh generated policy from durable configuration after owning both
+    // listeners, including YAML edits made while this instance was stopped.
+    xpressclaw_core::proxy::service::write_policy(&config.system.data_dir, &config.proxy)?;
+    on_bound()?;
 
     // Shutdown token: cancels all background tasks on Ctrl+C.
     let shutdown = tokio_util::sync::CancellationToken::new();
+
+    tokio::spawn(crate::routes::project_storage::run_retention(
+        state.clone(),
+        shutdown.clone(),
+    ));
 
     // Ensure every configured runtime context has a durable logical session.
     {
@@ -45,20 +305,25 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
         }
     }
 
-    // A process restart severs ownership of in-flight worker containers.
-    // Remove any leftovers, restore their durable queue records, and let the
-    // normal dispatcher retry them from a known state.
+    // A process restart severs ownership of in-flight ACP processes. Stop
+    // retained project containers without deleting their writable layers,
+    // remove obsolete containers owned by this installation, then retry
+    // durable work. Foreign and unlabelled containers are not enumerated.
     let dispatcher_docker = state.docker().await;
     if let Some(docker) = dispatcher_docker.as_ref() {
         match docker.list().await {
             Ok(containers) => {
                 for container in containers {
                     let is_attempt = container.agent_id.starts_with("attempt-");
-                    let is_legacy_session = config
+                    let is_configured_project = config
                         .agents
                         .iter()
                         .any(|agent| agent.name == container.agent_id);
-                    if is_attempt || is_legacy_session {
+                    let is_project_container =
+                        docker.is_project_container(&container.agent_id).await;
+                    if is_project_container && is_configured_project {
+                        let _ = docker.stop_preserving(&container.agent_id).await;
+                    } else if is_attempt || is_project_container || is_configured_project {
                         let _ = docker.stop(&container.agent_id).await;
                     }
                 }
@@ -74,6 +339,26 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
         _ => {}
     }
 
+    // Older builds treated ACP plan rows as durable child tasks. Reconcile
+    // only parents whose latest attempt already succeeded and which have no
+    // queued or active work, then let workflow recovery advance any repaired
+    // step normally.
+    match xpressclaw_core::tasks::board::TaskBoard::new(state.db.clone())
+        .reconcile_finished_reported_plans()
+    {
+        Ok(reconciliation)
+            if reconciliation.deferred_items > 0 || !reconciliation.completed_tasks.is_empty() =>
+        {
+            info!(
+                deferred_plan_items = reconciliation.deferred_items,
+                completed_tasks = reconciliation.completed_tasks.len(),
+                "reconciled completed work stranded by legacy ACP plans"
+            )
+        }
+        Err(error) => warn!(error = %error, "failed to reconcile legacy ACP plans"),
+        _ => {}
+    }
+
     // Recover workflow bookkeeping before workers can claim recovered tasks.
     {
         let engine = xpressclaw_core::workflows::engine::WorkflowEngine::new(state.db.clone());
@@ -83,14 +368,37 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
         }
     }
 
-    // Consume tasks with short-lived ACP agent workers. The former harness
-    // dispatcher and desired-state agent reconciler are intentionally not
-    // started: runtime contexts are durable sessions, not long-running loops.
+    xpressclaw_core::connect::ConnectJournal::new(state.db.clone()).recover()?;
+    let connect_state = state.clone();
+    let connect_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = crate::connect::run(connect_state) => {},
+            _ = connect_shutdown.cancelled() => {},
+        }
+    });
+    let lease_state = state.clone();
+    let lease_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = crate::connect::watch_leases(lease_state) => {},
+            _ = lease_shutdown.cancelled() => {},
+        }
+    });
+
+    // Consume tasks with ACP agent processes inside retained project
+    // containers. The former harness dispatcher and desired-state agent
+    // reconciler remain disabled: runtime contexts are durable sessions, not
+    // long-running autonomous loops.
     let dispatcher_db = state.db.clone();
     let dispatcher_config = state.config.clone();
     let dispatcher_event_bus = state.event_bus.clone();
     let dispatcher_elicitations = state.elicitations.clone();
     let dispatcher_turn_controls = state.turn_controls.clone();
+    let dispatcher_conversation_processes = state.conversation_processes.clone();
+    let dispatcher_project_processes = state.project_processes.clone();
+    let dispatcher_runtime_lifecycle = state.native_runtime_lifecycle.clone();
+    let dispatcher_control_token = internal_token.clone();
     let dispatcher_shutdown = shutdown.clone();
     tokio::spawn(async move {
         tokio::select! {
@@ -98,10 +406,16 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
                 dispatcher_db,
                 dispatcher_config,
                 dispatcher_docker,
-                dispatcher_event_bus,
-                dispatcher_elicitations,
-                dispatcher_turn_controls,
-                port,
+                xpressclaw_core::workers::native::NativeDispatcherServices {
+                    event_bus: dispatcher_event_bus,
+                    elicitation_broker: dispatcher_elicitations,
+                    turn_controls: dispatcher_turn_controls,
+                    conversation_processes: dispatcher_conversation_processes,
+                    project_processes: dispatcher_project_processes,
+                    runtime_lifecycle: dispatcher_runtime_lifecycle,
+                    control_plane_token: dispatcher_control_token,
+                },
+                internal_port,
             ) => {}
             _ = dispatcher_shutdown.cancelled() => { info!("dispatcher stopped"); }
         }
@@ -109,34 +423,89 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
 
     // Start the cron schedule runner.
     let scheduler_db = state.db.clone();
+    let scheduler_event_bus = state.event_bus.clone();
     let scheduler_shutdown = shutdown.clone();
     tokio::spawn(async move {
         tokio::select! {
-            _ = xpressclaw_core::tasks::scheduler::start_schedule_runner(scheduler_db) => {}
+            _ = xpressclaw_core::tasks::scheduler::start_schedule_runner_with_events(
+                scheduler_db,
+                Some(scheduler_event_bus),
+            ) => {}
             _ = scheduler_shutdown.cancelled() => { info!("scheduler stopped"); }
         }
     });
 
-    let app = create_router(state.clone());
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    // Start automatic cron triggers for multi-step workflows.
+    let workflow_scheduler_db = state.db.clone();
+    let workflow_scheduler_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = xpressclaw_core::workflows::scheduler::start_schedule_runner(workflow_scheduler_db) => {}
+            _ = workflow_scheduler_shutdown.cancelled() => { info!("workflow scheduler stopped"); }
+        }
+    });
 
-    info!("xpressclaw server listening on http://{addr}");
+    // Resume durable workflow event waits (for example PR review activity).
+    // The bound agent selects the project workspace and scoped GitHub access;
+    // no worker container remains alive while the workflow is sleeping.
+    let workflow_wait_db = state.db.clone();
+    let workflow_wait_config = state.config.clone();
+    let workflow_wait_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = xpressclaw_core::workflows::waits::start_wait_runner(workflow_wait_db, workflow_wait_config) => {}
+            _ = workflow_wait_shutdown.cancelled() => { info!("workflow wait runner stopped"); }
+        }
+    });
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    // Keep ordinary PR-producing tasks open through human/automated review.
+    // New feedback resumes the same task conversation; approval or merge
+    // releases the agent's queue lane and completes the task.
+    let github_review_db = state.db.clone();
+    let github_review_config = state.config.clone();
+    let github_review_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = xpressclaw_core::workers::github_review::start_review_runner(
+                github_review_db,
+                github_review_config,
+            ) => {}
+            _ = github_review_shutdown.cancelled() => { info!("GitHub task review runner stopped"); }
+        }
+    });
 
-    // Cancel all background tasks immediately
+    let public_app = create_router(state.clone());
+    let internal_app = create_internal_router(state.clone(), internal_token);
+
+    info!("xpressclaw server listening on http://{public_addr}");
+    info!(port = internal_port, "runner callback listener ready");
+
+    let signal_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        signal_shutdown.cancel();
+    });
+    let public_shutdown = shutdown.clone();
+    let internal_shutdown = shutdown.clone();
+    let servers = tokio::try_join!(
+        axum::serve(
+            public_listener,
+            public_app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(public_shutdown.cancelled_owned()),
+        axum::serve(internal_listener, internal_app)
+            .with_graceful_shutdown(internal_shutdown.cancelled_owned()),
+    );
     shutdown.cancel();
+    servers?;
 
     // Graceful shutdown: stop containers with a timeout.
     // A second Ctrl+C during shutdown forces immediate exit.
     info!("shutting down — stopping containers (Ctrl+C again to force quit)");
 
     let shutdown_task = async {
-        if let Ok(docker) = xpressclaw_core::docker::manager::DockerManager::connect().await {
-            let _ = docker.stop_all().await;
+        if let Some(docker) = state.docker().await {
+            let _ = docker.stop_all_for_shutdown().await;
             info!("all containers stopped");
         }
     };
@@ -175,5 +544,725 @@ async fn shutdown_signal() {
             .await
             .expect("failed to install Ctrl+C handler");
         info!("received shutdown signal");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::Body;
+    use axum::extract::connect_info::MockConnectInfo;
+    use axum::http::{header, Request};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+    use xpressclaw_core::config::Config;
+    use xpressclaw_core::db::Database;
+    use zeroize::Zeroizing;
+
+    use super::*;
+
+    fn state() -> AppState {
+        let mut config = Config::default();
+        config.system.data_dir = std::env::temp_dir().join(format!(
+            "xpressclaw-empty-callback-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        AppState::new(
+            Arc::new(config),
+            Arc::new(Database::open_memory().unwrap()),
+            None,
+            "test.yaml".into(),
+            true,
+        )
+    }
+
+    fn authenticated_state() -> (AppState, Zeroizing<String>) {
+        let root = tempfile::tempdir().unwrap().keep();
+        let mut config = Config::default();
+        config.system.data_dir = root.clone();
+        config.system.workspace_dir = root.join("workspaces");
+        config.instance.authentication_enabled = true;
+        let effective = config.instance.clone();
+        let db = Arc::new(Database::open_memory().unwrap());
+        let token = Zeroizing::new("test-startup-token-with-enough-entropy".to_string());
+        let state = AppState::new_with_instance(
+            Arc::new(config),
+            db,
+            None,
+            root.join("xpressclaw.yaml"),
+            true,
+            effective,
+            Some(token.clone()),
+        )
+        .unwrap();
+        (state, token)
+    }
+
+    async fn json_body(response: Response) -> serde_json::Value {
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn login_session(app: &Router, token: &str) -> (String, String) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/api/auth/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "credential": token }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        let body = json_body(response).await;
+        (cookie, body["csrf_token"].as_str().unwrap().to_string())
+    }
+
+    #[tokio::test]
+    async fn connected_callback_cannot_schedule_local_tasks_or_change_settings() {
+        let app = create_internal_router(state(), Arc::from("root-secret"));
+        let capability = xpressclaw_core::connect::callback_capability("root-secret", "atlas");
+        for (method, path, agent, allowed) in [
+            (
+                "POST",
+                "/api/settings/connect/commands/00000000-0000-0000-0000-000000000001/tools",
+                "atlas",
+                true,
+            ),
+            (
+                "GET",
+                "/api/settings/connect/commands/00000000-0000-0000-0000-000000000001/tools",
+                "atlas",
+                false,
+            ),
+            (
+                "POST",
+                "/api/settings/connect/conversations/00000000-0000-0000-0000-000000000001/tools",
+                "atlas",
+                true,
+            ),
+            (
+                "POST",
+                "/api/settings/connect/conversations/00000000-0000-0000-0000-000000000001/tools",
+                "other",
+                false,
+            ),
+            ("POST", "/api/environments/atlas/tasks", "atlas", false),
+            ("POST", "/api/environments/atlas/ports", "atlas", false),
+            ("GET", "/api/environments/atlas/ports", "atlas", false),
+            (
+                "DELETE",
+                "/api/environments/atlas/ports/mapping",
+                "atlas",
+                false,
+            ),
+            ("POST", "/api/settings/connect/pair", "atlas", false),
+            ("DELETE", "/api/settings/connect", "atlas", false),
+            ("GET", "/api/agents", "atlas", false),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header("x-xpressclaw-internal-token", &capability)
+                        .header("x-xpressclaw-agent-id", agent)
+                        .header("content-type", "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status() != StatusCode::UNAUTHORIZED,
+                allowed,
+                "{method} {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn project_planning_capabilities_are_bound_to_the_calling_agent() {
+        for (method, path) in [
+            ("GET", "/api/environments/atlas/agents"),
+            ("GET", "/api/environments/atlas/tasks"),
+            ("POST", "/api/environments/atlas/tasks/batch"),
+            ("GET", "/api/environments/atlas/tasks/task-1"),
+            ("PATCH", "/api/environments/atlas/tasks/task-1/planning"),
+            ("POST", "/api/environments/atlas/tasks/task-1/review"),
+            ("GET", "/api/environments/atlas/workflows"),
+            ("POST", "/api/environments/atlas/workflows"),
+            ("POST", "/api/environments/atlas/workflows/schedule"),
+            ("GET", "/api/environments/atlas/workflows/workflow-1"),
+            ("PATCH", "/api/environments/atlas/workflows/workflow-1"),
+        ] {
+            let method = method.parse().unwrap();
+            assert!(
+                environment_agent_capability_route(&method, path, "atlas"),
+                "{path}"
+            );
+            assert!(
+                !environment_agent_capability_route(&method, path, "other"),
+                "{path}"
+            );
+            assert!(!connected_capability_route(&method, path), "{path}");
+        }
+        for path in [
+            "/api/agents",
+            "/api/tasks",
+            "/api/workflows",
+            "/api/environments/atlas/workflows/id/delete",
+            "/api/environments/atlas/tasks/id/admin",
+        ] {
+            assert!(
+                !environment_agent_capability_route(&axum::http::Method::GET, path, "atlas"),
+                "{path}"
+            );
+            assert!(
+                !environment_agent_capability_route(&axum::http::Method::POST, path, "atlas"),
+                "{path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn runner_callback_listener_requires_its_ephemeral_capability() {
+        let token: Arc<str> = Arc::from("internal-secret");
+        let app = create_internal_router(state(), token);
+
+        let unauthorized = app
+            .clone()
+            .oneshot(Request::get("/api/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let independently_authenticated_git_proxy = app
+            .clone()
+            .oneshot(
+                Request::get(
+                    "/api/settings/collaboration/agent/git/xpressclaw-agent/demo/info/refs?service=git-receive-pack",
+                )
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            independently_authenticated_git_proxy.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        let agent_capability =
+            xpressclaw_core::repositories::agent_callback_capability("internal-secret", "atlas");
+        let overbroad_agent_request = app
+            .clone()
+            .oneshot(
+                Request::get("/api/health")
+                    .header("x-xpressclaw-internal-token", &agent_capability)
+                    .header("x-xpressclaw-agent-id", "atlas")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(overbroad_agent_request.status(), StatusCode::UNAUTHORIZED);
+        for (method, path, expected) in [
+            (
+                "GET",
+                "/api/environments/atlas/ports",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "GET",
+                "/api/environments/helper/ports",
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                "GET",
+                "/api/environments/atlas/file?path=/tmp/report",
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                "PUT",
+                "/api/environments/atlas/ports",
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                "POST",
+                "/api/environments/atlas/tasks/one/files/extra",
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                "GET",
+                "/api/environments/atlas/future-admin-route",
+                StatusCode::UNAUTHORIZED,
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header("x-xpressclaw-internal-token", &agent_capability)
+                        .header("x-xpressclaw-agent-id", "atlas")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{method} {path}");
+        }
+        let agent_authorized = app
+            .clone()
+            .oneshot(
+                Request::post("/api/workspaces/atlas/repository/resolve-github")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-xpressclaw-internal-token", &agent_capability)
+                    .header("x-xpressclaw-agent-id", "atlas")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(agent_authorized.status(), StatusCode::NOT_FOUND);
+        let cross_agent = app
+            .clone()
+            .oneshot(
+                Request::post("/api/workspaces/zephyr/repository/resolve-github")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-xpressclaw-internal-token", &agent_capability)
+                    .header("x-xpressclaw-agent-id", "zephyr")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cross_agent.status(), StatusCode::UNAUTHORIZED);
+
+        let mismatched_registration = app
+            .clone()
+            .oneshot(
+                Request::post("/api/tasks/task/pull-requests")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-xpressclaw-internal-token", &agent_capability)
+                    .header("x-xpressclaw-agent-id", "atlas")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "agent_id": "zephyr",
+                            "phase": "register",
+                            "url": "https://github.com/XpressAI/xpressclaw/pull/1"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mismatched_registration.status(), StatusCode::FORBIDDEN);
+
+        let authorized = app
+            .oneshot(
+                Request::get("/api/health")
+                    .header("x-xpressclaw-internal-token", "internal-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authorized.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn public_auth_gates_http_stream_file_and_websocket_route_families() {
+        let (state, token) = authenticated_state();
+        let app =
+            create_router(state).layer(MockConnectInfo(SocketAddr::from(([192, 0, 2, 9], 43100))));
+
+        for path in [
+            "/api/agents",
+            "/api/dashboard/stream?range=1h",
+            "/api/dashboard/resources",
+            "/api/settings/speech",
+            "/api/conversations/example/attachments/example",
+            "/api/tasks/example/messages/1/attachments/example",
+            "/api/settings/collaboration/agent/git/example/repository/info/refs?service=git-receive-pack",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+        }
+        let websocket = app
+            .clone()
+            .oneshot(
+                Request::get("/api/workspaces/example/terminal")
+                    .header(header::CONNECTION, "upgrade")
+                    .header(header::UPGRADE, "websocket")
+                    .header("sec-websocket-version", "13")
+                    .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(websocket.status(), StatusCode::UNAUTHORIZED);
+
+        let health = app
+            .clone()
+            .oneshot(Request::get("/api/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+        let bootstrap = app
+            .clone()
+            .oneshot(
+                Request::get("/api/auth/bootstrap")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bootstrap.status(), StatusCode::OK);
+
+        let (cookie, _) = login_session(&app, &token).await;
+        let agents = app
+            .oneshot(
+                Request::get("/api/agents")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(agents.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn authenticated_mutations_require_matching_csrf_and_logout_revokes_session() {
+        let (state, token) = authenticated_state();
+        let app =
+            create_router(state).layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 43101))));
+        let (cookie, csrf) = login_session(&app, &token).await;
+        for (method, path) in [
+            ("PUT", "/api/settings/speech"),
+            ("POST", "/api/speech/transcriptions"),
+            ("POST", "/api/speech/synthesize"),
+        ] {
+            for (session, expected) in [
+                (None, StatusCode::UNAUTHORIZED),
+                (Some(&cookie), StatusCode::FORBIDDEN),
+            ] {
+                let mut request = Request::builder().method(method).uri(path);
+                if let Some(session) = session {
+                    request = request.header(header::COOKIE, session);
+                }
+                let response = app
+                    .clone()
+                    .oneshot(request.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), expected, "{method} {path}");
+            }
+        }
+        let body = serde_json::json!({ "name": "Protected project" }).to_string();
+
+        let missing = app
+            .clone()
+            .oneshot(
+                Request::post("/api/projects")
+                    .header(header::COOKIE, &cookie)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::FORBIDDEN);
+
+        let accepted = app
+            .clone()
+            .oneshot(
+                Request::post("/api/projects")
+                    .header(header::COOKIE, &cookie)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(crate::auth::CSRF_HEADER, &csrf)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::CREATED);
+
+        let logout = app
+            .clone()
+            .oneshot(
+                Request::post("/api/auth/logout")
+                    .header(header::COOKIE, &cookie)
+                    .header(crate::auth::CSRF_HEADER, &csrf)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(logout.status(), StatusCode::NO_CONTENT);
+        let stale = app
+            .oneshot(
+                Request::get("/api/agents")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn browser_auth_never_replaces_the_runner_callback_capability() {
+        let (state, _) = authenticated_state();
+        let internal = create_internal_router(state, Arc::from("runner-capability"));
+        let authorized = internal
+            .oneshot(
+                Request::get("/api/agents")
+                    .header("x-xpressclaw-internal-token", "runner-capability")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authorized.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn relogin_prevents_session_fixation_and_https_origin_sets_secure_cookie() {
+        let (state, token) = authenticated_state();
+        let app =
+            create_router(state).layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 43102))));
+        let (old_cookie, _) = login_session(&app, &token).await;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/api/auth/login")
+                    .header(header::COOKIE, &old_cookie)
+                    .header(header::ORIGIN, "https://xpressclaw.example")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "credential": token.as_str() }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let set_cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(set_cookie.contains("; Secure"));
+        let new_cookie = set_cookie.split(';').next().unwrap().to_string();
+        assert_ne!(new_cookie, old_cookie);
+
+        let stale = app
+            .clone()
+            .oneshot(
+                Request::get("/api/agents")
+                    .header(header::COOKIE, old_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::UNAUTHORIZED);
+        let current = app
+            .oneshot(
+                Request::get("/api/agents")
+                    .header(header::COOKIE, new_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(current.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn authentication_payloads_do_not_inherit_the_attachment_body_limit() {
+        let (state, _) = authenticated_state();
+        let app =
+            create_router(state).layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 43103))));
+        let response = app
+            .oneshot(
+                Request::post("/api/auth/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "credential": "x".repeat(9 * 1024) }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn settings_pages_reach_json_routes_and_unknown_api_paths_are_not_html() {
+        let app = create_router(state())
+            .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 43104))));
+
+        // The exact paths the settings pages request.
+        for (path, field) in [
+            ("/api/settings/connect", "paired"),
+            ("/api/settings/instance", "instance_id"),
+            ("/api/settings/proxy", "config"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert!(json_body(response).await.get(field).is_some(), "{path}");
+        }
+
+        // Saving uses the same canonical endpoint. An invalid policy should
+        // reach validation without starting the gateway or changing settings.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::put("/api/settings/proxy")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "enabled": false,
+                            "blocked_domains": ["https://example.com"]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(json_body(response).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("Invalid domain"));
+
+        // A nested router's "/" does not match a trailing slash. That must
+        // fail as a JSON 404 rather than fall back to the SPA's index.html,
+        // on every listener that shares the frontend fallback.
+        for router in [app, create_unprotected_router(state())] {
+            for path in [
+                "/api/settings/connect/",
+                "/api/settings/proxy/",
+                "/api/does-not-exist",
+                "/api",
+            ] {
+                let response = router
+                    .clone()
+                    .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+                assert_eq!(
+                    response.headers()[header::CONTENT_TYPE],
+                    "application/json",
+                    "{path}"
+                );
+                assert_eq!(
+                    response.headers()[header::CACHE_CONTROL],
+                    "no-store",
+                    "{path}"
+                );
+                assert!(json_body(response).await["error"].is_string(), "{path}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn router_compresses_json_payloads_without_buffering_sse_streams() {
+        let s = state();
+        s.db.with_conn(|conn| {
+            for idx in 0..20 {
+                conn.execute(
+                    "INSERT INTO projects (id, name, description) VALUES (?1, ?2, ?3)",
+                    [
+                        format!("proj-{idx}"),
+                        format!("Project {idx}"),
+                        "Repeated project description payload to exceed compression threshold "
+                            .repeat(4),
+                    ],
+                )?;
+            }
+            Ok::<(), xpressclaw_core::error::Error>(())
+        })
+        .unwrap();
+        let app =
+            create_router(s).layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 43105))));
+
+        let json_resp = app
+            .clone()
+            .oneshot(
+                Request::get("/api/projects")
+                    .header(header::ACCEPT_ENCODING, "gzip, br")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(json_resp.status(), StatusCode::OK);
+        let encoding = json_resp
+            .headers()
+            .get(header::CONTENT_ENCODING)
+            .and_then(|val| val.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            encoding == "gzip" || encoding == "br",
+            "expected compressed JSON response, got Content-Encoding={encoding:?}"
+        );
+
+        let mut sse_resp = app
+            .oneshot(
+                Request::get("/api/ui/stream")
+                    .header(header::ACCEPT_ENCODING, "gzip, br")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sse_resp.status(), StatusCode::OK);
+        assert!(
+            sse_resp.headers().get(header::CONTENT_ENCODING).is_none(),
+            "SSE streams must never be compressed or buffered"
+        );
+        let first_frame = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            sse_resp.body_mut().frame(),
+        )
+        .await
+        .expect("initial SSE revisions frame should flush immediately")
+        .unwrap()
+        .unwrap();
+        let text = String::from_utf8(first_frame.into_data().unwrap().to_vec()).unwrap();
+        assert!(text.contains("event: revisions"));
     }
 }

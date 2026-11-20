@@ -1,0 +1,145 @@
+name: __WORKFLOW_NAME__
+description: Turn requirements into a challenged, detailed specification with acceptance criteria and implementation slices.
+version: 1
+
+inputs:
+  requirements:
+    type: string
+    description: Problem, request, or source requirements to specify.
+    required: true
+  context:
+    type: string
+    description: Relevant product, repository, organization, or domain context.
+    default: Use the available workspace and connected knowledge sources.
+  audience:
+    type: string
+    description: People who should be able to use the final specification.
+    default: Product, design, engineering, operations, and other delivery roles
+  drafter:
+    type: agent
+    description: Agent context that researches and writes the specification.
+    required: true
+    primary: true
+  challenger:
+    type: agent
+    description: Independent Agent that challenges gaps and assumptions.
+    required: true
+
+flows:
+  main:
+    color: "#a855f7"
+    steps:
+      - id: gather_context
+        type: step
+        label: Gather product and delivery context
+        agent: "@drafter"
+        prompt: |
+          Investigate the context needed to specify these requirements:
+
+          @requirements
+
+          Starting context: @context
+          Intended audience: @audience
+
+          Use the available workspace and connected knowledge sources when useful.
+          This may be product, policy, operations, research, or software work; do
+          not assume code is the deliverable. Separate facts, constraints,
+          assumptions, open questions, and unavailable context.
+        outputs:
+          context_summary:
+            type: string
+            description: Evidence-backed context and constraints.
+          assumptions:
+            type: array
+            description: Assumptions that need validation.
+          open_questions:
+            type: array
+            description: Missing decisions or information.
+
+      - id: draft_design
+        type: step
+        label: Draft high-level design
+        agent: "@drafter"
+        prompt: |
+          Draft a high-level design for these requirements:
+
+          @requirements
+
+          Context: @gather_context.context_summary
+          Assumptions: @gather_context.assumptions
+          Open questions: @gather_context.open_questions
+
+          Cover users and outcomes, scope and non-goals, proposed behavior or
+          process, dependencies, data or artifacts, risks, rollout, and validation.
+          Be explicit where a decision is provisional.
+        outputs:
+          design:
+            type: string
+            description: High-level design suitable for independent critique.
+          decisions:
+            type: array
+            description: Material design decisions and tradeoffs.
+          risks:
+            type: array
+            description: Delivery, product, operational, or technical risks.
+
+      - id: challenge_design
+        type: step
+        label: Challenge missing requirements
+        agent: "@challenger"
+        new_session: true
+        prompt: |
+          Independently challenge this proposed design:
+
+          Requirements: @requirements
+          Context: @gather_context.context_summary
+          Design: @draft_design.design
+          Decisions: @draft_design.decisions
+          Risks: @draft_design.risks
+
+          Look for missing users, ambiguous outcomes, hidden assumptions, unsafe or
+          untestable requirements, edge cases, operational gaps, conflicting goals,
+          and premature implementation choices. Do not rewrite the design yet.
+        outputs:
+          gaps:
+            type: array
+            description: Missing, ambiguous, or contradictory requirements.
+          challenges:
+            type: array
+            description: Assumptions and decisions that need stronger justification.
+          recommendations:
+            type: array
+            description: Concrete changes needed in the detailed specification.
+
+      - id: write_specification
+        type: step
+        label: Produce detailed specification
+        agent: "@drafter"
+        prompt: |
+          Produce a detailed specification for @audience from:
+
+          Requirements: @requirements
+          Context: @gather_context.context_summary
+          High-level design: @draft_design.design
+          Independent gaps: @challenge_design.gaps
+          Independent challenges: @challenge_design.challenges
+          Recommendations: @challenge_design.recommendations
+
+          Resolve or explicitly retain each challenged assumption. Include problem
+          and outcomes, scope and non-goals, actors, detailed requirements, flows or
+          behavior, edge cases, dependencies, risks, observability or evaluation,
+          rollout, acceptance criteria, and small independently deliverable
+          implementation slices. Preserve open questions that truly require a person.
+        outputs:
+          specification:
+            type: string
+            description: Complete detailed specification.
+          acceptance_criteria:
+            type: array
+            description: Observable criteria that determine whether the work is done.
+          implementation_slices:
+            type: array
+            description: Ordered, independently useful delivery slices.
+          open_questions:
+            type: array
+            description: Remaining decisions that require human input.

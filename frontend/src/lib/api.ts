@@ -1,19 +1,107 @@
 const BASE = '';
+let csrfToken: string | null = null;
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+type ApiRevisionObserver = (headerValue: string, path: string) => void;
+let apiRevisionObserver: ApiRevisionObserver | null = null;
+const earlyRevisionHeaders: Array<{ headerValue: string; path: string }> = [];
+
+export function setApiRevisionObserver(observer: ApiRevisionObserver | null): void {
+	apiRevisionObserver = observer;
+	if (observer && earlyRevisionHeaders.length > 0) {
+		const queued = earlyRevisionHeaders.splice(0);
+		for (const item of queued) {
+			observer(item.headerValue, item.path);
+		}
+	}
+}
+
+function mutation(method: string | undefined): boolean {
+	return !['GET', 'HEAD', 'OPTIONS'].includes((method ?? 'GET').toUpperCase());
+}
+
+export function sendToLogin(): void {
+	if (typeof window === 'undefined' || window.location.pathname === '/login') return;
+	const returnTo = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+	window.location.assign(`/login?return_to=${encodeURIComponent(returnTo)}`);
+}
+
+export class ApiError extends Error {
+	constructor(message: string, readonly status: number) {
+		super(message);
+		this.name = 'ApiError';
+	}
+}
+
+export async function requestResponse(path: string, init?: RequestInit, retryCsrf = true): Promise<Response> {
+	const headers = new Headers(init?.headers);
+	const isMutation = mutation(init?.method);
+	if (init?.body && !(init.body instanceof FormData) && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
+	if (isMutation && csrfToken) headers.set('X-XpressClaw-CSRF', csrfToken);
 	const res = await fetch(`${BASE}${path}`, {
-		headers: { 'Content-Type': 'application/json' },
-		...init
+		credentials: 'same-origin',
+		cache: isMutation ? init?.cache : (init?.cache ?? 'no-store'),
+		...init,
+		headers
 	});
 	if (!res.ok) {
 		const body = await res.json().catch(() => ({ error: res.statusText }));
-		throw new Error(body.error || res.statusText);
+		if (res.status === 403 && retryCsrf && isMutation && String(body.error).includes('CSRF')) {
+			const session = await auth.bootstrap();
+			if (session.authenticated) return requestResponse(path, init, false);
+		}
+		if (res.status === 401 && !path.startsWith('/api/auth/')) sendToLogin();
+		throw new ApiError(body.error || res.statusText, res.status);
 	}
+	if (!isMutation) {
+		const revHeader = res.headers.get('x-ui-revisions');
+		if (revHeader) {
+			if (apiRevisionObserver) {
+				apiRevisionObserver(revHeader, path);
+			} else {
+				earlyRevisionHeaders.push({ headerValue: revHeader, path });
+			}
+		}
+	}
+	return res;
+}
+
+export async function request<T>(path: string, init?: RequestInit, retryCsrf = true): Promise<T> {
+	const res = await requestResponse(path, init, retryCsrf);
 	if (res.status === 204 || res.headers.get('content-length') === '0') return undefined as T;
 	const text = await res.text();
 	if (!text) return undefined as T;
 	return JSON.parse(text);
 }
+
+export interface AuthBootstrap {
+	instance_id: string;
+	identity_public_key: string;
+	authentication_enabled: boolean;
+	credential_kind: 'disabled' | 'password' | 'startup_token' | 'restart_required';
+	authenticated: boolean;
+	csrf_token: string | null;
+}
+
+export const auth = {
+	bootstrap: async () => {
+		const result = await request<AuthBootstrap>('/api/auth/bootstrap', undefined, false);
+		csrfToken = result.csrf_token;
+		return result;
+	},
+	login: async (credential: string) => {
+		const result = await request<{ authenticated: boolean; csrf_token: string }>(
+			'/api/auth/login',
+			{ method: 'POST', body: JSON.stringify({ credential }) },
+			false
+		);
+		csrfToken = result.csrf_token;
+		return result;
+	},
+	logout: async () => {
+		await request<void>('/api/auth/logout', { method: 'POST', body: '{}' }, false);
+		csrfToken = null;
+	},
+};
 
 // -- Agents --
 
@@ -22,6 +110,7 @@ export interface Agent {
 	name: string;
 	title: string;
 	backend: string;
+	project_id: string | null;
 	status: string;
 	desired_status: string;
 	observed_status: string;
@@ -39,6 +128,12 @@ export interface Agent {
 	stopped_at: string | null;
 	error_message: string | null;
 	restart_count: number;
+}
+
+export interface PreservedEnvironment {
+	name: string;
+	container_id: string;
+	dependents: string[];
 }
 
 export const agents = {
@@ -73,8 +168,349 @@ export const agents = {
 	}) => request<{ agent: LiveConfig['agents'][0]; needs_restart: boolean }>(
 		`/api/agents/${id}/config`, { method: 'PATCH', body: JSON.stringify(data) }
 	),
+	updateRunnerImage: (id: string) => request<{
+		image: string;
+		version: string | null;
+		changed: boolean;
+		environment_stopped: boolean;
+		environment_preserved: boolean;
+	}>(`/api/agents/${id}/runner-image/update`, { method: 'POST', body: '{}' }),
+	environment: (id: string) => request<{ preserved_environments: PreservedEnvironment[] }>(`/api/agents/${id}/environment`),
+	rebuildEnvironment: (id: string) => request<{ rebuilt: boolean; preserved_environments: PreservedEnvironment[] }>(
+		`/api/agents/${id}/environment/rebuild`, { method: 'POST', body: JSON.stringify({ discard_installed_tools: true }) }
+	),
 	logs: (id: string, tail = 100) =>
 		request<{ logs: string }>(`/api/agents/${id}/logs?tail=${tail}`)
+};
+
+// -- Projects and conversations --
+
+export interface Project {
+	id: string;
+	name: string;
+	description: string | null;
+	icon: string | null;
+	created_at: string;
+	updated_at: string;
+	agent_ids: string[];
+	conversation_count: number;
+	task_count: number;
+	deletion_started_at?: string | null;
+	deletion_counts?: {
+		agents: number;
+		tasks: number;
+		task_messages: number;
+		conversations: number;
+		conversation_messages: number;
+		memory_notes: number;
+		workflows?: number;
+		workflow_runs: number;
+		schedules: number;
+	};
+}
+
+export interface ConversationParticipant {
+	participant_type: 'user' | 'agent';
+	participant_id: string;
+	joined_at: string;
+}
+
+export interface ConversationAttachment {
+	id: string;
+	message_id: number;
+	name: string;
+	mime_type: string;
+	size: number;
+	source_task_id: string | null;
+	created_at: string;
+}
+
+export interface MessageVisualization {
+	id: string;
+	reference_index: number;
+	title: string;
+	mode: 'normal' | 'wide';
+	status: 'ready' | 'unavailable';
+	error_code: string | null;
+	size: number | null;
+	retrieval_token: string;
+}
+
+export interface ConversationMessage {
+	id: number;
+	conversation_id: string;
+	sender_type: 'user' | 'agent' | 'system';
+	sender_id: string;
+	sender_name: string | null;
+	content: string;
+	message_type: string;
+	linked_task_id: string | null;
+	metadata: Record<string, unknown>;
+	attachments?: ConversationAttachment[];
+	visualizations?: MessageVisualization[];
+	created_at: string;
+}
+
+export interface Conversation {
+	id: string;
+	project_id: string | null;
+	title: string | null;
+	icon: string | null;
+	created_at: string;
+	updated_at: string;
+	last_message_at: string | null;
+	participants: ConversationParticipant[];
+}
+
+export interface ConversationTurn {
+	id: string;
+	conversation_id: string;
+	agent_id: string;
+	trigger_message_id: number | null;
+	status: string;
+	result_message_id: number | null;
+	error_message: string | null;
+	context_used: number | null;
+	context_size: number | null;
+	queued_at: string;
+	started_at: string | null;
+	completed_at: string | null;
+	response_queued_at?: string | null;
+	response_started_at?: string | null;
+}
+
+export interface ConversationMessageUpload {
+	name: string;
+	mime_type: string;
+	data: string;
+}
+
+export interface StoragePolicy { enabled: boolean; days: number }
+export interface StorageWorktree {
+    id: string; repository: string; path: string; branch: string | null; head: string;
+    agent_ids: string[]; bytes: number; size_complete: boolean; missing: boolean;
+    eligible: boolean; reasons: string[]; eligible_since: number | null; first_seen_at: number; fingerprint: string;
+}
+export interface StorageRecoveryImage {
+    id: string; agent_id: string; name: string; created_at: number; bytes: number | null; eligible: boolean; reasons: string[];
+}
+export interface ProjectStorage {
+    policy: StoragePolicy; worktrees: StorageWorktree[]; scanned_at: number; last_cleanup_at: number | null; errors: string[];
+    engine: { image_bytes: number | null; volume_bytes: number; unused_volume_bytes: number; recovery_images: StorageRecoveryImage[] } | null;
+    engine_error: string | null;
+}
+export interface StorageCleanupResult { removed: string[]; kept: { id: string; reason: string }[]; finished_at: number }
+
+export const projects = {
+    storage: (id: string) => request<ProjectStorage>(`/api/projects/${encodeURIComponent(id)}/storage`),
+    saveStoragePolicy: (id: string, policy: StoragePolicy) => request<StoragePolicy>(`/api/projects/${encodeURIComponent(id)}/storage`, { method: 'PATCH', body: JSON.stringify(policy) }),
+    cleanupStorage: (id: string, selection: { worktrees: Record<string, string>; recovery_images: string[] }) => request<StorageCleanupResult>(`/api/projects/${encodeURIComponent(id)}/storage/cleanup`, { method: 'POST', body: JSON.stringify(selection) }),
+	list: () => request<Project[]>('/api/projects'),
+	get: (id: string) => request<Project>(`/api/projects/${encodeURIComponent(id)}`),
+	create: (data: { name: string; description?: string; icon?: string }) =>
+		request<Project>('/api/projects', { method: 'POST', body: JSON.stringify(data) }),
+	update: (id: string, data: { name?: string; description?: string; icon?: string }) =>
+		request<Project>(`/api/projects/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(data) }),
+	delete: (id: string) =>
+		request<void>(`/api/projects/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+	deleteCascade: (id: string) =>
+		request<void>(`/api/projects/${encodeURIComponent(id)}?cascade=confirmed`, { method: 'DELETE' }),
+	assignAgent: (id: string, agentId: string) =>
+		request<Project>(`/api/projects/${encodeURIComponent(id)}/agents/${encodeURIComponent(agentId)}`, { method: 'PUT', body: '{}' }),
+	tasks: (id: string) => request<Task[]>(`/api/projects/${encodeURIComponent(id)}/tasks`),
+};
+
+export const conversations = {
+	list: (projectId?: string, limit = 100) => {
+		const params = new URLSearchParams({ limit: String(limit) });
+		if (projectId) params.set('project_id', projectId);
+		return request<Conversation[]>(`/api/conversations?${params}`);
+	},
+	get: (id: string) => request<Conversation>(`/api/conversations/${encodeURIComponent(id)}`),
+	create: (data: { project_id: string; title?: string; icon?: string; participant_ids?: string[] }) =>
+		request<Conversation>('/api/conversations', { method: 'POST', body: JSON.stringify(data) }),
+	update: (id: string, data: { title?: string; icon?: string }) =>
+		request<Conversation>(`/api/conversations/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(data) }),
+	delete: (id: string) => request<void>(`/api/conversations/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+	addParticipant: (id: string, agentId: string) =>
+		request<void>(`/api/conversations/${encodeURIComponent(id)}/participants`, { method: 'POST', body: JSON.stringify({ agent_id: agentId }) }),
+	removeParticipant: (id: string, agentId: string) =>
+		request<void>(`/api/conversations/${encodeURIComponent(id)}/participants/${encodeURIComponent(agentId)}`, { method: 'DELETE' }),
+	messages: (id: string, limit = 100, beforeId?: number) => {
+		const params = new URLSearchParams({ limit: String(limit) });
+		if (beforeId !== undefined) params.set('before_id', String(beforeId));
+		return request<ConversationMessage[]>(`/api/conversations/${encodeURIComponent(id)}/messages?${params}`);
+	},
+	messageDeletions: (id: string) =>
+		request<number[]>(`/api/conversations/${encodeURIComponent(id)}/message-deletions`),
+	sendMessage: (id: string, content: string, attachments: ConversationMessageUpload[] = []) =>
+		request<{ message: ConversationMessage; queued_agents: string[] }>(`/api/conversations/${encodeURIComponent(id)}/messages`, {
+			method: 'POST',
+			body: JSON.stringify({ content, attachments }),
+		}),
+	deleteMessage: (id: string, messageId: number) =>
+		request<void>(`/api/conversations/${encodeURIComponent(id)}/messages/${messageId}`, {
+			method: 'DELETE',
+		}),
+	tasks: (id: string) => request<Task[]>(`/api/conversations/${encodeURIComponent(id)}/tasks`),
+	createTask: (id: string, data: { title: string; description?: string; agent_id?: string; workflow_id?: string; workflow_inputs?: Record<string, unknown>; priority?: number }) =>
+		request<Task | { workflow_instance_id: string }>(`/api/conversations/${encodeURIComponent(id)}/tasks`, {
+			method: 'POST',
+			body: JSON.stringify(data),
+		}),
+	turns: (id: string) => request<ConversationTurn[]>(`/api/conversations/${encodeURIComponent(id)}/turns`),
+	cancelTurn: (id: string, turnId: string) =>
+		request<ConversationTurn>(`/api/conversations/${encodeURIComponent(id)}/turns/${encodeURIComponent(turnId)}/cancel`, {
+			method: 'POST',
+			body: '{}',
+		}),
+	attachmentUrl: (conversationId: string, attachmentId: string) => `/api/conversations/${encodeURIComponent(conversationId)}/attachments/${encodeURIComponent(attachmentId)}`,
+	visualizationUrl: (conversationId: string, messageId: number, artifactId: string) =>
+		`/api/conversations/${encodeURIComponent(conversationId)}/messages/${messageId}/visualizations/${encodeURIComponent(artifactId)}`,
+};
+
+// -- Control center dashboard --
+
+export type DashboardRange = '1h' | '24h' | '7d';
+
+export interface DashboardProject {
+	id: string;
+	name: string;
+}
+
+export interface DashboardCounters {
+	working_agents: number;
+	active_work: number;
+	needs_attention: number;
+	tool_calls: number;
+}
+
+export interface DashboardSeriesPoint {
+	timestamp: string;
+	context_used: number;
+	context_size: number;
+	tool_calls: number;
+	code_additions: number;
+	code_deletions: number;
+	git_state: 'none' | 'available' | 'partial' | 'unavailable';
+}
+
+export interface DashboardActiveWork {
+	work_kind: 'attempt' | 'conversation_turn';
+	work_id: string;
+	project_id: string | null;
+	project_name: string | null;
+	agent_id: string;
+	agent_name: string;
+	target_type: 'task' | 'conversation';
+	target_id: string;
+	target_title: string;
+	href: string;
+	phase: 'queued' | 'working';
+	queued_at: string;
+	started_at: string | null;
+	activity: string;
+}
+
+export interface DashboardEvent {
+	cursor: number;
+	event_id: string;
+	event_kind: string;
+	occurred_at: string;
+	project_id: string | null;
+	project_name: string | null;
+	agent_id: string | null;
+	agent_name: string | null;
+	source_kind: string;
+	source_label: string;
+	target_type: 'task' | 'conversation';
+	target_id: string;
+	target_title: string;
+	href: string;
+	severity: 'info' | 'success' | 'warning' | 'error';
+	needs_attention: boolean;
+	preview: string;
+	work_kind: string | null;
+	work_id: string | null;
+}
+
+export interface DashboardAttentionItem {
+	id: string;
+	kind: string;
+	project_id: string | null;
+	project_name: string | null;
+	agent_id: string | null;
+	agent_name: string | null;
+	target_type: 'task' | 'conversation';
+	target_id: string;
+	target_title: string;
+	href: string;
+	summary: string;
+	updated_at: string;
+	work_kind: 'task' | 'conversation_turn';
+	work_id: string;
+}
+
+export interface DashboardFeedPage {
+	events: DashboardEvent[];
+	next_before: number | null;
+	has_more: boolean;
+}
+
+export interface DashboardSnapshot {
+	generated_at: string;
+	cursor: number;
+	projects: DashboardProject[];
+	counters: DashboardCounters;
+	token_usage: DashboardTokenUsage;
+	series: DashboardSeriesPoint[];
+	active_work: DashboardActiveWork[];
+	attention: DashboardAttentionItem[];
+	feed: DashboardFeedPage;
+}
+
+export interface DashboardTokenUsage {
+	total_tokens: number | null;
+	input_tokens: number | null;
+	output_tokens: number | null;
+	cached_read_tokens: number | null;
+	cached_write_tokens: number | null;
+	thought_tokens: number | null;
+	reported_responses: number;
+	unreported_responses: number;
+	unclassified_responses: number;
+	recording_started_at: string;
+}
+
+export interface ResourceCapacity {
+	total_bytes: number;
+	available_bytes: number;
+	used_bytes: number;
+	used_percent: number;
+}
+
+export interface DashboardResources {
+	sampled_at: string;
+	cpu_percent: number | null;
+	cpu_count: number;
+	memory: ResourceCapacity | null;
+	disks: { locations: string[]; mount_point: string | null; capacity: ResourceCapacity | null }[];
+}
+
+function dashboardParams(projectId: string, range: DashboardRange, extras: Record<string, string> = {}) {
+	const params = new URLSearchParams({ range, ...extras });
+	if (projectId) params.set('project_id', projectId);
+	return params;
+}
+
+export const dashboard = {
+	resources: (signal?: AbortSignal) => request<DashboardResources>('/api/dashboard/resources', { signal }),
+	snapshot: (projectId: string, range: DashboardRange, limit = 40) =>
+		request<DashboardSnapshot>(`/api/dashboard/snapshot?${dashboardParams(projectId, range, { limit: String(limit) })}`),
+	feed: (projectId: string, range: DashboardRange, before: number, limit = 40) =>
+		request<DashboardFeedPage>(`/api/dashboard/feed?${dashboardParams(projectId, range, { before: String(before), limit: String(limit) })}`),
+	streamUrl: (projectId: string, range: DashboardRange, after: number) =>
+		`/api/dashboard/stream?${dashboardParams(projectId, range, { after: String(after) })}`,
 };
 
 // -- Logical sessions and native work attempts --
@@ -91,7 +527,9 @@ export interface NativeRunnerConfig {
 	startup_commands: string[];
 	command: string[];
 	subscription_auth: boolean;
+	ssh_agent_forwarding: boolean;
 	container_engine: 'none' | 'host';
+	proxy?: 'inherit' | 'direct';
 }
 
 export interface LogicalSession {
@@ -122,6 +560,9 @@ export interface WorkAttempt {
 	completed_at: string | null;
 	context_used: number | null;
 	context_size: number | null;
+	trigger_message_id?: number | null;
+	response_queued_at?: string | null;
+	response_started_at?: string | null;
 }
 
 export interface SessionEvent {
@@ -165,6 +606,25 @@ export interface AcpMode {
 	description?: string | null;
 }
 
+export interface TaskControlContext {
+	agent_id: string;
+	runner_kind: string;
+	native_session_id: string | null;
+}
+
+export interface TaskControlSnapshot {
+	context: TaskControlContext | null;
+	availability: 'live' | 'cached' | 'busy' | 'unavailable';
+	config_options: AcpConfigOption[];
+	modes: AcpModeState | null;
+	event_id: number | null;
+	revision: string | null;
+	pending: Record<string, string | boolean>;
+	model_pending: boolean;
+	has_preferences: boolean;
+	notice: string;
+}
+
 export interface AcpModeState {
 	currentModeId: string;
 	availableModes: AcpMode[];
@@ -190,6 +650,7 @@ export interface AttemptArtifact {
 
 export interface SessionOverview {
 	session: LogicalSession;
+	active_task_count?: number;
 	active_attempts: WorkAttempt[];
 	queued_attempts: WorkAttempt[];
 	recent_attempts: WorkAttempt[];
@@ -197,7 +658,14 @@ export interface SessionOverview {
 	artifacts: AttemptArtifact[];
 }
 
+export interface AgentAuthentication {
+	kind: string;
+	status: 'unknown' | 'required' | 'authenticated';
+	methods: { id: string; name: string; description: string | null; kind: 'terminal' | 'agent'; api_key: boolean }[];
+}
+
 export interface RunnerReadiness {
+	authentication_status?: AgentAuthentication['status'];
 	protocol: string;
 	ready: boolean;
 	docker_available: boolean;
@@ -207,15 +675,28 @@ export interface RunnerReadiness {
 	image: string;
 	runtime_image: string | null;
 	image_present: boolean;
+	using_retained?: boolean;
+	can_prepare?: boolean;
+	runner_update?: { current_version: string; available_version: string } | null;
 	workspace: string;
 	workspace_present: boolean;
 	model: string | null;
 	container_engine: 'none' | 'host';
 	container_engine_available: boolean;
 	container_engine_socket: string | null;
+	ssh_agent_forwarding: boolean;
+	ssh_agent_available: boolean;
+	ssh_agent_socket: string | null;
 	command_present: boolean;
 	subscription_auth: boolean;
 	auth_present: boolean;
+	presentation_artifacts?: {
+		supported: boolean;
+		available: boolean;
+		capability: string | null;
+		runtime: string | null;
+		reason: string | null;
+	};
 	issues: string[];
 }
 
@@ -226,14 +707,25 @@ export interface ImageAttachmentUpload {
 }
 
 export const sessions = {
-	get: (id: string) => request<SessionOverview>(`/api/sessions/${id}`),
+	prepareAuthentication: (id: string) => request<AgentAuthentication>(`/api/sessions/${encodeURIComponent(id)}/authentication`, { method: 'POST', body: '{}' }),
+	authentication: (id: string) => request<AgentAuthentication>(`/api/sessions/${encodeURIComponent(id)}/authentication`),
+	get: (id: string, includeDetails = false) =>
+		request<SessionOverview>(`/api/sessions/${id}${includeDetails ? '?include_details=true' : ''}`),
 	readiness: (id: string) => request<RunnerReadiness>(`/api/sessions/${id}/readiness`),
 	prepare: (id: string) => request<RunnerReadiness>(`/api/sessions/${id}/readiness`, {
 		method: 'POST',
 		body: '{}'
 	}),
-	events: (id: string, after?: number) => {
-		const query = after ? `?after=${after}` : '';
+	events: (id: string, afterOrOptions?: number | { after?: number; limit?: number; eventType?: string }) => {
+		if (typeof afterOrOptions === 'number') {
+			const query = afterOrOptions ? `?after=${afterOrOptions}` : '';
+			return request<SessionEvent[]>(`/api/sessions/${id}/events${query}`);
+		}
+		const params = new URLSearchParams();
+		if (afterOrOptions?.after) params.set('after', String(afterOrOptions.after));
+		if (afterOrOptions?.limit !== undefined) params.set('limit', String(afterOrOptions.limit));
+		if (afterOrOptions?.eventType) params.set('event_type', afterOrOptions.eventType);
+		const query = params.size ? `?${params}` : '';
 		return request<SessionEvent[]>(`/api/sessions/${id}/events${query}`);
 	},
 	attempts: (id: string, status?: string) => {
@@ -263,9 +755,131 @@ export const sessions = {
 		})
 };
 
+// -- Project workspaces --
+
+export interface WorkspaceStatus {
+    container_root?: string;
+	agent_id: string;
+	root: string;
+	repository: WorkspaceRepositoryStatus;
+	container_exists: boolean;
+	container_running: boolean;
+	terminal_available: boolean;
+}
+
+export interface WorkspaceRepositoryCandidate {
+	relative_path: string;
+	root: string;
+	github_repository: string | null;
+}
+
+export type WorkspaceRepositoryState = 'attached' | 'pending' | 'no_repository' | 'ambiguous' | 'missing' | 'cleared';
+export type WorkspaceGithubStatus = 'attached' | 'unavailable' | 'non_github_origin' | 'missing_credential' | 'incompatible_image' | 'explicit_override';
+
+export interface WorkspaceRepositoryStatus {
+	state: WorkspaceRepositoryState;
+	message: string;
+	bootstrap_root: string;
+	active: WorkspaceRepositoryCandidate | null;
+	candidates: WorkspaceRepositoryCandidate[];
+	discovery_truncated: boolean;
+	selected_relative_path: string | null;
+	pending_relative_path: string | null;
+	pending_action: 'manual' | 'cleared' | null;
+	github_status: WorkspaceGithubStatus;
+	github_repository: string | null;
+	restart_required: boolean;
+}
+
+export interface WorkspaceEntry {
+	name: string;
+	path: string;
+	kind: 'directory' | 'file' | 'symlink' | 'other';
+	symlink: boolean;
+	size: number | null;
+	modified_at: string | null;
+}
+
+export interface WorkspaceDirectory {
+	path: string;
+	entries: WorkspaceEntry[];
+	truncated: boolean;
+}
+
+export interface WorkspaceFile {
+	path: string;
+	content: string;
+	revision: string;
+	size: number;
+}
+
+export interface GitChange {
+	path: string;
+	original_path: string | null;
+	status: string;
+	index_status: string;
+	worktree_status: string;
+}
+
+export interface WorkspaceGitStatus {
+	repository: boolean;
+	branch: string | null;
+	files: GitChange[];
+	repository_status: WorkspaceRepositoryStatus;
+}
+
+export interface WorkspaceGitDiff {
+	path: string;
+	diff: string;
+	truncated: boolean;
+}
+
+export const workspaces = {
+	status: (agentId: string) =>
+		request<WorkspaceStatus>(`/api/workspaces/${encodeURIComponent(agentId)}`),
+	tree: (agentId: string, path = '') =>
+		request<WorkspaceDirectory>(`/api/workspaces/${encodeURIComponent(agentId)}/tree?path=${encodeURIComponent(path)}`),
+	readFile: (agentId: string, path: string) =>
+		request<WorkspaceFile>(`/api/workspaces/${encodeURIComponent(agentId)}/file?path=${encodeURIComponent(path)}`),
+	saveFile: (agentId: string, file: WorkspaceFile) =>
+		request<{ path: string; revision: string; size: number }>(
+			`/api/workspaces/${encodeURIComponent(agentId)}/file`,
+			{
+				method: 'PUT',
+				body: JSON.stringify({
+					path: file.path,
+					content: file.content,
+					expected_revision: file.revision,
+				}),
+			}
+		),
+	gitStatus: (agentId: string, signal?: AbortSignal) =>
+		request<WorkspaceGitStatus>(`/api/workspaces/${encodeURIComponent(agentId)}/git/status`, { signal }),
+	gitDiff: (agentId: string, path: string) =>
+		request<WorkspaceGitDiff>(`/api/workspaces/${encodeURIComponent(agentId)}/git/diff?path=${encodeURIComponent(path)}`),
+	repository: (agentId: string) =>
+		request<WorkspaceRepositoryStatus>(`/api/workspaces/${encodeURIComponent(agentId)}/repository`),
+	selectRepository: (agentId: string, path: string) =>
+		request<WorkspaceRepositoryStatus>(`/api/workspaces/${encodeURIComponent(agentId)}/repository`, {
+			method: 'PUT',
+			body: JSON.stringify({ path }),
+		}),
+	clearRepository: (agentId: string) =>
+		request<WorkspaceRepositoryStatus>(`/api/workspaces/${encodeURIComponent(agentId)}/repository`, {
+			method: 'DELETE',
+		}),
+};
+
 // -- Tasks --
 
 export interface Task {
+	parent_title?: string | null;
+	error_message?: string | null;
+	start_after?: string | null;
+	backlog?: boolean;
+	position?: number;
+	revision?: number;
+	planning?: { lane: string; disabled_reason: string | null; queued: boolean; actual_started_at: string | null };
 	id: string;
 	title: string;
 	description: string | null;
@@ -274,10 +888,16 @@ export interface Task {
 	agent_id: string | null;
 	parent_task_id: string | null;
 	sop_id: string | null;
+	conversation_id: string | null;
+	project_id?: string | null;
 	created_at: string;
 	updated_at: string;
 	completed_at: string | null;
 	context: unknown;
+	provenance?: string;
+	blocks_parent?: boolean;
+	parent_review_required?: boolean;
+	activity_status?: string;
 	depends_on?: string[];
 	dependents?: string[];
 	blocked_by?: string[];
@@ -298,6 +918,23 @@ export interface TaskActivity {
 	events: SessionEvent[];
 	has_more_before: boolean;
 	has_more_after: boolean;
+	delegated_work?: DelegatedWork[];
+}
+
+export interface DelegatedWork {
+	error_message?: string | null;
+	task_id: string;
+	title: string;
+	agent_id: string | null;
+	status: string;
+	activity_status: string;
+	blocks_parent: boolean;
+	created_at: string;
+	updated_at: string;
+	started_at: string | null;
+	finished_at: string | null;
+	latest_event_type: string | null;
+	latest_event_at: string | null;
 }
 
 export interface TaskListOptions {
@@ -306,9 +943,19 @@ export interface TaskListOptions {
 	statuses?: string[];
 	sort?: 'recent';
 	excludeStatuses?: string[];
+	search?: string;
 }
 
+export type PlanningAction = { action: 'schedule'; start_after: string | null; activate?: boolean } | { action: 'backlog' | 'queue' } | { action: 'assign'; agent_id: string } | { action: 'priority'; priority: number } | { action: 'reorder'; before_id?: string; after_id?: string };
 export const tasks = {
+	attention: (agentId?: string) => request<{ tasks: Task[] }>(`/api/tasks/attention${agentId ? `?agent_id=${encodeURIComponent(agentId)}` : ''}`),
+    planning: (options: { project_id?: string; agent_id?: string; status?: string; search?: string; limit?: number; offset?: number; sort?: 'planning' | 'newest' }) => {
+        const query = new URLSearchParams();
+        for (const [key, value] of Object.entries(options)) if (value !== undefined && value !== '') query.set(key, String(value));
+        return request<{ tasks: Task[]; total: number; counts: Record<string, number> }>(`/api/tasks/planning?${query}`);
+    },
+    planningTask: (id: string) => request<Task>(`/api/tasks/${id}/planning`),
+    plan: (task: Task, change: PlanningAction) => request<Task>(`/api/tasks/${task.id}/planning`, { method: 'PATCH', body: JSON.stringify({ expected_revision: task.revision, ...change }) }),
 	list: (status?: string, agentId?: string, options: TaskListOptions = {}) => {
 		const params = new URLSearchParams();
 		if (status) params.set('status', status);
@@ -318,13 +965,16 @@ export const tasks = {
 		if (options.statuses?.length) params.set('statuses', options.statuses.join(','));
 		if (options.sort) params.set('sort', options.sort);
 		if (options.excludeStatuses?.length) params.set('exclude_statuses', options.excludeStatuses.join(','));
+		if (options.search) params.set('search', options.search);
 		const qs = params.toString();
 		return request<{ tasks: Task[]; counts: TaskCounts }>(`/api/tasks${qs ? `?${qs}` : ''}`);
 	},
-	recentByAgent: (limit = 5) =>
-		request<{ tasks: Task[] }>(`/api/tasks/recent-by-agent?limit=${encodeURIComponent(limit)}`),
+	recentByAgent: (limit = 5, includeDetails = false) =>
+		request<{ tasks: Task[] }>(
+			`/api/tasks/recent-by-agent?limit=${encodeURIComponent(limit)}${includeDetails ? '&include_details=true' : ''}`
+		),
 	get: (id: string) => request<Task>(`/api/tasks/${id}`),
-	create: (data: { title: string; description?: string; agent_id?: string; priority?: number; context?: Record<string, unknown> }) =>
+	create: (data: { backlog?: boolean; start_after?: string; title: string; description?: string; agent_id?: string; priority?: number; context?: Record<string, unknown> }) =>
 		request<Task>('/api/tasks', { method: 'POST', body: JSON.stringify(data) }),
 	update: (id: string, data: { title?: string; description?: string; agent_id?: string; priority?: number }) =>
 		request<Task>(`/api/tasks/${id}`, {
@@ -337,7 +987,12 @@ export const tasks = {
 			body: JSON.stringify({ status })
 		}),
 	delete: (id: string) => request<void>(`/api/tasks/${id}`, { method: 'DELETE' }),
-	messages: (id: string) => request<TaskMessage[]>(`/api/tasks/${id}/messages`),
+	messages: (id: string, afterId?: number) =>
+		request<TaskMessage[]>(
+			`/api/tasks/${id}/messages${afterId !== undefined ? `?after_id=${encodeURIComponent(afterId)}` : ''}`
+		),
+	visualizationUrl: (taskId: string, messageId: number, artifactId: string) =>
+		`/api/tasks/${encodeURIComponent(taskId)}/messages/${messageId}/visualizations/${encodeURIComponent(artifactId)}`,
 	activity: (id: string, options: { after?: number; before?: number; limit?: number } = {}) => {
 		const params = new URLSearchParams();
 		if (options.after !== undefined) params.set('after', String(options.after));
@@ -346,6 +1001,9 @@ export const tasks = {
 		const query = params.size ? `?${params}` : '';
 		return request<TaskActivity>(`/api/tasks/${id}/activity${query}`);
 	},
+	config: (id: string) => request<TaskControlSnapshot>(`/api/tasks/${id}/config`),
+	setConfig: (id: string, configId: string | null, value: string | boolean, context: TaskControlContext, revision: string | null) =>
+		request<TaskControlSnapshot>(`/api/tasks/${id}/config`, { method: 'POST', body: JSON.stringify({ config_id: configId ?? undefined, value, context, revision, reset: configId === null }) }),
 	addMessage: (id: string, role: string, content: string, options?: { configOptions?: Record<string, string | boolean>; attachments?: ImageAttachmentUpload[]; delivery?: 'after_tool' | 'immediate' }) =>
 		request<TaskMessageResponse>(`/api/tasks/${id}/messages`, {
 			method: 'POST',
@@ -366,7 +1024,7 @@ export const tasks = {
 		{ method: 'POST', body: JSON.stringify(data) }
 	),
 	subtasks: (id: string) => request<{ tasks: Task[]; counts: TaskCounts }>(`/api/tasks?parent_task_id=${id}`),
-	createBatch: (data: { tasks: { ref: string; title: string; description?: string; agent_id?: string; priority?: number; new_session?: boolean; depends_on?: string[] }[]; parent_task_id?: string }) =>
+	createBatch: (data: { tasks: { ref: string; backlog?: boolean; start_after?: string; title: string; description?: string; agent_id?: string; priority?: number; new_session?: boolean; depends_on?: string[] }[]; parent_task_id?: string }) =>
 		request<Task[]>('/api/tasks/batch', { method: 'POST', body: JSON.stringify(data) }),
 	addDependency: (taskId: string, dependsOn: string) =>
 		request<{ task_id: string; depends_on: string }>(`/api/tasks/${taskId}/dependencies`, {
@@ -378,10 +1036,12 @@ export const tasks = {
 export interface TaskMessage {
 	id: number;
 	task_id: string;
+	agent_id?: string | null;
 	role: string;
 	content: string;
 	timestamp: string;
 	attachments: TaskMessageAttachment[];
+	visualizations?: MessageVisualization[];
 }
 
 export interface TaskMessageAttachment {
@@ -396,6 +1056,21 @@ export interface TaskMessageResponse {
 	continuation_queued: boolean;
 	attempt_id: string | null;
 	delivery: 'stored' | 'queued' | 'after_tool' | 'immediate';
+}
+
+export async function fetchVisualizationDocument(path: string, retrievalToken: string): Promise<Blob> {
+	const response = await fetch(`${BASE}${path}`, {
+		headers: { 'X-XpressClaw-Artifact-Token': retrievalToken },
+		credentials: 'same-origin',
+	});
+	if (!response.ok) {
+		throw new ApiError(response.status === 404 ? 'Visualization is no longer available.' : 'Could not load visualization.', response.status);
+	}
+	const contentType = response.headers.get('content-type') ?? '';
+	if (!contentType.toLowerCase().startsWith('text/html')) {
+		throw new ApiError('Visualization response was not HTML.', response.status);
+	}
+	return response.blob();
 }
 
 // -- Schedules --
@@ -414,12 +1089,17 @@ export interface Schedule {
 	schedule_type: 'cron' | 'once';
 	run_at: string | null;
 	continuation_task_id: string | null;
+	conversation_id: string | null;
 }
 
 export const schedules = {
-	list: (agentId?: string) => {
-		const params = agentId ? `?agent_id=${agentId}` : '';
-		return request<Schedule[]>(`/api/schedules${params}`);
+	list: (agentId?: string, options?: { enabled?: boolean; includeCompletedOnce?: boolean }) => {
+		const params = new URLSearchParams();
+		if (agentId) params.set('agent_id', agentId);
+		if (options?.enabled !== undefined) params.set('enabled', String(options.enabled));
+		if (options?.includeCompletedOnce) params.set('include_completed_once', 'true');
+		const qs = params.toString();
+		return request<Schedule[]>(`/api/schedules${qs ? `?${qs}` : ''}`);
 	},
 	get: (id: string) => request<Schedule>(`/api/schedules/${id}`),
 	create: (data: {
@@ -437,14 +1117,30 @@ export const schedules = {
 		run_at?: string;
 		delay_seconds?: number;
 		continuation_task_id?: string;
+		conversation_id?: string;
 	}) => request<Schedule>('/api/schedules/once', { method: 'POST', body: JSON.stringify(data) }),
 	delete: (id: string) => request<void>(`/api/schedules/${id}`, { method: 'DELETE' }),
 	enable: (id: string) => request<Schedule>(`/api/schedules/${id}/enable`, { method: 'POST' }),
 	disable: (id: string) => request<Schedule>(`/api/schedules/${id}/disable`, { method: 'POST' }),
-	trigger: (id: string) => request<Task>(`/api/schedules/${id}/trigger`, { method: 'POST' })
+	trigger: (id: string) => request<Task | { conversation_id: string; agent_id: string; message: ConversationMessage }>(`/api/schedules/${id}/trigger`, { method: 'POST' })
 };
 
-// -- Health --
+// -- Health & Live UI Revisions --
+
+export interface UiRevisions {
+	seq: number;
+	projects: number;
+	agents: number;
+	conversations: number;
+	tasks: number;
+	sessions: number;
+	schedules: number;
+	workflows: number;
+}
+
+export const ui = {
+	revisions: (signal?: AbortSignal) => request<UiRevisions>('/api/ui/revisions', { signal })
+};
 
 export const health = {
 	check: () =>
@@ -465,6 +1161,8 @@ export interface DockerStatus {
 	version: string | null;
 	socket: string | null;
 	rootless: boolean | null;
+	/** Set when this host cannot carry a host SSH agent into a runner. */
+	ssh_agent_forwarding_unsupported_reason: string | null;
 	error: string | null;
 }
 
@@ -480,6 +1178,8 @@ export interface SystemInfo {
 	os: string;
 	arch: string;
 	working_directory: string | null;
+	ssh_agent_available: boolean;
+	ssh_agent_socket: string | null;
 }
 
 export interface AcpAgentCatalogEntry {
@@ -519,6 +1219,8 @@ export interface ProjectEnvironment {
 	workspace: string;
 	detected_files: string[];
 	suggestions: ProjectEnvironmentSuggestion[];
+	git_repository: boolean;
+	git_uses_ssh: boolean;
 }
 
 export interface OllamaInfo {
@@ -559,6 +1261,11 @@ export interface AgentLlmConfig {
 }
 
 export interface LiveConfig {
+	instance: {
+		config_path: string;
+		data_dir: string;
+		workspace_dir: string;
+	};
 	llm: {
 		// Per-agent provider summary. There is no global LLM config — each
 		// agent declares its own provider/model/key/base_url.
@@ -584,6 +1291,41 @@ export interface LiveConfig {
 	mcp_servers: McpServerDefinition[];
 }
 
+export interface InstanceListenerSettings {
+	bind: string;
+	port: number;
+	authentication_enabled: boolean;
+	allow_unauthenticated_remote: boolean;
+}
+
+export interface InstanceSettings {
+	instance_id: string;
+	effective: InstanceListenerSettings;
+	saved: InstanceListenerSettings;
+	restart_required: boolean;
+	credential_kind: 'disabled' | 'password' | 'startup_token' | 'restart_required';
+	password_configured: boolean;
+	config_path: string;
+	data_dir: string;
+	workspace_dir: string;
+	transport_encryption: 'operator_managed';
+}
+
+export const instanceSettings = {
+	get: () => request<InstanceSettings>('/api/settings/instance'),
+	update: (value: {
+		bind: string;
+		port: number;
+		authentication_enabled: boolean;
+		acknowledge_unauthenticated_remote: boolean;
+		password?: string;
+		remove_password?: boolean;
+	}) => request<InstanceSettings>('/api/settings/instance', {
+		method: 'PUT',
+		body: JSON.stringify(value),
+	}),
+};
+
 export interface McpServerDefinition {
 	name: string;
 	type: 'stdio' | 'http' | 'sse' | string;
@@ -592,6 +1334,18 @@ export interface McpServerDefinition {
 	url?: string | null;
 	env: Record<string, string> | string[];
 	headers?: Record<string, string>;
+}
+
+export interface McpVerificationResult {
+	ok: boolean;
+	status: 'ready'
+		| 'authentication_required'
+		| 'command_path_incorrect'
+		| 'command_missing'
+		| 'project_required'
+		| string;
+	message: string;
+	suggestion: string | null;
 }
 
 export const mcpServers = {
@@ -604,6 +1358,11 @@ export const mcpServers = {
 	delete: (name: string) =>
 		request<{ success: boolean; deleted: string }>(`/api/setup/mcp-servers/${encodeURIComponent(name)}`, {
 			method: 'DELETE'
+		}),
+	verify: (name: string, agentId?: string) =>
+		request<McpVerificationResult>(`/api/setup/mcp-servers/${encodeURIComponent(name)}/verify`, {
+			method: 'POST',
+			body: JSON.stringify({ agent_id: agentId ?? null })
 		})
 };
 
@@ -627,7 +1386,7 @@ export const setup = {
 			body: JSON.stringify({ provider, api_key: apiKey, base_url: baseUrl })
 		}),
 	complete: (data: {
-		agents: { backend?: string; runner_kind?: string; runner_image?: string; runner_workspace?: string; workspace_mode?: 'existing' | 'managed'; project_name?: string; runner_model?: string; runner_command?: string[]; startup_commands?: string[]; subscription_auth?: boolean; runner_container_engine?: 'none' | 'host'; volumes?: string[] }[];
+		agents: { backend?: string; runner_kind?: string; runner_image?: string; runner_workspace?: string; workspace_mode?: 'existing' | 'managed'; project_name?: string; runner_model?: string; runner_command?: string[]; startup_commands?: string[]; subscription_auth?: boolean; ssh_agent_forwarding?: boolean; runner_container_engine?: 'none' | 'host'; volumes?: string[] }[];
 		mcp_servers?: Record<string, unknown>;
 		isolation?: string;
 	}) =>
@@ -636,8 +1395,8 @@ export const setup = {
 			body: JSON.stringify(data)
 		}),
 	addSession: (data: {
-		backend?: string; runner_kind?: string; runner_image?: string; runner_workspace?: string; workspace_mode?: 'existing' | 'managed'; project_name?: string; runner_model?: string; runner_command?: string[]; startup_commands?: string[]; subscription_auth?: boolean; runner_container_engine?: 'none' | 'host'; volumes?: string[];
-	}) => request<{ success: boolean; session: string; session_id: string; title: string }>('/api/setup/add-session', {
+		project_id?: string; backend?: string; runner_kind?: string; runner_image?: string; runner_workspace?: string; workspace_mode?: 'existing' | 'managed'; project_name?: string; runner_model?: string; runner_command?: string[]; startup_commands?: string[]; subscription_auth?: boolean; ssh_agent_forwarding?: boolean; runner_container_engine?: 'none' | 'host'; volumes?: string[];
+	}) => request<{ success: boolean; session: string; session_id: string; title: string; project_id: string | null }>('/api/setup/add-session', {
 		method: 'POST',
 		body: JSON.stringify(data)
 	})
@@ -648,13 +1407,152 @@ export interface UserProfile {
 	avatar: string | null;
 }
 
+export interface ProjectSyncStatus {
+	project_id: string;
+	project_name: string;
+	project_icon: string | null;
+	status: 'ready' | 'unconfigured' | 'unavailable' | 'conflict' | 'error';
+	project_dir: string | null;
+	remote: string | null;
+	branch: string | null;
+	store_path: string | null;
+	share_project_memory: boolean | null;
+	last_commit: string | null;
+	last_synced_at: string | null;
+	message: string | null;
+	warnings: string[];
+}
+
+export interface ProjectSyncCounts {
+	agents: number;
+	tasks: number;
+	task_messages: number;
+	conversations: number;
+	conversation_messages: number;
+	workflows: number;
+	memory_notes: number;
+}
+
+export interface ProjectSyncAction {
+	action: 'fetch' | 'publish';
+	project_id: string;
+	commit: string;
+	counts: ProjectSyncCounts;
+}
+
+export interface CollaborationConfig {
+	enabled: boolean;
+	bind_address: string;
+	gitbucket_port: number;
+	jenkins_port: number;
+	gitbucket_image: string;
+	jenkins_image: string;
+	authorized_agents: string[];
+}
+
+export interface CollaborationServiceStatus {
+	state: string;
+	health: string;
+	image: string;
+	version: string;
+	host_url: string;
+	internal_url: string;
+	volume: string;
+	error: string | null;
+}
+
+export interface CollaborationSettings {
+	config: CollaborationConfig;
+	status: {
+		configured: boolean;
+		docker_available: boolean;
+		network: string;
+		data_path: string;
+		gitbucket: CollaborationServiceStatus;
+		jenkins: CollaborationServiceStatus;
+	};
+	credentials_configured: boolean;
+	reset_confirmation: string;
+}
+
+export interface SpeechSettings {
+	enabled: boolean;
+	base_url: string;
+	has_api_key: boolean;
+	stt_model: string;
+	tts_model: string;
+	voice: string;
+}
+
+export interface ProxyHeaderRule {
+ header: string;
+ matcher: 'any' | 'exact' | 'contains' | 'regex' | 'email';
+ value: string;
+ action: 'remove' | 'replace' | 'block';
+ replacement: string;
+ domains: string[];
+}
+export interface ProxyNetworkRule {
+ name: string;
+ enabled: boolean;
+ protocol: 'tcp' | 'udp';
+ destination: string;
+ ports: string;
+}
+export interface ProxyConfig {
+ enabled: boolean;
+ domain_policy: 'allow_except_blocked' | 'allow_listed_only';
+ allowed_domains: string[];
+ blocked_domains: string[];
+ inspection_bypass: string[];
+ header_rules: ProxyHeaderRule[];
+ web_ports: number[];
+ network_rules: ProxyNetworkRule[];
+}
+export interface ProxySettings {
+ config: ProxyConfig;
+ status: { state: string; image: string; events: { time: number; action: string; host: string; rule: number | null; client: string | null }[] };
+ direct_agents: string[];
+ host_engine_agents: string[];
+}
 export const settings = {
+	getProxy: () => request<ProxySettings>('/api/settings/proxy'),
+	putProxy: (config: ProxyConfig) => request<ProxySettings>('/api/settings/proxy', { method: 'PUT', body: JSON.stringify(config) }),
+	getSpeech: () => request<SpeechSettings>('/api/settings/speech'),
+	putSpeech: (config: Omit<SpeechSettings, 'has_api_key'> & { api_key?: string }) =>
+		request<SpeechSettings>('/api/settings/speech', { method: 'PUT', body: JSON.stringify(config) }),
 	getProfile: () => request<UserProfile>('/api/settings/profile'),
 	putProfile: (profile: UserProfile) =>
 		request<UserProfile>('/api/settings/profile', {
 			method: 'PUT',
 			body: JSON.stringify(profile)
-		})
+		}),
+	listProjectSync: () => request<{ projects: ProjectSyncStatus[] }>('/api/settings/sync'),
+	fetchProject: (projectId: string, force = false) =>
+		request<ProjectSyncAction>(`/api/settings/sync/${encodeURIComponent(projectId)}/fetch`, {
+			method: 'POST',
+			body: JSON.stringify({ force })
+		}),
+	publishProject: (projectId: string) =>
+		request<ProjectSyncAction>(`/api/settings/sync/${encodeURIComponent(projectId)}/publish`, {
+			method: 'POST',
+			body: '{}'
+		}),
+	getCollaboration: () => request<CollaborationSettings>('/api/settings/collaboration'),
+	putCollaboration: (config: CollaborationConfig) =>
+		request<CollaborationSettings>('/api/settings/collaboration', {
+			method: 'PUT', body: JSON.stringify(config)
+		}),
+	runCollaborationAction: (action: 'install' | 'start' | 'stop' | 'restart' | 'upgrade') =>
+		request<CollaborationSettings>(`/api/settings/collaboration/${action}`, {
+			method: 'POST', body: '{}'
+		}),
+	resetCollaboration: (confirmation: string) =>
+		request<CollaborationSettings>('/api/settings/collaboration/reset', {
+			method: 'POST', body: JSON.stringify({ confirmation })
+		}),
+	getCollaborationLogs: (service: 'gitbucket' | 'jenkins') =>
+		request<{ logs: string }>(`/api/settings/collaboration/logs/${service}`)
 };
 
 // -- Connectors --
@@ -675,18 +1573,28 @@ export interface Connector {
 
 export interface Workflow {
 	id: string;
+	project_id?: string | null;
+	revision?: number;
 	name: string;
 	description: string | null;
 	yaml_content: string;
 	enabled: boolean;
+	default_for_tasks: boolean;
 	version: number;
 	created_at: string;
 	updated_at: string;
+	last_triggered_at: string | null;
+	trigger_count: number;
+	trigger_error: string | null;
 }
 
 export interface WorkflowInstance {
 	id: string;
 	workflow_id: string;
+	project_id?: string | null;
+	conversation_id?: string | null;
+	source_task_id?: string | null;
+	current_task_id?: string | null;
 	status: string;
 	current_flow: string;
 	current_step_index: number;
@@ -696,10 +1604,15 @@ export interface WorkflowInstance {
 	started_at: string;
 	completed_at: string | null;
 	error_message: string | null;
+	wait_event?: string | null;
+	wait_resource?: string | null;
+	wait_next_poll_at?: string | null;
+	wait_error?: string | null;
 	step_executions?: StepExecution[];
 }
 
 export interface StepExecution {
+	parent_execution_id?: string | null;
 	id: string;
 	instance_id: string;
 	flow_name: string;
@@ -713,6 +1626,11 @@ export interface StepExecution {
 	completed_at: string | null;
 }
 
+export interface WorkflowInstanceDetails {
+	instance: WorkflowInstance;
+	step_executions: StepExecution[];
+}
+
 export const workflows = {
 	list: () => request<Workflow[]>('/api/workflows'),
 	create: (data: { name: string; description?: string; yaml_content: string }) =>
@@ -723,9 +1641,35 @@ export const workflows = {
 	delete: (id: string) => request<void>(`/api/workflows/${id}`, { method: 'DELETE' }),
 	enable: (id: string) => request<Workflow>(`/api/workflows/${id}/enable`, { method: 'POST' }),
 	disable: (id: string) => request<Workflow>(`/api/workflows/${id}/disable`, { method: 'POST' }),
-	run: (id: string, triggerData?: Record<string, unknown>) =>
-		request<WorkflowInstance>(`/api/workflows/${id}/run`, { method: 'POST', body: JSON.stringify(triggerData || {}) }),
+	setDefaultForTasks: (id: string, defaultForTasks: boolean) => request<Workflow>(`/api/workflows/${id}/default`, {
+		method: 'POST',
+		body: JSON.stringify({ default_for_tasks: defaultForTasks })
+	}),
+	run: (id: string, triggerData?: Record<string, unknown>, projectId?: string) => {
+		const params = new URLSearchParams();
+		if (projectId) params.set('project_id', projectId);
+		const query = params.toString();
+		return request<WorkflowInstance>(`/api/workflows/${id}/run${query ? `?${query}` : ''}`, { method: 'POST', body: JSON.stringify(triggerData || {}) });
+	},
 	instances: (id: string) => request<WorkflowInstance[]>(`/api/workflows/${id}/instances`),
-	getInstance: (instanceId: string) => request<WorkflowInstance>(`/api/workflows/instances/${instanceId}`),
+	getInstance: (instanceId: string) => request<WorkflowInstanceDetails>(`/api/workflows/instances/${instanceId}`),
 	cancelInstance: (instanceId: string) => request<void>(`/api/workflows/instances/${instanceId}/cancel`, { method: 'POST' }),
+};
+
+export interface PortForward {
+ id: string;
+ direction: 'host_to_container' | 'container_to_host';
+ host_port: number;
+ container_port: number;
+ active: boolean;
+}
+export const environments = {
+ ports: (id: string) => request<{ports: PortForward[]}>(`/api/environments/${encodeURIComponent(id)}/ports`),
+ addPort: (id: string, port: Pick<PortForward, 'direction' | 'host_port' | 'container_port'>) => request<PortForward>(`/api/environments/${encodeURIComponent(id)}/ports`, { method: 'POST', body: JSON.stringify(port) }),
+ removePort: (id: string, port: string) => request(`/api/environments/${encodeURIComponent(id)}/ports/${encodeURIComponent(port)}`, { method: 'DELETE' }),
+ tree: (id: string, path: string) => request<WorkspaceDirectory>(`/api/environments/${encodeURIComponent(id)}/tree?path=${encodeURIComponent(path)}`),
+ readFile: (id: string, path: string) => request<WorkspaceFile>(`/api/environments/${encodeURIComponent(id)}/file?path=${encodeURIComponent(path)}`),
+ saveFile: (id: string, file: WorkspaceFile) => request<WorkspaceFile>(`/api/environments/${encodeURIComponent(id)}/file`, { method: 'PUT', body: JSON.stringify({path: file.path, content: file.content, expected_revision: file.revision}) }),
+ downloadUrl: (id: string, path: string) => `/api/environments/${encodeURIComponent(id)}/download?path=${encodeURIComponent(path)}`,
+ terminalSessions: (id: string) => request<{sessions: string[]}>(`/api/environments/${encodeURIComponent(id)}/terminal-sessions`),
 };

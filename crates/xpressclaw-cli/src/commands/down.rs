@@ -1,17 +1,30 @@
-use super::client;
+use std::path::PathBuf;
 
-pub async fn run(port: u16) -> anyhow::Result<()> {
+use super::client;
+use super::instance;
+
+pub async fn run(
+    port: Option<u16>,
+    instance_dir: Option<PathBuf>,
+    workdir: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    if workdir.is_some() {
+        eprintln!("warning: --workdir is deprecated; use --instance instead");
+    }
+    let instance = instance::resolve(instance_dir.or(workdir))?;
+    let saved = xpressclaw_core::config::Config::load(&instance.config_path())
+        .map(|config| config.instance)
+        .unwrap_or_default();
+    let port = port.unwrap_or(saved.port);
+
     // Sessions have no persistent processes to stop. A graceful server
     // shutdown cancels and removes any active short-lived worker containers.
-    if client::connect(port).await.is_ok() {
+    if client::connect_to(saved.bind, port).await.is_ok() {
         println!("Stopping the control plane and active ACP workers...");
     }
 
     // Kill background server process if running
-    let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE"))?;
-    let pid_path = std::path::Path::new(&home)
-        .join(".xpressclaw")
-        .join("server.pid");
+    let pid_path = instance.root.join("server.pid");
 
     if pid_path.exists() {
         if let Ok(pid_str) = std::fs::read_to_string(&pid_path) {

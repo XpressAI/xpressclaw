@@ -1,7 +1,7 @@
 # ADR-022: Connectors and Workflows
 
 ## Status
-Partially superseded by ADR-025 and ADR-026
+Partially superseded by ADR-025, ADR-026, and ADR-032
 
 The workflow definition and multi-agent execution portions remain in force.
 The connector runtime and UI are disabled for the ACP beta: connector changes
@@ -73,6 +73,7 @@ Each flow is a linear sequence of steps. Flows share a common variable namespace
 | **loop** | For-each: iterate over an array variable, execute nested steps per item |
 | **sink** | Notification: deliver messages through connectors |
 | **jump** | Control flow: jump to another flow, step, or workflow |
+| **wait** | Durable external-event wait that releases the agent until activity arrives |
 
 #### Variables and Outputs
 
@@ -171,6 +172,7 @@ The workflow engine walks `flows[flow].steps[index]` sequentially:
 3. **loop**: Resolve variable to array, iterate, execute nested steps per item.
 4. **sink**: Deliver messages through connectors, advance.
 5. **jump**: Switch to target flow/step or start a new workflow instance.
+6. **wait**: Persist an event cursor and resume after a provider matches it or its timeout fires.
 
 If a step fails and `on_error` flow exists, execution jumps there automatically.
 
@@ -212,7 +214,7 @@ The block editor components (StepBlock, WhenBlock, LoopBlock) are designed to be
 
 ### Negative
 - Sequential model can't express arbitrary parallel execution
-- Loop execution is synchronous (one item at a time)
+- Loop execution is serial (one durable agent task at a time)
 - Stub connectors (email, GitHub, Jira, Slack) need future implementation
 
 ### Risks

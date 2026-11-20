@@ -1,27 +1,36 @@
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use serde::Deserialize;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, CONTENT_TYPE};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use tracing::{info, warn};
-use xpressclaw_core::acp::ACP_AGENTS;
+use xpressclaw_core::acp::{
+    canonical_agent_kind, infer_agent_kind_from_backend, is_managed_runner_image_for_kind,
+    ACP_AGENTS,
+};
 use xpressclaw_core::agents::registry::AgentRegistry;
 use xpressclaw_core::config::{
     context_label, default_native_runner_image, unique_session_id, AgentConfig, Config,
-    ContainerEngineAccess, LlmConfig, McpServerConfig, NativeRunnerConfig,
+    ContainerEngineAccess, McpServerConfig, NativeRunnerConfig,
 };
+use xpressclaw_core::docker::manager::ContainerSpec;
+use xpressclaw_core::external_tools::path_for_external_tool;
 use xpressclaw_core::llm::anthropic::AnthropicProvider;
 use xpressclaw_core::llm::local::detect_ollama;
 use xpressclaw_core::llm::openai::OpenAiProvider;
 use xpressclaw_core::llm::router::LlmRouter;
-use xpressclaw_core::paths::strip_verbatim;
 use xpressclaw_core::system;
-use xpressclaw_core::workers::native::subscription_auth_available;
+use xpressclaw_core::workers::native::{
+    host_ssh_agent_socket, local_runner_image_alias, resolve_runner_kind, resolved_runner_image,
+    subscription_auth_available,
+};
 
 use crate::state::AppState;
 
@@ -42,6 +51,7 @@ pub fn routes() -> Router<AppState> {
         .route("/config", get(get_config))
         .route("/mcp-servers", get(list_mcp_servers))
         .route("/mcp-servers", post(upsert_mcp_server))
+        .route("/mcp-servers/{name}/verify", post(verify_mcp_server))
         .route(
             "/mcp-servers/{name}",
             axum::routing::delete(delete_mcp_server),
@@ -133,6 +143,11 @@ async fn get_config(State(state): State<AppState>) -> Json<Value> {
                 "on_exceeded": config.system.budget.on_exceeded,
             },
         },
+        "instance": {
+            "config_path": state.config_path.display().to_string(),
+            "data_dir": config.system.data_dir.display().to_string(),
+            "workspace_dir": config.system.workspace_dir.display().to_string(),
+        },
         "mcp_servers": config.mcp_servers.iter().map(|(name, cfg)| {
             json!({
                 "name": name,
@@ -154,18 +169,30 @@ async fn setup_status(State(state): State<AppState>) -> Json<Value> {
 /// Check if Docker/Podman is available.
 async fn check_docker() -> Json<Value> {
     use xpressclaw_core::docker::manager::DockerManager;
+    use xpressclaw_core::docker::ssh_forwarding::ssh_agent_forwarding;
     let installed = DockerManager::is_docker_desktop_installed();
     match DockerManager::connect().await {
-        Ok(runtime) => Json(json!({
-            "available": true,
-            "installed": installed,
-            "can_start": false,
-            "runtime": runtime.runtime(),
-            "version": runtime.runtime_version(),
-            "socket": runtime.host_engine_socket().map(|path| path.display().to_string()),
-            "rootless": runtime.is_rootless(),
-            "error": null,
-        })),
+        Ok(runtime) => {
+            // Report the same capability the native worker acts on, so the UI
+            // states what this host will do instead of inferring it from the
+            // browser's platform.
+            let forwarding = ssh_agent_forwarding(
+                cfg!(target_os = "macos"),
+                runtime.runtime(),
+                runtime.is_docker_desktop(),
+            );
+            Json(json!({
+                "available": true,
+                "installed": installed,
+                "can_start": false,
+                "runtime": runtime.runtime(),
+                "version": runtime.runtime_version(),
+                "socket": runtime.host_engine_socket().map(|path| path.display().to_string()),
+                "rootless": runtime.is_rootless(),
+                "ssh_agent_forwarding_unsupported_reason": forwarding.unsupported_reason(),
+                "error": null,
+            }))
+        }
         Err(error) => Json(json!({
             "available": false,
             "installed": installed,
@@ -174,6 +201,7 @@ async fn check_docker() -> Json<Value> {
             "version": null,
             "socket": null,
             "rootless": null,
+            "ssh_agent_forwarding_unsupported_reason": null,
             "error": error.to_string(),
         })),
     }
@@ -198,6 +226,9 @@ async fn system_info() -> Json<Value> {
     value["working_directory"] = json!(std::env::current_dir()
         .ok()
         .map(|path| path.display().to_string()));
+    let ssh_agent_socket = host_ssh_agent_socket();
+    value["ssh_agent_available"] = json!(ssh_agent_socket.is_some());
+    value["ssh_agent_socket"] = json!(ssh_agent_socket.map(|path| path.display().to_string()));
     Json(value)
 }
 
@@ -391,12 +422,11 @@ async fn list_directories(
     let current = requested.canonicalize().map_err(|error| {
         bad_request(format!(
             "Cannot open directory {}: {error}",
-            requested.display()
+            path_for_external_tool(&requested).display()
         ))
     })?;
-    // Filesystem calls keep the verbatim path, which is what lifts MAX_PATH;
-    // only what leaves this handler is stripped.
-    let display_path = strip_verbatim(current.clone());
+    // Keep the canonical path for filesystem access; normalize API fields only.
+    let display_path = path_for_external_tool(&current);
     if !current.is_dir() {
         return Err(bad_request(format!(
             "{} is not a directory",
@@ -418,7 +448,7 @@ async fn list_directories(
             }
             Some((
                 entry.file_name().to_string_lossy().into_owned(),
-                strip_verbatim(path).display().to_string(),
+                path_for_external_tool(&path).display().to_string(),
             ))
         })
         .collect::<Vec<_>>();
@@ -432,7 +462,7 @@ async fn list_directories(
     Ok(Json(json!({
         "path": display_path.display().to_string(),
         "parent": display_path.parent().map(|path| path.display().to_string()),
-        "home": home.map(|path| path.display().to_string()),
+        "home": home.map(|path| path_for_external_tool(&path).display().to_string()),
         "roots": [root],
         "directories": directories.into_iter().map(|(name, path)| json!({
             "name": name,
@@ -456,11 +486,11 @@ async fn project_environment(
     let workspace = requested.canonicalize().map_err(|error| {
         bad_request(format!(
             "Cannot inspect workspace {}: {error}",
-            requested.display()
+            path_for_external_tool(&requested).display()
         ))
     })?;
     // Probes below join onto the verbatim path; only the response is stripped.
-    let display_workspace = strip_verbatim(workspace.clone());
+    let display_workspace = path_for_external_tool(&workspace);
     if !workspace.is_dir() {
         return Err(bad_request(format!(
             "{} is not a directory",
@@ -592,11 +622,48 @@ async fn project_environment(
         }
     }
 
+    let git_repository = workspace.join(".git").exists();
+    let git_uses_ssh = git_repository && repository_uses_ssh_remote(&workspace);
+
     Ok(Json(json!({
         "workspace": display_workspace.display().to_string(),
         "detected_files": detected_files,
         "suggestions": suggestions,
+        "git_repository": git_repository,
+        "git_uses_ssh": git_uses_ssh,
     })))
+}
+
+fn repository_uses_ssh_remote(workspace: &FsPath) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(path_for_external_tool(workspace))
+        .args(["config", "--get-regexp", r"^remote\..*\.(url|pushurl)$"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .is_some_and(|output| {
+            String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+                line.split_once(char::is_whitespace)
+                    .is_some_and(|(_, remote)| is_ssh_git_remote(remote.trim()))
+            })
+        })
+}
+
+fn is_ssh_git_remote(remote: &str) -> bool {
+    if remote.starts_with("ssh://") || remote.starts_with("git+ssh://") {
+        return true;
+    }
+    if remote.contains("://") {
+        return false;
+    }
+    let Some((host, path)) = remote.split_once(':') else {
+        return false;
+    };
+    if path.is_empty() || host.contains('/') || host.contains('\\') {
+        return false;
+    }
+    !(host.len() == 1 && host.as_bytes()[0].is_ascii_alphabetic())
 }
 
 fn first_existing<'a>(workspace: &FsPath, candidates: &'a [&'a str]) -> Option<&'a str> {
@@ -710,7 +777,7 @@ struct CompleteSetupRequest {
     #[serde(default)]
     agents: Vec<AgentSetup>,
     #[serde(default)]
-    mcp_servers: std::collections::HashMap<String, McpServerConfig>,
+    mcp_servers: Option<std::collections::HashMap<String, McpServerConfig>>,
     /// Isolation mode. ACP workers currently require "docker".
     #[serde(default = "default_isolation")]
     isolation: String,
@@ -722,6 +789,9 @@ fn default_isolation() -> String {
 
 #[derive(Deserialize)]
 struct AgentSetup {
+    /// Existing collaboration Project that should own a newly added Agent.
+    /// Initial setup leaves this empty and creates the Agent's first Project.
+    project_id: Option<String>,
     backend: Option<String>,
     runner_kind: Option<String>,
     runner_image: Option<String>,
@@ -732,6 +802,7 @@ struct AgentSetup {
     runner_command: Option<Vec<String>>,
     startup_commands: Option<Vec<String>>,
     subscription_auth: Option<bool>,
+    ssh_agent_forwarding: Option<bool>,
     runner_container_engine: Option<ContainerEngineAccess>,
     volumes: Option<Vec<String>>,
     #[serde(default)]
@@ -739,21 +810,21 @@ struct AgentSetup {
 }
 
 fn runner_kind_from_setup(setup: &AgentSetup) -> String {
-    let configured = setup
-        .runner_kind
-        .as_deref()
-        .or(setup.backend.as_deref())
-        .unwrap_or("codex")
-        .to_lowercase();
-    if configured.contains("claude") {
-        "claude".to_string()
-    } else if configured.contains("opencode") {
-        "opencode".to_string()
-    } else if configured.contains("codex") || configured == "auto" {
-        "codex".to_string()
-    } else {
-        configured
+    if let Some(configured) = setup.runner_kind.as_deref() {
+        let configured = configured.to_lowercase();
+        return if configured == "auto" {
+            "codex".to_string()
+        } else {
+            canonical_agent_kind(&configured)
+                .unwrap_or(configured.as_str())
+                .to_string()
+        };
     }
+
+    let backend = setup.backend.as_deref().unwrap_or("codex").to_lowercase();
+    infer_agent_kind_from_backend(&backend)
+        .unwrap_or(backend.as_str())
+        .to_string()
 }
 
 fn runner_from_setup(setup: &AgentSetup) -> NativeRunnerConfig {
@@ -765,11 +836,8 @@ fn runner_from_setup(setup: &AgentSetup) -> NativeRunnerConfig {
         .map(str::trim)
         .filter(|image| !image.is_empty())
         .unwrap_or_default();
-    let minimal_image = default_native_runner_image(&kind, ContainerEngineAccess::None);
-    let host_image = default_native_runner_image(&kind, ContainerEngineAccess::Host);
     let image = if configured_image.is_empty()
-        || minimal_image == Some(configured_image)
-        || host_image == Some(configured_image)
+        || is_managed_runner_image_for_kind(configured_image, &kind)
     {
         default_native_runner_image(&kind, container_engine)
             .unwrap_or_default()
@@ -819,7 +887,9 @@ fn runner_from_setup(setup: &AgentSetup) -> NativeRunnerConfig {
             .filter(|argument| !argument.is_empty())
             .collect(),
         subscription_auth: setup.subscription_auth.unwrap_or(true),
+        ssh_agent_forwarding: setup.ssh_agent_forwarding.unwrap_or(false),
         container_engine,
+        proxy: Default::default(),
     }
 }
 
@@ -835,6 +905,12 @@ fn validate_runner(runner: &NativeRunnerConfig) -> Result<(), String> {
 
 fn managed_workspace_requested(setup: &AgentSetup) -> bool {
     setup.workspace_mode.as_deref() == Some("managed")
+        || (setup.workspace_mode.as_deref() != Some("existing")
+            && setup
+                .runner_workspace
+                .as_deref()
+                .map(str::trim)
+                .is_none_or(str::is_empty))
 }
 
 fn runner_context(runner: &NativeRunnerConfig) -> String {
@@ -850,6 +926,12 @@ fn assign_managed_workspace(
     session_id: &str,
     data_dir: &FsPath,
 ) -> std::io::Result<()> {
+    if setup.workspace_mode.as_deref() == Some("existing") && runner.workspace.is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "an existing workspace path is required",
+        ));
+    }
     if !managed_workspace_requested(setup) {
         return Ok(());
     }
@@ -860,6 +942,14 @@ fn assign_managed_workspace(
         runner.project_name = Some("New project".to_string());
     }
     Ok(())
+}
+
+fn managed_workspace_error(error: std::io::Error) -> (StatusCode, Json<Value>) {
+    if error.kind() == std::io::ErrorKind::InvalidInput {
+        bad_request(error.to_string())
+    } else {
+        internal_error(error)
+    }
 }
 
 /// Save the setup configuration and mark setup as complete.
@@ -873,11 +963,11 @@ async fn complete_setup(
             Json(json!({ "error": "ACP agents require Docker or Podman isolation" })),
         ));
     }
+    let _config_guard = state.config_write_lock.lock().await;
     // Native products own model selection, credentials, instructions, and
     // subagents. The control plane stores only session runtime context.
-    let llm = LlmConfig::default();
-
-    let managed_root = state.config().system.data_dir.clone();
+    let current_config = state.config();
+    let managed_root = current_config.system.data_dir.clone();
     let mut used_ids: Vec<String> = Vec::new();
     let mut agents: Vec<AgentConfig> = Vec::new();
     for session in &req.agents {
@@ -886,7 +976,7 @@ async fn complete_setup(
         let id_refs: Vec<&str> = used_ids.iter().map(String::as_str).collect();
         let session_id = unique_session_id(&context, &runner.kind, &id_refs);
         assign_managed_workspace(session, &mut runner, &session_id, &managed_root)
-            .map_err(internal_error)?;
+            .map_err(managed_workspace_error)?;
         validate_runner(&runner).map_err(bad_request)?;
         used_ids.push(session_id.clone());
         agents.push(AgentConfig {
@@ -898,16 +988,14 @@ async fn complete_setup(
         });
     }
 
-    let mut config = Config {
-        llm,
-        agents,
-        // ACP agents own their tool loop. Only keep connectors the user
-        // explicitly configured; do not inject the retired agent-layer MCPs.
-        mcp_servers: req.mcp_servers,
-        ..Default::default()
-    };
+    let mut config = (*current_config).clone();
+    config.agents = agents;
+    // Omission means the setup form did not manage connectors. An explicit
+    // map, including an empty one, still replaces the configured MCP servers.
+    if let Some(mcp_servers) = req.mcp_servers {
+        config.mcp_servers = mcp_servers;
+    }
     config.system.isolation = req.isolation.clone();
-    config.system.data_dir = managed_root;
 
     // Save config to disk
     config.save(&state.config_path).map_err(internal_error)?;
@@ -960,11 +1048,18 @@ async fn complete_setup(
     })))
 }
 
-/// Add a durable ACP project without replacing existing projects.
+/// Add a durable ACP Agent without replacing existing Agents.
 async fn add_session(
     State(state): State<AppState>,
     Json(req): Json<AgentSetup>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let target_project_id = req
+        .project_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|project_id| !project_id.is_empty())
+        .map(str::to_owned);
+    let _config_guard = state.config_write_lock.lock().await;
     let old_config = state.config();
     let existing_ids: Vec<&str> = old_config.agents.iter().map(|a| a.name.as_str()).collect();
     let mut runner = runner_from_setup(&req);
@@ -972,7 +1067,7 @@ async fn add_session(
     let title = runner_context(&runner);
     let session_id = unique_session_id(&title, &runner.kind, &existing_ids);
     assign_managed_workspace(&req, &mut runner, &session_id, &old_config.system.data_dir)
-        .map_err(internal_error)?;
+        .map_err(managed_workspace_error)?;
 
     let agent_config = AgentConfig {
         name: session_id,
@@ -1001,20 +1096,41 @@ async fn add_session(
         // policies, memory, system, and future configuration fields.
         ..old_config.as_ref().clone()
     };
-    new_config
-        .save(&state.config_path)
-        .map_err(internal_error)?;
+    // Register the durable Agent. ACP workers are started per
+    // attempt, so there is no long-running agent to auto-start. When an
+    // existing Project is selected, attach the Agent under one database write
+    // reservation before saving its configuration. Project deletion then
+    // either wins first (and no config is written) or observes the new Agent
+    // and is rejected as non-empty.
+    let registry = AgentRegistry::new(state.db.clone());
+    let record = if let Some(project_id) = target_project_id.as_deref() {
+        let record = registry
+            .create_in_project(&agent_config.name, &agent_config.backend, project_id)
+            .map_err(|error| match error {
+                xpressclaw_core::error::Error::ProjectNotFound { .. } => not_found(&error),
+                xpressclaw_core::error::Error::Project(_) => (
+                    StatusCode::CONFLICT,
+                    Json(json!({ "error": error.to_string() })),
+                ),
+                _ => internal_error(error),
+            })?;
+        if let Err(error) = new_config.save(&state.config_path) {
+            let _ = registry.delete(&record.id);
+            return Err(internal_error(error));
+        }
+        record
+    } else {
+        new_config
+            .save(&state.config_path)
+            .map_err(internal_error)?;
+        registry
+            .ensure(&agent_config.name, &agent_config.backend)
+            .map_err(internal_error)?
+    };
     info!(
         name = agent_config.name,
         "added ACP project to configuration"
     );
-
-    // Register the durable project. ACP workers are started per
-    // attempt, so there is no long-running agent to auto-start.
-    let registry = AgentRegistry::new(state.db.clone());
-    let record = registry
-        .ensure(&agent_config.name, &agent_config.backend)
-        .map_err(internal_error)?;
     xpressclaw_core::sessions::SessionManager::new(state.db.clone())
         .ensure(&record.id, Some(&title))
         .map_err(internal_error)?;
@@ -1031,12 +1147,50 @@ async fn add_session(
         "session": agent_config.name,
         "session_id": record.id,
         "title": title,
+        "project_id": target_project_id.or(record.project_id),
     })))
 }
 
 // ---------------------------------------------------------------------------
 // MCP server management
 // ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+struct McpVerificationResult {
+    ok: bool,
+    status: &'static str,
+    message: String,
+    suggestion: Option<String>,
+}
+
+impl McpVerificationResult {
+    fn ready(message: impl Into<String>) -> Self {
+        Self {
+            ok: true,
+            status: "ready",
+            message: message.into(),
+            suggestion: None,
+        }
+    }
+
+    fn failed(
+        status: &'static str,
+        message: impl Into<String>,
+        suggestion: Option<String>,
+    ) -> Self {
+        Self {
+            ok: false,
+            status,
+            message: message.into(),
+            suggestion,
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct VerifyMcpServerRequest {
+    agent_id: Option<String>,
+}
 
 /// List all configured MCP servers with full details.
 async fn list_mcp_servers(State(state): State<AppState>) -> Json<Value> {
@@ -1083,6 +1237,7 @@ async fn upsert_mcp_server(
     State(state): State<AppState>,
     Json(req): Json<UpsertMcpServerRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let _config_guard = state.config_write_lock.lock().await;
     let old_config = state.config();
 
     let name = req.name.trim().to_string();
@@ -1166,6 +1321,9 @@ async fn upsert_mcp_server(
     let new_config = Config {
         mcp_servers: new_mcp,
         agents: old_config.agents.clone(),
+        instance: old_config.instance.clone(),
+        collaboration: old_config.collaboration.clone(),
+        proxy: old_config.proxy.clone(),
         llm: old_config.llm.clone(),
         system: old_config.system.clone(),
         tools: old_config.tools.clone(),
@@ -1182,11 +1340,755 @@ async fn upsert_mcp_server(
     Ok(Json(json!({ "success": true, "name": name })))
 }
 
+/// Verify a saved MCP server using the closest safe execution context.
+///
+/// Remote transports receive a live protocol request from the control plane.
+/// Stdio commands are checked inside the selected project's runner image,
+/// because host paths say nothing about what is installed in that container.
+async fn verify_mcp_server(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<VerifyMcpServerRequest>,
+) -> Result<Json<McpVerificationResult>, (StatusCode, Json<Value>)> {
+    let config = state.config();
+    let server = config.mcp_servers.get(&name).cloned().ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("MCP server '{name}' not found") })),
+        )
+    })?;
+
+    let result = match server.server_type.as_str() {
+        "http" | "sse" => verify_remote_mcp_server(&server).await,
+        "stdio" => {
+            let Some(agent_id) = req
+                .agent_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+            else {
+                return Ok(Json(McpVerificationResult::failed(
+                    "project_required",
+                    "Stdio commands must be verified inside a project's runner image.",
+                    Some("Open the project's Agent page and verify this server there.".to_string()),
+                )));
+            };
+            verify_stdio_mcp_server(&state, &server, agent_id).await
+        }
+        _ => McpVerificationResult::failed(
+            "invalid_configuration",
+            "The saved MCP transport is not supported.",
+            Some("Edit the server and choose stdio, HTTP, or SSE.".to_string()),
+        ),
+    };
+
+    Ok(Json(result))
+}
+
+async fn verify_remote_mcp_server(server: &McpServerConfig) -> McpVerificationResult {
+    let Some(url) = server
+        .url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+    else {
+        return McpVerificationResult::failed(
+            "invalid_configuration",
+            "The MCP server has no URL.",
+            Some("Edit the server and provide an HTTP or HTTPS URL.".to_string()),
+        );
+    };
+
+    let mut headers = HeaderMap::new();
+    for (name, value) in &server.headers {
+        let Ok(header_name) = HeaderName::from_bytes(name.as_bytes()) else {
+            return McpVerificationResult::failed(
+                "invalid_configuration",
+                format!("HTTP header name '{name}' is invalid."),
+                Some("Edit the server's HTTP headers and verify again.".to_string()),
+            );
+        };
+        let Ok(header_value) = HeaderValue::from_str(value) else {
+            return McpVerificationResult::failed(
+                "invalid_configuration",
+                format!("HTTP header '{name}' has an invalid value."),
+                Some("Edit the server's HTTP headers and verify again.".to_string()),
+            );
+        };
+        headers.insert(header_name, header_value);
+    }
+    let default_accept = if server.server_type == "sse" {
+        HeaderValue::from_static("text/event-stream")
+    } else {
+        HeaderValue::from_static("application/json, text/event-stream")
+    };
+    headers.entry(ACCEPT).or_insert(default_accept);
+
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            warn!(%error, "failed to build MCP verification client");
+            return McpVerificationResult::failed(
+                "connection_failed",
+                "XpressClaw could not create an HTTP client for this verification.",
+                None,
+            );
+        }
+    };
+
+    let request = if server.server_type == "sse" {
+        client.get(url).headers(headers)
+    } else {
+        client.post(url).headers(headers).json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "xpressclaw-verifier",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+            },
+        }))
+    };
+
+    match request.send().await {
+        Ok(response) => verify_remote_mcp_response(&server.server_type, response).await,
+        Err(error) => {
+            let message = if error.is_timeout() {
+                "The MCP server did not respond within 10 seconds."
+            } else if error.is_connect() {
+                "XpressClaw could not connect to the MCP server."
+            } else {
+                "The MCP verification request failed."
+            };
+            warn!(
+                timed_out = error.is_timeout(),
+                connection_error = error.is_connect(),
+                "remote MCP verification failed"
+            );
+            McpVerificationResult::failed(
+                "connection_failed",
+                message,
+                Some(
+                    "Check the URL, network access, and TLS configuration, then try again."
+                        .to_string(),
+                ),
+            )
+        }
+    }
+}
+
+const MCP_VERIFICATION_BODY_LIMIT: usize = 256 * 1024;
+const MCP_VERIFICATION_STREAM_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn verify_remote_mcp_response(
+    server_type: &str,
+    response: reqwest::Response,
+) -> McpVerificationResult {
+    let status = response.status();
+    if !status.is_success() {
+        return remote_verification_from_status(status);
+    }
+
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .map(str::to_ascii_lowercase);
+
+    match server_type {
+        "http" => match content_type.as_deref() {
+            Some("application/json") => verify_json_initialize_response(response).await,
+            Some("text/event-stream") => verify_sse_initialize_response(response).await,
+            _ => McpVerificationResult::failed(
+                "invalid_response",
+                "The endpoint returned a successful HTTP status but not an MCP response.",
+                Some(
+                    "Check that the URL points to a Streamable HTTP MCP endpoint, not a login or web page."
+                        .to_string(),
+                ),
+            ),
+        },
+        "sse" if content_type.as_deref() == Some("text/event-stream") => {
+            verify_legacy_sse_handshake(response).await
+        }
+        "sse" => McpVerificationResult::failed(
+            "invalid_response",
+            "The endpoint did not return an MCP SSE stream.",
+            Some(
+                "Check that the URL points to the server's SSE endpoint and does not redirect to a login page."
+                    .to_string(),
+            ),
+        ),
+        _ => McpVerificationResult::failed(
+            "invalid_configuration",
+            "The saved MCP transport is not supported.",
+            None,
+        ),
+    }
+}
+
+async fn verify_json_initialize_response(response: reqwest::Response) -> McpVerificationResult {
+    let body = match tokio::time::timeout(
+        MCP_VERIFICATION_STREAM_TIMEOUT,
+        read_limited_response_body(response),
+    )
+    .await
+    {
+        Ok(Ok(body)) => body,
+        Ok(Err(ResponseBodyError::TooLarge)) => {
+            return McpVerificationResult::failed(
+                "invalid_response",
+                "The MCP initialize response was unexpectedly large.",
+                Some("Check the MCP server and verify again.".to_string()),
+            );
+        }
+        Ok(Err(ResponseBodyError::ReadFailed)) => {
+            return McpVerificationResult::failed(
+                "connection_failed",
+                "XpressClaw could not read the MCP initialize response.",
+                Some("Check the MCP server and verify again.".to_string()),
+            );
+        }
+        Err(_) => {
+            return McpVerificationResult::failed(
+                "verification_timeout",
+                "The MCP server did not finish its initialize response within 5 seconds.",
+                Some("Check the MCP server and verify again.".to_string()),
+            );
+        }
+    };
+
+    match serde_json::from_slice::<Value>(&body) {
+        Ok(value) => initialize_verification_result(&value),
+        Err(_) => McpVerificationResult::failed(
+            "invalid_response",
+            "The endpoint returned JSON that was not a valid MCP initialize response.",
+            Some("Check that the URL and transport match the MCP server.".to_string()),
+        ),
+    }
+}
+
+async fn verify_sse_initialize_response(response: reqwest::Response) -> McpVerificationResult {
+    let inspection = tokio::time::timeout(MCP_VERIFICATION_STREAM_TIMEOUT, async move {
+        let mut response = response;
+        let mut body = Vec::new();
+
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    if body.len().saturating_add(chunk.len()) > MCP_VERIFICATION_BODY_LIMIT {
+                        return SseInspection::TooLarge;
+                    }
+                    body.extend_from_slice(&chunk);
+
+                    for event in complete_sse_events(&body) {
+                        let Ok(value) = serde_json::from_str::<Value>(&event.data) else {
+                            continue;
+                        };
+                        match validate_initialize_response(&value) {
+                            InitializeResponse::Ready => return SseInspection::Ready,
+                            InitializeResponse::ProtocolError => {
+                                return SseInspection::ProtocolError;
+                            }
+                            InitializeResponse::Invalid => {}
+                        }
+                    }
+                }
+                Ok(None) => return SseInspection::Invalid,
+                Err(_) => return SseInspection::ReadFailed,
+            }
+        }
+    })
+    .await;
+
+    match inspection {
+        Ok(SseInspection::Ready) => McpVerificationResult::ready(
+            "The MCP endpoint returned a valid initialize response over SSE.",
+        ),
+        Ok(SseInspection::ProtocolError) => initialize_protocol_error_result(),
+        Ok(SseInspection::TooLarge) => McpVerificationResult::failed(
+            "invalid_response",
+            "The MCP SSE response was unexpectedly large before initialization completed.",
+            Some("Check the MCP server and verify again.".to_string()),
+        ),
+        Ok(SseInspection::ReadFailed) => McpVerificationResult::failed(
+            "connection_failed",
+            "XpressClaw could not read the MCP SSE response.",
+            Some("Check the MCP server and verify again.".to_string()),
+        ),
+        Ok(SseInspection::Invalid) => McpVerificationResult::failed(
+            "invalid_response",
+            "The SSE stream ended without a valid MCP initialize response.",
+            Some("Check that the URL and transport match the MCP server.".to_string()),
+        ),
+        Err(_) => McpVerificationResult::failed(
+            "verification_timeout",
+            "The SSE stream did not return an MCP initialize response within 5 seconds.",
+            Some("Check the MCP server and verify again.".to_string()),
+        ),
+    }
+}
+
+async fn verify_legacy_sse_handshake(response: reqwest::Response) -> McpVerificationResult {
+    let base_url = response.url().clone();
+    let inspection = tokio::time::timeout(MCP_VERIFICATION_STREAM_TIMEOUT, async move {
+        let mut response = response;
+        let mut body = Vec::new();
+
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    if body.len().saturating_add(chunk.len()) > MCP_VERIFICATION_BODY_LIMIT {
+                        return SseInspection::TooLarge;
+                    }
+                    body.extend_from_slice(&chunk);
+
+                    for event in complete_sse_events(&body) {
+                        if event.event.as_deref() != Some("endpoint") {
+                            continue;
+                        }
+                        let endpoint = event.data.trim();
+                        if endpoint.is_empty() {
+                            continue;
+                        }
+                        let Ok(endpoint_url) = base_url.join(endpoint) else {
+                            continue;
+                        };
+                        if matches!(endpoint_url.scheme(), "http" | "https") {
+                            return SseInspection::Ready;
+                        }
+                    }
+                }
+                Ok(None) => return SseInspection::Invalid,
+                Err(_) => return SseInspection::ReadFailed,
+            }
+        }
+    })
+    .await;
+
+    match inspection {
+        Ok(SseInspection::Ready) => McpVerificationResult::ready(
+            "The MCP endpoint returned a valid SSE endpoint handshake.",
+        ),
+        Ok(SseInspection::TooLarge) => McpVerificationResult::failed(
+            "invalid_response",
+            "The SSE response was unexpectedly large before its MCP handshake completed.",
+            Some("Check the MCP server and verify again.".to_string()),
+        ),
+        Ok(SseInspection::ReadFailed) => McpVerificationResult::failed(
+            "connection_failed",
+            "XpressClaw could not read the MCP SSE handshake.",
+            Some("Check the MCP server and verify again.".to_string()),
+        ),
+        Ok(SseInspection::Invalid | SseInspection::ProtocolError) => McpVerificationResult::failed(
+            "invalid_response",
+            "The SSE stream ended without a valid MCP endpoint handshake.",
+            Some("Check that the URL points to a legacy MCP SSE endpoint.".to_string()),
+        ),
+        Err(_) => McpVerificationResult::failed(
+            "verification_timeout",
+            "The SSE stream did not provide an MCP endpoint handshake within 5 seconds.",
+            Some("Check the MCP server and verify again.".to_string()),
+        ),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ResponseBodyError {
+    TooLarge,
+    ReadFailed,
+}
+
+async fn read_limited_response_body(
+    mut response: reqwest::Response,
+) -> Result<Vec<u8>, ResponseBodyError> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| ResponseBodyError::ReadFailed)?
+    {
+        if body.len().saturating_add(chunk.len()) > MCP_VERIFICATION_BODY_LIMIT {
+            return Err(ResponseBodyError::TooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum InitializeResponse {
+    Ready,
+    ProtocolError,
+    Invalid,
+}
+
+fn validate_initialize_response(value: &Value) -> InitializeResponse {
+    let Some(response) = value.as_object() else {
+        return InitializeResponse::Invalid;
+    };
+    if response.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+        || response.get("id").and_then(Value::as_u64) != Some(1)
+    {
+        return InitializeResponse::Invalid;
+    }
+    if response.get("error").is_some_and(Value::is_object) {
+        return InitializeResponse::ProtocolError;
+    }
+
+    let Some(result) = response.get("result").and_then(Value::as_object) else {
+        return InitializeResponse::Invalid;
+    };
+    let valid_protocol_version = result
+        .get("protocolVersion")
+        .and_then(Value::as_str)
+        .is_some_and(|version| !version.trim().is_empty());
+    let valid_capabilities = result.get("capabilities").is_some_and(Value::is_object);
+    let valid_server_info = result
+        .get("serverInfo")
+        .and_then(Value::as_object)
+        .is_some_and(|server_info| {
+            server_info
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| !name.trim().is_empty())
+                && server_info
+                    .get("version")
+                    .and_then(Value::as_str)
+                    .is_some_and(|version| !version.trim().is_empty())
+        });
+
+    if valid_protocol_version && valid_capabilities && valid_server_info {
+        InitializeResponse::Ready
+    } else {
+        InitializeResponse::Invalid
+    }
+}
+
+fn initialize_verification_result(value: &Value) -> McpVerificationResult {
+    match validate_initialize_response(value) {
+        InitializeResponse::Ready => {
+            McpVerificationResult::ready("The MCP endpoint returned a valid initialize response.")
+        }
+        InitializeResponse::ProtocolError => initialize_protocol_error_result(),
+        InitializeResponse::Invalid => McpVerificationResult::failed(
+            "invalid_response",
+            "The endpoint returned JSON that was not a valid MCP initialize response.",
+            Some("Check that the URL and transport match the MCP server.".to_string()),
+        ),
+    }
+}
+
+fn initialize_protocol_error_result() -> McpVerificationResult {
+    McpVerificationResult::failed(
+        "protocol_error",
+        "The MCP endpoint returned a JSON-RPC error for the initialize request.",
+        Some("Check the MCP server configuration and authentication, then try again.".to_string()),
+    )
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SseInspection {
+    Ready,
+    ProtocolError,
+    Invalid,
+    TooLarge,
+    ReadFailed,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SseEvent {
+    event: Option<String>,
+    data: String,
+}
+
+fn complete_sse_events(body: &[u8]) -> Vec<SseEvent> {
+    let normalized = String::from_utf8_lossy(body)
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+    let complete_length = normalized
+        .rfind("\n\n")
+        .map_or(0, |event_end| event_end + 2);
+
+    normalized[..complete_length]
+        .split("\n\n")
+        .filter_map(|event| {
+            let mut event_type = None;
+            let mut data = Vec::new();
+            for line in event.lines() {
+                if line.starts_with(':') {
+                    continue;
+                }
+                let (field, value) = line.split_once(':').unwrap_or((line, ""));
+                let value = value.strip_prefix(' ').unwrap_or(value);
+                match field {
+                    "event" => event_type = Some(value.to_string()),
+                    "data" => data.push(value),
+                    _ => {}
+                }
+            }
+            (!data.is_empty()).then(|| SseEvent {
+                event: event_type,
+                data: data.join("\n"),
+            })
+        })
+        .collect()
+}
+
+fn remote_verification_from_status(status: StatusCode) -> McpVerificationResult {
+    if status.is_success() {
+        return McpVerificationResult::failed(
+            "invalid_response",
+            "The endpoint returned a successful status without a verified MCP response.",
+            Some("Check that the URL and transport match the MCP server.".to_string()),
+        );
+    }
+    if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+        return McpVerificationResult::failed(
+            "authentication_required",
+            format!("The MCP endpoint responded with {status}; authentication is required."),
+            Some(
+                "Add a valid Authorization header to this server configuration, then verify again."
+                    .to_string(),
+            ),
+        );
+    }
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        return McpVerificationResult::failed(
+            "rate_limited",
+            "The MCP endpoint is reachable but rate-limited the verification request.",
+            Some("Wait briefly and verify again.".to_string()),
+        );
+    }
+    if status.is_server_error() {
+        return McpVerificationResult::failed(
+            "server_error",
+            format!("The MCP endpoint is reachable but returned {status}."),
+            Some("Check the MCP server and try again.".to_string()),
+        );
+    }
+    McpVerificationResult::failed(
+        "request_rejected",
+        format!("The MCP endpoint rejected the protocol request with {status}."),
+        Some("Check that the URL and transport match the MCP server.".to_string()),
+    )
+}
+
+async fn verify_stdio_mcp_server(
+    state: &AppState,
+    server: &McpServerConfig,
+    agent_id: &str,
+) -> McpVerificationResult {
+    let config = state.config();
+    let registry_name = AgentRegistry::new(state.db.clone())
+        .get(agent_id)
+        .ok()
+        .map(|record| record.name);
+    let agent = config.agents.iter().find(|agent| {
+        agent.name == agent_id || registry_name.as_deref() == Some(agent.name.as_str())
+    });
+    let Some(agent) = agent else {
+        return McpVerificationResult::failed(
+            "project_not_found",
+            "The selected project no longer has a runner configuration.",
+            Some("Reload the project and try again.".to_string()),
+        );
+    };
+
+    let kind = match resolve_runner_kind(agent) {
+        Ok(kind) => kind,
+        Err(error) => {
+            return McpVerificationResult::failed(
+                "runner_unavailable",
+                format!("The project runner could not be resolved: {error}"),
+                Some("Save a valid ACP agent configuration first.".to_string()),
+            );
+        }
+    };
+    let image = match resolved_runner_image(&agent.runner, &kind) {
+        Ok(image) => image,
+        Err(error) => {
+            return McpVerificationResult::failed(
+                "runner_unavailable",
+                format!("The project runner image could not be resolved: {error}"),
+                Some("Save a valid runner image first.".to_string()),
+            );
+        }
+    };
+    let Some(docker) = state.docker().await else {
+        return McpVerificationResult::failed(
+            "runner_unavailable",
+            "Docker or Podman is not available, so the runner image could not be checked.",
+            Some("Start the configured container runtime and try again.".to_string()),
+        );
+    };
+    let runtime_image = if docker.has_image(&image).await {
+        Some(image)
+    } else if let Some(local_image) = local_runner_image_alias(&image) {
+        docker
+            .has_image(local_image)
+            .await
+            .then(|| local_image.to_string())
+    } else {
+        None
+    };
+    let Some(runtime_image) = runtime_image else {
+        return McpVerificationResult::failed(
+            "runner_image_missing",
+            "The selected project's runner image is not available locally.",
+            Some("Prepare the project runner, then verify the MCP server again.".to_string()),
+        );
+    };
+
+    let Some(command) = server
+        .command
+        .as_deref()
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+    else {
+        return McpVerificationResult::failed(
+            "invalid_configuration",
+            "The stdio MCP server has no command.",
+            Some("Edit the server and provide an absolute command path.".to_string()),
+        );
+    };
+    let basename = FsPath::new(command)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    let script = r#"configured="$1"
+name="$2"
+if [ -x "$configured" ]; then
+  printf 'FOUND:%s\n' "$configured"
+  exit 0
+fi
+if [ -n "$name" ]; then
+  alternative="$(command -v "$name" 2>/dev/null || true)"
+  if [ -n "$alternative" ]; then
+    printf 'ALTERNATIVE:%s\n' "$alternative"
+    exit 3
+  fi
+fi
+printf 'MISSING:%s\n' "$configured"
+exit 4
+"#;
+    let workload_id = format!("mcp-verify-{}", uuid::Uuid::new_v4().simple());
+    let spec = ContainerSpec {
+        image: runtime_image,
+        memory_limit: Some(256 * 1024 * 1024),
+        cpu_limit: None,
+        environment: Vec::new(),
+        volumes: Vec::new(),
+        network_mode: Some("none".to_string()),
+        expose_port: None,
+        cmd: Some(vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            script.to_string(),
+            "mcp-verify".to_string(),
+            command.to_string(),
+            basename.to_string(),
+        ]),
+        working_dir: None,
+        run_as_host_user: false,
+        init: None,
+    };
+
+    if let Err(error) = docker.launch(&workload_id, &spec).await {
+        warn!(%error, "failed to launch stdio MCP verification container");
+        let _ = docker.stop(&workload_id).await;
+        return McpVerificationResult::failed(
+            "runner_unavailable",
+            "XpressClaw could not start the runner image to verify this command.",
+            Some(
+                "Check the project runner image and container runtime, then try again.".to_string(),
+            ),
+        );
+    }
+
+    let output =
+        match tokio::time::timeout(Duration::from_secs(15), docker.wait_for_exit(&workload_id))
+            .await
+        {
+            Ok(Ok(output)) => output,
+            Ok(Err(error)) => {
+                warn!(%error, "stdio MCP verification container failed");
+                let _ = docker.stop(&workload_id).await;
+                return McpVerificationResult::failed(
+                    "runner_unavailable",
+                    "XpressClaw could not inspect the command in the runner image.",
+                    Some("Check the project runner image and try again.".to_string()),
+                );
+            }
+            Err(_) => {
+                let _ = docker.stop(&workload_id).await;
+                return McpVerificationResult::failed(
+                    "verification_timeout",
+                    "The runner image check did not finish within 15 seconds.",
+                    Some("Check the container runtime and try again.".to_string()),
+                );
+            }
+        };
+
+    stdio_verification_from_output(command, output.status_code, &output.output)
+}
+
+fn stdio_verification_from_output(
+    command: &str,
+    status_code: i64,
+    output: &str,
+) -> McpVerificationResult {
+    if status_code == 0 && output.lines().any(|line| line.starts_with("FOUND:")) {
+        return McpVerificationResult::ready(format!(
+            "The command {command} is executable in this project's base runner image."
+        ));
+    }
+    if let Some(alternative) = output
+        .lines()
+        .find_map(|line| line.strip_prefix("ALTERNATIVE:"))
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    {
+        return McpVerificationResult::failed(
+            "command_path_incorrect",
+            format!("{command} is not executable in this project's base runner image."),
+            Some(format!("Use {alternative} instead.")),
+        );
+    }
+    if status_code == 4 || output.lines().any(|line| line.starts_with("MISSING:")) {
+        return McpVerificationResult::failed(
+            "command_missing",
+            format!("{command} is not executable in this project's base runner image."),
+            Some(
+                "Install it in the runner image, correct its path, or provide it with a project startup command."
+                    .to_string(),
+            ),
+        );
+    }
+    McpVerificationResult::failed(
+        "verification_failed",
+        "The runner could not verify the stdio command.",
+        Some(
+            "Check that the runner image contains /bin/sh and the configured command.".to_string(),
+        ),
+    )
+}
+
 /// Delete an MCP server from the global config.
 async fn delete_mcp_server(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let _config_guard = state.config_write_lock.lock().await;
     let old_config = state.config();
 
     let mut new_mcp = old_config.mcp_servers.clone();
@@ -1205,6 +2107,9 @@ async fn delete_mcp_server(
     let new_config = Config {
         mcp_servers: new_mcp,
         agents,
+        instance: old_config.instance.clone(),
+        collaboration: old_config.collaboration.clone(),
+        proxy: old_config.proxy.clone(),
         llm: old_config.llm.clone(),
         system: old_config.system.clone(),
         tools: old_config.tools.clone(),
@@ -1231,6 +2136,13 @@ fn internal_error(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
 fn bad_request(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
     (
         StatusCode::BAD_REQUEST,
+        Json(json!({ "error": e.to_string() })),
+    )
+}
+
+fn not_found(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::NOT_FOUND,
         Json(json!({ "error": e.to_string() })),
     )
 }
@@ -1268,6 +2180,283 @@ mod tests {
     }
 
     #[test]
+    fn remote_mcp_verification_reports_authentication_failures() {
+        let result = remote_verification_from_status(StatusCode::UNAUTHORIZED);
+        assert!(!result.ok);
+        assert_eq!(result.status, "authentication_required");
+        assert!(result.message.contains("401"));
+        assert!(result
+            .suggestion
+            .as_deref()
+            .is_some_and(|suggestion| suggestion.contains("Authorization")));
+    }
+
+    #[tokio::test]
+    async fn remote_mcp_verification_sends_headers_and_initialize_request() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/mcp",
+            post(
+                |headers: axum::http::HeaderMap, Json(body): Json<Value>| async move {
+                    let authorized = headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok())
+                        == Some("Bearer test-token");
+                    if authorized && body["method"] == "initialize" {
+                        (
+                            StatusCode::OK,
+                            Json(json!({
+                                "jsonrpc": "2.0",
+                                "id": 1,
+                                "result": {
+                                    "protocolVersion": "2025-06-18",
+                                    "capabilities": {},
+                                    "serverInfo": {
+                                        "name": "test-server",
+                                        "version": "1.0.0"
+                                    }
+                                }
+                            })),
+                        )
+                    } else {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({ "error": "bad request" })),
+                        )
+                    }
+                },
+            ),
+        );
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let server = McpServerConfig {
+            server_type: "http".to_string(),
+            url: Some(format!("http://{address}/mcp")),
+            headers: std::collections::HashMap::from([(
+                "Authorization".to_string(),
+                "Bearer test-token".to_string(),
+            )]),
+            ..Default::default()
+        };
+
+        let result = verify_remote_mcp_server(&server).await;
+        server_task.abort();
+
+        assert!(result.ok);
+        assert_eq!(result.status, "ready");
+    }
+
+    #[tokio::test]
+    async fn remote_mcp_verification_rejects_a_successful_login_page() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/mcp",
+            post(|| async {
+                axum::response::Html("<!doctype html><html><body>Please sign in</body></html>")
+            }),
+        );
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let server = McpServerConfig {
+            server_type: "http".to_string(),
+            url: Some(format!("http://{address}/mcp")),
+            ..Default::default()
+        };
+
+        let result = verify_remote_mcp_server(&server).await;
+        server_task.abort();
+
+        assert!(!result.ok);
+        assert_eq!(result.status, "invalid_response");
+        assert!(result
+            .suggestion
+            .as_deref()
+            .is_some_and(|suggestion| suggestion.contains("login")));
+    }
+
+    #[tokio::test]
+    async fn remote_mcp_verification_rejects_non_mcp_json() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route("/mcp", post(|| async { Json(json!({ "status": "ok" })) }));
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let server = McpServerConfig {
+            server_type: "http".to_string(),
+            url: Some(format!("http://{address}/mcp")),
+            ..Default::default()
+        };
+
+        let result = verify_remote_mcp_server(&server).await;
+        server_task.abort();
+
+        assert!(!result.ok);
+        assert_eq!(result.status, "invalid_response");
+        assert!(result.message.contains("initialize"));
+    }
+
+    #[tokio::test]
+    async fn remote_mcp_verification_accepts_streamable_http_sse_initialize_response() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/mcp",
+            post(|| async {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    concat!(
+                        "event: message\n",
+                        "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":",
+                        "{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},",
+                        "\"serverInfo\":{\"name\":\"test-server\",\"version\":\"1.0.0\"}}}\n\n"
+                    ),
+                )
+            }),
+        );
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let server = McpServerConfig {
+            server_type: "http".to_string(),
+            url: Some(format!("http://{address}/mcp")),
+            ..Default::default()
+        };
+
+        let result = verify_remote_mcp_server(&server).await;
+        server_task.abort();
+
+        assert!(result.ok);
+        assert_eq!(result.status, "ready");
+    }
+
+    #[tokio::test]
+    async fn remote_mcp_verification_requires_a_valid_legacy_sse_handshake() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/events",
+            get(|| async {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    "event: endpoint\ndata: /messages?session=test\n\n",
+                )
+            }),
+        );
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let server = McpServerConfig {
+            server_type: "sse".to_string(),
+            url: Some(format!("http://{address}/events")),
+            ..Default::default()
+        };
+
+        let result = verify_remote_mcp_server(&server).await;
+        server_task.abort();
+
+        assert!(result.ok);
+        assert_eq!(result.status, "ready");
+    }
+
+    #[tokio::test]
+    async fn remote_mcp_verification_rejects_sse_without_an_endpoint_handshake() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/events",
+            get(|| async {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    "event: message\ndata: connected\n\n",
+                )
+            }),
+        );
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let server = McpServerConfig {
+            server_type: "sse".to_string(),
+            url: Some(format!("http://{address}/events")),
+            ..Default::default()
+        };
+
+        let result = verify_remote_mcp_server(&server).await;
+        server_task.abort();
+
+        assert!(!result.ok);
+        assert_eq!(result.status, "invalid_response");
+        assert!(result.message.contains("handshake"));
+    }
+
+    #[test]
+    fn initialize_response_validation_requires_mcp_result_fields() {
+        assert_eq!(
+            validate_initialize_response(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "serverInfo": {
+                        "name": "test-server",
+                        "version": "1.0.0"
+                    }
+                }
+            })),
+            InitializeResponse::Ready
+        );
+        assert_eq!(
+            validate_initialize_response(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {}
+                }
+            })),
+            InitializeResponse::Invalid
+        );
+    }
+
+    #[test]
+    fn sse_parser_ignores_incomplete_events() {
+        assert!(complete_sse_events(b"event: endpoint\ndata: /messages").is_empty());
+        assert_eq!(
+            complete_sse_events(b": keepalive\n\nevent: endpoint\ndata: /messages\n\n"),
+            vec![SseEvent {
+                event: Some("endpoint".to_string()),
+                data: "/messages".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn stdio_mcp_verification_suggests_the_executable_found_in_the_runner() {
+        let result =
+            stdio_verification_from_output("/usr/bin/npx", 3, "ALTERNATIVE:/usr/local/bin/npx\n");
+        assert!(!result.ok);
+        assert_eq!(result.status, "command_path_incorrect");
+        assert_eq!(
+            result.suggestion.as_deref(),
+            Some("Use /usr/local/bin/npx instead.")
+        );
+    }
+
+    #[test]
+    fn stdio_mcp_verification_reports_a_missing_executable() {
+        let result =
+            stdio_verification_from_output("/opt/mcp/server", 4, "MISSING:/opt/mcp/server\n");
+        assert!(!result.ok);
+        assert_eq!(result.status, "command_missing");
+        assert!(result.message.contains("/opt/mcp/server is not executable"));
+    }
+
+    #[test]
     fn setup_selects_the_image_for_the_builtin_acp_agent() {
         let setup: AgentSetup = serde_json::from_value(json!({
             "name": "reviewer",
@@ -1278,7 +2467,7 @@ mod tests {
         assert_eq!(runner.kind, "claude");
         assert_eq!(
             runner.image,
-            "ghcr.io/xpressai/xpressclaw-runner-claude:latest"
+            default_native_runner_image("claude", ContainerEngineAccess::None).unwrap()
         );
     }
 
@@ -1294,8 +2483,38 @@ mod tests {
         assert_eq!(runner.container_engine, ContainerEngineAccess::Host);
         assert_eq!(
             runner.image,
-            "ghcr.io/xpressai/xpressclaw-runner-codex-docker:latest"
+            default_native_runner_image("codex", ContainerEngineAccess::Host).unwrap()
         );
+    }
+
+    #[test]
+    fn setup_preserves_explicit_ssh_agent_forwarding() {
+        let setup: AgentSetup = serde_json::from_value(json!({
+            "runner_kind": "codex",
+            "ssh_agent_forwarding": true
+        }))
+        .unwrap();
+        let runner = runner_from_setup(&setup);
+        assert!(runner.ssh_agent_forwarding);
+    }
+
+    #[test]
+    fn recognizes_ssh_git_remote_forms_without_confusing_local_paths() {
+        for remote in [
+            "git@github.com:XpressAI/xpressclaw.git",
+            "ssh://git@gitlab.example/team/repo.git",
+            "work-github:team/repo.git",
+        ] {
+            assert!(is_ssh_git_remote(remote), "{remote}");
+        }
+        for remote in [
+            "https://github.com/XpressAI/xpressclaw.git",
+            "file:///srv/repos/xpressclaw.git",
+            "/srv/repos/xpressclaw.git",
+            r"C:\repos\xpressclaw",
+        ] {
+            assert!(!is_ssh_git_remote(remote), "{remote}");
+        }
     }
 
     #[test]
@@ -1307,8 +2526,36 @@ mod tests {
         let runner = runner_from_setup(&setup);
         assert_eq!(
             runner.image,
-            "ghcr.io/xpressai/xpressclaw-runner-qwen:latest"
+            default_native_runner_image("qwen", ContainerEngineAccess::None).unwrap()
         );
+    }
+
+    #[test]
+    fn setup_selects_deepseek_harness_by_catalog_id_or_dsh_alias() {
+        for kind in ["deepseek-harness", "dsh"] {
+            let setup: AgentSetup = serde_json::from_value(json!({
+                "runner_kind": kind
+            }))
+            .unwrap();
+            let runner = runner_from_setup(&setup);
+            assert_eq!(runner.kind, "deepseek-harness");
+            assert_eq!(
+                runner.image,
+                default_native_runner_image("deepseek-harness", ContainerEngineAccess::None)
+                    .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn setup_does_not_reclassify_an_explicit_custom_kind() {
+        let setup: AgentSetup = serde_json::from_value(json!({
+            "runner_kind": "codex-proxy",
+            "backend": "codex",
+            "runner_command": ["codex-proxy", "acp"]
+        }))
+        .unwrap();
+        assert_eq!(runner_kind_from_setup(&setup), "codex-proxy");
     }
 
     #[test]
@@ -1331,6 +2578,57 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn omitted_workspace_path_defaults_to_an_isolated_managed_folder() {
+        let setup: AgentSetup = serde_json::from_value(json!({
+            "runner_kind": "opencode"
+        }))
+        .unwrap();
+        assert!(managed_workspace_requested(&setup));
+        let mut runner = runner_from_setup(&setup);
+        let root = tempfile::tempdir().unwrap();
+        assign_managed_workspace(&setup, &mut runner, "blank-opencode", root.path()).unwrap();
+        assert_eq!(
+            PathBuf::from(runner.workspace.unwrap()),
+            root.path().join("workspaces/blank-opencode")
+        );
+    }
+
+    #[test]
+    fn existing_workspace_mode_requires_a_path() {
+        let setup: AgentSetup = serde_json::from_value(json!({
+            "runner_kind": "codex",
+            "workspace_mode": "existing"
+        }))
+        .unwrap();
+        let mut runner = runner_from_setup(&setup);
+        let root = tempfile::tempdir().unwrap();
+        let error =
+            assign_managed_workspace(&setup, &mut runner, "invalid", root.path()).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn explicit_existing_workspace_is_preserved() {
+        let root = tempfile::tempdir().unwrap();
+        let setup: AgentSetup = serde_json::from_value(json!({
+            "runner_kind": "opencode",
+            "workspace_mode": "existing",
+            "runner_workspace": root.path().display().to_string()
+        }))
+        .unwrap();
+        let mut runner = runner_from_setup(&setup);
+        let data_dir = tempfile::tempdir().unwrap();
+
+        assign_managed_workspace(&setup, &mut runner, "must-not-replace", data_dir.path()).unwrap();
+
+        assert_eq!(
+            runner.workspace.as_deref(),
+            Some(root.path().to_str().unwrap())
+        );
+        assert!(!data_dir.path().join("workspaces/must-not-replace").exists());
+    }
+
     #[tokio::test]
     async fn agent_catalog_lists_every_supported_product() {
         let catalog = agent_catalog().await.0;
@@ -1338,7 +2636,86 @@ mod tests {
         assert_eq!(agents.len(), ACP_AGENTS.len());
         assert!(agents.iter().any(|agent| agent["kind"] == "cursor"));
         assert!(agents.iter().any(|agent| agent["kind"] == "mistral-vibe"));
+        let antigravity = agents
+            .iter()
+            .find(|agent| agent["kind"] == "antigravity")
+            .unwrap();
+        assert_eq!(
+            antigravity["command"],
+            json!(["agy", "acp", "--process-per-session"])
+        );
+        assert_eq!(antigravity["login_command"], "agy acp --login");
+        let dsh = agents
+            .iter()
+            .find(|agent| agent["kind"] == "deepseek-harness")
+            .unwrap();
+        assert_eq!(dsh["command"], json!(["dsh-acp"]));
+        assert_eq!(dsh["login_command"], "dsh-acp login");
+        assert_eq!(dsh["mark"], "DS");
         assert!(!agents.iter().any(|agent| agent["kind"] == "agoragentic"));
+    }
+
+    #[tokio::test]
+    async fn setup_paths_round_trip_long_directories_without_verbatim_prefixes() {
+        let root = tempfile::tempdir().unwrap();
+        let mut workspace = root.path().canonicalize().unwrap();
+        while workspace.as_os_str().len() <= 280 {
+            workspace.push("nested project folder");
+        }
+        std::fs::create_dir_all(workspace.join("child folder")).unwrap();
+        std::fs::write(workspace.join("compose.yaml"), "services: {}\n").unwrap();
+
+        let listing = list_directories(Query(DirectoryQuery {
+            path: Some(workspace.display().to_string()),
+        }))
+        .await
+        .unwrap()
+        .0;
+        let path = listing["path"].as_str().unwrap();
+        assert!(!path.starts_with(r"\\?\"));
+        assert_eq!(FsPath::new(path).canonicalize().unwrap(), workspace);
+        for value in [&listing["parent"], &listing["home"], &listing["roots"][0]] {
+            if let Some(path) = value.as_str() {
+                assert!(!path.starts_with(r"\\?\"), "{path}");
+            }
+        }
+        assert_eq!(listing["directories"].as_array().unwrap().len(), 1);
+        let child = listing["directories"][0]["path"].as_str().unwrap();
+        assert!(!child.starts_with(r"\\?\"));
+        let child_listing = list_directories(Query(DirectoryQuery {
+            path: Some(child.into()),
+        }))
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(child_listing["parent"], listing["path"]);
+
+        let environment = project_environment(Query(ProjectEnvironmentQuery { path: path.into() }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(environment["workspace"], listing["path"]);
+        assert_eq!(environment["detected_files"], json!(["compose.yaml"]));
+        assert_eq!(
+            environment["suggestions"][0]["command"],
+            "docker compose up -d"
+        );
+
+        let file = workspace.join("compose.yaml").display().to_string();
+        let directory_error = list_directories(Query(DirectoryQuery {
+            path: Some(file.clone()),
+        }))
+        .await
+        .unwrap_err();
+        let environment_error = project_environment(Query(ProjectEnvironmentQuery { path: file }))
+            .await
+            .unwrap_err();
+        for (status, Json(body)) in [directory_error, environment_error] {
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            let message = body["error"].as_str().unwrap();
+            assert!(message.ends_with("is not a directory"));
+            assert!(!message.contains(r"\\?\"));
+        }
     }
 
     #[tokio::test]
@@ -1350,6 +2727,24 @@ mod tests {
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::write(workspace.join("compose.yaml"), "services: {}\n").unwrap();
         std::fs::write(workspace.join("package-lock.json"), "{}\n").unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(&workspace)
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(&workspace)
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:XpressAI/xpressclaw.git",
+            ])
+            .status()
+            .unwrap()
+            .success());
 
         let response = project_environment(Query(ProjectEnvironmentQuery {
             path: workspace.display().to_string(),
@@ -1357,6 +2752,7 @@ mod tests {
         .await
         .unwrap()
         .0;
+        assert!(!response["workspace"].as_str().unwrap().starts_with(r"\\?\"));
         let suggestions = response["suggestions"].as_array().unwrap();
         assert!(suggestions
             .iter()
@@ -1364,6 +2760,53 @@ mod tests {
         assert!(suggestions
             .iter()
             .any(|suggestion| suggestion["command"] == "npm ci"));
+        assert_eq!(response["git_repository"], true);
+        assert_eq!(response["git_uses_ssh"], true);
+
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn detects_ssh_push_urls_when_fetching_over_https() {
+        let workspace = std::env::temp_dir().join(format!(
+            "xpressclaw-ssh-pushurl-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(&workspace)
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(&workspace)
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/XpressAI/xpressclaw.git",
+            ])
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(&workspace)
+            .args([
+                "remote",
+                "set-url",
+                "--add",
+                "--push",
+                "origin",
+                "git@github.com:XpressAI/xpressclaw.git",
+            ])
+            .status()
+            .unwrap()
+            .success());
+
+        assert!(repository_uses_ssh_remote(&workspace));
 
         std::fs::remove_dir_all(workspace).unwrap();
     }
@@ -1431,8 +2874,15 @@ mod tests {
         let _ = std::fs::remove_file(&config_path);
 
         let db = Arc::new(Database::open_memory().unwrap());
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO projects (id, name) VALUES ('website-project', 'Website')",
+                [],
+            )
+        })
+        .unwrap();
         let config = Arc::new(Config::load_default().unwrap());
-        let state = AppState::new(config, db, None, config_path.clone(), false);
+        let state = AppState::new(config, db.clone(), None, config_path.clone(), false);
         let app = Router::new().nest("/setup", routes()).with_state(state);
 
         let response = app
@@ -1443,6 +2893,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .body(Body::from(
                         json!({
+                            "project_id": "website-project",
                             "runner_kind": "codex",
                             "runner_workspace": "/tmp/website"
                         })
@@ -1457,7 +2908,18 @@ mod tests {
         let body = body_json(response.into_body()).await;
         assert_eq!(body["session"], "website-codex");
         assert_eq!(body["title"], "website");
+        assert_eq!(body["project_id"], "website-project");
         assert!(body["session_id"].as_str().is_some_and(|id| !id.is_empty()));
+        let project_id: String = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT project_id FROM agents WHERE id = 'website-codex'",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(project_id, "website-project");
 
         let saved = Config::load(&config_path).unwrap();
         assert_eq!(saved.agents.len(), 1);
@@ -1466,6 +2928,41 @@ mod tests {
             Some("/tmp/website")
         );
         let _ = std::fs::remove_file(&config_path);
+    }
+
+    #[tokio::test]
+    async fn add_session_rejects_a_missing_project_without_persisting_an_agent() {
+        let config_path = std::env::temp_dir().join(format!(
+            "test-xpressclaw-add-session-missing-project-{}.yaml",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let db = Arc::new(Database::open_memory().unwrap());
+        let config = Arc::new(Config::load_default().unwrap());
+        let state = AppState::new(config, db.clone(), None, config_path.clone(), false);
+        let app = Router::new().nest("/setup", routes()).with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/setup/add-session")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "project_id": "deleted-project",
+                            "runner_kind": "codex",
+                            "runner_workspace": "/tmp/website"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(AgentRegistry::new(db).get("website-codex").is_err());
+        assert!(!config_path.exists());
     }
 
     #[tokio::test]
@@ -1552,6 +3049,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn config_identifies_the_control_plane_instance() {
+        let app = test_app();
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/setup/config")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(
+            body["instance"]["config_path"],
+            test_config_path().display().to_string()
+        );
+        assert!(body["instance"]["data_dir"].as_str().is_some());
+        assert!(body["instance"]["workspace_dir"].as_str().is_some());
+    }
+
+    #[tokio::test]
     async fn test_system_info() {
         let app = test_app();
 
@@ -1570,6 +3091,8 @@ mod tests {
         assert!(body["total_memory_gb"].as_f64().unwrap() > 0.0);
         assert!(body["cpu_count"].as_u64().unwrap() > 0);
         assert!(body["working_directory"].as_str().is_some());
+        assert!(body["ssh_agent_available"].as_bool().is_some());
+        assert!(body.get("ssh_agent_socket").is_some());
     }
 
     #[tokio::test]
@@ -1637,6 +3160,120 @@ mod tests {
 
         // Cleanup
         let _ = std::fs::remove_file(config_path);
+    }
+
+    #[tokio::test]
+    async fn complete_setup_preserves_instance_local_system_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let instance = root.path().join("instance");
+        std::fs::create_dir_all(&instance).unwrap();
+        let config_path = instance.join("xpressclaw.yaml");
+        let mut config = Config::default();
+        config.system.data_dir = instance.clone();
+        config.system.workspace_dir = instance.join("workspaces");
+        let state = AppState::new(
+            Arc::new(config),
+            Arc::new(Database::open_memory().unwrap()),
+            None,
+            config_path.clone(),
+            false,
+        );
+        let app = Router::new().nest("/setup", routes()).with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/setup/complete")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({ "agents": [] }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let saved = Config::load(&config_path).unwrap();
+        assert_eq!(saved.system.data_dir, instance);
+        assert_eq!(saved.system.workspace_dir, instance.join("workspaces"));
+    }
+
+    #[tokio::test]
+    async fn complete_setup_preserves_existing_top_level_configuration() {
+        let root = tempfile::tempdir().unwrap();
+        let config_path = root.path().join("xpressclaw.yaml");
+        let mut config = Config::default();
+        config.system.budget.daily = Some("$12.00".into());
+        config.tools.insert(
+            "shell".into(),
+            ToolConfig {
+                enabled: false,
+                confirmation_required: true,
+                ..Default::default()
+            },
+        );
+        config.tool_policies.push(ToolPolicyRule {
+            pattern: "dangerous_*".into(),
+            action: PolicyAction::Deny,
+            approval: None,
+        });
+        config.memory.near_term_slots = 3;
+        config.memory.eviction = "custom-eviction".into();
+        config.mcp_servers.insert(
+            "existing-connector".into(),
+            McpServerConfig {
+                server_type: "http".into(),
+                url: Some("https://mcp.example.test".into()),
+                ..Default::default()
+            },
+        );
+
+        let state = AppState::new(
+            Arc::new(config),
+            Arc::new(Database::open_memory().unwrap()),
+            None,
+            config_path.clone(),
+            false,
+        );
+        let app = Router::new()
+            .nest("/setup", routes())
+            .with_state(state.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/setup/complete")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "agents": [{
+                                "runner_kind": "codex",
+                                "runner_workspace": "/tmp/preserved-project"
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let saved = Config::load(&config_path).unwrap();
+        assert_eq!(saved.agents.len(), 1);
+        assert_eq!(saved.system.budget.daily.as_deref(), Some("$12.00"));
+        assert!(!saved.tools["shell"].enabled);
+        assert!(saved.tools["shell"].confirmation_required);
+        assert_eq!(saved.tool_policies[0].pattern, "dangerous_*");
+        assert_eq!(saved.memory.near_term_slots, 3);
+        assert_eq!(saved.memory.eviction, "custom-eviction");
+        assert!(saved.mcp_servers.contains_key("existing-connector"));
+
+        let live = state.config();
+        assert_eq!(live.system.budget.daily.as_deref(), Some("$12.00"));
+        assert_eq!(live.memory.near_term_slots, 3);
+        assert!(live.mcp_servers.contains_key("existing-connector"));
     }
 
     /// Verify native session configuration round-trips without profiles.

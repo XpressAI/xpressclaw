@@ -1,7 +1,8 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, onDestroy } from 'svelte';
 	import { tasks as tasksApi } from '$lib/api';
 	import type { Task } from '$lib/api';
+	import { isTransientRefreshError, subscribeLiveUpdates, usePaneActive } from '$lib/liveUpdates';
 	import { statusColor, timeAgo } from '$lib/utils';
 
 	interface Props {
@@ -12,6 +13,10 @@
 
 	let taskList = $state<Task[]>([]);
 	let loading = $state(true);
+	const paneActive = usePaneActive();
+	let unsubscribeLiveUpdates: (() => void) | null = null;
+	let loadGeneration = 0;
+	let appliedGeneration = 0;
 	let error = $state<string | null>(null);
 
 	// Create task form
@@ -21,19 +26,34 @@
 	let composing = $state(false);
 
 	onMount(() => {
-		loadTasks();
+		void loadTasks();
+		unsubscribeLiveUpdates = subscribeLiveUpdates(
+			['tasks'],
+			() => loadTasks(false, true),
+			{ active: paneActive, fallbackIntervalMs: 5000 }
+		);
+	});
+	onDestroy(() => {
+		unsubscribeLiveUpdates?.();
+		unsubscribeLiveUpdates = null;
 	});
 
-	async function loadTasks() {
-		loading = true;
+	async function loadTasks(initial = true, rethrowTransient = false) {
+		const gen = ++loadGeneration;
+		if (initial) loading = true;
 		error = null;
 		try {
-			const result = await tasksApi.list(undefined, agentId);
-			taskList = result.tasks;
+			const result = await tasksApi.list(undefined, agentId, { sort: 'recent' });
+			if (gen >= appliedGeneration) {
+				appliedGeneration = gen;
+				taskList = result.tasks;
+			}
 		} catch (e) {
-			error = `Failed to load tasks: ${e}`;
+			if (gen >= appliedGeneration) error = `Failed to load tasks: ${e}`;
+			if (rethrowTransient && isTransientRefreshError(e)) throw e;
+		} finally {
+			if (appliedGeneration > 0 || gen === loadGeneration) loading = false;
 		}
-		loading = false;
 	}
 
 	async function createTask() {
@@ -111,7 +131,9 @@
 								<td class="py-2 pr-4">
 									<a href="/tasks/{task.id}" class="text-foreground hover:text-primary transition-colors">
 										{task.title}
-									</a>
+                                    </a>
+                                    {#if task.parent_task_id}<a href="/tasks/{task.parent_task_id}" class="mt-1 block text-xs text-muted-foreground hover:underline">Parent: {task.parent_title || 'Open parent task'}</a>{/if}
+                                    {#if task.error_message}<p class="mt-1 whitespace-pre-wrap break-words text-xs text-destructive">{task.error_message}</p>{/if}
 								</td>
 								<td class="py-2 pr-4">
 									<span class="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium {statusColor(task.status)}">

@@ -1,0 +1,5 @@
+# Keep local builds and tests compact; test inherits the dev profile.
+# File/line backtraces remain available without full debugger data.
+[profile.dev]
+debug = "line-tables-only"
+incremental = false

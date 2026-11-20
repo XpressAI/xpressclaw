@@ -1,0 +1,51 @@
+name: Update Runner Versions
+
+on:
+  schedule:
+    - cron: '17 8 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: update-runner-versions
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Resolve latest exact versions
+        run: node scripts/runner-versions.mjs update
+
+      - name: Validate runner manifest
+        run: node --test scripts/runner-versions.test.mjs
+
+      - name: Open or refresh update pull request
+        uses: peter-evans/create-pull-request@v7
+        with:
+          # A PAT is intentional: GitHub suppresses CI for pull requests opened
+          # with the workflow's GITHUB_TOKEN.
+          token: ${{ secrets.PRIVATE_REPOS_TOKEN }}
+          branch: automation/update-runner-versions
+          delete-branch: true
+          add-paths: harnesses/runner-versions.json
+          commit-message: 'chore(harnesses): update runner versions'
+          title: 'chore(harnesses): update runner versions'
+          body: |
+            Automated exact-version refresh from the ACP Registry and package registries.
+
+            Runner images are built and smoke-tested by this pull request before these
+            pins can reach a prerelease. If one update is broken, restore its last known
+            good values in `harnesses/runner-versions.json`, set `auto_update` to `false`,
+            and add a `pin_reason`; subsequent runs will leave that runner pinned while
+            updating the rest.
+          draft: false

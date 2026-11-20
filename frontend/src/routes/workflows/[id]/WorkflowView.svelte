@@ -4,12 +4,18 @@
 	import { onMount } from 'svelte';
 	import yaml from 'js-yaml';
 	import StepBlock from '$lib/components/blocks/StepBlock.svelte';
+	import ContinueTaskBlock from '$lib/components/blocks/ContinueTaskBlock.svelte';
 	import WhenBlock from '$lib/components/blocks/WhenBlock.svelte';
+	import CommandBlock from '$lib/components/blocks/CommandBlock.svelte';
 	import LoopBlock from '$lib/components/blocks/LoopBlock.svelte';
 	import JumpBlock from '$lib/components/blocks/JumpBlock.svelte';
+	import WaitBlock from '$lib/components/blocks/WaitBlock.svelte';
 	import BlockConnector from '$lib/components/blocks/BlockConnector.svelte';
+	import WorkflowConfiguration from '$lib/components/blocks/WorkflowConfiguration.svelte';
+	import type { WorkflowInputDefinition, WorkflowScheduleDefinition } from '$lib/components/blocks/WorkflowConfiguration.svelte';
 	import VariablePopup from '$lib/components/blocks/VariablePopup.svelte';
 	import JumpArrows from '$lib/components/blocks/JumpArrows.svelte';
+	import { serverTimestampMs } from '$lib/serverTime';
 
 	let { workflowId }: { workflowId: string } = $props();
 
@@ -19,11 +25,17 @@
 	interface SinkCfg { connector: string; channel: string; template?: string }
 	interface WhenArmDef { match?: string; continue?: boolean; goto?: string }
 
+	function serverTimeOfDay(value: string): string {
+		const parsed = serverTimestampMs(value);
+		return parsed === null ? value : new Date(parsed).toLocaleTimeString();
+	}
+
 	interface Block {
 		id: string;
-		type: 'trigger' | 'step' | 'when' | 'loop' | 'sink' | 'jump';
+		type: 'trigger' | 'step' | 'command' | 'parallel' | 'continue' | 'when' | 'loop' | 'sink' | 'jump' | 'wait';
 		label: string;
 		agent?: string; prompt?: string; command?: string; procedure?: string;
+		cwd?: string; allowFailure?: boolean;
 		sessionConfig?: Record<string, string | boolean>; newSession?: boolean;
 		mcpServer?: string; mcpTool?: string; mcpArguments?: string;
 		outputs?: Record<string, OutputSchema>;
@@ -35,6 +47,7 @@
 		overVar?: string; asVar?: string;
 		children?: Block[];
 		target?: string;
+		resource?: string; timeout?: string; onTimeout?: string;
 		expanded: boolean;
 	}
 
@@ -54,12 +67,16 @@
 	let showInstances = $state(false);
 	let showRunDialog = $state(false);
 	let runInputs = $state<Record<string, string>>({});
+	let runInputError = $state('');
+	let configurationError = $state('');
 	let toast = $state<{ message: string; type: 'success' | 'error' } | null>(null);
 	let compactView = $state(false);
 
 	let flows = $state<Record<string, FlowDef>>({});
 	let currentFlow = $state('main');
 	let triggerConfig = $state<{ connector: string; channel: string; event: string; filter?: Record<string, unknown> } | null>(null);
+	let scheduleConfig = $state<WorkflowScheduleDefinition | null>(null);
+	let inputDefs = $state<Record<string, WorkflowInputDefinition>>({});
 	let globalVars = $state<Record<string, unknown>>({});
 
 	let variablePopup = $state<{ x: number; y: number; filter: string; target: HTMLTextAreaElement | null; blockIdx?: number; loopContext?: { asVar: string; overVar: string } } | null>(null);
@@ -67,12 +84,25 @@
 	let currentBlocks = $derived(flows[currentFlow]?.blocks ?? []);
 	let flowNames = $derived(Object.keys(flows));
 	let flowColors = $derived(Object.fromEntries(Object.entries(flows).map(([k, v]) => [k, v.color])));
+	let runFieldNames = $derived(
+		Object.keys(inputDefs).length > 0 ? Object.keys(inputDefs) : Object.keys(globalVars)
+	);
+	let agentRoles = $derived(Object.entries(inputDefs)
+		.filter(([, definition]) => definition.type === 'agent')
+		.map(([name, definition]) => ({ name, description: definition.description })));
 	let hasDisabledConnectorAutomation = $derived(
 		Boolean(triggerConfig) || Object.values(flows).some((flow) => blocksUseConnectors(flow.blocks))
+	);
+	let hasSourceTaskContinuation = $derived(
+		Object.values(flows).some((flow) => blocksContinueSourceTask(flow.blocks))
 	);
 
 	function blocksUseConnectors(blocks: Block[]): boolean {
 		return blocks.some((block) => block.type === 'sink' || blocksUseConnectors(block.children ?? []));
+	}
+
+	function blocksContinueSourceTask(blocks: Block[]): boolean {
+		return blocks.some((block) => block.type === 'continue' || blocksContinueSourceTask(block.children ?? []));
 	}
 
 	function sinkSummary(sinks: SinkCfg[]): string {
@@ -84,14 +114,16 @@
 	interface YamlDef {
 		name?: string; description?: string; version?: number;
 		trigger?: { connector: string; channel: string; event: string; filter?: Record<string, unknown> };
+		schedule?: { cron: string; run_at?: string; inputs?: Record<string, unknown> };
+		inputs?: Record<string, WorkflowInputDefinition>;
 		variables?: Record<string, unknown>;
 		flows?: Record<string, { color?: string; steps?: any[] }>;
 	}
 
-	function yamlToFlows(yamlStr: string): { flows: Record<string, FlowDef>; trigger: typeof triggerConfig; variables: Record<string, unknown> } {
+	function yamlToFlows(yamlStr: string): { flows: Record<string, FlowDef>; trigger: typeof triggerConfig; schedule: WorkflowScheduleDefinition | null; inputs: Record<string, WorkflowInputDefinition>; variables: Record<string, unknown> } {
 		let def: YamlDef;
-		try { def = yaml.load(yamlStr) as YamlDef; } catch { return { flows: { main: { color: '#22c55e', blocks: [] } }, trigger: null, variables: {} }; }
-		if (!def?.flows) return { flows: { main: { color: '#22c55e', blocks: [] } }, trigger: null, variables: {} };
+		try { def = yaml.load(yamlStr) as YamlDef; } catch { return { flows: { main: { color: '#22c55e', blocks: [] } }, trigger: null, schedule: null, inputs: {}, variables: {} }; }
+		if (!def?.flows) return { flows: { main: { color: '#22c55e', blocks: [] } }, trigger: null, schedule: null, inputs: {}, variables: {} };
 
 		const result: Record<string, FlowDef> = {};
 		for (const [name, flow] of Object.entries(def.flows)) {
@@ -100,7 +132,13 @@
 				blocks: (flow.steps || []).map(stepToBlock)
 			};
 		}
-		return { flows: result, trigger: def.trigger || null, variables: def.variables || {} };
+		return {
+			flows: result,
+			trigger: def.trigger || null,
+			schedule: def.schedule ? { cron: def.schedule.cron || '', ...(def.schedule.run_at ? { run_at: def.schedule.run_at } : {}), inputs: def.schedule.inputs || {} } : null,
+			inputs: def.inputs || {},
+			variables: def.variables || {},
+		};
 	}
 
 	function stepToBlock(s: any): Block {
@@ -113,10 +151,17 @@
 			block.mcpArguments = s.mcp_arguments == null ? '' : JSON.stringify(s.mcp_arguments, null, 2);
 			block.procedure = s.procedure; block.outputs = s.outputs;
 		}
+		if (type === 'command') { block.agent = s.agent; block.command = s.command; block.cwd = s.cwd; block.timeout = s.timeout; block.allowFailure = s.allow_failure; }
+		if (type === 'parallel') { block.children = (s.steps || s.body || []).map(stepToBlock); }
+		if (type === 'continue') { block.prompt = s.prompt; }
 		if (type === 'sink') { block.sinks = s.sinks; }
 		if (type === 'when') { block.switchVar = s.switch; block.arms = s.arms; }
 		if (type === 'loop') { block.overVar = s.over; block.asVar = s.as; block.children = (s.steps || s.body || []).map(stepToBlock); }
 		if (type === 'jump') { block.target = s.target; }
+		if (type === 'wait') {
+			block.agent = s.agent; block.event = s.event; block.resource = s.resource;
+			block.timeout = s.timeout; block.onTimeout = s.on_timeout;
+		}
 		return block;
 	}
 
@@ -127,6 +172,8 @@
 			version: 1,
 		};
 		if (triggerConfig) def.trigger = triggerConfig;
+		if (scheduleConfig) def.schedule = scheduleConfig;
+		if (Object.keys(inputDefs).length > 0) def.inputs = inputDefs;
 		if (Object.keys(globalVars).length > 0) def.variables = globalVars;
 
 		const flowsOut: Record<string, unknown> = {};
@@ -155,10 +202,20 @@
 			if (b.procedure) s.procedure = b.procedure;
 			if (b.outputs && Object.keys(b.outputs).length) s.outputs = b.outputs;
 		}
+		if (b.type === 'command') { s.agent = b.agent ?? ''; s.command = b.command ?? ''; if (b.cwd) s.cwd = b.cwd; if (b.timeout) s.timeout = b.timeout; if (b.allowFailure) s.allow_failure = true; }
+		if (b.type === 'parallel') s.steps = (b.children ?? []).map(blockToStep);
+		if (b.type === 'continue') s.prompt = b.prompt ?? '';
 		if (b.type === 'sink') s.sinks = b.sinks ?? [];
 		if (b.type === 'when') { s.switch = b.switchVar ?? ''; s.arms = b.arms ?? []; }
 		if (b.type === 'loop') { s.over = b.overVar ?? ''; s.as = b.asVar ?? 'item'; s.steps = (b.children ?? []).map(blockToStep); }
 		if (b.type === 'jump') s.target = b.target ?? '';
+		if (b.type === 'wait') {
+			s.agent = b.agent ?? '';
+			s.event = b.event ?? 'github.pull_request.activity';
+			s.resource = b.resource ?? '';
+			if (b.timeout) s.timeout = b.timeout;
+			if (b.onTimeout) s.on_timeout = b.onTimeout;
+		}
 		return s;
 	}
 
@@ -201,17 +258,24 @@
 			const [wf, al] = await Promise.all([
 				workflows.get(id), agents.list().catch(() => [])
 			]);
-				workflow = wf; workflowName = wf.name; yamlContent = wf.yaml_content; agentList = al;
+				workflow = wf; workflowName = wf.name; yamlContent = wf.yaml_content; agentList = wf.project_id ? al.filter(agent => agent.project_id === wf.project_id) : al;
 			const capabilities = await Promise.all(al.map(async (agent) => {
-				const events = await sessions.events(agent.id).catch(() => []);
-				return [agent.name, controlsFromEvents(events, agent.config?.runner?.mcp_servers ?? [])] as const;
+				const [configEvents, commandEvents] = await Promise.all([
+					sessions.events(agent.id, { eventType: 'session_config_options', limit: 1 }).catch(() => []),
+					sessions.events(agent.id, { eventType: 'available_commands', limit: 1 }).catch(() => []),
+				]);
+				return [agent.name, controlsFromEvents([...configEvents, ...commandEvents], agent.config?.runner?.mcp_servers ?? [])] as const;
 			}));
 			harnessCapabilities = Object.fromEntries(capabilities);
 			const parsed = yamlToFlows(wf.yaml_content);
-			flows = parsed.flows; triggerConfig = parsed.trigger; globalVars = parsed.variables;
-			runInputs = Object.fromEntries(Object.entries(parsed.variables).map(([key, value]) => [key, String(value ?? '')]));
+			flows = parsed.flows; triggerConfig = parsed.trigger; scheduleConfig = parsed.schedule; inputDefs = parsed.inputs; globalVars = parsed.variables;
+			runInputs = initialRunInputs(parsed.inputs, parsed.variables);
 			if (!flows.main) { flows = { main: { color: '#22c55e', blocks: [] }, ...flows }; }
 			instances = await workflows.instances(id).catch(() => []);
+			if (new URLSearchParams(window.location.search).get('run') === '1') {
+				window.history.replaceState(window.history.state, '', window.location.pathname);
+				requestRun();
+			}
 		} catch (e) { showToast(`Failed to load: ${e}`, 'error'); }
 	});
 
@@ -223,6 +287,14 @@
 
 	async function save() {
 		if (!workflow) return;
+		if (configurationError) {
+			showToast(configurationError, 'error');
+			return;
+		}
+		if (hasSourceTaskContinuation && scheduleConfig) {
+			showToast('Continue-task blocks cannot use a cron schedule', 'error');
+			return;
+		}
 		saving = true;
 		try {
 			const y = flowsToYaml();
@@ -244,20 +316,97 @@
 		catch (e) { showToast(String(e), 'error'); }
 	}
 
+	async function toggleDefaultForTasks() {
+		if (!workflow) return;
+		try {
+			workflow = await workflows.setDefaultForTasks(workflow.id, !workflow.default_for_tasks);
+			showToast(workflow.default_for_tasks ? 'This workflow now runs once for every new task' : 'Default task workflow disabled', 'success');
+		} catch (error) {
+			showToast(String(error), 'error');
+		}
+	}
+
 	function requestRun() {
 		if (hasDisabledConnectorAutomation) {
 			showToast('Remove disabled connector blocks before running this workflow', 'error');
 			return;
 		}
-		if (Object.keys(globalVars).length === 0) {
+		if (hasSourceTaskContinuation) {
+			showToast('Continue-task blocks run when this workflow is attached to a task', 'error');
+			return;
+		}
+		if (Object.keys(inputDefs).length === 0 && Object.keys(globalVars).length === 0) {
 			runWorkflow({});
 			return;
 		}
-		runInputs = Object.fromEntries(Object.entries(globalVars).map(([key, value]) => [key, String(value ?? '')]));
+		runInputError = '';
+		runInputs = initialRunInputs(inputDefs, globalVars);
 		showRunDialog = true;
 	}
 
-	async function runWorkflow(inputs: Record<string, string>) {
+	function displayRunValue(value: unknown, type: WorkflowInputDefinition['type'] = 'string'): string {
+		if (value === undefined || value === null) return '';
+		if (type === 'json') {
+			try { return JSON.stringify(value, null, 2); } catch { return ''; }
+		}
+		return String(value);
+	}
+
+	function initialRunInputs(definitions: Record<string, WorkflowInputDefinition>, variables: Record<string, unknown>): Record<string, string> {
+		const values: Record<string, string> = {};
+		for (const [name, definition] of Object.entries(definitions)) {
+			const initial = definition.default ?? (definition.type === 'agent' && definition.required ? agentList[0]?.id : undefined);
+			values[name] = displayRunValue(initial, definition.type);
+		}
+		if (Object.keys(definitions).length === 0) {
+			for (const [name, value] of Object.entries(variables)) {
+				values[name] = String(value ?? '');
+			}
+		}
+		return values;
+	}
+
+	function typedRunInputs(): Record<string, unknown> | null {
+		const values: Record<string, unknown> = {};
+		try {
+			for (const [name, definition] of Object.entries(inputDefs)) {
+				const raw = runInputs[name]?.trim() ?? '';
+				if (!raw) {
+					if (definition.required && definition.default === undefined) throw new Error(`${name} is required`);
+					continue;
+				}
+				if (definition.type === 'number') {
+					const number = Number(raw);
+					if (!Number.isFinite(number)) throw new Error(`${name} must be a number`);
+					values[name] = number;
+				} else if (definition.type === 'boolean') {
+					if (raw !== 'true' && raw !== 'false') throw new Error(`${name} must be yes or no`);
+					values[name] = raw === 'true';
+				} else if (definition.type === 'json') {
+					values[name] = JSON.parse(runInputs[name]);
+				} else {
+					values[name] = runInputs[name];
+				}
+			}
+			if (Object.keys(inputDefs).length === 0) {
+				for (const name of Object.keys(globalVars)) {
+					if (runInputs[name]?.trim()) values[name] = runInputs[name];
+				}
+			}
+			runInputError = '';
+			return values;
+		} catch (error) {
+			runInputError = error instanceof Error ? error.message : String(error);
+			return null;
+		}
+	}
+
+	function submitRun() {
+		const inputs = typedRunInputs();
+		if (inputs) void runWorkflow(inputs);
+	}
+
+	async function runWorkflow(inputs: Record<string, unknown>) {
 		if (!workflow) return;
 		running = true;
 		try {
@@ -276,7 +425,7 @@
 
 	function applyYaml() {
 		const parsed = yamlToFlows(yamlContent);
-		flows = parsed.flows; triggerConfig = parsed.trigger; globalVars = parsed.variables;
+		flows = parsed.flows; triggerConfig = parsed.trigger; scheduleConfig = parsed.schedule; inputDefs = parsed.inputs; globalVars = parsed.variables;
 		showYaml = false;
 	}
 
@@ -316,7 +465,7 @@
 	function nextStepNumber(): number {
 		let count = 0;
 		for (const flow of Object.values(flows)) {
-			count += flow.blocks.filter(b => b.type === 'step').length;
+			count += flow.blocks.filter(b => b.type === 'step' || b.type === 'continue').length;
 		}
 		return count + 1;
 	}
@@ -326,9 +475,13 @@
 		let id: string;
 		switch (type) {
 			case 'step': label = `Step ${nextStepNumber()}`; break;
+			case 'command': label = 'Run command'; break;
+			case 'parallel': label = 'Parallel branches'; break;
+			case 'continue': label = 'Continue task'; break;
 			case 'when': label = 'Condition'; break;
 			case 'loop': label = 'For Each'; break;
 			case 'jump': label = 'Jump'; break;
+			case 'wait': label = 'Wait for review'; break;
 			default: return;
 		}
 		id = slugify(label);
@@ -339,10 +492,14 @@
 		let block: Block;
 		switch (type) {
 			case 'step': block = { id, type, label, agent: '', prompt: '', expanded: true }; break;
+			case 'command': block = { id, type, label, agent: '', command: '', timeout: '5m', cwd: '.', expanded: true }; break;
+			case 'parallel': block = { id, type, label, children: [], expanded: true }; break;
+			case 'continue': block = { id, type, label, prompt: '', expanded: true }; break;
 			case 'when': block = { id, type, label, switchVar: '', expanded: true,
 				arms: [{ match: 'approved', continue: true }, { match: 'rejected', goto: 'step ' }] }; break;
 			case 'loop': block = { id, type, label, overVar: '', asVar: 'item', children: [], expanded: true }; break;
 			case 'jump': block = { id, type, label, target: '', expanded: true }; break;
+			case 'wait': block = { id, type, label, agent: '', event: 'github.pull_request.activity', resource: '', timeout: '14d', expanded: true }; break;
 			default: return;
 		}
 		const blocks = [...(flows[currentFlow]?.blocks ?? [])];
@@ -355,6 +512,18 @@
 		const blocks = [...(flows[flowName]?.blocks ?? [])];
 		blocks[idx] = { ...blocks[idx], ...updates } as Block;
 		flows = { ...flows, [flowName]: { ...flows[flowName], blocks } };
+	}
+
+	function renameInputReferences(oldName: string, newName: string) {
+		const replace = (blocks: Block[]): Block[] => blocks.map((block) => ({
+			...block,
+			agent: block.agent === `@${oldName}` ? `@${newName}` : block.agent,
+			children: block.children ? replace(block.children) : block.children,
+		}));
+		flows = Object.fromEntries(Object.entries(flows).map(([name, flow]) => [
+			name,
+			{ ...flow, blocks: replace(flow.blocks) },
+		]));
 	}
 
 	function removeBlock(flowName: string, idx: number) {
@@ -379,7 +548,7 @@
 			if (b.type === 'trigger') continue;
 			const n = prefix ? `${prefix}.${String.fromCharCode(96 + num)}` : String(num).padStart(2, '0');
 			result.push({ id: b.id, number: n, label: b.label });
-			if (b.type === 'loop' && b.children) {
+			if ((b.type === 'loop' || b.type === 'parallel') && b.children) {
 				result.push(...computeStepNumbers(b.children, n));
 			}
 			num++;
@@ -393,24 +562,47 @@
 	// All step IDs across flows for when block goto targets
 	let allStepIds = $derived(
 		Object.entries(flows).flatMap(([, flow]) =>
-			computeStepNumbers(flow.blocks)
+			computeStepNumbers(flow.blocks).filter((step) => flow.blocks.some((block) => block.id === step.id))
 		)
 	);
 
 	// --- Variables ---
 
+	function outputFields(block: Block): Record<string, OutputSchema> {
+		if (block.type !== 'command') return block.outputs ?? {};
+		return Object.fromEntries(Object.entries({ passed: 'boolean', exit_code: 'number', stdout: 'string', stderr: 'string', signal: 'string', timed_out: 'boolean', stdout_truncated: 'boolean', stderr_truncated: 'boolean' }).map(([name, type]) => [name, { type }]));
+	}
+
 	function availableVariables(upToIdx: number, loopContext?: { asVar: string; overVar: string }): { name: string; type?: string; source?: string }[] {
 		const vars: { name: string; type?: string; source?: string }[] = [];
-		if (triggerConfig) vars.push({ name: 'trigger.payload', type: 'object', source: 'Trigger' });
+		if (workflow?.default_for_tasks) {
+			for (const [name, type] of [['id', 'string'], ['title', 'string'], ['description', 'string'], ['agent_id', 'string'], ['project_id', 'string'], ['conversation_id', 'string'], ['status', 'string'], ['output', 'any']]) {
+				vars.push({ name: `source_task.${name}`, type, source: 'Source task' });
+			}
+		}
+		if (triggerConfig || scheduleConfig || Object.keys(inputDefs).length > 0) vars.push({ name: 'trigger.payload', type: 'object', source: 'Run payload' });
+		for (const [name, definition] of Object.entries(inputDefs)) {
+			vars.push({ name, type: definition.type, source: 'Input' });
+		}
 		for (const [k, v] of Object.entries(globalVars)) {
-			vars.push({ name: k, type: typeof v, source: 'Global' });
+			if (!inputDefs[k]) vars.push({ name: k, type: typeof v, source: 'Global' });
 		}
 		const blocks = flows[currentFlow]?.blocks ?? [];
 		for (let i = 0; i <= upToIdx && i < blocks.length; i++) {
 			const b = blocks[i];
-			if (b.outputs) {
-				for (const [name, schema] of Object.entries(b.outputs)) {
+			if (Object.keys(outputFields(b)).length) {
+				for (const [name, schema] of Object.entries(outputFields(b))) {
 					vars.push({ name: `${b.id}.${name}`, type: schema.type || 'any', source: b.label });
+				}
+			}
+			if (b.type === 'parallel' && i < upToIdx) {
+				for (const branch of b.children ?? []) {
+					for (const [name, schema] of Object.entries(outputFields(branch))) vars.push({ name: `${branch.id}.${name}`, type: schema.type || 'any', source: branch.label });
+				}
+			}
+			if (b.type === 'wait') {
+				for (const name of ['kind', 'author', 'state', 'body', 'url', 'created_at', 'cursor']) {
+					vars.push({ name: `${b.id}.${name}`, type: 'string', source: b.label });
 				}
 			}
 			// Include loop iteration variable if this block is the loop we're inside
@@ -476,7 +668,7 @@
 			if (loopEl) {
 				const loopId = loopEl.getAttribute('data-loop-id');
 				const loopBlock = currentBlocks.find(b => b.id === loopId);
-				if (loopBlock) {
+				if (loopBlock?.type === 'loop') {
 					loopContext = { asVar: loopBlock.asVar || 'item', overVar: loopBlock.overVar || '' };
 					const loopIdx = currentBlocks.findIndex(b => b.id === loopId);
 					if (loopIdx >= 0) blockIdx = loopIdx;
@@ -539,7 +731,7 @@
 <div class="flex h-full flex-col overflow-hidden">
 	<!-- Toolbar -->
 	<div class="flex items-center gap-3 border-b border-border bg-card px-4 py-2 flex-shrink-0">
-		<a href="/workflows" class="text-muted-foreground hover:text-foreground" title="Back">
+		<a href="/automations" class="text-muted-foreground hover:text-foreground" title="Back to automations">
 			<svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M15.75 19.5L8.25 12l7.5-7.5" /></svg>
 		</a>
 		<span class="text-xs text-muted-foreground/50">/</span>
@@ -547,10 +739,16 @@
 			class="border-none text-sm font-semibold text-foreground focus:outline-none w-48" style="background: transparent;" placeholder="Workflow name" />
 		<div class="flex-1"></div>
 
-		{#if workflow}
+		{#if workflow && scheduleConfig}
 			<label class="relative inline-flex items-center cursor-pointer shrink-0" title={workflow.enabled ? 'Disable' : 'Enable'}>
-				<input type="checkbox" checked={workflow.enabled} onchange={toggleEnabled} class="sr-only peer" />
+				<input type="checkbox" checked={workflow.enabled} disabled={Boolean(scheduleConfig.run_at && workflow.last_triggered_at)} onchange={toggleEnabled} class="sr-only peer" />
 				<div class="w-8 h-[18px] bg-muted rounded-full peer peer-checked:bg-emerald-600 transition-colors after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:rounded-full after:h-3.5 after:w-3.5 after:transition-all peer-checked:after:translate-x-full"></div>
+			</label>
+		{/if}
+		{#if workflow}
+			<label class="flex shrink-0 cursor-pointer items-center gap-2 rounded-md border border-border px-2.5 py-1.5 text-xs" title={workflow.project_id ? 'Attach this workflow once to each ordinary task in its Project' : 'Attach this workflow once to every ordinary Agent task'}>
+				<input aria-label="Run for every new task" type="checkbox" checked={workflow.default_for_tasks} onchange={toggleDefaultForTasks} class="accent-primary" />
+				{workflow.project_id ? 'Run for each Project task' : 'Run for every task'}
 			</label>
 		{/if}
 
@@ -562,12 +760,12 @@
 			class="rounded-md border border-border px-3 py-1.5 text-xs font-medium {showYaml ? 'bg-primary text-primary-foreground' : 'hover:bg-accent'}">YAML</button>
 		<button onclick={() => (compactView = !compactView)}
 			class="rounded-md border border-border px-3 py-1.5 text-xs font-medium {compactView ? 'bg-primary text-primary-foreground' : 'hover:bg-accent'}">{compactView ? 'Full' : 'Compact'}</button>
-		<button onclick={requestRun} disabled={running || hasDisabledConnectorAutomation} title={hasDisabledConnectorAutomation ? 'Remove disabled connector blocks before running' : 'Run workflow'}
+		<button onclick={requestRun} disabled={running || hasDisabledConnectorAutomation || hasSourceTaskContinuation} title={hasDisabledConnectorAutomation ? 'Remove disabled connector blocks before running' : hasSourceTaskContinuation ? 'Continue-task blocks run only when attached to a task' : 'Run workflow'}
 			class="rounded-md bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-emerald-700 disabled:opacity-50 flex items-center gap-1.5">
 			<svg class="h-3 w-3" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg>
 			{running ? 'Running...' : 'Run'}
 		</button>
-		<button onclick={save} disabled={saving}
+		<button onclick={save} disabled={saving || Boolean(configurationError) || (hasSourceTaskContinuation && Boolean(scheduleConfig))}
 			class="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50">{saving ? 'Saving...' : 'Save'}</button>
 	</div>
 
@@ -643,6 +841,17 @@
 
 		<!-- Block list -->
 		<div class="max-w-3xl mx-auto px-4 pb-6">
+			{#if currentFlow === 'main'}
+				<WorkflowConfiguration
+					inputs={inputDefs}
+					schedule={scheduleConfig}
+					{agentList}
+					onupdate={(inputs, schedule) => { inputDefs = inputs; scheduleConfig = schedule; }}
+					onrename={renameInputReferences}
+					onvalidationchange={(message) => { configurationError = message; }}
+				/>
+				<div class="flex"><div class="w-10"></div><BlockConnector /></div>
+			{/if}
 			{#if hasDisabledConnectorAutomation}
 				<div class="mb-3 rounded-lg border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs leading-relaxed text-amber-200/80">
 					Connector triggers and notification sinks are disabled in this beta. Existing definitions are preserved read-only and will not receive events; remove them through the YAML editor before running this workflow.
@@ -689,11 +898,24 @@
 								outputs={block.outputs || {}}
 								expanded={block.expanded} compact={compactView}
 								{agentList}
+								{agentRoles}
 								capabilities={harnessCapabilities[block.agent || '']}
 								onupdate={(u) => updateBlock(currentFlow, idx, u)}
 								ontoggle={() => updateBlock(currentFlow, idx, { expanded: !block.expanded })}
 								onremove={() => removeBlock(currentFlow, idx)}
-								/>
+							/>
+						{:else if block.type === 'command'}
+							<CommandBlock label={block.label} agent={block.agent || ''} command={block.command || ''} cwd={block.cwd || '.'} timeout={block.timeout || '5m'} allowFailure={block.allowFailure || false}
+								expanded={block.expanded} compact={compactView} {agentList} {agentRoles}
+								onupdate={(updates) => updateBlock(currentFlow, idx, updates)} ontoggle={() => updateBlock(currentFlow, idx, { expanded: !block.expanded })} onremove={() => removeBlock(currentFlow, idx)} />
+						{:else if block.type === 'continue'}
+							<ContinueTaskBlock
+								label={block.label} prompt={block.prompt || ''}
+								expanded={block.expanded} compact={compactView}
+								onupdate={(updates) => updateBlock(currentFlow, idx, updates)}
+								ontoggle={() => updateBlock(currentFlow, idx, { expanded: !block.expanded })}
+								onremove={() => removeBlock(currentFlow, idx)}
+							/>
 						{:else if block.type === 'when'}
 							<WhenBlock
 								label={block.label} switchVar={block.switchVar || ''}
@@ -705,10 +927,10 @@
 								ontoggle={() => updateBlock(currentFlow, idx, { expanded: !block.expanded })}
 								onremove={() => removeBlock(currentFlow, idx)}
 							/>
-						{:else if block.type === 'loop'}
+						{:else if block.type === 'loop' || block.type === 'parallel'}
 							<div data-loop-id={block.id}>
 							<LoopBlock
-								label={block.label} overVar={block.overVar || ''} asVar={block.asVar || 'item'}
+								parallel={block.type === 'parallel'} label={block.label} overVar={block.overVar || ''} asVar={block.asVar || 'item'}
 								expanded={block.expanded} compact={compactView}
 								onupdate={(u) => updateBlock(currentFlow, idx, u)}
 								ontoggle={() => updateBlock(currentFlow, idx, { expanded: !block.expanded })}
@@ -738,11 +960,20 @@
 							<StepBlock label={child.label} agent={child.agent || ''} prompt={child.prompt || ''} command={child.command || ''} outputs={child.outputs || {}}
 								sessionConfig={child.sessionConfig || {}} newSession={child.newSession || false}
 								mcpServer={child.mcpServer || ''} mcpTool={child.mcpTool || ''} mcpArguments={child.mcpArguments || ''}
-													expanded={child.expanded} compact={compactView} {agentList}
+											expanded={child.expanded} compact={compactView} {agentList} {agentRoles}
 													capabilities={harnessCapabilities[child.agent || '']}
-														onupdate={childUpdate} ontoggle={childToggle} onremove={childRemove}
-													/>
-												{:else if child.type === 'when'}
+									onupdate={childUpdate} ontoggle={childToggle} onremove={childRemove}
+								/>
+								{:else if child.type === 'command'}
+									<CommandBlock label={child.label} agent={child.agent || ''} command={child.command || ''} cwd={child.cwd || '.'} timeout={child.timeout || '5m'} allowFailure={child.allowFailure || false}
+										expanded={child.expanded} compact={compactView} {agentList} {agentRoles} onupdate={childUpdate} ontoggle={childToggle} onremove={childRemove} />
+								{:else if child.type === 'continue'}
+									<ContinueTaskBlock
+										label={child.label} prompt={child.prompt || ''}
+										expanded={child.expanded} compact={compactView}
+										onupdate={childUpdate} ontoggle={childToggle} onremove={childRemove}
+									/>
+								{:else if child.type === 'when'}
 													<WhenBlock label={child.label} switchVar={child.switchVar || ''} arms={child.arms || []}
 														{flowNames} {flowColors} stepIds={allStepIds}
 														expanded={child.expanded} compact={compactView}
@@ -756,11 +987,11 @@
 												{/if}
 											</div>
 										</div>
-										{#if ci < (block.children?.length ?? 0) - 1}
+										{#if block.type === 'loop' && ci < (block.children?.length ?? 0) - 1}
 											<div class="flex"><div class="w-8"></div><BlockConnector /></div>
 										{/if}
 									{/each}
-									<!-- Add step inside loop -->
+									<!-- Add a branch or loop body task -->
 									<div class="flex items-center gap-0 mt-2">
 										<div class="w-8"></div>
 										<button onclick={() => {
@@ -770,8 +1001,12 @@
 											const children = [...(block.children || []), { id, type: 'step' as const, label, agent: '', prompt: '', expanded: true }];
 											updateBlock(currentFlow, idx, { children });
 										}} class="rounded border border-dashed border-border/40 px-3 py-1.5 text-[10px] text-muted-foreground hover:text-foreground hover:border-border transition-colors">
-											+ Add Step
+											{block.type === 'parallel' ? '+ Add branch' : '+ Add Step'}
 										</button>
+										<button onclick={() => {
+											const id = 'command_' + Date.now().toString(36);
+											updateBlock(currentFlow, idx, { children: [...(block.children || []), { id, type: 'command', label: 'Run command', agent: '', command: '', timeout: '5m', expanded: true }] });
+										}} class="ml-2 rounded border border-dashed border-border/40 px-3 py-1.5 text-[10px] text-muted-foreground hover:text-foreground">+ Add command</button>
 									</div>
 								{/snippet}
 							</LoopBlock>
@@ -786,6 +1021,15 @@
 								label={block.label} target={block.target || ''}
 								{flowNames} {flowColors} stepIds={allStepIds}
 								expanded={block.expanded} compact={compactView}
+								onupdate={(u) => updateBlock(currentFlow, idx, u)}
+								ontoggle={() => updateBlock(currentFlow, idx, { expanded: !block.expanded })}
+								onremove={() => removeBlock(currentFlow, idx)}
+							/>
+						{:else if block.type === 'wait'}
+							<WaitBlock
+								label={block.label} agent={block.agent || ''} event={block.event || 'github.pull_request.activity'}
+								resource={block.resource || ''} timeout={block.timeout || ''} onTimeout={block.onTimeout || ''}
+								expanded={block.expanded} compact={compactView} {agentList} {agentRoles} {flowNames}
 								onupdate={(u) => updateBlock(currentFlow, idx, u)}
 								ontoggle={() => updateBlock(currentFlow, idx, { expanded: !block.expanded })}
 								onremove={() => removeBlock(currentFlow, idx)}
@@ -812,6 +1056,11 @@
 						<svg class="h-3 w-3" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 4.5v15m7.5-7.5h-15" /></svg>
 						Step
 					</button>
+					<button onclick={() => addBlock('continue')}
+						class="flex items-center gap-1.5 rounded-lg border border-dashed border-border px-3 py-2 text-xs text-muted-foreground transition-all hover:border-violet-500/50 hover:bg-violet-950/20 hover:text-violet-300">
+						<svg class="h-3 w-3" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M8 7h8m-8 4h5m-7 9l-3-3m0 0l3-3m-3 3h12a4 4 0 004-4V7a4 4 0 00-4-4H7a4 4 0 00-4 4v3" /></svg>
+						Continue task
+					</button>
 					<button onclick={() => addBlock('when')}
 						class="rounded-lg border border-dashed border-border hover:border-amber-500/50 hover:bg-amber-950/20 px-3 py-2 text-xs text-muted-foreground hover:text-amber-300 transition-all flex items-center gap-1.5">
 						<svg class="h-3 w-3" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M7.5 21L3 16.5m0 0L7.5 12M3 16.5h13.5m0-13.5L21 7.5m0 0L16.5 12M21 7.5H7.5" /></svg>
@@ -826,6 +1075,12 @@
 						class="rounded-lg border border-dashed border-border hover:border-indigo-500/50 hover:bg-indigo-950/20 px-3 py-2 text-xs text-muted-foreground hover:text-indigo-300 transition-all flex items-center gap-1.5">
 						<svg class="h-3 w-3" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M13.5 4.5L21 12m0 0l-7.5 7.5M21 12H3" /></svg>
 						Jump
+					</button>
+					<button onclick={() => addBlock('parallel')} class="rounded-lg border border-dashed border-border px-3 py-2 text-xs text-muted-foreground hover:text-foreground">Parallel</button>
+					<button onclick={() => addBlock('command')} class="rounded-lg border border-dashed border-border px-3 py-2 text-xs text-muted-foreground hover:text-foreground">Command</button>
+					<button onclick={() => addBlock('wait')}
+						class="rounded-lg border border-dashed border-border px-3 py-2 text-xs text-muted-foreground transition-all hover:border-cyan-500/50 hover:bg-cyan-950/20 hover:text-cyan-300">
+						Wait for event
 					</button>
 				</div>
 			</div>
@@ -866,10 +1121,15 @@
 							<tr class="border-b border-border/20 hover:bg-accent/30">
 								<td class="px-4 py-1.5 font-mono text-muted-foreground">{inst.id.slice(0, 8)}</td>
 								<td class="px-4 py-1.5">
-									<span class="inline-flex items-center gap-1">
-										<span class="h-1.5 w-1.5 rounded-full {inst.status === 'running' ? 'bg-blue-400 animate-pulse' : inst.status === 'completed' ? 'bg-emerald-400' : inst.status === 'failed' ? 'bg-red-400' : 'bg-muted-foreground'}"></span>
+									<span class="inline-flex items-center gap-1" title={inst.wait_resource || undefined}>
+										<span class="h-1.5 w-1.5 rounded-full {inst.status === 'running' ? 'bg-blue-400 animate-pulse' : inst.status === 'waiting' ? 'bg-cyan-400' : inst.status === 'completed' ? 'bg-emerald-400' : inst.status === 'failed' ? 'bg-red-400' : 'bg-muted-foreground'}"></span>
 										{inst.status}
 									</span>
+									{#if inst.wait_error}
+										<div class="max-w-64 truncate text-[9px] text-red-400" title={inst.wait_error}>{inst.wait_error}</div>
+									{:else if inst.status === 'waiting' && inst.wait_event}
+										<div class="max-w-64 truncate text-[9px] text-muted-foreground">{inst.wait_event.replace('github.pull_request.', 'PR ')}</div>
+									{/if}
 								</td>
 								<td class="px-4 py-1.5">
 									<span class="inline-flex items-center gap-1">
@@ -878,9 +1138,9 @@
 									</span>
 								</td>
 								<td class="px-4 py-1.5 text-muted-foreground">{inst.current_step_index}</td>
-								<td class="px-4 py-1.5 text-muted-foreground">{new Date(inst.started_at + 'Z').toLocaleTimeString()}</td>
+								<td class="px-4 py-1.5 text-muted-foreground">{serverTimeOfDay(inst.started_at)}</td>
 								<td class="px-4 py-1.5 text-right">
-									{#if inst.status === 'running'}
+									{#if inst.status === 'running' || inst.status === 'waiting'}
 										<button onclick={async () => { await workflows.cancelInstance(inst.id); loadInstances(); }}
 											class="text-[10px] text-muted-foreground hover:text-destructive">Cancel</button>
 									{/if}
@@ -897,18 +1157,38 @@
 		<div class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
 			<div class="w-full max-w-lg rounded-xl border border-border bg-card p-5 shadow-2xl">
 				<h2 class="text-base font-semibold">Run {workflowName}</h2>
-				<p class="mt-1 text-xs text-muted-foreground">Set this run's inputs. They override the workflow defaults without changing the saved definition.</p>
-				<div class="mt-4 space-y-3">
-					{#each Object.keys(globalVars) as key}
+				<p class="mt-1 text-xs text-muted-foreground">Set this run's inputs. Saved defaults are used when an optional field is left empty.</p>
+				<div class="mt-4 max-h-[60vh] space-y-3 overflow-y-auto pr-1">
+					{#each runFieldNames as key}
+						{@const definition = inputDefs[key]}
 						<div>
-							<label for="run-input-{key}" class="mb-1 block text-xs font-medium capitalize text-muted-foreground">{key.replaceAll('_', ' ')}</label>
-							<textarea id="run-input-{key}" rows={key === 'goal' ? 3 : 2} value={runInputs[key] ?? ''} oninput={(event) => { runInputs = { ...runInputs, [key]: event.currentTarget.value }; }} class="w-full resize-y rounded-md border border-input bg-background px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring"></textarea>
+							<label for="run-input-{key}" class="mb-1 flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
+								<span>{key.replaceAll('_', ' ')}</span>
+								{#if definition?.required}<span class="text-destructive">required</span>{/if}
+								{#if definition}<span class="ml-auto font-mono text-[10px] font-normal">{definition.type}</span>{/if}
+							</label>
+							{#if definition?.description}<p class="mb-1 text-[10px] text-muted-foreground">{definition.description}</p>{/if}
+							{#if definition?.type === 'agent'}
+								<select id="run-input-{key}" value={runInputs[key] ?? ''} onchange={(event) => { runInputs = { ...runInputs, [key]: event.currentTarget.value }; }} class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring">
+									<option value="">{definition.required ? 'Select an agent…' : 'Use default'}</option>
+									{#each agentList as agent}<option value={agent.id}>{agent.title || agent.name}</option>{/each}
+								</select>
+							{:else if definition?.type === 'boolean'}
+								<select id="run-input-{key}" value={runInputs[key] ?? ''} onchange={(event) => { runInputs = { ...runInputs, [key]: event.currentTarget.value }; }} class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring">
+									<option value="">Use default</option><option value="true">Yes</option><option value="false">No</option>
+								</select>
+							{:else if definition?.type === 'number'}
+								<input id="run-input-{key}" type="number" value={runInputs[key] ?? ''} oninput={(event) => { runInputs = { ...runInputs, [key]: event.currentTarget.value }; }} class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring" />
+							{:else}
+								<textarea id="run-input-{key}" rows={key === 'goal' || definition?.type === 'json' ? 4 : 2} value={runInputs[key] ?? ''} oninput={(event) => { runInputs = { ...runInputs, [key]: event.currentTarget.value }; }} class="w-full resize-y rounded-md border border-input bg-background px-3 py-2 {definition?.type === 'json' ? 'font-mono' : ''} text-sm outline-none focus:ring-1 focus:ring-ring"></textarea>
+							{/if}
 						</div>
 					{/each}
 				</div>
+				{#if runInputError}<p class="mt-3 text-xs text-destructive">{runInputError}</p>{/if}
 				<div class="mt-5 flex justify-end gap-2">
 					<button onclick={() => (showRunDialog = false)} disabled={running} class="rounded-md border border-border px-4 py-2 text-sm hover:bg-accent disabled:opacity-50">Cancel</button>
-					<button onclick={() => runWorkflow(runInputs)} disabled={running || Object.values(runInputs).some((value) => !value.trim())} class="rounded-md bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700 disabled:opacity-50">{running ? 'Starting…' : 'Start workflow'}</button>
+					<button onclick={submitRun} disabled={running} class="rounded-md bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700 disabled:opacity-50">{running ? 'Starting…' : 'Start workflow'}</button>
 				</div>
 			</div>
 		</div>

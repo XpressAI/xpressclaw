@@ -1,0 +1,31 @@
+name: __WORKFLOW_NAME__
+description: A reusable native-agent workflow.
+version: 1
+
+inputs:
+  goal:
+    type: string
+    description: The outcome this workflow should produce.
+    required: true
+  worker:
+    type: agent
+    description: Agent context that performs the work.
+    required: true
+    primary: true
+
+flows:
+  main:
+    color: "#22c55e"
+    steps:
+      - id: work
+        type: step
+        label: Do the work
+        agent: "@worker"
+        prompt: |
+          Complete this goal autonomously in the configured workspace:
+
+          @goal
+        outputs:
+          result:
+            type: string
+            description: Outcome and verification summary.

@@ -1,21 +1,33 @@
 pub mod acp;
 pub mod config;
+pub mod dashboard;
 pub mod db;
+pub mod desktop_auth;
 pub mod error;
-pub mod paths;
+pub mod external_tools;
 pub mod runtime;
+pub mod sync;
 pub mod system;
 
 pub mod activity;
 pub mod agents;
 pub mod budget;
+pub mod collaboration;
+pub mod connect;
 pub mod connectors;
 pub mod conversations;
 pub mod docker;
 pub mod llm;
 pub mod memory;
+pub mod message_artifacts;
+pub mod projects;
+pub mod repositories;
 pub mod sessions;
+pub mod storage;
 pub mod tasks;
 pub mod tools;
+pub mod visualizations;
 pub mod workers;
 pub mod workflows;
+
+pub mod proxy;

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -280,9 +281,13 @@ pub struct NativeRunnerConfig {
     pub command: Vec<String>,
     /// Reuse the host agent login from its standard config directory.
     pub subscription_auth: bool,
+    /// Share the host SSH directory and forward an available SSH agent into
+    /// the retained Agent container. This is intentionally opt-in.
+    pub ssh_agent_forwarding: bool,
     /// Optional access to the same Docker-compatible engine used by the
     /// control plane. Built-in agents select a separate CLI-enabled image.
     pub container_engine: ContainerEngineAccess,
+    pub proxy: crate::proxy::AgentProxyMode,
 }
 
 impl Default for NativeRunnerConfig {
@@ -299,7 +304,9 @@ impl Default for NativeRunnerConfig {
             startup_commands: Vec::new(),
             command: Vec::new(),
             subscription_auth: true,
+            ssh_agent_forwarding: false,
             container_engine: ContainerEngineAccess::None,
+            proxy: crate::proxy::AgentProxyMode::Inherit,
         }
     }
 }
@@ -329,8 +336,8 @@ pub struct AgentConfig {
     /// Per-agent LLM configuration (provider, model, api_key, base_url).
     #[serde(default)]
     pub llm: Option<AgentLlmConfig>,
-    /// Short-lived ACP worker configuration. This supersedes the old in-house
-    /// harness for task execution.
+    /// ACP runner and retained project-environment configuration. This
+    /// supersedes the old in-house harness for task execution.
     #[serde(default)]
     pub runner: NativeRunnerConfig,
     #[serde(default)]
@@ -414,17 +421,12 @@ impl AgentConfig {
         let configured_kind = self.runner.kind.trim().to_lowercase();
         let kind = if configured_kind.is_empty() || configured_kind == "auto" {
             let backend = self.backend.to_lowercase();
-            if backend.contains("codex") {
-                "codex"
-            } else if backend.contains("claude") {
-                "claude"
-            } else if backend.contains("opencode") {
-                "opencode"
-            } else {
+            let Some(kind) = crate::acp::infer_agent_kind_from_backend(&backend) else {
                 return false;
-            }
+            };
+            kind
         } else {
-            configured_kind.as_str()
+            crate::acp::canonical_agent_kind(&configured_kind).unwrap_or(configured_kind.as_str())
         };
 
         if let Some(image) = default_native_runner_image(kind, ContainerEngineAccess::None) {
@@ -558,6 +560,35 @@ pub struct SystemConfig {
     pub workspace_dir: PathBuf,
 }
 
+/// Instance-local listener and browser authentication settings.
+///
+/// These values belong to the control plane, not to a portable Project, and
+/// are deliberately kept separate from password verifiers and session state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct InstanceConfig {
+    /// Address exposed to browser clients.
+    pub bind: IpAddr,
+    /// Browser/API listener port.
+    pub port: u16,
+    /// Require a password or per-start token before serving instance data.
+    pub authentication_enabled: bool,
+    /// Explicit operator acknowledgement for non-loopback access without app
+    /// authentication. This does not imply transport encryption.
+    pub allow_unauthenticated_remote: bool,
+}
+
+impl Default for InstanceConfig {
+    fn default() -> Self {
+        Self {
+            bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 8935,
+            authentication_enabled: false,
+            allow_unauthenticated_remote: false,
+        }
+    }
+}
+
 impl Default for SystemConfig {
     fn default() -> Self {
         let home = dirs_home();
@@ -611,6 +642,13 @@ pub struct LlmConfig {
 #[serde(default)]
 pub struct Config {
     pub system: SystemConfig,
+    /// Local connection policy for this control-plane instance.
+    pub instance: InstanceConfig,
+    /// Optional instance-local GitBucket/Jenkins services. Disabled by
+    /// default and never started as a side effect of loading configuration.
+    pub collaboration: crate::collaboration::CollaborationConfig,
+    #[serde(default = "crate::proxy::ProxyConfig::legacy_default")]
+    pub proxy: crate::proxy::ProxyConfig,
     #[serde(default)]
     pub agents: Vec<AgentConfig>,
     #[serde(default)]
@@ -754,6 +792,26 @@ impl Config {
             ));
         }
 
+        if self.instance.port == 0 {
+            return Err(Error::ConfigValidation(
+                "instance.port must be between 1 and 65535".to_string(),
+            ));
+        }
+        if !self.instance.bind.is_loopback()
+            && !self.instance.authentication_enabled
+            && !self.instance.allow_unauthenticated_remote
+        {
+            return Err(Error::ConfigValidation(format!(
+                "instance.bind {} exposes an unauthenticated control plane; set instance.allow_unauthenticated_remote only after acknowledging that another trusted network boundary protects access",
+                self.instance.bind
+            )));
+        }
+
+        self.proxy.validate().map_err(Error::ConfigValidation)?;
+        self.collaboration
+            .validate()
+            .map_err(Error::ConfigValidation)?;
+
         Ok(())
     }
 }
@@ -827,7 +885,10 @@ fn dirs_home() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("."))
 }
 
-/// Default config template written by `xpressclaw init`.
+/// Legacy minimal config template retained for downstream API compatibility.
+///
+/// The CLI now renders instance-local paths when it initializes a new instance
+/// and therefore does not use this constant.
 pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# xpressclaw Configuration
 # Generated by `xpressclaw init`
 # Docs: https://xpressclaw.ai
@@ -835,6 +896,12 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# xpressclaw Configuration
 system:
   isolation: docker
   workspace_dir: .
+
+instance:
+  bind: 127.0.0.1
+  port: 8935
+  authentication_enabled: false
+  allow_unauthenticated_remote: false
 
 # Sessions are created in the web UI. Each one selects its own native runner
 # image and project workspace.
@@ -849,6 +916,10 @@ mod tests {
     fn test_default_config() {
         let config = Config::default();
         assert_eq!(config.system.isolation, "docker");
+        assert!(config.instance.bind.is_loopback());
+        assert_eq!(config.instance.port, 8935);
+        assert!(!config.instance.authentication_enabled);
+        assert!(!config.instance.allow_unauthenticated_remote);
         assert!(config.agents.is_empty());
         assert_eq!(config.memory.near_term_slots, 8);
     }
@@ -892,6 +963,26 @@ memory:
         let mut config = Config::default();
         config.system.isolation = "podman".to_string();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn instance_remote_no_auth_requires_persisted_acknowledgement() {
+        let mut config = Config::default();
+        config.instance.bind = "0.0.0.0".parse().unwrap();
+        assert!(config.validate().is_err());
+
+        config.instance.allow_unauthenticated_remote = true;
+        assert!(config.validate().is_ok());
+
+        config.instance.allow_unauthenticated_remote = false;
+        config.instance.authentication_enabled = true;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn old_configuration_gets_safe_instance_defaults() {
+        let config: Config = serde_yaml::from_str("system:\n  isolation: docker\n").unwrap();
+        assert_eq!(config.instance, InstanceConfig::default());
     }
 
     #[test]
@@ -1000,7 +1091,46 @@ agents:
         assert_eq!(config.agents[0].runner.kind, "codex");
         assert_eq!(
             config.agents[0].runner.image,
-            "ghcr.io/xpressai/xpressclaw-runner-codex:latest"
+            default_native_runner_image("codex", ContainerEngineAccess::None).unwrap()
+        );
+    }
+
+    #[test]
+    fn retired_shared_runner_image_recognizes_a_dsh_backend_alias() {
+        let yaml = r#"
+agents:
+  - name: deepseek
+    backend: dsh-acp
+    runner:
+      kind: auto
+      image: xpressclaw-native-runner:latest
+"#;
+        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.migrate_legacy_fields());
+        assert_eq!(config.agents[0].runner.kind, "deepseek-harness");
+        assert_eq!(
+            config.agents[0].runner.image,
+            default_native_runner_image("deepseek-harness", ContainerEngineAccess::None).unwrap()
+        );
+    }
+
+    #[test]
+    fn retired_shared_runner_image_does_not_reclassify_an_explicit_custom_kind() {
+        let yaml = r#"
+agents:
+  - name: proxy
+    backend: codex
+    runner:
+      kind: codex-proxy
+      image: xpressclaw-native-runner:latest
+      command: [codex-proxy, acp]
+"#;
+        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(!config.agents[0].migrate_legacy_runner_image());
+        assert_eq!(config.agents[0].runner.kind, "codex-proxy");
+        assert_eq!(
+            config.agents[0].runner.image,
+            "xpressclaw-native-runner:latest"
         );
     }
 
@@ -1025,10 +1155,11 @@ agents:
         assert_eq!(loaded.agents[0].runner.kind, "claude");
         assert_eq!(
             loaded.agents[0].runner.image,
-            "ghcr.io/xpressai/xpressclaw-runner-claude:latest"
+            default_native_runner_image("claude", ContainerEngineAccess::None).unwrap()
         );
         let saved = std::fs::read_to_string(path).unwrap();
-        assert!(saved.contains("xpressclaw-runner-claude:latest"));
+        assert!(saved
+            .contains(default_native_runner_image("claude", ContainerEngineAccess::None).unwrap()));
         assert!(!saved.contains("xpressclaw-native-runner:latest"));
     }
 

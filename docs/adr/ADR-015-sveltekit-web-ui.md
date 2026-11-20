@@ -30,6 +30,7 @@ The web UI is a **SvelteKit static SPA** that:
 | Styling | Tailwind CSS 3 with CSS custom properties (HSL theme) |
 | Icons | Lucide Svelte + Unicode |
 | Markdown | marked + DOMPurify |
+| Diagrams | Mermaid, loaded on demand for fenced `mermaid` blocks |
 | Build | Vite → static adapter → `frontend/build/` |
 | Embedding | rust-embed compiles `frontend/build/` into the server binary |
 
@@ -107,6 +108,15 @@ The conversation page uses SSE for real-time agent responses:
 3. Frontend parses these incrementally, updating `$state` variables
 4. Markdown is rendered via `marked`, with custom handling for `<think>` blocks (collapsible reasoning) and `<tool_call>` blocks (collapsible tool invocations)
 5. `@mention` picker for multi-agent conversations
+
+Fenced `mermaid` blocks render inline in messages, activity details, and task
+results. The shared DOM action renders with Mermaid's strict security mode and
+SVG text labels, sanitizes the output, and displays it as an SVG image to isolate
+diagram styles and links from the application. Diagrams fit the message width,
+with an actual-size view for horizontal scrolling and a source disclosure.
+Incomplete or invalid diagrams remain readable code blocks.
+Rendering follows the application theme, coalesces streamed updates, and reuses
+completed diagrams while surrounding prose changes.
 
 ### Sidebar Layout
 

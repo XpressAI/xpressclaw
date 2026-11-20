@@ -1,7 +1,7 @@
 # ADR-019: Background Conversations
 
 ## Status
-Superseded by ADR-025 and ADR-028
+Superseded by ADR-025, ADR-028, and ADR-037
 
 ## Context
 

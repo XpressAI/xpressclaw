@@ -1,17 +1,19 @@
 //! Event-driven logical sessions and their isolated native work attempts.
 //!
-//! A session is the durable, user-facing project context. Native harnesses own
+//! A session is the durable task context for one Agent. Native harnesses own
 //! their instructions and subagents; every invocation is represented by a work
 //! attempt that contributes structured events and artifacts to the timeline.
 
 use std::sync::Arc;
 
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::db::Database;
 use crate::error::{Error, Result};
+use crate::projects::ensure_project_accepts_work;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogicalSession {
@@ -43,6 +45,12 @@ pub struct WorkAttempt {
     pub completed_at: Option<String>,
     pub context_used: Option<i64>,
     pub context_size: Option<i64>,
+    /// User message that triggered this response cycle, when applicable.
+    pub trigger_message_id: Option<i64>,
+    /// UTC timestamp at which this response cycle entered the queue.
+    pub response_queued_at: Option<String>,
+    /// UTC timestamp at which the agent began the active response phase.
+    pub response_started_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +88,8 @@ pub struct SessionOverview {
     pub recent_attempts: Vec<WorkAttempt>,
     pub recent_events: Vec<SessionEvent>,
     pub artifacts: Vec<AttemptArtifact>,
+    #[serde(default)]
+    pub active_task_count: usize,
 }
 
 /// Native work history scoped to one task. This is the task page's semantic
@@ -112,21 +122,65 @@ impl SessionManager {
         Self { db }
     }
 
-    /// Ensure that the durable project-context session exists. IDs retain the
+    /// Ensure that the durable Agent task session exists. IDs retain the
     /// legacy registry key shape so existing task and workflow references stay
     /// valid, but titles are always refreshed from the current project path.
     pub fn ensure(&self, session_id: &str, title: Option<&str>) -> Result<LogicalSession> {
         self.db.with_conn(|conn| {
-            conn.execute(
+            let project_id = conn
+                .query_row(
+                    "SELECT project_id FROM agents WHERE id = ?1",
+                    [session_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .ok_or_else(|| Error::AgentNotFound {
+                    name: session_id.to_string(),
+                })?;
+            if let Some(project_id) = project_id.as_deref() {
+                ensure_project_accepts_work(conn, project_id)?;
+            }
+            let existing_title = conn
+                .query_row(
+                    "SELECT title FROM logical_sessions WHERE id = ?1",
+                    [session_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?;
+            if let Some(existing_title) = existing_title {
+                if title.is_none() || existing_title.as_deref() == title {
+                    return Ok(());
+                }
+            }
+
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let project_id = transaction
+                .query_row(
+                    "SELECT project_id FROM agents WHERE id = ?1",
+                    [session_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .ok_or_else(|| Error::AgentNotFound {
+                    name: session_id.to_string(),
+                })?;
+            if let Some(project_id) = project_id.as_deref() {
+                ensure_project_accepts_work(&transaction, project_id)?;
+            }
+            transaction.execute(
                 "INSERT OR IGNORE INTO logical_sessions (id, agent_id, title) VALUES (?1, ?1, ?2)",
                 rusqlite::params![session_id, title],
             )?;
             if title.is_some() {
-                conn.execute(
-                    "UPDATE logical_sessions SET title = ?1 WHERE id = ?2",
+                transaction.execute(
+                    "UPDATE logical_sessions SET title = ?1 WHERE id = ?2 AND title IS NOT ?1",
                     rusqlite::params![title, session_id],
                 )?;
             }
+            transaction.commit()?;
             Ok::<_, Error>(())
         })?;
         self.get(session_id)
@@ -134,15 +188,46 @@ impl SessionManager {
 
     pub fn get(&self, session_id: &str) -> Result<LogicalSession> {
         self.db.with_conn(|conn| {
-            conn.query_row(
-                "SELECT id, agent_id, title, status, latest_summary, created_at, updated_at
+            let mut session = conn
+                .query_row(
+                    "SELECT id, agent_id, title, status, latest_summary, created_at, updated_at
                  FROM logical_sessions WHERE id = ?1",
+                    [session_id],
+                    row_to_session,
+                )
+                .map_err(|_| Error::AgentNotFound {
+                    name: session_id.to_string(),
+                })?;
+            // Stored status is a cache. Reads must reflect current unresolved
+            // work, including tasks cancelled/completed since an earlier failure.
+            session.status = self.derive_status_with_conn(conn, session_id)?;
+            Ok(session)
+        })
+    }
+
+    pub fn active_task_count(&self, session_id: &str) -> Result<usize> {
+        self.db.with_conn(|conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM tasks
+                 WHERE agent_id = ?1 AND hidden = 0 AND backlog = 0
+                   AND status IN ('pending', 'in_progress')",
                 [session_id],
-                row_to_session,
-            )
-            .map_err(|_| Error::AgentNotFound {
-                name: session_id.to_string(),
-            })
+                |row| row.get(0),
+            )?;
+            Ok(count.max(0) as usize)
+        })
+    }
+
+    pub fn overview_summary(&self, session_id: &str) -> Result<SessionOverview> {
+        let session = self.get(session_id)?;
+        Ok(SessionOverview {
+            active_attempts: self.list_attempts(session_id, Some("running"), 20)?,
+            queued_attempts: self.list_attempts(session_id, Some("queued"), 20)?,
+            recent_attempts: Vec::new(),
+            recent_events: Vec::new(),
+            artifacts: Vec::new(),
+            active_task_count: self.active_task_count(session_id)?,
+            session,
         })
     }
 
@@ -154,6 +239,7 @@ impl SessionManager {
             recent_attempts: self.list_attempts(session_id, None, 30)?,
             recent_events: self.list_events(session_id, None, 100)?,
             artifacts: self.list_artifacts(session_id, 50)?,
+            active_task_count: self.active_task_count(session_id)?,
             session,
         })
     }
@@ -205,29 +291,61 @@ impl SessionManager {
         after: Option<i64>,
         limit: i64,
     ) -> Result<Vec<SessionEvent>> {
+        self.list_events_filtered(session_id, after, None, limit)
+    }
+
+    pub fn list_events_filtered(
+        &self,
+        session_id: &str,
+        after: Option<i64>,
+        event_type: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<SessionEvent>> {
+        let event_type = event_type.map(str::trim).filter(|value| !value.is_empty());
         self.db.with_conn(|conn| {
-            let (sql, pivot) = if let Some(after_id) = after {
-                (
+            let (sql, pivot) = match (after, event_type.is_some()) {
+                (Some(after_id), false) => (
                     "SELECT id, session_id, attempt_id, task_id, source_type, source_id,
                             event_type, summary, payload, created_at
                      FROM session_events WHERE session_id = ?1 AND id > ?2
                      ORDER BY id ASC LIMIT ?3",
                     after_id,
-                )
-            } else {
-                (
+                ),
+                (None, false) => (
                     "SELECT id, session_id, attempt_id, task_id, source_type, source_id,
                             event_type, summary, payload, created_at
                      FROM session_events WHERE session_id = ?1 AND id > ?2
                      ORDER BY id DESC LIMIT ?3",
                     -1,
-                )
+                ),
+                (Some(after_id), true) => (
+                    "SELECT id, session_id, attempt_id, task_id, source_type, source_id,
+                            event_type, summary, payload, created_at
+                     FROM session_events WHERE session_id = ?1 AND id > ?2 AND event_type = ?4
+                     ORDER BY id ASC LIMIT ?3",
+                    after_id,
+                ),
+                (None, true) => (
+                    "SELECT id, session_id, attempt_id, task_id, source_type, source_id,
+                            event_type, summary, payload, created_at
+                     FROM session_events WHERE session_id = ?1 AND id > ?2 AND event_type = ?4
+                     ORDER BY id DESC LIMIT ?3",
+                    -1,
+                ),
             };
             let mut stmt = conn.prepare(sql)?;
-            let mut events: Vec<_> = stmt
-                .query_map(rusqlite::params![session_id, pivot, limit], row_to_event)?
+            let mut events: Vec<_> = if let Some(kind) = event_type {
+                stmt.query_map(
+                    rusqlite::params![session_id, pivot, limit, kind],
+                    row_to_event,
+                )?
                 .filter_map(|row| row.ok())
-                .collect();
+                .collect()
+            } else {
+                stmt.query_map(rusqlite::params![session_id, pivot, limit], row_to_event)?
+                    .filter_map(|row| row.ok())
+                    .collect()
+            };
             if after.is_none() {
                 events.reverse();
             }
@@ -247,29 +365,52 @@ impl SessionManager {
         source_id: Option<&str>,
         prompt: &str,
     ) -> Result<WorkAttempt> {
-        self.ensure(session_id, None)?;
         let id = Uuid::new_v4().to_string();
         self.db.with_conn(|conn| {
-            conn.execute(
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let project_id = transaction
+                .query_row(
+                    "SELECT project_id FROM tasks WHERE id = ?1",
+                    [task_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .ok_or_else(|| Error::TaskNotFound {
+                    id: task_id.to_string(),
+                })?;
+            if let Some(project_id) = project_id.as_deref() {
+                ensure_project_accepts_work(&transaction, project_id)?;
+            }
+            transaction.execute(
+                "INSERT OR IGNORE INTO logical_sessions (id, agent_id, title)
+                 VALUES (?1, ?1, NULL)",
+                [session_id],
+            )?;
+            transaction.execute(
                 "INSERT INTO work_attempts
-                 (id, session_id, task_id, queue_id, kind, runner, status, prompt)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', ?7)",
+                 (id, session_id, task_id, queue_id, kind, runner, status, prompt,
+                  response_queued_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', ?7, CURRENT_TIMESTAMP)",
                 rusqlite::params![id, session_id, task_id, queue_id, kind, runner, prompt],
             )?;
-            conn.execute(
+            transaction.execute(
                 "UPDATE task_queue SET attempt_id = ?1 WHERE id = ?2",
                 rusqlite::params![id, queue_id],
             )?;
-            conn.execute(
+            transaction.execute(
                 "UPDATE tasks SET session_id = ?1, active_attempt_id = ?2,
                     updated_at = CURRENT_TIMESTAMP WHERE id = ?3",
                 rusqlite::params![session_id, id, task_id],
             )?;
-            conn.execute(
+            transaction.execute(
                 "UPDATE logical_sessions SET status = 'queued', updated_at = CURRENT_TIMESTAMP
                  WHERE id = ?1 AND status != 'running'",
                 [session_id],
             )?;
+            transaction.commit()?;
             Ok::<_, Error>(())
         })?;
         self.append_event(
@@ -292,12 +433,74 @@ impl SessionManager {
             conn.query_row(
                 "SELECT id, session_id, task_id, queue_id, kind, runner, status, prompt,
                         native_session_id, container_id, result, error_message,
-                        created_at, started_at, completed_at, context_used, context_size
+                        created_at, started_at, completed_at, context_used, context_size,
+                        trigger_message_id, response_queued_at, response_started_at
                  FROM work_attempts WHERE id = ?1",
                 [attempt_id],
                 row_to_attempt,
             )
             .map_err(|e| Error::Task(format!("attempt {attempt_id} not found: {e}")))
+        })
+    }
+
+    /// Shared task-session selection for dispatch and picker inspection. Busy
+    /// inspection may use the active attempt; it must not borrow an older
+    /// catalog while a new attempt is still opening its session.
+    pub fn task_control_attempt(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+        runner: &str,
+        include_active: bool,
+    ) -> Result<Option<WorkAttempt>> {
+        self.db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT id, session_id, task_id, queue_id, kind, runner, status, prompt,
+                    native_session_id, container_id, result, error_message,
+                    created_at, started_at, completed_at, context_used, context_size,
+                    trigger_message_id, response_queued_at, response_started_at
+             FROM work_attempts WHERE task_id=?1 AND session_id=?2 AND runner=?3
+               AND ((status IN ('completed','interrupted')
+                    AND native_session_id IS NOT NULL AND TRIM(native_session_id) != '')
+                 OR (?4 AND status IN ('preparing','running','waiting_for_input','review')))
+             ORDER BY CASE WHEN status IN ('completed','interrupted') THEN 1 ELSE 0 END,
+                      COALESCE(completed_at,created_at) DESC, rowid DESC LIMIT 1",
+                rusqlite::params![task_id, agent_id, runner, include_active],
+                row_to_attempt,
+            )
+            .optional()
+            .map_err(Error::from)
+        })
+    }
+
+    /// Durable schemas are observations of one native conversation, never task
+    /// preferences. A failed fork is excluded; a later update on the same
+    /// reusable native session remains useful even if that turn failed.
+    pub fn task_control_event(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+        runner: &str,
+        native_id: &str,
+        event_type: &str,
+    ) -> Result<Option<SessionEvent>> {
+        self.db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT e.id,e.session_id,e.attempt_id,e.task_id,e.source_type,e.source_id,
+                    e.event_type,e.summary,e.payload,e.created_at
+             FROM session_events e JOIN work_attempts a ON a.id=e.attempt_id
+             WHERE e.task_id=?1 AND e.session_id=?2 AND a.task_id=?1 AND a.session_id=?2
+               AND a.native_session_id=?4 AND e.event_type=?5
+               AND ((e.source_type='acp' AND e.source_id=?3)
+                 OR (e.source_type='user' AND a.runner=?3))
+               AND (json_extract(e.payload,'$.native_session_id') IS NULL
+                    OR json_extract(e.payload,'$.native_session_id')=?4)
+             ORDER BY e.id DESC LIMIT 1",
+                rusqlite::params![task_id, agent_id, runner, native_id, event_type],
+                row_to_event,
+            )
+            .optional()
+            .map_err(Error::from)
         })
     }
 
@@ -311,7 +514,8 @@ impl SessionManager {
             let mut sql = String::from(
                 "SELECT id, session_id, task_id, queue_id, kind, runner, status, prompt,
                         native_session_id, container_id, result, error_message,
-                        created_at, started_at, completed_at, context_used, context_size
+                        created_at, started_at, completed_at, context_used, context_size,
+                        trigger_message_id, response_queued_at, response_started_at
                  FROM work_attempts WHERE session_id = ?1",
             );
             let mut values: Vec<Box<dyn rusqlite::types::ToSql>> =
@@ -337,6 +541,22 @@ impl SessionManager {
         })
     }
 
+    /// Whether a session has work that has not reached a terminal state.
+    pub fn has_active_attempts(&self, session_id: &str) -> Result<bool> {
+        self.db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM work_attempts
+                    WHERE session_id = ?1
+                      AND status NOT IN ('completed', 'failed', 'cancelled', 'interrupted')
+                )",
+                [session_id],
+                |row| row.get(0),
+            )
+            .map_err(Error::from)
+        })
+    }
+
     pub fn task_activity(
         &self,
         task_id: &str,
@@ -354,7 +574,8 @@ impl SessionManager {
             let mut attempt_stmt = conn.prepare(
                 "SELECT id, session_id, task_id, queue_id, kind, runner, status, prompt,
                         native_session_id, container_id, result, error_message,
-                        created_at, started_at, completed_at, context_used, context_size
+                        created_at, started_at, completed_at, context_used, context_size,
+                        trigger_message_id, response_queued_at, response_started_at
                  FROM work_attempts WHERE task_id = ?1
                  ORDER BY created_at DESC LIMIT ?2",
             )?;
@@ -443,6 +664,10 @@ impl SessionManager {
                 "UPDATE work_attempts SET status = ?1,
                     started_at = CASE WHEN ?1 IN ('preparing', 'running')
                         THEN COALESCE(started_at, CURRENT_TIMESTAMP) ELSE started_at END,
+                    response_started_at = CASE
+                        WHEN ?1 = 'running' AND status != 'running' THEN CURRENT_TIMESTAMP
+                        WHEN ?1 = 'running' THEN COALESCE(response_started_at, CURRENT_TIMESTAMP)
+                        ELSE response_started_at END,
                     completed_at = CASE WHEN ?2 = 1 THEN CURRENT_TIMESTAMP ELSE completed_at END,
                     result = COALESCE(?3, result), error_message = ?4
                  WHERE id = ?5
@@ -491,11 +716,355 @@ impl SessionManager {
         self.get_attempt(attempt_id)
     }
 
+    /// Associate a queued continuation with the latest user message it will
+    /// answer. Updating an already-queued attempt is intentional: consecutive
+    /// guidance is coalesced into one response cycle whose queue latency starts
+    /// at the newest message included in that response.
+    pub fn associate_response_trigger(
+        &self,
+        attempt_id: &str,
+        message_id: i64,
+        queued_at: &str,
+    ) -> Result<()> {
+        self.db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE work_attempts
+                 SET trigger_message_id = ?1, response_queued_at = ?2
+                 WHERE id = ?3
+                   AND status NOT IN ('completed', 'failed', 'cancelled', 'interrupted')
+                   AND (trigger_message_id IS NULL OR trigger_message_id <= ?1)",
+                rusqlite::params![message_id, queued_at, attempt_id],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Cancel every live attempt for a task before any asynchronous container
+    /// cleanup begins. Selecting the attempts and transitioning the attempts,
+    /// queued dispatches, task, active-attempt pointer, logical sessions, and
+    /// pull-request review gates happen together so work enqueued immediately
+    /// before cancellation cannot survive it.
+    ///
+    /// `None` means the task already completed in another path, so the caller
+    /// must preserve that terminal state. Otherwise the returned attempts are
+    /// the ones whose containers and running dispatch leases need cleanup.
+    pub fn cancel_task_attempts(
+        &self,
+        task_id: &str,
+        summary: &str,
+    ) -> Result<Option<Vec<WorkAttempt>>> {
+        let attempts = self.db.with_conn(|conn| {
+            let transaction = conn.unchecked_transaction()?;
+            let attempts =
+                self.cancel_task_attempts_in_transaction(&transaction, task_id, summary)?;
+            transaction.commit()?;
+            Ok::<_, Error>(attempts)
+        })?;
+
+        attempts
+            .map(|attempts| self.record_task_attempt_cancellations(task_id, summary, attempts))
+            .transpose()
+    }
+
+    /// Apply the durable half of whole-task cancellation inside a caller-owned
+    /// transaction.
+    pub(crate) fn cancel_task_attempts_in_transaction(
+        &self,
+        transaction: &rusqlite::Transaction<'_>,
+        task_id: &str,
+        summary: &str,
+    ) -> Result<Option<Vec<WorkAttempt>>> {
+        let task_status: String =
+            transaction.query_row("SELECT status FROM tasks WHERE id = ?1", [task_id], |row| {
+                row.get(0)
+            })?;
+        if task_status == "completed" {
+            return Ok(None);
+        }
+
+        let mut statement = transaction.prepare(
+            "SELECT id, session_id, task_id, queue_id, kind, runner, status, prompt,
+                        native_session_id, container_id, result, error_message,
+                        created_at, started_at, completed_at, context_used, context_size,
+                        trigger_message_id, response_queued_at, response_started_at
+                 FROM work_attempts
+                 WHERE task_id = ?1
+                   AND status NOT IN ('completed', 'failed', 'cancelled', 'interrupted')
+                 ORDER BY created_at ASC",
+        )?;
+        let attempts = statement
+            .query_map([task_id], row_to_attempt)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(statement);
+
+        transaction.execute(
+            "UPDATE work_attempts SET status = 'cancelled',
+                    completed_at = CURRENT_TIMESTAMP, error_message = NULL
+                 WHERE task_id = ?1
+                   AND status NOT IN ('completed', 'failed', 'cancelled', 'interrupted')",
+            [task_id],
+        )?;
+        for attempt in &attempts {
+            let prompt_message_id = transaction
+                .query_row(
+                    "SELECT continuation_prompt_message_id
+                     FROM workflow_step_executions
+                     WHERE continuation_attempt_id = ?1 AND task_id = ?2
+                       AND continuation_prompt_message_id IS NOT NULL
+                     ORDER BY rowid DESC LIMIT 1",
+                    rusqlite::params![&attempt.id, task_id],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .optional()?
+                .flatten();
+            self.retire_unconsumed_workflow_prompt_in_transaction(
+                transaction,
+                attempt,
+                prompt_message_id,
+            )?;
+        }
+        // Queued dispatches are safe to release immediately because their
+        // attempts are now terminal. Running rows remain the retained
+        // container lease until the caller finishes asynchronous cleanup.
+        transaction.execute(
+            "UPDATE task_queue SET status = 'failed', completed_at = CURRENT_TIMESTAMP,
+                    harness_response = 'cancelled by user'
+                 WHERE task_id = ?1 AND status = 'queued'",
+            [task_id],
+        )?;
+        transaction.execute(
+            "UPDATE tasks SET status = 'cancelled', completed_at = NULL,
+                    active_attempt_id = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?1 AND status != 'completed'",
+            [task_id],
+        )?;
+        crate::tasks::board::TaskBoard::release_child_parent_reviews_in_transaction(
+            transaction,
+            task_id,
+        )?;
+        transaction.execute(
+            "UPDATE task_pull_requests SET status = 'cancelled', next_poll_at = NULL,
+                    last_checked_at = CURRENT_TIMESTAMP, last_error = NULL
+                WHERE task_id = ?1 AND status IN ('waiting', 'attention')",
+            [task_id],
+        )?;
+        let mut session_ids = attempts
+            .iter()
+            .map(|attempt| attempt.session_id.as_str())
+            .collect::<Vec<_>>();
+        session_ids.sort_unstable();
+        session_ids.dedup();
+        for session_id in session_ids {
+            let session_status = self.derive_status_with_conn(transaction, session_id)?;
+            transaction.execute(
+                "UPDATE logical_sessions SET status = ?1, latest_summary = ?2,
+                        updated_at = CURRENT_TIMESTAMP WHERE id = ?3",
+                rusqlite::params![session_status, summary, session_id],
+            )?;
+        }
+        Ok(Some(attempts))
+    }
+
+    /// Cancel one workflow-owned attempt without changing unrelated attempts
+    /// or making the shared source task terminal. Same-task continuations use
+    /// this narrower lifecycle when their workflow run is cancelled.
+    pub(crate) fn cancel_workflow_attempt_in_transaction(
+        &self,
+        transaction: &rusqlite::Transaction<'_>,
+        attempt_id: &str,
+        prompt_message_id: Option<i64>,
+        restore_task_status: &str,
+        summary: &str,
+    ) -> Result<Option<WorkAttempt>> {
+        let attempt = transaction
+            .query_row(
+                "SELECT id, session_id, task_id, queue_id, kind, runner, status, prompt,
+                        native_session_id, container_id, result, error_message,
+                        created_at, started_at, completed_at, context_used, context_size,
+                        trigger_message_id, response_queued_at, response_started_at
+                 FROM work_attempts WHERE id = ?1",
+                [attempt_id],
+                row_to_attempt,
+            )
+            .optional()?
+            .ok_or_else(|| Error::Task(format!("attempt {attempt_id} not found")))?;
+        let attempt_is_terminal = matches!(
+            attempt.status.as_str(),
+            "completed" | "failed" | "cancelled" | "interrupted"
+        );
+        // An elicited user answer may adopt the continuation execution so its
+        // completion advances the workflow. It remains user-owned work: only
+        // the attempt triggered by this execution's original fixed prompt is
+        // cancelled with the workflow.
+        let Some(prompt_message_id) = prompt_message_id else {
+            return Ok(None);
+        };
+        if attempt.trigger_message_id != Some(prompt_message_id) {
+            return Ok(None);
+        }
+        let task_id = attempt.task_id.as_deref().ok_or_else(|| {
+            Error::Task(format!(
+                "workflow continuation attempt {attempt_id} has no task"
+            ))
+        })?;
+
+        if !attempt_is_terminal {
+            transaction.execute(
+                "UPDATE work_attempts
+                 SET status = 'cancelled', completed_at = CURRENT_TIMESTAMP,
+                     error_message = NULL
+                 WHERE id = ?1",
+                [attempt_id],
+            )?;
+            if let Some(queue_id) = attempt.queue_id {
+                // A running dispatch retains the container lease until the server
+                // has stopped it. A queued dispatch can be retired immediately.
+                transaction.execute(
+                    "UPDATE task_queue
+                     SET status = 'failed', completed_at = CURRENT_TIMESTAMP,
+                         harness_response = 'workflow cancelled by user'
+                     WHERE id = ?1 AND status = 'queued'",
+                    [queue_id],
+                )?;
+            }
+            self.retire_unconsumed_workflow_prompt_in_transaction(
+                transaction,
+                &attempt,
+                Some(prompt_message_id),
+            )?;
+        }
+
+        let replacement_attempt_id = transaction
+            .query_row(
+                "SELECT id FROM work_attempts
+                 WHERE task_id = ?1
+                   AND status IN ('queued', 'preparing', 'running',
+                                  'waiting_for_input', 'review')
+                 ORDER BY rowid DESC LIMIT 1",
+                [task_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let current_task_status: String =
+            transaction.query_row("SELECT status FROM tasks WHERE id = ?1", [task_id], |row| {
+                row.get(0)
+            })?;
+        let next_task_status = if matches!(current_task_status.as_str(), "completed" | "cancelled")
+            || replacement_attempt_id.is_some()
+        {
+            current_task_status
+        } else {
+            restore_task_status.to_string()
+        };
+        transaction.execute(
+            "UPDATE tasks
+             SET status = ?1, active_attempt_id = ?2,
+                 completed_at = CASE
+                     WHEN ?1 = 'completed' THEN COALESCE(completed_at, CURRENT_TIMESTAMP)
+                     ELSE NULL END,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?3",
+            rusqlite::params![next_task_status, replacement_attempt_id, task_id],
+        )?;
+
+        let session_status = self.derive_status_with_conn(transaction, &attempt.session_id)?;
+        transaction.execute(
+            "UPDATE logical_sessions
+             SET status = ?1, latest_summary = ?2, updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?3",
+            rusqlite::params![session_status, summary, &attempt.session_id],
+        )?;
+        Ok((!attempt_is_terminal).then_some(attempt))
+    }
+
+    /// Remove a fixed prompt that belongs to a workflow continuation only
+    /// when no response ever began consuming it. This is shared by
+    /// workflow-only and whole-task cancellation so either path closes the
+    /// same prompt-leak boundary.
+    fn retire_unconsumed_workflow_prompt_in_transaction(
+        &self,
+        transaction: &rusqlite::Transaction<'_>,
+        attempt: &WorkAttempt,
+        prompt_message_id: Option<i64>,
+    ) -> Result<()> {
+        let (Some(task_id), Some(prompt_message_id)) =
+            (attempt.task_id.as_deref(), prompt_message_id)
+        else {
+            return Ok(());
+        };
+        if attempt.trigger_message_id != Some(prompt_message_id)
+            || attempt.response_started_at.is_some()
+        {
+            return Ok(());
+        }
+
+        transaction.execute(
+            "DELETE FROM task_messages
+             WHERE id = ?1 AND task_id = ?2 AND role = 'user'
+               AND EXISTS (
+                   SELECT 1 FROM workflow_step_executions
+                   WHERE continuation_attempt_id = ?3
+                     AND continuation_prompt_message_id = ?1
+                     AND task_id = ?2
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM work_attempts
+                   WHERE trigger_message_id = ?1 AND id != ?3
+                     AND (
+                         response_started_at IS NOT NULL
+                         OR status IN ('queued', 'preparing', 'running',
+                                       'waiting_for_input', 'review')
+                     )
+               )",
+            rusqlite::params![prompt_message_id, task_id, &attempt.id],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn record_task_attempt_cancellations(
+        &self,
+        task_id: &str,
+        summary: &str,
+        attempts: Vec<WorkAttempt>,
+    ) -> Result<Vec<WorkAttempt>> {
+        let mut cancelled = Vec::with_capacity(attempts.len());
+        for attempt in attempts {
+            self.append_event(
+                &attempt.session_id,
+                NewEvent {
+                    attempt_id: Some(&attempt.id),
+                    task_id: Some(task_id),
+                    source_type: "runner",
+                    source_id: Some(&attempt.runner),
+                    event_type: "attempt_cancelled",
+                    summary,
+                    payload: json!({ "status": "cancelled", "error": Value::Null }),
+                },
+            )?;
+            cancelled.push(self.get_attempt(&attempt.id)?);
+        }
+        Ok(cancelled)
+    }
+
     pub fn set_container(&self, attempt_id: &str, container_id: &str) -> Result<()> {
         self.db.with_conn(|conn| {
             conn.execute(
                 "UPDATE work_attempts SET container_id = ?1 WHERE id = ?2",
                 rusqlite::params![container_id, attempt_id],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Release this attempt's lease on its Agent container after the
+    /// process has stopped. The container itself remains available for a
+    /// later attempt.
+    pub fn clear_container(&self, attempt_id: &str) -> Result<()> {
+        self.db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE work_attempts SET container_id = NULL WHERE id = ?1",
+                [attempt_id],
             )?;
             Ok(())
         })
@@ -507,6 +1076,32 @@ impl SessionManager {
                 "UPDATE work_attempts SET native_session_id = ?1 WHERE id = ?2",
                 rusqlite::params![native_session_id, attempt_id],
             )?;
+            Ok(())
+        })
+    }
+
+    /// Forget harness sessions after an explicit environment rebuild. Callers
+    /// must hold the Agent runtime boundary until this commits. Logical task
+    /// and conversation history remains available to seed fresh ACP sessions.
+    pub fn invalidate_native_sessions(&self, agent_id: &str) -> Result<()> {
+        self.db.with_conn(|conn| {
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            transaction.execute(
+                "UPDATE work_attempts SET native_session_id = NULL
+                 WHERE session_id IN (SELECT id FROM logical_sessions WHERE agent_id = ?1)
+                   AND native_session_id IS NOT NULL",
+                [agent_id],
+            )?;
+            transaction.execute(
+                "UPDATE conversation_agent_sessions SET native_session_id = NULL,
+                        updated_at = CURRENT_TIMESTAMP
+                 WHERE agent_id = ?1 AND native_session_id IS NOT NULL",
+                [agent_id],
+            )?;
+            transaction.commit()?;
             Ok(())
         })
     }
@@ -654,6 +1249,32 @@ impl SessionManager {
         if running > 0 {
             return Ok("running".to_string());
         }
+        let waiting: i64 = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tasks
+             WHERE agent_id = ?1 AND status = 'waiting_for_input' AND hidden=0 AND provenance!='native_plan')
+             OR EXISTS(SELECT 1 FROM work_attempts WHERE session_id=?1 AND status='waiting_for_input')",
+            [session_id],
+            |row| row.get(0),
+        )?;
+        if waiting > 0 {
+            return Ok("waiting_for_input".to_string());
+        }
+        let blocked: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM tasks t
+             WHERE t.agent_id = ?1 AND t.hidden=0 AND t.provenance!='native_plan'
+               AND (t.status='blocked' OR (
+                 t.status IN ('pending','in_progress') AND t.backlog=0
+                 AND (t.start_after IS NULL OR julianday(t.start_after)<=julianday('now'))
+                 AND NOT EXISTS (SELECT 1 FROM task_queue q WHERE q.task_id=t.id AND q.status='running')
+                 AND NOT EXISTS (SELECT 1 FROM task_pull_requests pr WHERE pr.task_id=t.id AND pr.status IN ('waiting','attention'))
+                 AND EXISTS (SELECT 1 FROM tasks child WHERE child.parent_task_id=t.id
+                   AND child.blocks_parent=1 AND child.status IN ('blocked','waiting_for_input','cancelled'))))",
+            [session_id],
+            |row| row.get(0),
+        )?;
+        if blocked > 0 {
+            return Ok("blocked".into());
+        }
         let queued: i64 = conn.query_row(
             "SELECT COUNT(*) FROM work_attempts
              WHERE session_id = ?1 AND status = 'queued'",
@@ -663,22 +1284,7 @@ impl SessionManager {
         if queued > 0 {
             return Ok("queued".to_string());
         }
-        let waiting: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM tasks
-             WHERE agent_id = ?1 AND status = 'waiting_for_input'",
-            [session_id],
-            |row| row.get(0),
-        )?;
-        if waiting > 0 {
-            return Ok("waiting_for_input".to_string());
-        }
-        let blocked: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM tasks
-             WHERE agent_id = ?1 AND status = 'blocked'",
-            [session_id],
-            |row| row.get(0),
-        )?;
-        Ok(if blocked > 0 { "blocked" } else { "idle" }.to_string())
+        Ok("idle".into())
     }
 }
 
@@ -717,6 +1323,9 @@ fn row_to_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkAttempt> {
         completed_at: row.get(14)?,
         context_used: row.get(15)?,
         context_size: row.get(16)?,
+        trigger_message_id: row.get(17)?,
+        response_queued_at: row.get(18)?,
+        response_started_at: row.get(19)?,
     })
 }
 
@@ -753,9 +1362,190 @@ fn row_to_artifact(row: &rusqlite::Row<'_>) -> rusqlite::Result<AttemptArtifact>
 mod tests {
     use super::*;
 
+    fn insert_agent(db: &Arc<Database>, id: &str) {
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO agents (id, name, backend, config)
+                 VALUES (?1, ?1, 'native', '{}')",
+                [id],
+            )
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn task_control_context_matches_dispatch_scope_and_resumability() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        for agent in ["a", "b"] {
+            insert_agent(&db, agent);
+        }
+        let sessions = SessionManager::new(db.clone());
+        for agent in ["a", "b"] {
+            sessions.ensure(agent, None).unwrap();
+        }
+        db.conn().execute_batch(
+            "INSERT INTO tasks(id,title,status,agent_id) VALUES('task','Task','pending','a'),('sibling','Sibling','pending','a');
+             INSERT INTO work_attempts(id,session_id,task_id,runner,status,native_session_id,created_at) VALUES
+              ('first','a','task','pi','completed','pi-first','2026-01-01'),
+              ('interrupted','a','task','pi','interrupted','pi-last','2026-01-01'),
+              ('b','b','task','pi','completed','b-native','2026-01-02'),
+              ('runner','a','task','codex','completed','codex-native','2026-01-02'),
+              ('sibling','a','sibling','pi','completed','sibling-native','2026-01-03'),
+              ('failed','a','task','pi','failed','failed-native','2026-01-04'),
+              ('blank','a','task','pi','completed','  ','2026-01-05'),
+              ('opening','a','task','pi','preparing',NULL,'2026-01-06');"
+        ).unwrap();
+        for (agent, runner, id) in [
+            ("a", "pi", "interrupted"),
+            ("b", "pi", "b"),
+            ("a", "codex", "runner"),
+        ] {
+            assert_eq!(
+                sessions
+                    .task_control_attempt("task", agent, runner, false)
+                    .unwrap()
+                    .unwrap()
+                    .id,
+                id
+            );
+        }
+        assert!(sessions
+            .task_control_attempt("task", "a", "claude", false)
+            .unwrap()
+            .is_none());
+        assert!(sessions
+            .task_control_attempt("missing", "a", "pi", false)
+            .unwrap()
+            .is_none());
+        let active = sessions
+            .task_control_attempt("task", "a", "pi", true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.id, "opening");
+        assert!(active.native_session_id.is_none());
+    }
+
+    #[test]
+    fn session_reads_clear_stale_failure_flags_without_erasing_history() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        insert_agent(&db, "reviewer");
+        let manager = SessionManager::new(db.clone());
+        manager.ensure("reviewer", None).unwrap();
+        db.conn().execute_batch("UPDATE logical_sessions SET status='blocked';
+            INSERT INTO tasks(id,title,status,agent_id) VALUES('cancelled','Old work','cancelled','reviewer');
+            INSERT INTO work_attempts(id,session_id,task_id,runner,status,error_message)
+              VALUES('old','reviewer','cancelled','codex','failed','Historical failure');").unwrap();
+        assert_eq!(manager.get("reviewer").unwrap().status, "idle");
+        assert_eq!(
+            manager.get_attempt("old").unwrap().error_message.as_deref(),
+            Some("Historical failure")
+        );
+        db.conn().execute_batch("INSERT INTO tasks(id,title,status,agent_id) VALUES('review','Review','blocked','reviewer');").unwrap();
+        assert_eq!(manager.get("reviewer").unwrap().status, "blocked");
+        db.conn()
+            .execute("UPDATE tasks SET status='completed' WHERE id='review'", [])
+            .unwrap();
+        assert_eq!(manager.overview("reviewer").unwrap().session.status, "idle");
+        db.conn().execute_batch("INSERT INTO work_attempts(id,session_id,runner,status) VALUES('active','reviewer','codex','running');").unwrap();
+        assert_eq!(manager.get("reviewer").unwrap().status, "running");
+    }
+
+    #[test]
+    fn session_status_includes_required_child_blockers_ahead_of_saved_wakeups() {
+        for child_status in ["blocked", "waiting_for_input", "cancelled"] {
+            let db = Arc::new(Database::open_memory().unwrap());
+            insert_agent(&db, "owner");
+            let manager = SessionManager::new(db.clone());
+            manager.ensure("owner", None).unwrap();
+            db.conn().execute_batch("INSERT INTO tasks(id,title,status,agent_id) VALUES('parent','Parent','in_progress','owner');
+                INSERT INTO tasks(id,title,status,parent_task_id) VALUES('child','Review','blocked','parent');").unwrap();
+            db.conn()
+                .execute(
+                    "UPDATE tasks SET status=?1 WHERE id='child'",
+                    [child_status],
+                )
+                .unwrap();
+            assert_eq!(manager.get("owner").unwrap().status, "blocked");
+            db.conn().execute_batch("INSERT INTO work_attempts(id,session_id,task_id,runner,status) VALUES('saved','owner','parent','codex','queued');").unwrap();
+            assert_eq!(manager.get("owner").unwrap().status, "blocked");
+            db.conn()
+                .execute(
+                    "UPDATE work_attempts SET status='running' WHERE id='saved'",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(manager.get("owner").unwrap().status, "running");
+            db.conn()
+                .execute(
+                    "UPDATE work_attempts SET status='queued' WHERE id='saved'",
+                    [],
+                )
+                .unwrap();
+            db.conn()
+                .execute("UPDATE tasks SET blocks_parent=0 WHERE id='child'", [])
+                .unwrap();
+            assert_eq!(manager.get("owner").unwrap().status, "queued");
+            db.conn()
+                .execute(
+                    "UPDATE tasks SET blocks_parent=1,status='completed' WHERE id='child'",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(manager.get("owner").unwrap().status, "queued");
+            db.conn()
+                .execute(
+                    "UPDATE work_attempts SET status='completed' WHERE id='saved'",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(manager.get("owner").unwrap().status, "idle");
+        }
+    }
+
+    #[test]
+    fn ensuring_a_session_serializes_with_project_deletion() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO projects (id, name) VALUES ('project-one', 'Project One');
+                 INSERT INTO agents (id, name, backend, config, project_id)
+                 VALUES ('atlas', 'Atlas', 'native', '{}', 'project-one');",
+            )
+        })
+        .unwrap();
+        let manager = SessionManager::new(db.clone());
+        manager.ensure("atlas", Some("Before deletion")).unwrap();
+
+        let projects = crate::projects::ProjectManager::new(db.clone());
+        projects.begin_cascade("project-one").unwrap();
+        let deleting_error = manager
+            .ensure("atlas", Some("After deletion started"))
+            .unwrap_err();
+        assert!(deleting_error.to_string().contains("being deleted"));
+        assert_eq!(
+            manager.get("atlas").unwrap().title.as_deref(),
+            Some("Before deletion")
+        );
+
+        projects.finish_cascade("project-one").unwrap();
+        assert!(matches!(
+            manager.ensure("atlas", Some("Stale request")),
+            Err(Error::AgentNotFound { .. })
+        ));
+        let session_count = db
+            .with_conn(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM logical_sessions", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+            })
+            .unwrap();
+        assert_eq!(session_count, 0);
+    }
+
     #[test]
     fn session_timeline_and_attempt_lifecycle() {
         let db = Arc::new(Database::open_memory().unwrap());
+        insert_agent(&db, "builder");
         let manager = SessionManager::new(db.clone());
         manager.ensure("builder", Some("Builder")).unwrap();
         db.with_conn(|conn| {
@@ -781,10 +1571,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(attempt.status, "queued");
+        assert!(attempt.response_queued_at.is_some());
+        assert!(attempt.response_started_at.is_none());
+        assert!(manager.has_active_attempts("builder").unwrap());
 
-        manager
+        let running = manager
             .transition_attempt(&attempt.id, "running", "Codex is working", None, None)
             .unwrap();
+        assert!(running.response_started_at.is_some());
         manager
             .add_artifact(
                 &attempt.id,
@@ -804,6 +1598,7 @@ mod tests {
                 None,
             )
             .unwrap();
+        assert!(!manager.has_active_attempts("builder").unwrap());
 
         let overview = manager.overview("builder").unwrap();
         assert_eq!(overview.session.status, "idle");
@@ -816,8 +1611,72 @@ mod tests {
     }
 
     #[test]
+    fn response_phase_resets_after_waiting_without_rewriting_attempt_start() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        insert_agent(&db, "builder");
+        let manager = SessionManager::new(db.clone());
+        manager.ensure("builder", Some("Builder")).unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO tasks (id, title) VALUES ('task-1', 'Build it')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO task_queue (id, task_id, agent_id, status)
+                 VALUES (1, 'task-1', 'builder', 'queued')",
+                [],
+            )?;
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+        let attempt = manager
+            .create_attempt(
+                "builder", "task-1", 1, "codex", "task", "task", None, "Build it",
+            )
+            .unwrap();
+        manager
+            .transition_attempt(&attempt.id, "running", "Responding", None, None)
+            .unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE work_attempts
+                 SET started_at = '2020-01-01 00:00:00',
+                     response_started_at = '2020-01-01 00:00:05'
+                 WHERE id = ?1",
+                [&attempt.id],
+            )?;
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+
+        let waiting = manager
+            .transition_attempt(
+                &attempt.id,
+                "waiting_for_input",
+                "Waiting for input",
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            waiting.response_started_at.as_deref(),
+            Some("2020-01-01 00:00:05")
+        );
+        let resumed = manager
+            .transition_attempt(&attempt.id, "running", "Responding again", None, None)
+            .unwrap();
+
+        assert_eq!(resumed.started_at.as_deref(), Some("2020-01-01 00:00:00"));
+        assert_ne!(
+            resumed.response_started_at.as_deref(),
+            Some("2020-01-01 00:00:05")
+        );
+    }
+
+    #[test]
     fn event_provenance_is_preserved() {
         let db = Arc::new(Database::open_memory().unwrap());
+        insert_agent(&db, "seo");
         let manager = SessionManager::new(db);
         manager.ensure("seo", None).unwrap();
         let event = manager
@@ -843,6 +1702,7 @@ mod tests {
     #[test]
     fn task_activity_is_scoped_and_incremental() {
         let db = Arc::new(Database::open_memory().unwrap());
+        insert_agent(&db, "builder");
         let manager = SessionManager::new(db.clone());
         manager.ensure("builder", Some("website")).unwrap();
         db.with_conn(|conn| {
@@ -907,6 +1767,7 @@ mod tests {
     #[test]
     fn task_activity_pages_back_through_older_events() {
         let db = Arc::new(Database::open_memory().unwrap());
+        insert_agent(&db, "builder");
         let manager = SessionManager::new(db.clone());
         manager.ensure("builder", Some("website")).unwrap();
         db.with_conn(|conn| {
@@ -959,6 +1820,7 @@ mod tests {
     #[test]
     fn deleting_a_session_clears_task_and_queue_pointers() {
         let db = Arc::new(Database::open_memory().unwrap());
+        insert_agent(&db, "builder");
         let manager = SessionManager::new(db.clone());
         manager.ensure("builder", Some("Builder")).unwrap();
         db.with_conn(|conn| {
@@ -1008,6 +1870,7 @@ mod tests {
     #[test]
     fn terminal_attempt_cannot_be_revived_by_a_late_worker_transition() {
         let db = Arc::new(Database::open_memory().unwrap());
+        insert_agent(&db, "builder");
         let manager = SessionManager::new(db.clone());
         manager.ensure("builder", Some("Builder")).unwrap();
         db.with_conn(|conn| {
@@ -1041,5 +1904,34 @@ mod tests {
         assert!(!events
             .iter()
             .any(|event| event.event_type == "attempt_running"));
+    }
+
+    #[test]
+    fn ensuring_existing_session_with_unchanged_title_does_not_bump_ui_revisions() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        insert_agent(&db, "builder");
+        let manager = SessionManager::new(db.clone());
+        let before_create = db.ui_revisions();
+
+        let created = manager.ensure("builder", Some("Builder")).unwrap();
+        assert_eq!(created.title.as_deref(), Some("Builder"));
+        let after_create = db.ui_revisions();
+        assert_eq!(after_create.seq, before_create.seq + 1);
+        assert_eq!(after_create.sessions, before_create.sessions + 1);
+
+        // Repeated ensures with the same title or None must be pure reads so
+        // GET /api/sessions/* and GET /api/agents* never retrigger SSE loops.
+        manager.ensure("builder", Some("Builder")).unwrap();
+        manager.ensure("builder", None).unwrap();
+        assert_eq!(db.ui_revisions(), after_create);
+
+        let renamed = manager.ensure("builder", Some("Builder v2")).unwrap();
+        assert_eq!(renamed.title.as_deref(), Some("Builder v2"));
+        let after_rename = db.ui_revisions();
+        assert_eq!(after_rename.seq, after_create.seq + 1);
+        assert_eq!(after_rename.sessions, after_create.sessions + 1);
+
+        manager.ensure("builder", Some("Builder v2")).unwrap();
+        assert_eq!(db.ui_revisions(), after_rename);
     }
 }

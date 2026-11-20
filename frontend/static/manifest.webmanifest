@@ -1,0 +1,25 @@
+{
+	"name": "XpressClaw",
+	"short_name": "XpressClaw",
+	"description": "XpressClaw control plane for agents, tasks, and workflows.",
+	"start_url": "/",
+	"scope": "/",
+	"display": "standalone",
+	"orientation": "any",
+	"background_color": "#0b0d11",
+	"theme_color": "#0b0d11",
+	"icons": [
+		{
+			"src": "/icon.png",
+			"sizes": "512x512",
+			"type": "image/png",
+			"purpose": "any"
+		},
+		{
+			"src": "/icon.png",
+			"sizes": "512x512",
+			"type": "image/png",
+			"purpose": "maskable"
+		}
+	]
+}

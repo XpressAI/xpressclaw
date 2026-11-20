@@ -1,17 +1,19 @@
 <script lang="ts">
+	import AntigravityAuth from '$lib/components/AntigravityAuth.svelte';
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/stores';
 	import { setup } from '$lib/api';
 	import { openExternal } from '$lib/utils';
 	import DirectoryPicker from '$lib/components/DirectoryPicker.svelte';
+	import HostSshAccess from '$lib/components/HostSshAccess.svelte';
 	import type { AcpAgentCatalogEntry, DockerStatus, ProjectEnvironmentSuggestion } from '$lib/api';
 
 	const customRunner: AcpAgentCatalogEntry = {
 		kind: 'custom',
-		name: 'Other ACP agent',
+		name: 'Other ACP harness',
 		mark: '+',
-		description: 'Any containerized agent that speaks ACP over stdio.',
+		description: 'Any containerized coding harness that speaks ACP over stdio.',
 		command: [],
 		login_command: '',
 		install_url: '',
@@ -26,6 +28,8 @@
 	let isAddSession = $derived(
 		['add-session', 'add-agent'].includes($page.url.searchParams.get('mode') ?? '')
 	);
+	let targetProjectId = $derived($page.url.searchParams.get('project_id')?.trim() || '');
+	let cancelPath = $derived(targetProjectId ? `/projects/${encodeURIComponent(targetProjectId)}` : '/agents');
 	let agentCatalog = $state<AcpAgentCatalogEntry[]>([]);
 	let agentCatalogLoading = $state(true);
 	let runnerOptions = $derived([...agentCatalog, customRunner]);
@@ -34,6 +38,7 @@
 	let runnerModel = $state('');
 	let runnerCommand = $state('');
 	let subscriptionAuth = $state(true);
+	let sshAgentForwarding = $state(false);
 	let containerEngine = $state<'none' | 'host'>('none');
 	let workspaceMode = $state<'existing' | 'managed'>('existing');
 	let workspacePath = $state('');
@@ -45,16 +50,17 @@
 	let environmentSuggestions = $state<ProjectEnvironmentSuggestion[]>([]);
 	let environmentLoading = $state(false);
 	let inspectedWorkspace = $state('');
+	let gitUsesSsh = $state(false);
 	let startupCommandText = $state('');
 	let dockerStatus = $state<DockerStatus | null>(null);
 	let dockerLoading = $state(true);
 	let saving = $state(false);
 	let saveError = $state('');
-	let contextLabel = $derived(
-		workspaceMode === 'managed'
-			? projectName.trim() || 'New project'
-			: workspacePath.split(/[\\/]/).filter(Boolean).pop() || runnerKind
-	);
+	let lastSuggestedAgentName = '';
+	let contextLabel = $derived(projectName.trim()
+		|| (workspaceMode === 'managed'
+			? 'New agent'
+			: workspacePath.split(/[\\/]/).filter(Boolean).pop() || runnerKind));
 
 	onMount(async () => {
 		// Keep old bookmarks working while making the native-session URL canonical.
@@ -69,6 +75,7 @@
 		if (systemResult.status === 'fulfilled') {
 			workspacePath = systemResult.value.working_directory ?? '';
 			hostOs = systemResult.value.os;
+			suggestAgentName(workspacePath);
 		}
 		if (catalogResult.status === 'fulfilled') {
 			agentCatalog = catalogResult.value.agents;
@@ -79,6 +86,17 @@
 		if (workspacePath) await inspectEnvironment();
 		await recheckDocker();
 	});
+
+	function suggestedAgentName(path: string): string {
+		const folder = path.split(/[\\/]/).filter(Boolean).pop();
+		return folder ? `${folder}-agent` : 'new-agent';
+	}
+
+	function suggestAgentName(path: string) {
+		const suggestion = suggestedAgentName(path);
+		if (!projectName.trim() || projectName === lastSuggestedAgentName) projectName = suggestion;
+		lastSuggestedAgentName = suggestion;
+	}
 
 	function selectRunner(kind: string) {
 		const runner = runnerOptions.find((option) => option.kind === kind);
@@ -92,13 +110,12 @@
 
 	function setContainerEngine(enabled: boolean) {
 		const defaults = new Set<string>([
-			...runnerOptions.flatMap((runner) => [runner.image, runner.host_image]),
-			'xpressclaw-runner-codex:latest',
-			'xpressclaw-runner-codex-docker:latest',
-			'xpressclaw-runner-claude:latest',
-			'xpressclaw-runner-claude-docker:latest',
-			'xpressclaw-runner-opencode:latest',
-			'xpressclaw-runner-opencode-docker:latest'
+			...runnerOptions.flatMap((runner) => [
+				runner.image,
+				runner.host_image,
+				runner.image.replace('ghcr.io/xpressai/', ''),
+				runner.host_image.replace('ghcr.io/xpressai/', '')
+			])
 		]);
 		const replaceImage = !runnerImage.trim() || defaults.has(runnerImage.trim());
 		containerEngine = enabled ? 'host' : 'none';
@@ -141,9 +158,11 @@
 			const result = await setup.projectEnvironment(path);
 			environmentSuggestions = result.suggestions;
 			inspectedWorkspace = result.workspace;
+			gitUsesSsh = result.git_uses_ssh;
 		} catch {
 			environmentSuggestions = [];
 			inspectedWorkspace = path;
+			gitUsesSsh = false;
 		} finally {
 			environmentLoading = false;
 		}
@@ -169,6 +188,7 @@
 				version: null,
 				socket: null,
 				rootless: null,
+				ssh_agent_forwarding_unsupported_reason: null,
 				error: 'Could not check the container runtime'
 			};
 		}
@@ -177,28 +197,30 @@
 
 	function additionalVolumes(): string[] {
 		return workspaceFolders.map((folder) => {
-			if (containerEngine === 'host' && hostOs !== 'windows') return `${folder}:${folder}`;
+			if (containerEngine === 'host' && hostOs !== 'windows') return `${folder}:${folder}:z`;
 			const basename = folder.split(/[\\/]/).filter(Boolean).pop() || 'shared';
-			return `${folder}:/workspace/${basename}`;
+			return `${folder}:/workspace/${basename}:z`;
 		});
 	}
 
 	async function createSession() {
-		if ((workspaceMode === 'existing' && !workspacePath.trim()) || !runnerImage.trim() || (runnerKind === 'custom' && !runnerCommand.trim()) || saving) return;
+		if (!projectName.trim() || (workspaceMode === 'existing' && !workspacePath.trim()) || !runnerImage.trim() || (runnerKind === 'custom' && !runnerCommand.trim()) || saving) return;
 		saving = true;
 		saveError = '';
 
 		const session = {
+			project_id: targetProjectId || undefined,
 			backend: runnerKind,
 			runner_kind: runnerKind,
 			runner_image: runnerImage.trim(),
 			runner_workspace: workspaceMode === 'existing' ? workspacePath.trim() : undefined,
 			workspace_mode: workspaceMode,
-			project_name: projectName.trim() || undefined,
+			project_name: projectName.trim(),
 			runner_model: runnerModel.trim() || undefined,
 			runner_command: runnerCommand.split('\n').map((line) => line.trim()).filter(Boolean),
 			startup_commands: startupCommands(),
 			subscription_auth: subscriptionAuth,
+			ssh_agent_forwarding: sshAgentForwarding,
 			runner_container_engine: containerEngine,
 			volumes: additionalVolumes()
 		};
@@ -215,7 +237,7 @@
 				await goto('/');
 			}
 		} catch (error) {
-			saveError = error instanceof Error ? error.message : 'Could not create the project';
+			saveError = error instanceof Error ? error.message : 'Could not create the agent';
 		} finally {
 			saving = false;
 		}
@@ -225,18 +247,20 @@
 <div class="rounded-2xl border border-border bg-card shadow-sm">
 	<div class="flex items-start justify-between border-b border-border px-4 py-5 sm:px-6">
 		<div>
-			<p class="text-xs font-medium uppercase tracking-wider text-primary">Project</p>
+			<p class="text-xs font-medium uppercase tracking-wider text-primary">{isAddSession ? 'Agent' : 'Project & Agent'}</p>
 			<h2 class="mt-1 text-xl font-semibold text-foreground">
-				{isAddSession ? 'Connect a project' : 'Connect your first project'}
+				{isAddSession ? 'Create an agent' : 'Create your first Project and Agent'}
 			</h2>
 			<p class="mt-1 text-sm text-muted-foreground">
-				Choose the agent you already use, then point it at a folder on this computer.
+				{isAddSession
+					? 'Name its durable context, choose a coding harness, and point it at a workspace.'
+					: 'Choose a repository or managed workspace and an Agent to begin. You can add more to this instance later.'}
 			</p>
 		</div>
 		{#if isAddSession}
 			<button
 				type="button"
-				onclick={() => goto('/agents')}
+				onclick={() => goto(cancelPath)}
 				aria-label="Cancel"
 				class="ml-4 rounded-md p-2 text-xl leading-none text-muted-foreground hover:bg-accent hover:text-foreground"
 			>&times;</button>
@@ -246,13 +270,13 @@
 	<form class="space-y-7 p-4 sm:p-6" onsubmit={(event) => { event.preventDefault(); createSession(); }}>
 		<section>
 			<div class="mb-3">
-				<h3 class="text-sm font-medium text-foreground">Agent</h3>
+				<h3 class="text-sm font-medium text-foreground">Harness</h3>
 				<p class="mt-0.5 text-xs text-muted-foreground">Detected tools are shown first. Sign in on this computer once; XpressClaw reuses that login inside the isolated ACP runner.</p>
 			</div>
 			{#if agentCatalogLoading}
 				<div class="mb-3 flex items-center gap-2 text-xs text-muted-foreground">
 					<span class="h-3.5 w-3.5 animate-spin rounded-full border-2 border-primary border-t-transparent"></span>
-					Detecting installed agent tools...
+					Detecting installed harnesses...
 				</div>
 			{/if}
 			<div class="grid gap-3 sm:grid-cols-2">
@@ -295,41 +319,48 @@
 		</section>
 
 		<section>
-			<h3 class="mb-2 text-sm font-medium text-foreground">Workspace</h3>
+			<h3 class="mb-2 text-sm font-medium text-foreground">Agent context</h3>
+			<label for="project-name" class="mb-1.5 block text-xs font-medium text-foreground">Agent name</label>
+			<input
+				id="project-name"
+				type="text"
+				bind:value={projectName}
+				placeholder={workspaceMode === 'existing' ? 'Derived from workspace folder' : 'New agent'}
+				class="mb-4 w-full rounded-lg border border-input bg-background px-3.5 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+			/>
+			<h4 class="mb-2 text-xs font-medium text-foreground">Workspace</h4>
 			<div class="mb-3 grid grid-cols-2 rounded-lg border border-border bg-muted/30 p-1">
 				<button type="button" onclick={() => (workspaceMode = 'existing')} class="rounded-md px-3 py-2 text-xs font-medium {workspaceMode === 'existing' ? 'bg-background text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}">Existing folder</button>
 				<button type="button" onclick={() => (workspaceMode = 'managed')} class="rounded-md px-3 py-2 text-xs font-medium {workspaceMode === 'managed' ? 'bg-background text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}">Start without a folder</button>
 			</div>
 			{#if workspaceMode === 'existing'}
-				<label for="workspace-path" class="mb-1.5 block text-xs font-medium text-foreground">Project folder</label>
+				<label for="workspace-path" class="mb-1.5 block text-xs font-medium text-foreground">Repository or workspace folder</label>
 				<div class="flex gap-2">
 					<input
 						id="workspace-path"
 						type="text"
 						bind:value={workspacePath}
+						onchange={() => suggestAgentName(workspacePath)}
 						placeholder="/home/me/projects/my-app"
 						class="min-w-0 flex-1 rounded-lg border border-input bg-background px-3.5 py-2.5 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-ring"
 					/>
 					<button type="button" onclick={() => (folderPicker = 'workspace')} class="rounded-lg border border-border px-3.5 py-2.5 text-sm hover:bg-accent">Browse…</button>
 				</div>
 				<p class="mt-1.5 text-xs text-muted-foreground">
-					The folder must exist on this machine.
+					This is the Agent's workspace, not another XpressClaw instance. The folder must exist on the control-plane machine.
 					{containerEngine === 'host'
 						? ' It is mounted at the same absolute path so Compose bind mounts resolve correctly.'
 						: ' It is mounted at /workspace.'}
-					It appears as <strong>{contextLabel}</strong> in the UI.
+					This agent appears as <strong>{contextLabel}</strong> in the UI.
 				</p>
+				{#if gitUsesSsh}
+					<p class="mt-2 rounded-md border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-amber-600">
+						This repository has an SSH remote. Enable host SSH access below if it is not covered by XpressClaw's scoped GitHub credential.
+					</p>
+				{/if}
 			{:else}
-				<label for="project-name" class="mb-1.5 block text-xs font-medium text-foreground">Project name</label>
-				<input
-					id="project-name"
-					type="text"
-					bind:value={projectName}
-					placeholder="New project"
-					class="w-full rounded-lg border border-input bg-background px-3.5 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-				/>
 				<p class="mt-1.5 text-xs leading-relaxed text-muted-foreground">
-					XpressClaw creates an empty persistent workspace. Your first message can ask the agent to clone a GitHub repository or create a project from scratch.
+					XpressClaw creates an empty persistent workspace. Your first message can ask the agent's harness to clone a GitHub repository or create a project from scratch.
 				</p>
 			{/if}
 		</section>
@@ -384,31 +415,37 @@
 					class="mt-0.5 rounded border-border"
 				/>
 				<span>
-					<span class="block text-sm font-medium text-foreground">Give the agent host Docker or Podman access</span>
+					<span class="block text-sm font-medium text-foreground">Give the harness host Docker or Podman access</span>
 					<span class="mt-0.5 block text-xs leading-relaxed text-muted-foreground">Use Docker Compose, Buildx, and the host engine's image cache from inside the runner.</span>
 				</span>
 			</label>
 			{#if containerEngine === 'host'}
 				<p class="mt-3 rounded-md border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-amber-600">
-					The agent can control host containers, images, volumes, and any paths the engine can mount. Enable this only for agents and images you trust.
+					The harness can control host containers, images, volumes, and any paths the engine can mount. Enable this only for harnesses and images you trust.
 				</p>
 			{/if}
+		</section>
+
+		<section class="rounded-xl border border-border bg-muted/20 p-4">
+			<HostSshAccess bind:enabled={sshAgentForwarding}
+				agentForwardingUnsupportedReason={dockerStatus?.ssh_agent_forwarding_unsupported_reason ?? null} />
 		</section>
 
 		<section class="rounded-xl border border-border bg-muted/20 p-4">
 			{#if runnerKind === 'custom'}
 				<div>
 					<p class="text-sm font-medium text-foreground">Authentication is image-defined</p>
-					<p class="mt-0.5 text-xs leading-relaxed text-muted-foreground">Add any required credential directories as mounts below. XpressClaw only knows the standard login locations for its built-in agents.</p>
+					<p class="mt-0.5 text-xs leading-relaxed text-muted-foreground">Add any required credential directories as mounts below. XpressClaw only knows the standard login locations for its built-in harnesses.</p>
 				</div>
 			{:else}
 			<label class="flex cursor-pointer items-start gap-3">
 				<input type="checkbox" bind:checked={subscriptionAuth} class="mt-0.5 rounded border-border" />
 				<span>
 					<span class="block text-sm font-medium text-foreground">Use my existing {runnerOptions.find((runner) => runner.kind === runnerKind)?.name} login</span>
-					<span class="mt-0.5 block text-xs leading-relaxed text-muted-foreground">Mount the agent's standard login directory so its subscription and native sessions can continue across tasks. Only enable this for images you trust.</span>
+					<span class="mt-0.5 block text-xs leading-relaxed text-muted-foreground">Mount the harness's standard login directory so its subscription and native sessions can continue across tasks. Only enable this for images you trust.</span>
 				</span>
 			</label>
+			{#if runnerKind === 'antigravity'}<AntigravityAuth />{/if}
 			{/if}
 		</section>
 
@@ -428,7 +465,7 @@
 						bind:value={runnerImage}
 						class="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs focus:outline-none focus:ring-2 focus:ring-ring"
 					/>
-					<p class="mt-1 text-xs text-muted-foreground">{containerEngine === 'host' ? 'The built-in Docker variant adds Docker CLI, Compose, and Buildx.' : 'Use the minimal agent image or a compatible derivative.'}</p>
+					<p class="mt-1 text-xs text-muted-foreground">{containerEngine === 'host' ? 'The built-in Docker variant adds Docker CLI, Compose, and Buildx.' : 'Use the minimal harness image or a compatible derivative.'}</p>
 				</div>
 
 				<div>
@@ -437,10 +474,10 @@
 						id="runner-model"
 						type="text"
 						bind:value={runnerModel}
-						placeholder="Agent default"
+						placeholder="Harness default"
 						class="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs focus:outline-none focus:ring-2 focus:ring-ring"
 					/>
-					<p class="mt-1 text-xs text-muted-foreground">Optional ACP model value ID. Invalid values are rejected with the choices advertised by the agent.</p>
+					<p class="mt-1 text-xs text-muted-foreground">Optional ACP model value ID. Invalid values are rejected with the choices advertised by the harness.</p>
 				</div>
 
 				<div>
@@ -464,7 +501,7 @@
 						placeholder={'npm ci\ndocker compose up -d'}
 						class="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs focus:outline-none focus:ring-2 focus:ring-ring"
 					></textarea>
-					<p class="mt-1 text-xs text-muted-foreground">One shell command per line, run before each ACP task. Commands have the same workspace and container permissions as the agent.</p>
+					<p class="mt-1 text-xs text-muted-foreground">One shell command per line, run before each ACP task. Commands have the same workspace and container permissions as the harness.</p>
 				</div>
 
 				<div>
@@ -523,7 +560,7 @@
 					<div class="flex items-start justify-between gap-4">
 						<div>
 							<p class="text-sm font-medium text-foreground">Container runtime not available</p>
-							<p class="mt-0.5 text-xs text-muted-foreground">You can save the project, but work will wait until Docker or Podman is running.</p>
+							<p class="mt-0.5 text-xs text-muted-foreground">You can save the agent, but work will wait until Docker or Podman is running.</p>
 						</div>
 						<button type="button" onclick={recheckDocker} class="rounded-md border border-border px-2.5 py-1.5 text-xs hover:bg-accent">Retry</button>
 					</div>
@@ -541,16 +578,16 @@
 
 		<div class="flex items-center justify-between border-t border-border pt-5">
 			{#if isAddSession}
-				<button type="button" onclick={() => goto('/agents')} class="rounded-lg px-4 py-2 text-sm text-muted-foreground hover:bg-accent hover:text-foreground">Cancel</button>
+				<button type="button" onclick={() => goto(cancelPath)} class="rounded-lg px-4 py-2 text-sm text-muted-foreground hover:bg-accent hover:text-foreground">Cancel</button>
 			{:else}
 				<span class="text-xs text-muted-foreground">No API key required when using a subscription login.</span>
 			{/if}
 			<button
 				type="submit"
-				disabled={saving || (workspaceMode === 'existing' && !workspacePath.trim()) || !runnerImage.trim() || (runnerKind === 'custom' && !runnerCommand.trim())}
+				disabled={saving || !projectName.trim() || (workspaceMode === 'existing' && !workspacePath.trim()) || !runnerImage.trim() || (runnerKind === 'custom' && !runnerCommand.trim())}
 				class="rounded-lg bg-primary px-5 py-2.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
 			>
-				{saving ? 'Creating...' : (isAddSession ? 'Create project' : 'Finish setup')}
+				{saving ? 'Creating...' : (isAddSession ? 'Create agent' : 'Finish setup')}
 			</button>
 		</div>
 	</form>
@@ -558,12 +595,13 @@
 
 {#if folderPicker}
 	<DirectoryPicker
-		title={folderPicker === 'workspace' ? 'Choose project folder' : 'Choose additional folder'}
+		title={folderPicker === 'workspace' ? 'Choose workspace folder' : 'Choose additional folder'}
 		initialPath={folderPicker === 'workspace' ? workspacePath : newFolderPath || workspacePath}
 		onclose={() => (folderPicker = null)}
 		onselect={(path) => {
 			if (folderPicker === 'workspace') {
 				workspacePath = path;
+				suggestAgentName(path);
 				void inspectEnvironment();
 			} else {
 				newFolderPath = path;

@@ -53,7 +53,7 @@
 		<span class="text-[10px] font-bold tracking-wider text-amber-400">WHEN</span>
 		<span class="text-sm font-medium text-foreground flex-1 truncate">{label || 'Condition'}</span>
 		{#if switchVar}
-			<span class="text-[10px] text-amber-300/70 font-mono">{switchVar}</span>
+			<span title={switchVar} class="max-w-[50%] truncate text-[10px] text-amber-300/70 font-mono">{switchVar}</span>
 		{/if}
 		{#if !compact}
 			<button onclick={ontoggle} aria-label={expanded ? 'Collapse condition' : 'Expand condition'} class="text-muted-foreground hover:text-foreground">

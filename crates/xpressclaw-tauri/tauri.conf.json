@@ -2,7 +2,7 @@
   "$schema": "https://raw.githubusercontent.com/nicedoc/tauri-conf-schema/main/schema.json",
   "productName": "xpressclaw",
   "identifier": "ai.xpress.xpressclaw",
-  "version": "0.2.0",
+  "version": "0.4.35",
   "build": {
     "frontendDist": "../../frontend/build",
     "devUrl": "http://localhost:5173",
@@ -18,7 +18,7 @@
         "height": 800,
         "minWidth": 800,
         "minHeight": 600,
-        "url": "http://localhost:8935",
+        "url": "about:blank",
         "visible": false,
         "dragDropEnabled": false,
         "hiddenTitle": true
@@ -48,7 +48,8 @@
       "icons/icon.ico"
     ],
     "macOS": {
-      "minimumSystemVersion": "10.15"
+      "minimumSystemVersion": "10.15",
+      "entitlements": "Entitlements.plist"
     },
     "linux": {
       "deb": {

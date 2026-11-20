@@ -1,0 +1,185 @@
+name: __WORKFLOW_NAME__
+description: One agent implements, another reviews, and the loop continues until approval.
+version: 1
+
+inputs:
+  goal:
+    type: string
+    description: The code change to implement and review.
+    required: true
+  implementer:
+    type: agent
+    description: Agent context that owns the implementation and pull request.
+    required: true
+    primary: true
+  reviewer:
+    type: agent
+    description: Independent agent context that reviews the implementation.
+    required: true
+  wait_for_human_review:
+    type: boolean
+    description: Keep the workflow alive until GitHub review activity arrives.
+    default: true
+
+flows:
+  main:
+    color: "#4A90D9"
+    steps:
+      - id: implement
+        type: step
+        label: Implement on a draft PR
+        agent: "@implementer"
+        prompt: |
+          Implement this goal in the current repository:
+
+          @goal
+
+          Run the relevant checks, commit and push the branch, and create or
+          update a DRAFT GitHub pull request. Do not mark it ready yet. This
+          draft URL is the stable handoff that lets a reviewer in another
+          XpressClaw context inspect the exact diff without sharing a folder.
+        outputs:
+          pull_request_url:
+            type: string
+            description: URL of the draft pull request.
+          summary:
+            type: string
+            description: What changed and how it was verified.
+
+      - id: review
+        type: step
+        label: Independent review
+        agent: "@reviewer"
+        new_session: true
+        prompt: |
+          Independently review the actual pull request at:
+
+          @implement.pull_request_url
+
+          The intended goal is:
+
+          @goal
+
+          Use the project-scoped GitHub tools to inspect the complete diff and
+          checks; do not rely on a shared working tree. Approve only when it is
+          correct, complete, maintainable, and tested. Return a verdict of
+          exactly "approved" or "changes_requested".
+        outputs:
+          verdict:
+            type: string
+            description: Either approved or changes_requested.
+          feedback:
+            type: string
+            description: Specific actionable feedback for the implementer.
+
+      - id: review_gate
+        type: when
+        label: Review decision
+        switch: "@review.verdict"
+        arms:
+          - match: approved
+            goto: step mark_ready
+          - match: changes_requested
+            continue: true
+          - match: default
+            goto: step review
+
+      - id: revise
+        type: step
+        label: Address independent review
+        agent: "@implementer"
+        prompt: |
+          Address this independent review of @implement.pull_request_url:
+
+          @review.feedback
+
+          Reinspect the current branch, implement the fixes, run relevant checks,
+          and push the updated commits to the same draft pull request.
+        outputs:
+          summary:
+            type: string
+            description: What changed in response to review and how it was verified.
+
+      - id: repeat_review
+        type: jump
+        label: Review the revision
+        target: step review
+
+      - id: mark_ready
+        type: step
+        label: Mark PR ready
+        agent: "@implementer"
+        prompt: |
+          The independent review approved the implementation. Verify final checks,
+          push the branch if needed, and mark @implement.pull_request_url ready
+          for human review. Return that exact pull request URL.
+        outputs:
+          pull_request_url:
+            type: string
+            description: URL of the ready pull request.
+          checks:
+            type: string
+            description: Final verification summary.
+
+      - id: human_review_gate
+        type: when
+        label: Wait for human review?
+        switch: "@wait_for_human_review"
+        arms:
+          - match: "true"
+            continue: true
+          - match: "false"
+            goto: flow done
+
+      - id: wait_for_review
+        type: wait
+        label: Wait for GitHub review activity
+        agent: "@implementer"
+        event: github.pull_request.activity
+        resource: "@mark_ready.pull_request_url"
+        timeout: 14d
+        on_timeout: flow timed_out
+
+      - id: handle_review
+        type: step
+        label: Triage and address human review
+        agent: "@implementer"
+        prompt: |
+          GitHub activity arrived for @mark_ready.pull_request_url:
+
+          @wait_for_review
+
+          Inspect the complete current PR conversation, reviews, checks, and diff.
+          If approval means no work remains, return outcome "approved". If actionable
+          feedback exists, address it, run the relevant checks, push the updates to
+          the same PR, and return "changes_addressed". If this event needs no code
+          change and review is still pending, return "keep_waiting".
+        outputs:
+          outcome:
+            type: string
+            description: approved, changes_addressed, or keep_waiting.
+          summary:
+            type: string
+            description: What the review said and what action was taken.
+
+      - id: human_review_result
+        type: when
+        label: Human review result
+        switch: "@handle_review.outcome"
+        arms:
+          - match: approved
+            goto: flow done
+          - match: changes_addressed
+            goto: step review
+          - match: keep_waiting
+            goto: step wait_for_review
+          - match: default
+            goto: step wait_for_review
+
+  done:
+    color: "#22c55e"
+    steps: []
+
+  timed_out:
+    color: "#f59e0b"
+    steps: []

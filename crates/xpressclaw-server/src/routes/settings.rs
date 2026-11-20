@@ -5,8 +5,20 @@ use serde::{Deserialize, Serialize};
 
 use crate::state::AppState;
 
+use super::{settings_collaboration, settings_instance, settings_proxy, settings_sync, speech};
+
 pub fn routes() -> Router<AppState> {
-    Router::new().route("/profile", get(get_profile).put(put_profile))
+    Router::new()
+        .route("/profile", get(get_profile).put(put_profile))
+        .route(
+            "/speech",
+            get(speech::get_settings).put(speech::put_settings),
+        )
+        .nest("/instance", settings_instance::routes())
+        .nest("/collaboration", settings_collaboration::routes())
+        .nest("/connect", crate::connect::routes())
+        .nest("/sync", settings_sync::routes())
+        .nest("/proxy", settings_proxy::routes())
 }
 
 #[derive(Serialize, Deserialize)]

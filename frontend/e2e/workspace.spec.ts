@@ -1,11 +1,210 @@
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type Locator, type Page, type Route } from '@playwright/test';
+import yaml from 'js-yaml';
+import type { ProjectStorage } from '../src/lib/api';
 
 const taskId = 'task-browser-test';
 const agentId = 'project-browser-test';
+const projectId = 'collaboration-project-test';
+const conversationId = 'conversation-browser-test';
 const startTime = Date.parse('2026-07-19T00:00:00.000Z');
 
 function timestamp(second: number): string {
 	return new Date(startTime + second * 1_000).toISOString();
+}
+
+function recentSqliteTimestamp(millisecondsAgo: number): string {
+	return new Date(Date.now() - millisecondsAgo).toISOString().slice(0, 19).replace('T', ' ');
+}
+
+function visualizationDocument(artifactId: string, label: string, followUp?: { prompt: string; title?: string }): string {
+	const action = followUp
+		? `<button id="visual-follow-up" type="button">Follow up</button><script>
+			window.openai = Object.freeze({ sendFollowUpMessage(value) {
+				parent.postMessage({ source: 'xpressclaw-visualization', type: 'follow-up-request', artifactId: ${JSON.stringify(artifactId)}, requestId: 'request-browser-test', prompt: value.prompt, title: value.title || null }, '*');
+			} });
+			document.querySelector('#visual-follow-up').addEventListener('click', () => window.openai.sendFollowUpMessage(${JSON.stringify(followUp)}));
+		</script>`
+		: '';
+	const artifactDocument = `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'"></head><body><div id="visual-content">${label}</div>${action}<script>
+		addEventListener('message', (event) => {
+			if (event.source === parent && event.data?.source === 'xpressclaw-host' && event.data.artifactId === ${JSON.stringify(artifactId)} && event.data.type === 'theme') {
+				document.documentElement.dataset.theme = event.data.theme;
+			}
+		});
+		try { void parent.document.body; document.documentElement.dataset.parentBlocked = 'false'; } catch { document.documentElement.dataset.parentBlocked = 'true'; }
+		try { localStorage.setItem('artifact-test', 'bad'); document.documentElement.dataset.storageBlocked = 'false'; } catch { document.documentElement.dataset.storageBlocked = 'true'; }
+		try { document.cookie = 'artifact-test=bad'; document.documentElement.dataset.cookieBlocked = document.cookie ? 'false' : 'true'; } catch { document.documentElement.dataset.cookieBlocked = 'true'; }
+		try { const popup = window.open('about:blank'); document.documentElement.dataset.popupBlocked = popup === null ? 'true' : 'false'; popup?.close(); } catch { document.documentElement.dataset.popupBlocked = 'true'; }
+		try { top.location.href = 'https://example.invalid/visualization-top-navigation'; document.documentElement.dataset.navigationBlocked = 'false'; } catch { document.documentElement.dataset.navigationBlocked = 'true'; }
+		fetch('https://example.invalid/visualization-network').then(() => { document.documentElement.dataset.networkBlocked = 'false'; }).catch(() => { document.documentElement.dataset.networkBlocked = 'true'; });
+		const form = document.createElement('form'); form.action = 'https://example.invalid/visualization-form'; form.method = 'post'; document.body.append(form); const beforeSubmit = location.href; form.submit(); setTimeout(() => { document.documentElement.dataset.formBlocked = location.href === beforeSubmit ? 'true' : 'false'; }, 0);
+	</script></body></html>`;
+	const encodedDocument = Buffer.from(artifactDocument, 'utf8').toString('base64');
+	return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; frame-src blob:; child-src blob:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'"><style>html,body,#root,iframe{width:100%;height:100%;margin:0;border:0}#blocked[hidden]{display:none}</style><script>
+		const artifactId = ${JSON.stringify(artifactId)};
+		let child;
+		let childUrl;
+		let initialLoadComplete = false;
+		let lastTheme = null;
+		addEventListener('message', (event) => {
+			const data = event.data;
+			if (!data || typeof data !== 'object') return;
+			if (event.source === parent) {
+				if (data.source !== 'xpressclaw-host' || data.artifactId !== artifactId) return;
+				if (data.type === 'theme') lastTheme = data.theme;
+				if (data.type === 'theme' || data.type === 'follow-up-result') child?.contentWindow?.postMessage(data, '*');
+				return;
+			}
+			if (event.source !== child?.contentWindow || data.source !== 'xpressclaw-visualization' || data.artifactId !== artifactId) return;
+			if (data.type === 'resize' || data.type === 'follow-up-request') parent.postMessage(data, '*');
+		});
+		addEventListener('DOMContentLoaded', () => {
+			const binary = atob(${JSON.stringify(encodedDocument)});
+			const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+			childUrl = URL.createObjectURL(new Blob([bytes], { type: 'text/html;charset=utf-8' }));
+			child = document.createElement('iframe');
+			child.dataset.artifactFrame = '';
+			child.title = ${JSON.stringify(label)};
+			child.setAttribute('sandbox', 'allow-scripts');
+			child.setAttribute('referrerpolicy', 'no-referrer');
+			child.addEventListener('load', () => {
+				if (initialLoadComplete) {
+					child.remove();
+					document.querySelector('#blocked').hidden = false;
+					parent.postMessage({ source: 'xpressclaw-visualization', type: 'resize', artifactId, height: 160 }, '*');
+					return;
+				}
+				initialLoadComplete = true;
+				if (lastTheme) child.contentWindow?.postMessage({ source: 'xpressclaw-host', type: 'theme', artifactId, theme: lastTheme }, '*');
+			});
+			child.src = childUrl;
+			document.querySelector('#root').append(child);
+		});
+	</script></head><body><div id="root"></div><div id="blocked" role="status" hidden>Navigation was blocked.</div></body></html>`;
+}
+
+async function expectVerticalScroll(scroller: Locator) {
+	await expect(scroller).toBeVisible();
+	await expect(scroller).toHaveCSS('overflow-y', 'auto');
+	await expect.poll(() => scroller.evaluate((element) => element.scrollHeight > element.clientHeight)).toBe(true);
+	await scroller.evaluate((element) => element.scrollTo({ top: element.scrollHeight }));
+	await expect.poll(() => scroller.evaluate((element) => element.scrollTop)).toBeGreaterThan(0);
+}
+
+async function elapsedSeconds(indicator: Locator): Promise<number> {
+	const text = await indicator.locator('[data-elapsed-time]').innerText();
+	expect(text).toMatch(/^\d{1,2}\.\d+s$/);
+	return Number.parseFloat(text);
+}
+
+function cssRgb(value: string): [number, number, number] {
+	const channels = value.match(/[\d.]+/g)?.slice(0, 3).map(Number);
+	if (!channels || channels.length !== 3) throw new Error(`Could not parse CSS color: ${value}`);
+	return channels as [number, number, number];
+}
+
+function contrastRatio(foreground: string, background: string): number {
+	const luminance = (value: string) => {
+		const channels = cssRgb(value).map((channel) => {
+			const normalized = channel / 255;
+			return normalized <= 0.04045
+				? normalized / 12.92
+				: ((normalized + 0.055) / 1.055) ** 2.4;
+		});
+		return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2];
+	};
+	const lighter = Math.max(luminance(foreground), luminance(background));
+	const darker = Math.min(luminance(foreground), luminance(background));
+	return (lighter + 0.05) / (darker + 0.05);
+}
+
+async function expectExternalPopup(page: Page, buttonName: string, expectedUrl: string) {
+	await page.context().route(expectedUrl, async (route) => {
+		await route.fulfill({ contentType: 'text/html', body: '<!doctype html><title>External documentation</title>' });
+	}, { times: 1 });
+	const popupPromise = page.waitForEvent('popup');
+	await page.getByRole('button', { name: buttonName, exact: true }).click();
+	const popup = await popupPromise;
+	await expect.poll(() => popup.url()).toBe(expectedUrl);
+	await popup.close();
+}
+
+async function mockDesktopExternalLinks(page: Page, local = true) {
+	const opened: string[] = [];
+	await page.exposeFunction('recordExternalUrl', (url: string) => opened.push(url));
+	await page.addInitScript((local) => {
+		Object.defineProperty(window, 'isTauri', { value: true });
+		const desktop = window as unknown as {
+			recordExternalUrl: (url: string) => Promise<void>;
+			__TAURI_INTERNALS__: { invoke: (command: string, args: { url: string }) => Promise<unknown> };
+		};
+		desktop.__TAURI_INTERNALS__ = {
+			invoke: async (command, args) => {
+				if (command === 'get_active_instance_profile') return { identity_status: 'matched', navigation_status: 'ready', local };
+				if (command === 'open_external_url') return desktop.recordExternalUrl(args.url);
+				throw new Error(`Unexpected Tauri command: ${command}`);
+			},
+		};
+	}, local);
+	return opened;
+}
+
+async function expectReadableCode(message: Locator) {
+	const inlineCode = message.locator('.prose-chat p code').first();
+	const fencedCode = message.locator('.prose-chat pre').first();
+	await expect(inlineCode).toBeVisible();
+	await expect(fencedCode).toBeVisible();
+
+	const inlineStyles = await inlineCode.evaluate((element) => {
+		const styles = getComputedStyle(element);
+		return {
+			color: styles.color,
+			background: styles.backgroundColor,
+			borderStyle: styles.borderStyle,
+			borderWidth: styles.borderWidth,
+			userSelect: styles.userSelect,
+		};
+	});
+	const fencedStyles = await fencedCode.evaluate((element) => {
+		const styles = getComputedStyle(element);
+		const codeStyles = getComputedStyle(element.querySelector('code')!);
+		return {
+			color: codeStyles.color,
+			background: styles.backgroundColor,
+			borderStyle: styles.borderStyle,
+			borderWidth: styles.borderWidth,
+			overflowX: styles.overflowX,
+			userSelect: codeStyles.userSelect,
+		};
+	});
+
+	expect(contrastRatio(inlineStyles.color, inlineStyles.background)).toBeGreaterThanOrEqual(4.5);
+	expect(contrastRatio(fencedStyles.color, fencedStyles.background)).toBeGreaterThanOrEqual(4.5);
+	expect(inlineStyles.borderStyle).not.toBe('none');
+	expect(inlineStyles.borderWidth).not.toBe('0px');
+	expect(fencedStyles.borderStyle).not.toBe('none');
+	expect(fencedStyles.borderWidth).not.toBe('0px');
+	expect(fencedStyles.overflowX).toBe('auto');
+	expect(inlineStyles.userSelect).not.toBe('none');
+	expect(fencedStyles.userSelect).not.toBe('none');
+}
+
+async function installTauriClipboardImage(page: Page) {
+	await page.addInitScript(() => {
+		Object.defineProperty(window, 'isTauri', { value: true });
+		(window as unknown as { __clipboardCommands: string[] }).__clipboardCommands = [];
+		(window as unknown as { __TAURI_INTERNALS__: { invoke: (command: string) => Promise<unknown> } }).__TAURI_INTERNALS__ = {
+			invoke: async (command: string) => {
+				if (command === 'get_active_instance_profile') return { identity_status: 'matched', local: true };
+				(window as unknown as { __clipboardCommands: string[] }).__clipboardCommands.push(command);
+				if (command === 'plugin:clipboard-manager|read_image') return 42;
+				if (command === 'plugin:image|rgba') return [255, 0, 0, 255];
+				if (command === 'plugin:image|size') return { width: 1, height: 1 };
+				if (command === 'plugin:resources|close') return null;
+				throw new Error(`Unexpected Tauri command: ${command}`);
+			},
+		};
+	});
 }
 
 function activityEvent(id: number, prefix = id <= 20 ? 'Earlier activity' : 'Current activity') {
@@ -33,7 +232,13 @@ function timelineEvent(id: number, second: number, eventType: string, summary: s
 	};
 }
 
-function attempt(status: string, contextUsed = 128_000) {
+function attempt(
+	status: string,
+	contextUsed = 128_000,
+	errorMessage: string | null = null,
+	result: string | null = null,
+	overrides: Record<string, unknown> = {},
+) {
 	return {
 		id: 'attempt-browser-test',
 		session_id: agentId,
@@ -45,73 +250,286 @@ function attempt(status: string, contextUsed = 128_000) {
 		prompt: 'Test the workspace',
 		native_session_id: 'native-browser-test',
 		container_id: 'container-browser-test',
-		result: null,
-		error_message: null,
+		result,
+		error_message: errorMessage,
 		created_at: timestamp(0),
 		started_at: timestamp(1),
 		completed_at: status === 'completed' ? timestamp(61) : null,
 		context_used: contextUsed,
 		context_size: 256_000,
+		trigger_message_id: null,
+		response_queued_at: timestamp(0),
+		response_started_at: status === 'running' ? timestamp(1) : null,
+		...overrides,
 	};
+}
+
+interface MockProject {
+	id: string;
+	name: string;
+	description: string | null;
+	icon: string | null;
+	created_at: string;
+	updated_at: string;
+	agent_ids: string[];
+	conversation_count: number;
+	task_count: number;
+	deletion_started_at?: string | null;
+	deletion_counts?: {
+		agents: number;
+		tasks: number;
+		task_messages: number;
+		conversations: number;
+		conversation_messages: number;
+		memory_notes: number;
+		workflows?: number;
+		workflow_runs: number;
+		schedules: number;
+	};
+}
+
+interface SharedProjectState {
+	project?: MockProject;
+	deleted?: boolean;
 }
 
 async function mockApi(
 	page: Page,
 	options: {
 		live?: boolean;
+		connectedTask?: boolean;
+		attemptError?: string;
+		taskLoadFailureOnce?: boolean;
+		taskUpdateRequests?: Record<string, unknown>[];
+		taskUpdateFailureOnce?: boolean;
+		taskStatusRequests?: string[];
+		taskStatusFailureOnce?: boolean;
+		taskPlanRequests?: Record<string, unknown>[];
 		agentTimeline?: boolean;
+		agentResponseLinks?: boolean;
 		richToolActivity?: boolean;
 		postedMessages?: Record<string, unknown>[];
 		interruptedAttempts?: string[];
+		pendingElicitation?: Record<string, unknown>;
+		elicitationResponses?: { elicitationId: string; payload: Record<string, unknown> }[];
 		connection?: { online: boolean };
 		multipleAgents?: boolean;
+		projectCount?: number;
 		queuedSessionMessages?: { agentId: string; payload: Record<string, unknown> }[];
 		projectTaskUpdates?: number[];
 		completedTaskCount?: number;
+		taskTitle?: string;
+		taskDescription?: string;
+		taskStatus?: string;
+		taskAgentId?: string | null;
+		taskActivityStatus?: string;
+		taskDependency?: { id: string; title: string; status: string };
+		taskParentId?: string | null;
+		taskParentReviewRequired?: boolean;
+		taskSubtasks?: Record<string, unknown>[];
+		taskMessages?: Record<string, unknown>[];
+		taskActivityEvents?: Record<string, unknown>[];
+		taskAttempts?: Record<string, unknown>[];
+		attemptResult?: string;
+		mcpServers?: {
+			name: string;
+			type: 'stdio' | 'http' | 'sse';
+			command: string | null;
+			args: string[];
+			url: string | null;
+			env: Record<string, string>;
+			headers: Record<string, string>;
+		}[];
+		mcpVerificationResults?: Record<string, {
+			ok: boolean;
+			status: string;
+			message: string;
+			suggestion: string | null;
+		}>;
+		mcpVerificationRequests?: { name: string; agent_id: string | null }[];
+		openUrlRequests?: string[];
+		agentCatalog?: {
+			kind: string;
+			name: string;
+			install_url: string;
+			image: string;
+			host_image: string;
+		}[];
+		agentKind?: { value: string };
 		workflows?: {
 			id: string;
 			name: string;
 			description: string | null;
 			yaml_content: string;
 			enabled: boolean;
+			default_for_tasks?: boolean;
 			version: number;
 			created_at: string;
 			updated_at: string;
+			last_triggered_at?: string | null;
+			trigger_count?: number;
+			trigger_error?: string | null;
 		}[];
+		schedules?: {
+			id: string;
+			name: string;
+			cron: string;
+			agent_id: string;
+			title: string;
+			description: string | null;
+			enabled: boolean;
+			last_run: string | null;
+			run_count: number;
+			created_at: string;
+			schedule_type: 'cron' | 'once';
+			run_at: string | null;
+			continuation_task_id: string | null;
+			conversation_id: string | null;
+		}[];
+		workflowCreateRequests?: { name: string; description?: string; yaml_content: string }[];
+		workflowRunRequests?: { id: string; inputs: Record<string, unknown>; projectId?: string }[];
+		workflowDefaultRequests?: { id: string; defaultForTasks: boolean }[];
+		workspaceSaveRequests?: { path: string; content: string; expected_revision: string }[];
+		workspaceSaveDelayMs?: number;
+		workspaceReadRequests?: string[];
+		workspaceReadDelaysMs?: Record<string, number>;
+		repositoryStatus?: Record<string, unknown>;
+		repositorySelections?: (string | null)[];
+		includeDeletedWorkspaceFile?: boolean;
+		conversations?: Record<string, unknown>[];
+		conversationMessages?: Record<string, unknown>[];
+		conversationTurns?: Record<string, unknown>[];
+		conversationMessageRequests?: Record<string, unknown>[];
+		conversationMessageDeleteRequests?: number[];
+		deleteConversationMessageAfterHistoryLoad?: number;
+		conversationTurnCancelRequests?: string[];
+		conversationTaskRequests?: Record<string, unknown>[];
+		projectSyncStatuses?: Record<string, unknown>[];
+		projectSyncRequests?: { projectId: string; operation: 'fetch' | 'publish'; force: boolean }[];
+		projectSyncFetchConflictOnce?: boolean;
+		collaborationSettings?: Record<string, unknown>;
+		collaborationActions?: string[];
+		projectUpdateRequests?: { projectId: string; data: Record<string, unknown> }[];
+		projectDeleteRequests?: string[];
+		projectDeleteAcknowledgements?: (string | null)[];
+		projectDeleteGate?: Promise<void>;
+		projectDeleteError?: string;
+		projectDeletionStartedAt?: string | null;
+		projectDeletionCounts?: MockProject['deletion_counts'];
+		projectGetRequests?: string[];
+		projectGetGate?: Promise<void>;
+		projectListRequests?: string[];
+		projectListGate?: Promise<void>;
+		projectListTargetLast?: boolean;
+		secondaryProjectName?: string;
+		secondaryProjectUpdatedAt?: string;
+		sharedProjectState?: SharedProjectState;
+		preserveWorkspace?: boolean;
+		agentRunnerKind?: string;
+		sshAgentForwardingUnsupportedReason?: string;
+		sshAgentForwarding?: boolean;
+		runnerImageUpdateRequests?: string[];
+		runnerReadiness?: Record<string, unknown>;
+		visualizationDocuments?: Record<string, string>;
+		visualizationRequests?: { path: string; token: string | undefined }[];
 	} = {},
 ) {
 	let liveEvent = 0;
 	let contextUsed = 128_000;
-	const status = options.live ? 'in_progress' : 'completed';
-	const attemptStatus = options.live ? 'running' : 'completed';
+	let createdWorkflow: Record<string, unknown> | null = null;
+	let workspaceFileContent = 'export const greeting = "hello";\n';
+	let workspaceFileRevision = 'revision-before-save';
+	let repositoryStatus: Record<string, unknown> = options.repositoryStatus ?? {
+		state: 'attached',
+		message: 'The active repository and bundled GitHub MCP are ready.',
+		bootstrap_root: '/srv/workspaces/browser-tested',
+		active: { relative_path: 'xpressclaw', root: '/srv/workspaces/browser-tested/xpressclaw', github_repository: 'XpressAI/xpressclaw' },
+		candidates: [
+			{ relative_path: 'xpressclaw', root: '/srv/workspaces/browser-tested/xpressclaw', github_repository: 'XpressAI/xpressclaw' },
+		],
+		discovery_truncated: false,
+		selected_relative_path: 'xpressclaw',
+		pending_relative_path: null,
+		pending_action: null,
+		github_status: 'attached',
+		github_repository: 'XpressAI/xpressclaw',
+		restart_required: false,
+	};
+	let projectSyncConflictReturned = false;
+	let taskLoadFailed = false;
+	let taskUpdateFailed = false;
+	let taskStatusFailed = false;
+	const deletedConversationMessageIds = new Set<number>();
+	const status = options.taskStatus ?? (options.pendingElicitation ? 'waiting_for_input' : options.live ? 'in_progress' : 'completed');
+	const attemptStatus = options.attemptError
+		? 'failed'
+		: options.pendingElicitation
+			? 'waiting_for_input'
+			: options.live ? 'running' : 'completed';
+	const mockAttempt = () => attempt(
+		attemptStatus,
+		contextUsed,
+		options.attemptError ?? null,
+		options.attemptResult ?? null,
+	);
+	const firstAnswer = options.agentResponseLinks
+		? 'First answer with [agent docs](https://example.com/agent-docs).'
+		: 'First answer';
+	const userFollowUp = options.agentResponseLinks
+		? 'Please continue using [my reference](https://example.com/user-reference).'
+		: 'Please continue';
+	const secondAnswer = options.agentResponseLinks
+		? 'Second answer with <a href="https://example.com/raw-agent-link" target="_self" rel="opener">a raw agent link</a>.'
+		: 'Second answer';
+	const firstAgentUpdate = options.agentResponseLinks
+		? "Yes, I'll inspect the project.\n\nI'm starting with the [timeline component](https://example.com/timeline) so this update remains readable even when it spans multiple lines."
+		: "Yes, I'll inspect the project.\n\nI'm starting with the timeline component so this update remains readable even when it spans multiple lines.";
 	const task = {
 		id: taskId,
-		title: 'Browser-tested workspace',
-		description: 'Inspect the project and report what you find.',
+		revision: 0,
+		start_after: null as string | null,
+		backlog: false,
+		title: options.taskTitle ?? 'Browser-tested workspace',
+		description: options.taskDescription ?? 'Inspect the project and report what you find.',
 		status,
 		priority: 0,
-		agent_id: agentId,
-		parent_task_id: null,
+		agent_id: options.taskAgentId === undefined ? agentId : options.taskAgentId,
+		project_id: projectId,
+		parent_task_id: options.taskParentId ?? null,
+		parent_review_required: options.taskParentReviewRequired ?? false,
 		sop_id: null,
+		conversation_id: null,
 		created_at: timestamp(0),
 		updated_at: timestamp(61),
 		completed_at: status === 'completed' ? timestamp(61) : null,
 		context: {},
-		depends_on: [],
+		provenance: options.connectedTask ? 'xpress_ai_connect' : 'durable',
+		blocks_parent: true,
+		activity_status: options.taskActivityStatus ?? status,
+		depends_on: options.taskDependency ? [options.taskDependency.id] : [],
 		dependents: [],
-		blocked_by: [],
+		blocked_by: options.taskDependency ? [options.taskDependency.id] : [],
 		ready: true,
 	};
+	const agentRunnerKind = options.agentRunnerKind ?? 'codex';
 	const agent = {
 		id: agentId,
 		name: 'browser-tested-workspace',
 		title: 'Browser-tested workspace',
-		backend: 'codex',
+		backend: agentRunnerKind,
+		project_id: projectId,
 		status: options.live ? 'running' : 'stopped',
 		desired_status: options.live ? 'running' : 'stopped',
 		observed_status: options.live ? 'running' : 'stopped',
 		container_id: options.live ? 'container-browser-test' : null,
-		config: { runner: { session_config: {} } },
+		config: {
+			runner: {
+				kind: agentRunnerKind,
+				workspace: '/srv/repos/xpressclaw',
+				project_name: 'Browser-tested workspace',
+				session_config: {},
+			},
+		},
 		created_at: timestamp(0),
 		started_at: options.live ? timestamp(1) : null,
 		stopped_at: options.live ? null : timestamp(61),
@@ -124,12 +542,26 @@ async function mockApi(
 		name: 'secondary-browser-workspace',
 		title: 'Secondary browser workspace',
 	};
-	const availableAgents = options.multipleAgents ? [agent, secondaryAgent] : [agent];
+	const availableAgents = options.projectCount
+		? Array.from({ length: options.projectCount }, (_, index) => index === 0 ? agent : {
+			...agent,
+			id: `project-mobile-${index + 1}`,
+			name: `mobile-workspace-${index + 1}`,
+			title: `Mobile workspace ${index + 1}`,
+			project_id: `project-mobile-${index + 1}`,
+		})
+		: options.multipleAgents ? [agent, secondaryAgent] : [agent];
 	const listedTasks = options.completedTaskCount
 		? Array.from({ length: options.completedTaskCount }, (_, index) => ({
 			...task,
 			id: `completed-task-${index + 1}`,
 			title: `Completed task ${index + 1}`,
+			agent_id: options.projectCount
+				? availableAgents[index % availableAgents.length].id
+				: task.agent_id,
+			project_id: options.projectCount
+				? availableAgents[index % availableAgents.length].project_id
+				: task.project_id,
 			status: 'completed',
 			created_at: timestamp(index),
 			updated_at: timestamp(index),
@@ -142,6 +574,9 @@ async function mockApi(
 			created_at: timestamp(index),
 			updated_at: timestamp(second),
 		})) ?? [task];
+	if (options.taskDependency) {
+		listedTasks.push({ ...task, ...options.taskDependency, activity_status: options.taskDependency.status, depends_on: [], blocked_by: [] });
+	}
 	const counts = listedTasks.reduce((result, listedTask) => {
 		result[listedTask.status as keyof typeof result] += 1;
 		return result;
@@ -153,43 +588,434 @@ async function mockApi(
 		completed: 0,
 		cancelled: 0,
 	});
+	let project: MockProject = {
+		id: projectId,
+		name: 'Browser collaboration project',
+		description: 'A project with conversations, Agents, and tasks.',
+		icon: null,
+		created_at: timestamp(0),
+		updated_at: timestamp(61),
+		agent_ids: availableAgents.map((availableAgent) => availableAgent.id),
+		conversation_count: options.conversations?.length ?? 0,
+		task_count: listedTasks.length,
+		deletion_started_at: options.projectDeletionStartedAt ?? null,
+		deletion_counts: options.projectDeletionCounts ?? {
+			agents: availableAgents.length,
+			tasks: listedTasks.length,
+			task_messages: options.taskMessages?.length ?? 0,
+			conversations: options.conversations?.length ?? 0,
+			conversation_messages: options.conversationMessages?.length ?? 0,
+			memory_notes: 0,
+			workflow_runs: 0,
+			schedules: 0,
+		},
+	};
+	if (options.sharedProjectState?.project) {
+		project = { ...project, ...options.sharedProjectState.project };
+	} else if (options.sharedProjectState) {
+		options.sharedProjectState.project = { ...project };
+	}
+	let availableProjects = options.projectCount
+		? availableAgents.map((availableAgent, index) => ({
+			...project,
+			id: index === 0 ? project.id : availableAgent.project_id,
+			name: index === 0 ? project.name : options.secondaryProjectName ?? `Mobile project ${index + 1}`,
+			description: index === 0
+				? project.description
+				: `Project ${index + 1} verifies the mobile hierarchy can scroll.`,
+			updated_at: index === 0 ? project.updated_at : options.secondaryProjectUpdatedAt ?? project.updated_at,
+			agent_ids: [availableAgent.id],
+			task_count: listedTasks.filter((listedTask) => listedTask.agent_id === availableAgent.id).length,
+		}))
+		: [project];
+	if (options.projectListTargetLast && availableProjects.length > 1) {
+		availableProjects = [...availableProjects.slice(1), availableProjects[0]];
+	}
+	let conversationMessages = [...(options.conversationMessages ?? [])];
+	let conversationTurns = [...(options.conversationTurns ?? [])];
 
-	await page.addInitScript(() => localStorage.removeItem('xpressclaw.workspace.v1'));
+	if (!options.preserveWorkspace) {
+		await page.addInitScript(() => localStorage.removeItem('xpressclaw.workspace.v1'));
+	}
 	await page.route('**/api/**', async (route) => {
 		const request = route.request();
 		const url = new URL(request.url());
 		const path = url.pathname;
 		let response: unknown;
 
-		if (path === '/api/health') {
+		if (path.includes('/visualizations/')) {
+			options.visualizationRequests?.push({ path, token: request.headers()['x-xpressclaw-artifact-token'] });
+			const document = options.visualizationDocuments?.[path];
+			if (!document) {
+				await route.fulfill({ status: 404, contentType: 'application/json', body: JSON.stringify({ error: 'Visualization not found' }) });
+				return;
+			}
+			await route.fulfill({
+				status: 200,
+				contentType: 'text/html; charset=utf-8',
+				headers: { 'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff' },
+				body: document,
+			});
+			return;
+		} else if (path === '/api/health') {
 			if (options.connection?.online === false) {
 				await route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ status: 'unavailable' }) });
 				return;
 			}
 			response = { status: 'ok', version: '0.2.0', build: 'dev', git_hash: 'test' };
 		} else if (path === '/api/setup/check-docker') {
-			response = { available: true, installed: true, can_start: false };
+			response = {
+				available: true,
+				installed: true,
+				can_start: false,
+				runtime: 'docker',
+				ssh_agent_forwarding_unsupported_reason:
+					options.sshAgentForwardingUnsupportedReason ?? null
+			};
 		} else if (path === '/api/setup/status') {
 			response = { setup_complete: true };
+		} else if (path === '/api/setup/mcp-servers') {
+			response = { servers: options.mcpServers ?? [] };
+		} else if (path === '/api/setup/agent-catalog') {
+			response = { agents: options.agentCatalog ?? [
+				{
+					kind: 'codex', name: 'Codex', mark: 'C', description: 'Codex over ACP.',
+					command: ['codex-acp'], login_command: 'codex login', install_url: 'https://developers.openai.com/codex/cli/',
+					image: 'ghcr.io/xpressai/xpressclaw-runner-codex:latest', host_image: 'ghcr.io/xpressai/xpressclaw-runner-codex-docker:latest',
+					installed: true, configured: true, status: 'ready', executable: 'codex',
+				},
+				{
+					kind: 'deepseek-harness', name: 'DeepSeek Harness', mark: 'DS', description: "DeepSeek Harness through openma-ai's maintained ACP adapter.",
+					command: ['dsh-acp'], login_command: 'dsh-acp login', install_url: 'https://github.com/openma-ai/deepseek-harness-acp',
+					image: 'ghcr.io/xpressai/xpressclaw-runner-deepseek-harness:latest', host_image: 'ghcr.io/xpressai/xpressclaw-runner-deepseek-harness-docker:latest',
+					installed: true, configured: true, status: 'ready', executable: 'dsh-acp',
+				},
+			] };
+		} else if (path === '/api/open-url') {
+			const payload = request.postDataJSON() as { url: string };
+			options.openUrlRequests?.push(payload.url);
+			response = { success: true };
+		} else if (/^\/api\/setup\/mcp-servers\/[^/]+\/verify$/.test(path)) {
+			const name = decodeURIComponent(path.split('/')[4]);
+			const payload = request.postDataJSON() as { agent_id: string | null };
+			options.mcpVerificationRequests?.push({ name, agent_id: payload.agent_id });
+			response = options.mcpVerificationResults?.[name] ?? {
+				ok: true,
+				status: 'ready',
+				message: 'The MCP endpoint accepted a protocol verification request.',
+				suggestion: null,
+			};
+		} else if (path === '/api/settings/sync') {
+			const sharedProject = options.sharedProjectState?.project;
+			response = {
+				projects: (options.projectSyncStatuses ?? [])
+					.filter((syncProject) => syncProject.project_id !== projectId || !options.sharedProjectState?.deleted)
+					.map((syncProject) => syncProject.project_id === projectId && sharedProject
+						? { ...syncProject, project_name: sharedProject.name, project_icon: sharedProject.icon }
+						: syncProject),
+			};
+		} else if (/^\/api\/settings\/sync\/[^/]+\/(fetch|publish)$/.test(path)) {
+			const parts = path.split('/');
+			const projectId = decodeURIComponent(parts[4]);
+			const operation = parts[5] as 'fetch' | 'publish';
+			const payload = (request.postDataJSON() ?? {}) as { force?: boolean };
+			const force = operation === 'fetch' && payload.force === true;
+			options.projectSyncRequests?.push({ projectId, operation, force });
+			if (operation === 'fetch' && options.projectSyncFetchConflictOnce && !force && !projectSyncConflictReturned) {
+				projectSyncConflictReturned = true;
+				await route.fulfill({
+					status: 409,
+					contentType: 'application/json',
+					body: JSON.stringify({ error: 'project synchronization error: this is the first fetch for a populated local Project; rerun with --force to acknowledge a non-destructive merge' }),
+				});
+				return;
+			}
+			response = {
+				action: operation,
+				project_id: projectId,
+				commit: operation === 'fetch' ? '12345678fetch' : '87654321publish',
+				counts: { agents: 2, tasks: 8, task_messages: 13, conversations: 3, conversation_messages: 21, workflows: 1, memory_notes: 5 },
+			};
+		} else if (path === '/api/settings/collaboration') {
+			response = options.collaborationSettings ?? {
+				config: {
+					enabled: false, bind_address: '127.0.0.1', gitbucket_port: 8088, jenkins_port: 8089,
+					gitbucket_image: 'ghcr.io/gitbucket/gitbucket:4.46.1', jenkins_image: 'jenkins/jenkins:2.568.1-jdk21',
+					authorized_agents: [],
+				},
+				status: {
+					configured: false, docker_available: true, network: 'xpressclaw-collaboration-test-network', data_path: '/data/collaboration',
+					gitbucket: { state: 'not_installed', health: 'unknown', image: 'ghcr.io/gitbucket/gitbucket:4.46.1', version: '4.46.1', host_url: 'http://127.0.0.1:8088', internal_url: 'http://gitbucket:8080', volume: 'gitbucket-data', error: null },
+					jenkins: { state: 'not_installed', health: 'unknown', image: 'jenkins/jenkins:2.568.1-jdk21', version: '2.568.1-jdk21', host_url: 'http://127.0.0.1:8089', internal_url: 'http://jenkins:8080', volume: 'jenkins-data', error: null },
+				},
+				credentials_configured: false, reset_confirmation: 'RESET LOCAL COLLABORATION',
+			};
+			if (request.method() === 'PUT') {
+				options.collaborationActions?.push('save');
+				response = { ...response, config: request.postDataJSON() };
+				options.collaborationSettings = response;
+			}
+		} else if (/^\/api\/settings\/collaboration\/(install|start|stop|restart|upgrade|reset)$/.test(path)) {
+			options.collaborationActions?.push(path.split('/').at(-1) ?? '');
+			response = options.collaborationSettings;
+		} else if (path === '/api/projects') {
+			const sharedProject = options.sharedProjectState?.project;
+			const projectListSnapshot = availableProjects
+				.filter((availableProject) => availableProject.id !== projectId || !options.sharedProjectState?.deleted)
+				.map((availableProject) => ({
+					...availableProject,
+					...(availableProject.id === projectId && sharedProject ? sharedProject : {}),
+					agent_ids: [...availableProject.agent_ids],
+				}));
+			options.projectListRequests?.push(path);
+			await options.projectListGate;
+			response = projectListSnapshot;
+		} else if (path === `/api/projects/${projectId}`) {
+			if (request.method() === 'PATCH') {
+				const data = request.postDataJSON() as Record<string, unknown>;
+				options.projectUpdateRequests?.push({ projectId, data });
+				project = {
+					...project,
+					name: typeof data.name === 'string' ? data.name : project.name,
+					description: typeof data.description === 'string' ? data.description : project.description,
+					updated_at: timestamp(120),
+				};
+				if (options.sharedProjectState) {
+					options.sharedProjectState.project = { ...project };
+					options.sharedProjectState.deleted = false;
+				}
+				availableProjects = availableProjects.map((availableProject) =>
+					availableProject.id === projectId ? { ...availableProject, ...project } : availableProject
+				);
+				response = project;
+			} else if (request.method() === 'DELETE') {
+				options.projectDeleteRequests?.push(projectId);
+				options.projectDeleteAcknowledgements?.push(url.searchParams.get('cascade'));
+				await options.projectDeleteGate;
+				if (options.projectDeleteError) {
+					await route.fulfill({
+						status: 409,
+						contentType: 'application/json',
+						body: JSON.stringify({ error: options.projectDeleteError }),
+					});
+					return;
+				}
+				availableProjects = availableProjects.filter((availableProject) => availableProject.id !== projectId);
+				if (options.sharedProjectState) options.sharedProjectState.deleted = true;
+				await route.fulfill({ status: 204, body: '' });
+				return;
+			} else {
+				const projectWasDeleted = options.sharedProjectState?.deleted === true;
+				const projectSnapshot = {
+					...project,
+					...(options.sharedProjectState?.project ?? {}),
+				};
+				options.projectGetRequests?.push(projectId);
+				await options.projectGetGate;
+				if (projectWasDeleted) {
+					await route.fulfill({
+						status: 404,
+						contentType: 'application/json',
+						body: JSON.stringify({ error: 'Project not found' }),
+					});
+					return;
+				}
+				response = projectSnapshot;
+			}
+		} else if (path === `/api/projects/${projectId}/tasks`) {
+			response = listedTasks;
+		} else if (path === '/api/conversations') {
+			response = options.conversations ?? [];
+		} else if (path === `/api/conversations/${conversationId}`) {
+			response = options.conversations?.find((conversation) => conversation.id === conversationId) ?? { error: 'Unknown conversation' };
+		} else if (path === `/api/conversations/${conversationId}/message-deletions`) {
+			response = [...deletedConversationMessageIds].sort((left, right) => left - right);
+		} else if (path === `/api/conversations/${conversationId}/messages`) {
+			if (request.method() === 'POST') {
+				const payload = request.postDataJSON() as Record<string, unknown>;
+				options.conversationMessageRequests?.push(payload);
+				const messageId = conversationMessages.length + 100;
+				const uploads = Array.isArray(payload.attachments)
+					? payload.attachments as { name: string; mime_type: string; data: string }[]
+					: [];
+				const sent = {
+					id: messageId,
+					conversation_id: conversationId,
+					sender_type: 'user', sender_id: 'local', sender_name: 'You',
+					content: payload.content, message_type: 'message', linked_task_id: null,
+					metadata: {},
+					attachments: uploads.map((attachment, index) => ({
+						id: `sent-attachment-${index}`,
+						message_id: messageId,
+						name: attachment.name,
+						mime_type: attachment.mime_type,
+						size: Math.floor(attachment.data.length * 3 / 4),
+						source_task_id: null,
+						created_at: timestamp(200),
+					})),
+					created_at: timestamp(200),
+				};
+				conversationMessages.push(sent);
+				response = { message: sent, queued_agents: [agentId] };
+			} else {
+				const requestedLimit = Number(url.searchParams.get('limit'));
+				const limit = Number.isFinite(requestedLimit) && requestedLimit > 0
+					? requestedLimit
+					: conversationMessages.length;
+				const requestedBefore = Number(url.searchParams.get('before_id'));
+				const before = Number.isFinite(requestedBefore) && requestedBefore > 0
+					? requestedBefore
+					: null;
+				const eligible = before === null
+					? conversationMessages
+					: conversationMessages.filter((message) => Number(message.id) < before);
+				response = eligible.slice(-limit);
+				if (before !== null && options.deleteConversationMessageAfterHistoryLoad !== undefined) {
+					deletedConversationMessageIds.add(options.deleteConversationMessageAfterHistoryLoad);
+					conversationMessages = conversationMessages.filter(
+						(message) => Number(message.id) !== options.deleteConversationMessageAfterHistoryLoad,
+					);
+				}
+			}
+		} else if (path.startsWith(`/api/conversations/${conversationId}/messages/`) && request.method() === 'DELETE') {
+			const messageId = Number(path.slice(path.lastIndexOf('/') + 1));
+			options.conversationMessageDeleteRequests?.push(messageId);
+			deletedConversationMessageIds.add(messageId);
+			conversationMessages = conversationMessages.filter((message) => message.id !== messageId);
+			await route.fulfill({ status: 204, body: '' });
+			return;
+		} else if (path === `/api/conversations/${conversationId}/tasks`) {
+			if (request.method() === 'POST') {
+				const payload = request.postDataJSON() as Record<string, unknown>;
+				options.conversationTaskRequests?.push(payload);
+				response = payload.workflow_id
+					? { workflow_instance_id: 'conversation-workflow-instance' }
+					: { ...task, id: 'conversation-task-test', title: payload.title, description: payload.description ?? null, agent_id: payload.agent_id ?? null, conversation_id: conversationId };
+			} else response = listedTasks.filter((listedTask) => listedTask.conversation_id === conversationId);
+		} else if (path === `/api/conversations/${conversationId}/turns`) {
+			response = conversationTurns;
+		} else if (path.startsWith(`/api/conversations/${conversationId}/turns/`) && path.endsWith('/cancel')) {
+			const turnId = decodeURIComponent(path.split('/').at(-2) ?? '');
+			options.conversationTurnCancelRequests?.push(turnId);
+			conversationTurns = conversationTurns.map((turn) => turn.id === turnId
+				? { ...turn, status: 'cancelled', error_message: null, completed_at: timestamp(200) }
+				: turn);
+			response = conversationTurns.find((turn) => turn.id === turnId);
+		} else if (path === `/api/conversations/${conversationId}/events`) {
+			await route.fulfill({ status: 200, contentType: 'text/event-stream', body: ': connected\n\n' });
+			return;
+		} else if (path === `/api/conversations/${conversationId}/participants`) {
+			response = {};
+		} else if (path.startsWith(`/api/conversations/${conversationId}/participants/`)) {
+			response = {};
 		} else if (path === '/api/agents') {
 			response = availableAgents;
+		} else if (path === `/api/agents/${agentId}/environment`) {
+			response = { preserved_environments: [] };
+		} else if (path === `/api/agents/${agentId}/runner-image/update`) {
+			options.runnerImageUpdateRequests?.push(agentId);
+			response = {
+				image: `ghcr.io/xpressai/xpressclaw-runner-${agentRunnerKind}@sha256:${'a'.repeat(64)}`,
+				version: '9.9.9',
+				changed: true,
+				environment_stopped: false, environment_preserved: true,
+			};
 		} else if (path === `/api/agents/${agentId}`) {
-			response = agent;
+			response = options.agentKind ? {
+				...agent,
+				backend: options.agentKind.value,
+				config: {
+					...agent.config,
+					runner: { ...agent.config.runner, kind: options.agentKind.value },
+				},
+			} : agent;
 		} else if (path === '/api/workflows') {
-			response = options.workflows ?? [];
-		} else if (path === '/api/schedules') {
+			if (request.method() === 'POST') {
+				const payload = request.postDataJSON() as { name: string; description?: string; yaml_content: string };
+				options.workflowCreateRequests?.push(payload);
+				createdWorkflow = {
+					id: 'workflow-created',
+					...payload,
+					enabled: true,
+					default_for_tasks: false,
+					version: 1,
+					created_at: timestamp(100),
+					updated_at: timestamp(100),
+				};
+				response = createdWorkflow;
+			} else {
+				response = options.workflows ?? [];
+			}
+		} else if (/^\/api\/workflows\/instances\/[^/]+$/.test(path)) {
+			response = {
+				instance: {
+					id: path.split('/')[4], workflow_id: 'workflow-review-loop', status: 'running',
+					current_flow: 'main', current_step_index: 0, trigger_data: '{}', variable_store: '{}',
+					loop_state: null, started_at: timestamp(200), completed_at: null, error_message: null,
+				},
+				step_executions: [{
+					id: 'conversation-workflow-step', instance_id: path.split('/')[4], flow_name: 'main',
+					step_id: 'implement', task_id: taskId, status: 'running', input_context: null,
+					output: null, attempt: 1, started_at: timestamp(200), completed_at: null,
+				}],
+			};
+		} else if (/^\/api\/workflows\/[^/]+\/instances$/.test(path)) {
 			response = [];
+		} else if (/^\/api\/workflows\/[^/]+\/run$/.test(path)) {
+			const id = path.split('/')[3];
+			const inputs = request.postDataJSON() as Record<string, unknown>;
+			const runRequest: { id: string; inputs: Record<string, unknown>; projectId?: string } = { id, inputs };
+			if (url.searchParams.has('project_id')) runRequest.projectId = url.searchParams.get('project_id') ?? undefined;
+			options.workflowRunRequests?.push(runRequest);
+			response = {
+				id: 'workflow-instance', workflow_id: id, status: 'running', current_flow: 'main', current_step_index: 0,
+				current_task_id: taskId,
+				trigger_data: JSON.stringify(inputs), variable_store: '{}', loop_state: null,
+				started_at: timestamp(200), completed_at: null, error_message: null,
+			};
+		} else if (/^\/api\/workflows\/[^/]+\/default$/.test(path)) {
+			const id = path.split('/')[3];
+			const payload = request.postDataJSON() as { default_for_tasks: boolean };
+			options.workflowDefaultRequests?.push({ id, defaultForTasks: payload.default_for_tasks });
+			const workflow = createdWorkflow ?? options.workflows?.find((candidate) => candidate.id === id);
+			response = { ...workflow, default_for_tasks: payload.default_for_tasks, enabled: true };
+		} else if (/^\/api\/workflows\/[^/]+$/.test(path)) {
+			const id = path.split('/')[3];
+			response = createdWorkflow ?? options.workflows?.find((workflow) => workflow.id === id) ?? {
+				error: `Unknown workflow: ${id}`,
+			};
+		} else if (path === '/api/ui/stream' || path === '/api/ui/revisions') {
+			await route.fulfill({ status: 204, body: '' });
+			return;
+		} else if (path === '/api/schedules') {
+			const agentFilter = url.searchParams.get('agent_id');
+			const enabledOnly = url.searchParams.get('enabled') === 'true';
+			const includeCompletedOnce = url.searchParams.get('include_completed_once') === 'true';
+			response = (options.schedules ?? []).filter((schedule: Record<string, unknown>) => {
+				if (agentFilter && schedule.agent_id !== agentFilter) return false;
+				if (enabledOnly && !schedule.enabled) return false;
+				if (
+					!includeCompletedOnce
+					&& schedule.schedule_type === 'once'
+					&& !schedule.enabled
+					&& Number(schedule.run_count ?? 0) > 0
+				) {
+					return false;
+				}
+				return true;
+			});
 		} else if (path === '/api/setup/config') {
+			const configuredKind = options.agentKind?.value ?? agentRunnerKind;
 			response = {
 				llm: { providers: [] },
 				agents: [{
 					name: agent.name,
 					title: agent.title,
-					backend: agent.backend,
+					backend: configuredKind,
 					model: null,
 					runner: {
-						kind: 'codex',
-						image: 'xpressclaw-runner-codex:latest',
+						kind: configuredKind,
+						image: `xpressclaw-runner-${configuredKind}:latest`,
 						workspace: '/workspace',
 						model: null,
 						session_config: {},
@@ -197,6 +1023,7 @@ async function mockApi(
 						environment: {},
 						command: [],
 						subscription_auth: true,
+						ssh_agent_forwarding: options.sshAgentForwarding ?? false,
 						container_engine: 'none',
 					},
 					tools: [],
@@ -206,17 +1033,146 @@ async function mockApi(
 				system: { budget: { daily: '0', monthly: null, on_exceeded: 'warn' } },
 				mcp_servers: [],
 			};
-		} else if (path === '/api/tasks') {
-			if (url.searchParams.has('parent_task_id')) {
-				response = { tasks: [], counts: { ...counts, completed: 0 } };
+		} else if (path === `/api/workspaces/${agentId}`) {
+			response = {
+				agent_id: agentId,
+				root: (repositoryStatus.active as { root?: string } | null)?.root ?? '/srv/workspaces/browser-tested',
+				repository: repositoryStatus,
+				container_exists: true,
+				container_running: true,
+				terminal_available: true,
+			};
+		} else if (path === `/api/workspaces/${agentId}/repository`) {
+			if (request.method() === 'PUT') {
+				const payload = request.postDataJSON() as { path: string };
+				options.repositorySelections?.push(payload.path);
+				const selected = (repositoryStatus.candidates as Record<string, unknown>[]).find((candidate) => candidate.relative_path === payload.path) ?? null;
+				repositoryStatus = {
+					...repositoryStatus,
+					state: selected ? 'pending' : 'missing',
+					pending_relative_path: selected ? payload.path : null,
+					pending_action: selected ? 'manual' : null,
+					restart_required: Boolean(selected),
+					message: selected ? 'The repository change is pending and will be applied at the next safe turn boundary.' : 'The selected repository is missing.',
+				};
+			} else if (request.method() === 'DELETE') {
+				options.repositorySelections?.push(null);
+				repositoryStatus = {
+					...repositoryStatus,
+					state: 'pending',
+					pending_relative_path: null,
+					pending_action: 'cleared',
+					restart_required: true,
+					message: 'The repository change is pending and will be applied at the next safe turn boundary.',
+				};
+			}
+			response = repositoryStatus;
+		} else if (path === `/api/workspaces/${agentId}/tree`) {
+			const directory = url.searchParams.get('path') ?? '';
+			response = directory === 'src'
+				? {
+					path: 'src',
+					entries: [{ name: 'main.ts', path: 'src/main.ts', kind: 'file', size: workspaceFileContent.length }],
+					truncated: false,
+				}
+				: {
+					path: '',
+					entries: [
+						{ name: 'src', path: 'src', kind: 'directory', size: null },
+						{ name: 'README.md', path: 'README.md', kind: 'file', size: 32 },
+					],
+					truncated: false,
+				};
+		} else if (path === `/api/workspaces/${agentId}/file`) {
+			if (request.method() === 'PUT') {
+				const payload = request.postDataJSON() as { path: string; content: string; expected_revision: string };
+				options.workspaceSaveRequests?.push(payload);
+				if (options.workspaceSaveDelayMs) {
+					await new Promise((resolve) => setTimeout(resolve, options.workspaceSaveDelayMs));
+				}
+				workspaceFileContent = payload.content;
+				workspaceFileRevision = 'revision-after-save';
+				response = { path: payload.path, revision: workspaceFileRevision, size: payload.content.length };
 			} else {
+				const filePath = url.searchParams.get('path') ?? 'src/main.ts';
+				options.workspaceReadRequests?.push(filePath);
+				const readDelayMs = options.workspaceReadDelaysMs?.[filePath] ?? 0;
+				if (readDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, readDelayMs));
+				if (options.includeDeletedWorkspaceFile && filePath === 'src/removed.ts') {
+					await route.fulfill({ status: 404, contentType: 'application/json', body: JSON.stringify({ error: 'workspace path was not found' }) });
+					return;
+				}
+				response = {
+					path: filePath,
+					content: filePath === 'src/main.ts' ? workspaceFileContent : '# Browser-tested workspace\n',
+					revision: workspaceFileRevision,
+					size: workspaceFileContent.length,
+				};
+			}
+		} else if (path === `/api/workspaces/${agentId}/git/status`) {
+			response = {
+				repository: true,
+				branch: 'feature/workspace-browser',
+				repository_status: repositoryStatus,
+				files: [
+					{ path: 'src/main.ts', original_path: null, status: ' M', index_status: ' ', worktree_status: 'M' },
+					{ path: 'README.md', original_path: null, status: '??', index_status: '?', worktree_status: '?' },
+					...(options.includeDeletedWorkspaceFile
+						? [{ path: 'src/removed.ts', original_path: null, status: ' D', index_status: ' ', worktree_status: 'D' }]
+						: []),
+				],
+			};
+		} else if (path === `/api/workspaces/${agentId}/git/diff`) {
+			const filePath = url.searchParams.get('path') ?? 'src/main.ts';
+			response = {
+				path: filePath,
+				diff: filePath === 'src/main.ts'
+					? 'diff --git a/src/main.ts b/src/main.ts\n--- a/src/main.ts\n+++ b/src/main.ts\n@@ -1 +1 @@\n-export const greeting = "hi";\n+export const greeting = "hello";\n'
+					: filePath === 'src/removed.ts'
+						? 'diff --git a/src/removed.ts b/src/removed.ts\ndeleted file mode 100644\n--- a/src/removed.ts\n+++ /dev/null\n@@ -1 +0,0 @@\n-export const removed = true;\n'
+						: '',
+				truncated: false,
+			};
+		} else if (path === '/api/tasks/planning') {
+            const laneFor = (task: {status:string;activity_status?:string}) => ({pending:'queue',in_progress:'working',waiting_for_input:'input',blocked:'blocked',completed:'done',cancelled:'done',idle:'queue',awaiting_review:'review'}[task.activity_status??task.status]??'queue');
+            const terms=(url.searchParams.get('search')??'').toLocaleLowerCase().split(/\s+/).filter(Boolean);
+            const matching=listedTasks.filter(t=>(!url.searchParams.get('project_id')||t.project_id===url.searchParams.get('project_id'))&&(!url.searchParams.get('agent_id')||t.agent_id===url.searchParams.get('agent_id'))&&terms.every(term=>(t.title+' '+(t.description??'')).toLocaleLowerCase().includes(term)));
+            const counts:Record<string,number>={};for(const task of matching){const lane=laneFor(task);counts[lane]=(counts[lane]??0)+1;}
+            const selected=url.searchParams.get('status')??'active';
+            const filtered=matching.filter(t=>selected==='all'||selected==='active'&&laneFor(t)!=='done'||selected==='attention'&&['input','blocked','review'].includes(laneFor(t))||laneFor(t)===selected);
+            if(url.searchParams.get('sort')==='newest') filtered.sort((a,b)=>Date.parse(b.created_at)-Date.parse(a.created_at)||b.id.localeCompare(a.id));
+            const offset=Number(url.searchParams.get('offset')??0);const limit=Number(url.searchParams.get('limit')??100);
+            response={tasks:filtered.slice(offset,offset+limit).map(t=>({...t,revision:0,position:0,start_after:null,backlog:false,planning:{lane:laneFor(t),disabled_reason:laneFor(t)==='done'?'Finished':null,queued:t.status==='pending',actual_started_at:null}})),total:filtered.length,counts};
+        } else if (path === '/api/tasks') {
+			if (url.searchParams.has('parent_task_id')) {
+				response = { tasks: options.taskSubtasks ?? [], counts: { ...counts, completed: 0 } };
+			} else {
+				const searchTerms = (url.searchParams.get('search') ?? '')
+					.toLocaleLowerCase()
+					.split(/\s+/)
+					.filter(Boolean);
+				const searchedTasks = listedTasks.filter((listedTask) => {
+					const text = `${listedTask.title}\n${listedTask.description ?? ''}`.toLocaleLowerCase();
+					return searchTerms.every((term) => text.includes(term));
+				});
 				const includedStatuses = new Set((url.searchParams.get('statuses') ?? '').split(',').filter(Boolean));
 				const excludedStatuses = new Set((url.searchParams.get('exclude_statuses') ?? '').split(',').filter(Boolean));
 				const limit = Number.parseInt(url.searchParams.get('limit') ?? '100', 10);
 				const offset = Number.parseInt(url.searchParams.get('offset') ?? '0', 10);
-				const filteredTasks = [...listedTasks]
+				const filteredTasks = [...searchedTasks]
 					.filter((listedTask) => includedStatuses.size === 0 || includedStatuses.has(listedTask.status))
 					.filter((listedTask) => !excludedStatuses.has(listedTask.status));
+				const filteredCounts = searchedTasks.reduce((result, listedTask) => {
+					result[listedTask.status as keyof typeof result] += 1;
+					return result;
+				}, {
+					pending: 0,
+					in_progress: 0,
+					waiting_for_input: 0,
+					blocked: 0,
+					completed: 0,
+					cancelled: 0,
+				});
 				if (url.searchParams.get('sort') === 'recent') {
 					filteredTasks.sort((left, right) =>
 						Date.parse(right.updated_at) - Date.parse(left.updated_at)
@@ -226,11 +1182,14 @@ async function mockApi(
 				}
 				response = {
 					tasks: filteredTasks.slice(offset, offset + limit),
-					counts,
+					counts: filteredCounts,
 				};
 			}
+		} else if (path === '/api/tasks/attention') {
+			response = { tasks: listedTasks.filter(task => ['blocked', 'waiting_for_input'].includes(task.status) && (!url.searchParams.get('agent_id') || task.agent_id === url.searchParams.get('agent_id'))) };
 		} else if (path === '/api/tasks/recent-by-agent') {
 			const limit = Number.parseInt(url.searchParams.get('limit') ?? '5', 10);
+			const countsByAgent = new Map<string, number>();
 			response = {
 				tasks: [...listedTasks]
 					.sort((left, right) =>
@@ -238,9 +1197,56 @@ async function mockApi(
 						|| Date.parse(right.created_at) - Date.parse(left.created_at)
 						|| right.id.localeCompare(left.id)
 					)
-					.slice(0, limit),
+					.filter((listedTask) => {
+						const key = listedTask.agent_id ?? 'unassigned';
+						const count = countsByAgent.get(key) ?? 0;
+						if (count >= limit) return false;
+						countsByAgent.set(key, count + 1);
+						return true;
+					}),
 			};
+		} else if (path === `/api/tasks/${taskId}/planning`) {
+			if (request.method() === 'PATCH') {
+				const payload = request.postDataJSON() as Record<string, unknown>;
+				options.taskPlanRequests?.push(payload);
+				if (payload.expected_revision !== task.revision || task.status !== 'pending') {
+					await route.fulfill({ status: 409, json: { error: 'Task changed or is controlled by its current lifecycle.' } });
+					return;
+				}
+				if (payload.action === 'schedule') task.start_after = payload.start_after as string | null;
+				task.revision++;
+			}
+			response = { ...task, planning: {
+				lane: task.start_after ? 'scheduled' : task.status === 'pending' ? 'queue' : 'working',
+				disabled_reason: task.status === 'pending' ? null : 'This task has an active turn. Planning cannot interrupt it.',
+				queued: true, actual_started_at: null,
+			} };
+		} else if (path === `/api/tasks/${taskId}/status`) {
+			const payload = request.postDataJSON() as { status: string };
+			options.taskStatusRequests?.push(payload.status);
+			if (options.taskStatusFailureOnce && !taskStatusFailed) {
+				taskStatusFailed = true;
+				await route.fulfill({ status: 409, json: { error: 'Task still requires review.' } });
+				return;
+			}
+			Object.assign(task, { status: payload.status, activity_status: payload.status, revision: task.revision + 1 });
+			response = task;
 		} else if (path === `/api/tasks/${taskId}`) {
+			if (request.method() === 'PATCH') {
+				const payload = request.postDataJSON() as Record<string, unknown>;
+				options.taskUpdateRequests?.push(payload);
+				if (options.taskUpdateFailureOnce && !taskUpdateFailed) {
+					taskUpdateFailed = true;
+					await route.fulfill({ status: 503, json: { error: 'Could not save task details.' } });
+					return;
+				}
+				Object.assign(task, payload, { revision: task.revision + 1 });
+			}
+			if (options.taskLoadFailureOnce && !taskLoadFailed) {
+				taskLoadFailed = true;
+				await route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: 'Temporary task load failure' }) });
+				return;
+			}
 			response = task;
 		} else if (path === `/api/tasks/${taskId}/messages`) {
 			if (request.method() === 'POST') {
@@ -253,28 +1259,37 @@ async function mockApi(
 					delivery: payload.delivery === 'immediate' ? 'immediate' : (options.live ? 'after_tool' : 'queued'),
 				};
 			} else {
-				response = [
-					{ id: 1, task_id: taskId, role: 'assistant', content: 'First answer', attachments: [], timestamp: timestamp(25) },
-					{ id: 2, task_id: taskId, role: 'user', content: 'Please continue', attachments: [], timestamp: timestamp(40) },
-					{ id: 3, task_id: taskId, role: 'assistant', content: 'Second answer', attachments: [], timestamp: timestamp(55) },
+				const allMessages = options.taskMessages ?? [
+					{ id: 1, task_id: taskId, role: 'assistant', content: firstAnswer, attachments: [], timestamp: timestamp(25) },
+					{ id: 2, task_id: taskId, role: 'user', content: userFollowUp, attachments: [], timestamp: timestamp(40) },
+					{ id: 3, task_id: taskId, role: 'assistant', content: secondAnswer, attachments: [], timestamp: timestamp(55) },
 				];
+				const afterId = url.searchParams.has('after_id') ? Number(url.searchParams.get('after_id')) : null;
+				response = afterId !== null && Number.isFinite(afterId)
+					? allMessages.filter((message) => Number(message.id) > afterId)
+					: allMessages;
 			}
+		} else if (path.startsWith(`/api/tasks/${taskId}/elicitations/`) && path.endsWith('/response')) {
+			const elicitationId = decodeURIComponent(path.split('/')[5]);
+			const payload = request.postDataJSON() as Record<string, unknown>;
+			options.elicitationResponses?.push({ elicitationId, payload });
+			response = { resolved: true, action: payload.action };
 		} else if (path === `/api/tasks/${taskId}/activity`) {
 			if (options.agentTimeline) {
 				response = {
-					attempts: [attempt(attemptStatus)],
+					attempts: options.taskAttempts ?? [mockAttempt()],
 					events: [
-						timelineEvent(1, 10, 'runner_progress', "Yes, I'll inspect the project.", { item_type: 'agent_message', message_id: 'status-1' }),
+						timelineEvent(1, 10, 'runner_progress', firstAgentUpdate, { item_type: 'agent_message', message_id: 'status-1' }),
 						timelineEvent(2, 15, 'tool_call', 'Read the project', { toolCallId: 'tool-1', status: 'in_progress' }),
-						timelineEvent(3, 20, 'runner_progress', 'Tests are running.', { item_type: 'agent_message', message_id: 'status-2' }),
-						timelineEvent(4, 24, 'runner_progress', 'First answer', { item_type: 'agent_message', message_id: 'final-1' }),
+						timelineEvent(3, 20, 'runner_progress', 'Tests are running.\n\nI’m checking the timeline in both light and dark themes before I wrap up.', { item_type: 'agent_message', message_id: 'status-2' }),
+						timelineEvent(4, 24, 'runner_progress', firstAnswer, { item_type: 'agent_message', message_id: 'final-1' }),
 					],
 					has_more_before: false,
 					has_more_after: false,
 				};
 			} else if (url.searchParams.has('before')) {
 				response = {
-					attempts: [attempt(attemptStatus, contextUsed)],
+					attempts: options.taskAttempts ?? [mockAttempt()],
 					events: Array.from({ length: 20 }, (_, index) => activityEvent(index + 1)),
 					has_more_before: false,
 					has_more_after: true,
@@ -283,15 +1298,21 @@ async function mockApi(
 				liveEvent += 1;
 				contextUsed += 1_000;
 				response = {
-					attempts: [attempt(attemptStatus, contextUsed)],
+					attempts: options.taskAttempts ?? [mockAttempt()],
 					events: options.live ? [activityEvent(60 + liveEvent, 'New background activity')] : [],
 					has_more_before: false,
 					has_more_after: false,
 				};
 			} else {
 				response = {
-					attempts: [attempt(attemptStatus, contextUsed)],
-					events: options.richToolActivity ? [
+					attempts: options.taskAttempts ?? [mockAttempt()],
+					events: options.taskActivityEvents ?? (options.pendingElicitation ? [
+						timelineEvent(42, 58, 'elicitation_pending', 'The agent needs your input', {
+							elicitationId: 'elicitation-browser-test',
+							status: 'pending',
+							...options.pendingElicitation,
+						}),
+					] : options.richToolActivity ? [
 						{
 							...activityEvent(21),
 							event_type: 'usage',
@@ -327,14 +1348,17 @@ async function mockApi(
 								rawOutput: { formatted_output: 'Applied patch.' },
 							},
 						},
-					] : Array.from({ length: 40 }, (_, index) => activityEvent(index + 21)),
-					has_more_before: !options.richToolActivity,
+					] : Array.from({ length: 40 }, (_, index) => activityEvent(index + 21))),
+					has_more_before: options.taskActivityEvents ? false : !options.richToolActivity,
 					has_more_after: false,
 				};
 			}
 		} else if (path === `/api/sessions/${agentId}`) {
 			response = {
 				session: { id: agentId, status: options.live ? 'running' : 'idle' },
+				active_task_count: listedTasks.filter(
+					(listedTask) => listedTask.agent_id === agentId && ['pending', 'in_progress'].includes(listedTask.status),
+				).length,
 				active_attempts: [],
 				queued_attempts: [],
 				recent_attempts: [],
@@ -342,7 +1366,7 @@ async function mockApi(
 				artifacts: [],
 			};
 		} else if (path === `/api/sessions/${agentId}/readiness`) {
-			response = { ready: true };
+			response = options.runnerReadiness ?? { ready: true };
 		} else if (/^\/api\/sessions\/[^/]+\/messages$/.test(path) && request.method() === 'POST') {
 			const targetAgentId = path.split('/')[3];
 			const payload = request.postDataJSON() as Record<string, unknown>;
@@ -356,8 +1380,17 @@ async function mockApi(
 		} else if (path === `/api/sessions/${agentId}/attempts/attempt-browser-test/interrupt`) {
 			options.interruptedAttempts?.push('attempt-browser-test');
 			response = { ...attempt('interrupted'), status: 'interrupted', completed_at: timestamp(62) };
+		} else if (path === `/api/tasks/${taskId}/config`) {
+			response = {
+				context: { agent_id: task.agent_id, runner_kind: 'codex', native_session_id: 'native-browser-test' },
+				availability: 'cached', revision: null, event_id: 70, pending: {}, model_pending: false,
+				config_options: [
+					{ id: 'model', name: 'Model', category: 'model', type: 'select', currentValue: 'codex-test', options: [{ value: 'codex-test', name: 'Codex Test' }] },
+					{ id: 'reasoning_effort', name: 'Reasoning', category: 'thought_level', type: 'select', currentValue: 'high', options: [{ value: 'high', name: 'High' }] },
+				], modes: null, notice: 'Last observed controls; changes will apply on the next turn.',
+			};
 		} else if (path === `/api/sessions/${agentId}/events`) {
-			response = [
+			const allEvents = [
 				{
 					...activityEvent(70),
 					event_type: 'session_config_options',
@@ -377,6 +1410,18 @@ async function mockApi(
 					] },
 				},
 			];
+			const eventType = url.searchParams.get('event_type');
+			const after = url.searchParams.has('after') ? Number(url.searchParams.get('after')) : null;
+			const limit = url.searchParams.has('limit') ? Number(url.searchParams.get('limit')) : null;
+			let filteredEvents = allEvents.filter((event) => {
+				if (eventType && event.event_type !== eventType) return false;
+				if (after !== null && Number.isFinite(after) && event.id <= after) return false;
+				return true;
+			});
+			if (limit !== null && Number.isFinite(limit) && limit > 0) {
+				filteredEvents = after !== null ? filteredEvents.slice(0, limit) : filteredEvents.slice(-limit);
+			}
+			response = filteredEvents;
 		} else {
 			await route.fulfill({ status: 404, contentType: 'application/json', body: JSON.stringify({ error: `Unmocked API route: ${path}` }) });
 			return;
@@ -385,6 +1430,184 @@ async function mockApi(
 		await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(response) });
 	});
 }
+
+function pickerSnapshot(model = 'sol', thought = model === 'qwen' ? 'off' : 'high') {
+	const levels = model === 'qwen' ? ['off'] : ['high', 'max'];
+	return {
+		context: { agent_id: agentId, runner_kind: 'codex', native_session_id: 'native-picker' },
+		availability: 'live', revision: null as string | null, event_id: 100, pending: {} as Record<string, string | boolean>, model_pending: false, has_preferences: false,
+		config_options: [
+			{ id: 'model', name: 'Model', category: 'model', type: 'select', currentValue: model, options: [{ value: 'sol', name: 'Sol Reasoning' }, { value: 'qwen', name: 'Local Qwen' }] },
+			{ id: 'thought_level', name: 'Thinking', category: 'thought_level', type: 'select', currentValue: thought, options: levels.map(value => ({ value, name: value.toUpperCase() })) },
+		], modes: { currentModeId: thought, availableModes: levels.map(id => ({ id, name: `Thinking: ${id}` })) },
+		notice: 'Applied to the connected session.',
+	};
+}
+
+for (const history of ['evicted', 'sibling', 'abandoned']) {
+	test(`canonical picker ignores ${history} history and does not submit observed defaults`, async ({ page }) => {
+		const postedMessages: Record<string, unknown>[] = [];
+		await mockApi(page, { taskStatus: 'completed', postedMessages });
+		await page.route(`**/api/sessions/${agentId}/events*`, route => route.fulfill({ json: history === 'evicted' ? [] : [{
+			...activityEvent(500), task_id: history === 'sibling' ? 'another-task' : taskId,
+			event_type: 'session_config_options', payload: pickerSnapshot('qwen'),
+		}] }));
+		await page.route(`**/api/tasks/${taskId}/config`, route => route.fulfill({ json: pickerSnapshot() }));
+		await page.goto(`/tasks/${taskId}`);
+		const picker = page.getByTitle('Model and reasoning effort');
+		await expect(picker).toContainText('Sol Reasoning');
+		await picker.click();
+		await expect(page.getByRole('button', { name: 'MAX', exact: true })).toBeVisible();
+		await expect(page.getByRole('button', { name: 'Thinking: max', exact: true })).toHaveCount(0);
+		expect(postedMessages).toEqual([]);
+		await page.locator(`#task-message-input-${taskId}`).fill('Continue unchanged');
+		await page.getByRole('button', { name: 'Send message', exact: true }).click();
+		await expect.poll(() => postedMessages.length).toBe(1);
+		expect(postedMessages[0].config_options).toEqual({});
+	});
+}
+
+test('explicit picker edits refresh dependent reasoning without a message', async ({ page }) => {
+	const postedMessages: Record<string, unknown>[] = [];
+	await mockApi(page, { taskStatus: 'completed', postedMessages });
+	let snapshot = pickerSnapshot();
+	const edits: Record<string, unknown>[] = [];
+	await page.route(`**/api/tasks/${taskId}/config`, async route => {
+		if (route.request().method() === 'POST') {
+			const edit = route.request().postDataJSON(); edits.push(edit);
+			snapshot = { ...(edit.config_id === 'model' ? pickerSnapshot(edit.value) : pickerSnapshot('sol', edit.value)), revision: String(edits.length) };
+		}
+		await route.fulfill({ json: snapshot });
+	});
+	await page.goto(`/tasks/${taskId}`);
+	const picker = page.getByTitle('Model and reasoning effort');
+	await expect(picker).toContainText('Sol Reasoning');
+	await picker.click();
+	await page.getByLabel('Search models').fill('qwen');
+	await expect(page.locator('[data-model-picker]').getByRole('button', { name: 'Sol Reasoning', exact: true })).toHaveCount(0);
+	await page.getByRole('button', { name: 'Local Qwen', exact: true }).click();
+	await expect(page.getByRole('button', { name: 'OFF', exact: true })).toBeVisible();
+	await expect(page.getByRole('button', { name: 'MAX', exact: true })).toHaveCount(0);
+	await page.getByLabel('Search models').fill('');
+	await page.getByRole('button', { name: 'Sol Reasoning', exact: true }).click();
+	await page.getByRole('button', { name: 'MAX', exact: true }).click();
+	await expect.poll(() => edits.length).toBe(3);
+	expect(edits.map(({ config_id, value }) => ({ config_id, value }))).toEqual([
+		{ config_id: 'model', value: 'qwen' }, { config_id: 'model', value: 'sol' }, { config_id: 'thought_level', value: 'max' },
+	]);
+	expect(edits[2].revision).toBe('2');
+	expect(edits[0].context).toEqual(pickerSnapshot().context);
+	expect(postedMessages).toEqual([]);
+});
+
+for (const availability of ['busy', 'cached']) {
+	test(`${availability} edits are durable pending preferences, not message payloads`, async ({ page }) => {
+		const postedMessages: Record<string, unknown>[] = [];
+		await mockApi(page, { taskStatus: 'completed', postedMessages });
+		let snapshot = { ...pickerSnapshot(), availability };
+		await page.route(`**/api/tasks/${taskId}/config`, async route => {
+			if (route.request().method() === 'POST') snapshot = { ...snapshot, revision: 'saved', pending: { model: 'qwen' }, model_pending: true, notice: 'Saved for the next turn; not yet applied.' };
+			await route.fulfill({ json: snapshot });
+		});
+		await page.goto(`/tasks/${taskId}`);
+		const picker = page.getByTitle('Model and reasoning effort');
+		await expect(picker).toContainText('Sol Reasoning'); await picker.click();
+		await page.getByRole('button', { name: 'Local Qwen', exact: true }).click();
+		await expect(picker).toContainText('Local Qwen (pending)');
+		await expect(page.getByRole('button', { name: 'MAX', exact: true })).toHaveCount(0);
+		await page.reload();
+		await expect(picker).toContainText('Local Qwen (pending)');
+		await picker.click();
+		await expect(page.locator('[data-model-picker]')).toContainText('not yet applied');
+		expect(postedMessages).toEqual([]);
+		snapshot = { ...pickerSnapshot('qwen'), revision: 'saved' };
+		await expect(picker).toContainText('Local Qwen');
+		await expect(picker).not.toContainText('(pending)');
+		await expect(page.getByRole('button', { name: 'OFF', exact: true })).toBeVisible();
+	});
+}
+
+test('stale picker context refreshes without saving the rejected edit or losing a draft', async ({ page }) => {
+	await mockApi(page, { taskStatus: 'completed' });
+	let snapshot = pickerSnapshot();
+	let posts = 0;
+	await page.route(`**/api/tasks/${taskId}/config`, async route => {
+		if (route.request().method() === 'POST') {
+			++posts;
+			snapshot = { ...pickerSnapshot('qwen'), context: { ...snapshot.context, runner_kind: 'pi', native_session_id: 'new-session' } };
+			await route.fulfill({ status: 409, json: { error: 'Control context changed; refresh and try again' } });
+		} else await route.fulfill({ json: snapshot });
+	});
+	await page.goto(`/tasks/${taskId}`);
+	const input = page.locator(`#task-message-input-${taskId}`);
+	await input.fill('Keep this draft');
+	const picker = page.getByTitle('Model and reasoning effort');
+	await expect(picker).toContainText('Sol Reasoning'); await picker.click();
+	await page.getByRole('button', { name: 'MAX', exact: true }).click();
+	await expect(picker).toContainText('Local Qwen');
+	await expect(page.locator('[data-model-picker]')).toContainText('refresh and try again');
+	await expect(input).toHaveValue('Keep this draft');
+	await expect(picker).not.toContainText('(pending)');
+	expect(posts).toBe(1);
+});
+
+test('explicit preferences can be cleared even when their old catalog is unavailable', async ({ page }) => {
+	await mockApi(page, { taskStatus: 'completed' });
+	let snapshot = { ...pickerSnapshot(), availability: 'unavailable', config_options: [] as ReturnType<typeof pickerSnapshot>['config_options'],
+		pending: { model: 'gone' } as Record<string, string | boolean>, has_preferences: true, revision: 'old', notice: 'Saved for the next turn; not yet applied.' };
+	let reset: Record<string, unknown> | undefined;
+	await page.route(`**/api/tasks/${taskId}/config`, async route => {
+		if (route.request().method() === 'POST') {
+			reset = route.request().postDataJSON();
+			snapshot = { ...snapshot, pending: {}, has_preferences: false, revision: 'cleared', notice: 'Task preferences cleared; agent defaults apply on the next turn.' };
+		}
+		await route.fulfill({ json: snapshot });
+	});
+	await page.goto(`/tasks/${taskId}`);
+	const picker = page.getByTitle('Model and reasoning effort');
+	await expect(picker).toContainText('(pending)'); await picker.click();
+	await page.getByRole('button', { name: 'Clear task preferences', exact: true }).click();
+	await expect(picker).not.toContainText('(pending)');
+	await expect(page.locator('[data-model-picker]')).toContainText('preferences cleared');
+	expect(reset?.reset).toBe(true);
+	expect(reset?.revision).toBe('old');
+});
+
+test('a late snapshot cannot undo a successful explicit edit', async ({ page }) => {
+	await mockApi(page, { taskStatus: 'completed' });
+	let reads = 0;
+	let held = false;
+	let release!: () => void;
+	const gate = new Promise<void>(resolve => release = resolve);
+	let snapshot = pickerSnapshot();
+	await page.route(`**/api/tasks/${taskId}/config`, async route => {
+		if (route.request().method() === 'POST') { snapshot = pickerSnapshot('qwen'); await route.fulfill({ json: snapshot }); }
+		else if (++reads === 2) { held = true; await gate; await route.fulfill({ headers: { 'x-old': 'yes' }, json: pickerSnapshot() }); }
+		else await route.fulfill({ json: snapshot });
+	});
+	await page.goto(`/tasks/${taskId}`);
+	const picker = page.getByTitle('Model and reasoning effort');
+	await expect(picker).toContainText('Sol Reasoning'); await picker.click();
+	await expect.poll(() => held).toBe(true);
+	await page.getByRole('button', { name: 'Local Qwen', exact: true }).click();
+	await expect(picker).toContainText('Local Qwen');
+	const old = page.waitForResponse(response => response.headers()['x-old'] === 'yes');
+	release(); await (await old).finished();
+	await expect(picker).toContainText('Local Qwen');
+});
+
+test('uninitialized picker stays reachable without borrowing history', async ({ page }) => {
+	await mockApi(page, { taskStatus: 'completed' });
+	await page.route(`**/api/tasks/${taskId}/config`, route => route.fulfill({ json: {
+		...pickerSnapshot(), availability: 'unavailable', config_options: [], modes: null,
+		context: { ...pickerSnapshot().context, native_session_id: null }, notice: 'This context has not advertised usable controls yet.',
+	} }));
+	await page.goto(`/tasks/${taskId}`);
+	const picker = page.getByTitle('Model and reasoning effort');
+	await expect(picker).toContainText('Model settings'); await picker.click();
+	await expect(page.locator('[data-model-picker]')).toContainText('has not advertised');
+	await expect(page.locator('[data-model-picker]').getByRole('button')).toHaveCount(0);
+});
 
 test('activity stays chronological, compact, expandable, and pageable', async ({ page }) => {
 	await mockApi(page);
@@ -425,13 +1648,74 @@ test('activity stays chronological, compact, expandable, and pageable', async ({
 	await expect(page.getByText('Reasoning effort', { exact: true })).toBeVisible();
 });
 
+test('attempt errors can be dismissed', async ({ page }) => {
+	const rawError = '<img src=x onerror="window.__rawHtmlExecuted = true"> ACP process stopped during the turn';
+	await mockApi(page, { attemptError: rawError });
+	await page.goto(`/tasks/${taskId}`);
+
+	const notification = page.locator('[data-attempt-error]');
+	await expect(notification).toBeVisible();
+	await expect(notification).toContainText(rawError);
+	await expect(notification.locator('img')).toHaveCount(0);
+	const dismiss = notification.getByRole('button', { name: 'Dismiss attempt error' });
+	await dismiss.focus();
+	await dismiss.press('Enter');
+	await expect(notification).toHaveCount(0);
+	await expect(page.locator('[data-task-transcript-scroll]')).toBeFocused();
+});
+
+test('failed initial task loads can be retried', async ({ page }) => {
+	await mockApi(page, { taskLoadFailureOnce: true });
+	await page.goto(`/tasks/${taskId}`);
+
+	const alert = page.getByRole('alert');
+	await expect(alert).toContainText('Temporary task load failure');
+	await alert.getByRole('button', { name: 'Retry' }).click();
+	await expect(page.getByRole('heading', { name: 'Browser-tested workspace' })).toBeVisible();
+	await expect(alert).toHaveCount(0);
+});
+
+test('dismissing an initial task load failure returns to the task list', async ({ page }) => {
+	await mockApi(page, { taskLoadFailureOnce: true });
+	await page.goto(`/tasks/${taskId}`);
+
+	await page.getByRole('button', { name: 'Dismiss task error and return to tasks' }).click();
+	await expect(page).toHaveURL('/tasks');
+});
+
 test('agent updates stay beside their tools while the final reply is shown once', async ({ page }) => {
 	await mockApi(page, { agentTimeline: true });
 	await page.goto(`/tasks/${taskId}`);
 
 	const transcript = page.locator('[data-task-transcript]');
 	await expect(transcript).toBeVisible();
-	await expect(page.getByRole('button', { name: /Yes, I'll inspect the project\./ })).toBeVisible();
+	const updates = transcript.locator('[data-agent-update]');
+	await expect(updates).toHaveCount(2);
+	const firstUpdate = updates.first();
+	await expect(firstUpdate).toHaveAttribute('aria-label', 'Agent update');
+	await expect(firstUpdate.getByText('agent', { exact: true })).toBeVisible();
+	await expect(firstUpdate.getByText('Update', { exact: true })).toBeVisible();
+	await expect(firstUpdate.getByText("Yes, I'll inspect the project.", { exact: true })).toBeVisible();
+	await expect(firstUpdate.getByText("I'm starting with the timeline component so this update remains readable even when it spans multiple lines.", { exact: true })).toBeVisible();
+	await expect(firstUpdate.locator('button')).toHaveCount(0);
+	await expect(page.getByRole('button', { name: /Read the project/ })).toBeVisible();
+
+	const updateContent = firstUpdate.locator('[data-agent-update-content]');
+	const updateTextStyle = await updateContent.evaluate((element) => {
+		const style = getComputedStyle(element);
+		return { overflow: style.overflow, textOverflow: style.textOverflow, whiteSpace: style.whiteSpace };
+	});
+	expect(updateTextStyle.overflow).not.toBe('hidden');
+	expect(updateTextStyle.textOverflow).not.toBe('ellipsis');
+	expect(updateTextStyle.whiteSpace).not.toBe('nowrap');
+
+	const finalMessage = transcript.locator('[data-message-role="assistant"]').first();
+	const [updateBackground, finalBackground] = await Promise.all([
+		updateContent.evaluate((element) => getComputedStyle(element).backgroundColor),
+		finalMessage.locator('.rounded-lg').evaluate((element) => getComputedStyle(element).backgroundColor),
+	]);
+	expect(updateBackground).not.toBe(finalBackground);
+
 	const entries = await transcript.locator('[data-transcript-kind]').allTextContents();
 	const statusIndex = entries.findIndex((entry) => entry.includes("Yes, I'll inspect the project."));
 	const toolIndex = entries.findIndex((entry) => entry.includes('Read the project'));
@@ -445,6 +1729,494 @@ test('agent updates stay beside their tools while the final reply is shown once'
 	expect(toolIndex).toBeLessThan(testIndex);
 	expect(finalIndexes).toHaveLength(1);
 	expect(testIndex).toBeLessThan(finalIndexes[0]);
+});
+
+test('near-simultaneous sentence fragments render as one agent update', async ({ page }) => {
+	await mockApi(page, {
+		taskMessages: [],
+		taskActivityEvents: [
+			timelineEvent(1, 10, 'runner_progress', 'The audit', { item_type: 'agent_message', message_id: 'fragment-1' }),
+			timelineEvent(2, 10, 'runner_progress', '-retention regression is now exercising the actual migration DDL', { item_type: 'agent_message', message_id: 'fragment-2' }),
+			timelineEvent(3, 11, 'runner_progress', 'against H2: it inserts an audit row', { item_type: 'agent_message', message_id: 'fragment-3' }),
+			timelineEvent(4, 11, 'runner_progress', ',', { item_type: 'agent_message', message_id: 'fragment-4' }),
+			timelineEvent(5, 12, 'runner_progress', 'deletes', { item_type: 'agent_message', message_id: 'fragment-5' }),
+			timelineEvent(6, 12, 'runner_progress', 'the parent conversation, and creates a tombstone.', { item_type: 'agent_message', message_id: 'fragment-6' }),
+			timelineEvent(7, 12, 'runner_progress', 'Tests passed.', { item_type: 'agent_message', message_id: 'status-1' }),
+			timelineEvent(8, 12, 'runner_progress', 'Ready to review.', { item_type: 'agent_message', message_id: 'status-2' }),
+			timelineEvent(9, 13, 'runner_progress', 'Done.', { item_type: 'agent_message', message_id: 'status-3' }),
+			timelineEvent(10, 13, 'runner_progress', '.env is configured.', { item_type: 'agent_message', message_id: 'status-4' }),
+			timelineEvent(11, 14, 'runner_progress', 'Updated config', { item_type: 'agent_message', message_id: 'status-5' }),
+			timelineEvent(12, 14, 'runner_progress', '.env is ready.', { item_type: 'agent_message', message_id: 'status-6' }),
+			timelineEvent(13, 15, 'runner_progress', 'The exit code is', { item_type: 'agent_message', message_id: 'status-7' }),
+			timelineEvent(14, 15, 'runner_progress', '-1 when unavailable.', { item_type: 'agent_message', message_id: 'status-8' }),
+			timelineEvent(15, 16, 'runner_progress', 'Then use', { item_type: 'agent_message', message_id: 'status-9' }),
+			timelineEvent(16, 16, 'runner_progress', '--force to override.', { item_type: 'agent_message', message_id: 'status-10' }),
+			timelineEvent(17, 17, 'runner_progress', 'The audit-', { item_type: 'agent_message', message_id: 'fragment-7' }),
+			timelineEvent(18, 17, 'runner_progress', 'retention policy passed.', { item_type: 'agent_message', message_id: 'fragment-8' }),
+			timelineEvent(19, 18, 'runner_progress', 'Choose and/', { item_type: 'agent_message', message_id: 'fragment-9' }),
+			timelineEvent(20, 18, 'runner_progress', 'or syntax.', { item_type: 'agent_message', message_id: 'fragment-10' }),
+			timelineEvent(21, 19, 'runner_progress', 'Call (', { item_type: 'agent_message', message_id: 'fragment-11' }),
+			timelineEvent(22, 19, 'runner_progress', 'child) first.', { item_type: 'agent_message', message_id: 'fragment-12' }),
+			timelineEvent(23, 20, 'runner_progress', 'Tests passed -', { item_type: 'agent_message', message_id: 'fragment-13' }),
+			timelineEvent(24, 20, 'runner_progress', 'ready for review.', { item_type: 'agent_message', message_id: 'fragment-14' }),
+			timelineEvent(25, 21, 'runner_progress', 'Use input /', { item_type: 'agent_message', message_id: 'fragment-15' }),
+			timelineEvent(26, 21, 'runner_progress', 'output channels.', { item_type: 'agent_message', message_id: 'fragment-16' }),
+		],
+	});
+	await page.goto(`/tasks/${taskId}`);
+
+	const updates = page.locator('[data-task-transcript] [data-agent-update]');
+	await expect(updates).toHaveCount(16);
+	await expect(updates.nth(0).locator('[data-agent-update-content]')).toHaveText(
+		'The audit-retention regression is now exercising the actual migration DDL against H2: it inserts an audit row, deletes the parent conversation, and creates a tombstone.',
+	);
+	await expect(updates.nth(1).locator('[data-agent-update-content]')).toHaveText('Tests passed.');
+	await expect(updates.nth(2).locator('[data-agent-update-content]')).toHaveText('Ready to review.');
+	await expect(updates.nth(3).locator('[data-agent-update-content]')).toHaveText('Done.');
+	await expect(updates.nth(4).locator('[data-agent-update-content]')).toHaveText('.env is configured.');
+	await expect(updates.nth(5).locator('[data-agent-update-content]')).toHaveText('Updated config');
+	await expect(updates.nth(6).locator('[data-agent-update-content]')).toHaveText('.env is ready.');
+	await expect(updates.nth(7).locator('[data-agent-update-content]')).toHaveText('The exit code is');
+	await expect(updates.nth(8).locator('[data-agent-update-content]')).toHaveText('-1 when unavailable.');
+	await expect(updates.nth(9).locator('[data-agent-update-content]')).toHaveText('Then use');
+	await expect(updates.nth(10).locator('[data-agent-update-content]')).toHaveText('--force to override.');
+	await expect(updates.nth(11).locator('[data-agent-update-content]')).toHaveText('The audit-retention policy passed.');
+	await expect(updates.nth(12).locator('[data-agent-update-content]')).toHaveText('Choose and/or syntax.');
+	await expect(updates.nth(13).locator('[data-agent-update-content]')).toHaveText('Call (child) first.');
+	await expect(updates.nth(14).locator('[data-agent-update-content]')).toHaveText('Tests passed - ready for review.');
+	await expect(updates.nth(15).locator('[data-agent-update-content]')).toHaveText('Use input / output channels.');
+});
+
+test('mirrored final fragments stay hidden without duplicating durable replies', async ({ page }) => {
+	await mockApi(page, {
+		taskMessages: [{
+			id: 1,
+			task_id: taskId,
+			role: 'assistant',
+			content: 'ready for review.',
+			attachments: [],
+			timestamp: timestamp(11),
+		}],
+		taskActivityEvents: [
+			timelineEvent(1, 10, 'runner_progress', 'Tests passed -', { item_type: 'agent_message', message_id: 'fragment-before-reply' }),
+			timelineEvent(2, 11, 'runner_progress', 'ready for review.', { item_type: 'agent_message', message_id: 'mirrored-reply' }),
+		],
+	});
+	await page.goto(`/tasks/${taskId}`);
+
+	const transcript = page.locator('[data-task-transcript]');
+	const updates = transcript.locator('[data-agent-update]');
+	await expect(updates).toHaveCount(1);
+	await expect(updates.locator('[data-agent-update-content]')).toHaveText('Tests passed -');
+	await expect(transcript.locator('[data-message-role="assistant"]')).toHaveCount(1);
+	await expect(transcript.getByText('ready for review.', { exact: true })).toHaveCount(1);
+});
+
+test('mirrored replies remain boundaries between otherwise joinable updates', async ({ page }) => {
+	await mockApi(page, {
+		taskMessages: [{
+			id: 1,
+			task_id: taskId,
+			role: 'assistant',
+			content: 'Done.',
+			attachments: [],
+			timestamp: timestamp(50),
+		}],
+		taskActivityEvents: [
+			timelineEvent(1, 10, 'runner_progress', 'Database ready', { item_type: 'agent_message', message_id: 'before-mirror' }),
+			timelineEvent(2, 10, 'runner_progress', 'Done.', { item_type: 'agent_message', message_id: 'mirrored-boundary' }),
+			timelineEvent(3, 11, 'runner_progress', 'checking deployment', { item_type: 'agent_message', message_id: 'after-mirror' }),
+		],
+	});
+	await page.goto(`/tasks/${taskId}`);
+
+	const transcript = page.locator('[data-task-transcript]');
+	const updates = transcript.locator('[data-agent-update]');
+	await expect(updates).toHaveCount(2);
+	await expect(updates).toHaveText([/Database ready/, /checking deployment/]);
+	await expect(transcript.getByText('Done.', { exact: true })).toHaveCount(1);
+});
+
+test('agent update coalescing does not cross message, attempt, time, or tool boundaries', async ({ page }) => {
+	await mockApi(page, {
+		taskMessages: [{
+			id: 1,
+			task_id: taskId,
+			role: 'user',
+			content: 'Keep the migration compatible.',
+			attachments: [],
+			timestamp: timestamp(41),
+		}],
+		taskActivityEvents: [
+			timelineEvent(1, 9, 'tool_call', 'Read the project', { toolCallId: 'tool-boundary', status: 'in_progress' }),
+			timelineEvent(2, 10, 'runner_progress', 'Reading', { item_type: 'agent_message', message_id: 'before-tool' }),
+			timelineEvent(3, 10, 'tool_call_update', 'Completed Read the project', { toolCallId: 'tool-boundary', status: 'completed' }),
+			timelineEvent(4, 10, 'runner_progress', 'the migration', { item_type: 'agent_message', message_id: 'after-tool' }),
+			timelineEvent(5, 20, 'runner_progress', 'Checking', { item_type: 'agent_message', message_id: 'attempt-a' }),
+			{
+				...timelineEvent(6, 20, 'runner_progress', 'the workspace', { item_type: 'agent_message', message_id: 'attempt-b' }),
+				attempt_id: 'attempt-browser-test-2',
+			},
+			timelineEvent(7, 30, 'runner_progress', 'Inspecting', { item_type: 'agent_message', message_id: 'early' }),
+			timelineEvent(8, 33, 'runner_progress', 'the repository', { item_type: 'agent_message', message_id: 'late' }),
+			timelineEvent(9, 40, 'runner_progress', 'Updating', { item_type: 'agent_message', message_id: 'before-message' }),
+			timelineEvent(10, 42, 'runner_progress', 'the query', { item_type: 'agent_message', message_id: 'after-message' }),
+			{
+				...timelineEvent(11, 50, 'runner_progress', 'Working on tests', { item_type: 'agent_message', message_id: 'opencode-1' }),
+				source_id: 'opencode',
+			},
+			{
+				...timelineEvent(12, 50, 'runner_progress', 'checking deployment', { item_type: 'agent_message', message_id: 'opencode-2' }),
+				source_id: 'opencode',
+			},
+		],
+	});
+	await page.goto(`/tasks/${taskId}`);
+
+	const updates = page.locator('[data-task-transcript] [data-agent-update]');
+	await expect(updates).toHaveCount(10);
+	await expect(updates).toHaveText([
+		/Reading/,
+		/the migration/,
+		/Checking/,
+		/the workspace/,
+		/Inspecting/,
+		/the repository/,
+		/Updating/,
+		/the query/,
+		/Working on tests/,
+		/checking deployment/,
+	]);
+});
+
+test('links in agent responses open in new windows without changing user links', async ({ page }) => {
+	await mockApi(page, { agentTimeline: true, agentResponseLinks: true });
+	await page.goto(`/tasks/${taskId}`);
+
+	const transcript = page.locator('[data-task-transcript]');
+	const responseLinks = transcript.locator('[data-message-role="assistant"] a, [data-agent-update] a');
+	await expect(responseLinks).toHaveCount(2);
+	for (const link of await responseLinks.all()) {
+		await expect(link).toHaveAttribute('target', '_blank');
+		await expect(link).toHaveAttribute('rel', 'noopener noreferrer');
+	}
+
+	const userLink = transcript.locator('[data-message-role="user"] a', { hasText: 'my reference' });
+	await expect(userLink).toBeVisible();
+	await expect(userLink).not.toHaveAttribute('target', '_blank');
+	await expect(userLink).not.toHaveAttribute('rel', /noopener|noreferrer/);
+	await expect(userLink).toHaveCSS('color', 'rgb(255, 255, 255)');
+
+	const rawLinkMessage = transcript.locator('[data-message-role="assistant"]', { hasText: 'a raw agent link' });
+	await expect(rawLinkMessage.locator('.prose-chat')).toContainText('<a href="https://example.com/raw-agent-link" target="_self" rel="opener">a raw agent link</a>');
+	await expect(rawLinkMessage.locator('a')).toHaveCount(0);
+});
+
+test('assistant text selections offer follow-up actions in the task composer', async ({ page }) => {
+	await mockApi(page);
+	await page.goto(`/tasks/${taskId}`);
+	const composer = page.locator(`#task-message-input-${taskId}`);
+	await composer.fill('Keep this draft');
+
+	const assistantMessage = page.locator('[data-message-role="assistant"]').first();
+	const messageContent = assistantMessage.locator('.prose-chat');
+	await messageContent.evaluate((element) => {
+		const selection = window.getSelection();
+		const range = document.createRange();
+		range.selectNodeContents(element);
+		selection?.removeAllRanges();
+		selection?.addRange(range);
+		element.dispatchEvent(new PointerEvent('pointerup', { bubbles: true }));
+	});
+
+	const actions = assistantMessage.locator('[data-selection-actions]');
+	await expect(actions).toBeVisible();
+	await actions.getByRole('button', { name: 'Improve' }).click();
+	await expect(composer).toHaveValue(/Keep this draft\n\nImprove this passage:\n\n> First answer/);
+	await expect(composer).toBeFocused();
+});
+
+test('active work uses the elapsed agent loading indicator', async ({ page }) => {
+	await mockApi(page, {
+		live: true,
+		taskAttempts: [attempt('running', 128_000, null, null, {
+			started_at: recentSqliteTimestamp(60_000),
+			response_started_at: recentSqliteTimestamp(3_000),
+		})],
+	});
+	await page.goto(`/tasks/${taskId}`);
+
+	const loadingIndicator = page.locator('[data-agent-loading]', { hasText: 'The agent is responding' });
+	await expect(loadingIndicator).toBeVisible();
+	await expect(loadingIndicator).toHaveAttribute('data-agent-phase', 'active');
+	await expect(loadingIndicator.locator('[aria-hidden="true"]').first().locator('span')).toHaveCount(9);
+	await expect.poll(() => elapsedSeconds(loadingIndicator)).toBeGreaterThan(1);
+	await expect.poll(() => elapsedSeconds(loadingIndicator)).toBeLessThan(60);
+	await expect(loadingIndicator.locator('[data-elapsed-time]')).toHaveAttribute('aria-label', /Elapsed \d{1,2}\.\d+s/);
+});
+
+test.describe('current response timing semantics', () => {
+	test.use({ timezoneId: 'America/Los_Angeles' });
+
+	test('task guidance keeps the active timer and gets a distinct queue timer', async ({ page }) => {
+		await mockApi(page, {
+			live: true,
+			taskAttempts: [
+				attempt('queued', 128_000, null, null, {
+					id: 'attempt-follow-up',
+					created_at: recentSqliteTimestamp(20_000),
+					response_queued_at: recentSqliteTimestamp(2_000),
+				}),
+				attempt('running', 128_000, null, null, {
+					id: 'attempt-current',
+					started_at: recentSqliteTimestamp(90_000),
+					response_started_at: recentSqliteTimestamp(7_000),
+				}),
+			],
+		});
+		await page.goto(`/tasks/${taskId}`);
+
+		const active = page.locator('[data-agent-loading]', { hasText: 'The agent is responding' });
+		const queued = page.locator('[data-agent-loading]', { hasText: 'New guidance is queued for the next safe break' });
+		await expect(active).toHaveAttribute('data-agent-phase', 'active');
+		await expect(queued).toHaveAttribute('data-agent-phase', 'queued');
+		await expect.poll(async () => (await elapsedSeconds(active)) - (await elapsedSeconds(queued))).toBeGreaterThan(3);
+		await expect.poll(async () => (await elapsedSeconds(active)) - (await elapsedSeconds(queued))).toBeLessThan(8);
+	});
+
+	test('qualified API timestamps are not double-zoned', async ({ page }) => {
+		await mockApi(page, {
+			live: true,
+			taskAttempts: [attempt('running', 128_000, null, null, {
+				response_started_at: new Date(Date.now() - 3_000).toISOString(),
+			})],
+		});
+		await page.goto(`/tasks/${taskId}`);
+		const indicator = page.locator('[data-agent-loading]', { hasText: 'The agent is responding' });
+		await expect.poll(() => elapsedSeconds(indicator)).toBeGreaterThan(0.5);
+		await expect.poll(() => elapsedSeconds(indicator)).toBeLessThan(60);
+	});
+
+	test('a task follow-up uses its new response anchor', async ({ page }) => {
+		await mockApi(page, {
+			live: true,
+			taskAttempts: [
+				attempt('running', 128_000, null, null, {
+					id: 'attempt-follow-up',
+					started_at: recentSqliteTimestamp(600_000),
+					response_started_at: recentSqliteTimestamp(2_000),
+					trigger_message_id: 42,
+				}),
+				attempt('completed', 128_000, null, null, {
+					id: 'attempt-initial',
+					started_at: recentSqliteTimestamp(900_000),
+					response_started_at: recentSqliteTimestamp(899_000),
+				}),
+			],
+		});
+		await page.goto(`/tasks/${taskId}`);
+		const indicator = page.locator('[data-agent-loading]', { hasText: 'The agent is responding' });
+		await expect.poll(() => elapsedSeconds(indicator)).toBeGreaterThan(0.5);
+		await expect.poll(() => elapsedSeconds(indicator)).toBeLessThan(60);
+	});
+
+	test('waiting for input stops the response timer', async ({ page }) => {
+		await mockApi(page, {
+			taskStatus: 'waiting_for_input',
+			taskActivityStatus: 'waiting_for_input',
+			taskAttempts: [attempt('waiting_for_input', 128_000, null, null, {
+				response_started_at: recentSqliteTimestamp(500_000),
+			})],
+		});
+		await page.goto(`/tasks/${taskId}`);
+		await expect(page.getByText('Waiting for your response...')).toBeVisible();
+		await expect(page.locator('[data-agent-loading]')).toHaveCount(0);
+	});
+
+	test('conversation follow-ups and concurrent agents have independent response timers', async ({ page }) => {
+		const conversation = {
+			id: conversationId,
+			project_id: projectId,
+			title: 'Timed collaboration',
+			icon: null,
+			created_at: timestamp(1),
+			updated_at: timestamp(20),
+			last_message_at: timestamp(20),
+			participants: [
+				{ participant_type: 'user', participant_id: 'local', joined_at: timestamp(1) },
+				{ participant_type: 'agent', participant_id: agentId, joined_at: timestamp(2) },
+				{ participant_type: 'agent', participant_id: 'project-secondary-test', joined_at: timestamp(2) },
+			],
+		};
+		await mockApi(page, {
+			multipleAgents: true,
+			conversations: [conversation],
+			conversationTurns: [
+				{
+					id: 'turn-current', conversation_id: conversationId, agent_id: agentId,
+					trigger_message_id: 20, status: 'running', result_message_id: null,
+					error_message: null, context_used: null, context_size: null,
+					queued_at: recentSqliteTimestamp(90_000), started_at: recentSqliteTimestamp(60_000),
+					completed_at: null, response_queued_at: recentSqliteTimestamp(8_000),
+					response_started_at: recentSqliteTimestamp(7_000),
+				},
+				{
+					id: 'turn-secondary', conversation_id: conversationId, agent_id: 'project-secondary-test',
+					trigger_message_id: 20, status: 'running', result_message_id: null,
+					error_message: null, context_used: null, context_size: null,
+					queued_at: recentSqliteTimestamp(90_000), started_at: recentSqliteTimestamp(50_000),
+					completed_at: null, response_queued_at: recentSqliteTimestamp(4_000),
+					response_started_at: recentSqliteTimestamp(2_000),
+				},
+			],
+		});
+		await page.goto(`/conversations/${conversationId}`);
+
+		const primary = page.locator('[data-agent-loading]', { hasText: 'Browser-tested workspace is responding' });
+		const secondary = page.locator('[data-agent-loading]', { hasText: 'Secondary browser workspace is responding' });
+		await expect.poll(async () => (await elapsedSeconds(primary)) - (await elapsedSeconds(secondary))).toBeGreaterThan(3);
+		await expect.poll(async () => (await elapsedSeconds(primary)) - (await elapsedSeconds(secondary))).toBeLessThan(8);
+		await expect(page.locator('[data-agent-loading]')).toHaveCount(2);
+	});
+
+	test('conversation queue and preparation durations are labelled without claiming active thinking', async ({ page }) => {
+		const conversation = {
+			id: conversationId, project_id: projectId, title: 'Queued collaboration', icon: null,
+			created_at: timestamp(1), updated_at: timestamp(20), last_message_at: timestamp(20),
+			participants: [
+				{ participant_type: 'user', participant_id: 'local', joined_at: timestamp(1) },
+				{ participant_type: 'agent', participant_id: agentId, joined_at: timestamp(2) },
+				{ participant_type: 'agent', participant_id: 'project-secondary-test', joined_at: timestamp(2) },
+			],
+		};
+		await mockApi(page, {
+			multipleAgents: true,
+			conversations: [conversation],
+			conversationTurns: [
+				{
+					id: 'turn-queued', conversation_id: conversationId, agent_id: agentId,
+					status: 'queued', error_message: null, context_used: null, context_size: null,
+					queued_at: recentSqliteTimestamp(80_000), started_at: null, completed_at: null,
+					response_queued_at: recentSqliteTimestamp(3_000), response_started_at: null,
+				},
+				{
+					id: 'turn-preparing', conversation_id: conversationId, agent_id: 'project-secondary-test',
+					status: 'running', error_message: null, context_used: null, context_size: null,
+					queued_at: recentSqliteTimestamp(80_000), started_at: recentSqliteTimestamp(5_000), completed_at: null,
+					response_queued_at: recentSqliteTimestamp(8_000), response_started_at: null,
+				},
+			],
+		});
+		await page.goto(`/conversations/${conversationId}`);
+
+		await expect(page.locator('[data-agent-loading]', { hasText: 'Browser-tested workspace is queued to respond' })).toHaveAttribute('data-agent-phase', 'queued');
+		await expect(page.locator('[data-agent-loading]', { hasText: 'Preparing Secondary browser workspace' })).toHaveAttribute('data-agent-phase', 'preparing');
+		await expect(page.getByText(/Secondary browser workspace is responding/)).toHaveCount(0);
+	});
+});
+
+test('conversation failures, active responses, and messages all have clear actions', async ({ page }) => {
+	const conversation = {
+		id: conversationId,
+		project_id: projectId,
+		title: 'Recoverable collaboration',
+		icon: null,
+		created_at: timestamp(1),
+		updated_at: timestamp(20),
+		last_message_at: timestamp(20),
+		participants: [
+			{ participant_type: 'user', participant_id: 'local', joined_at: timestamp(1) },
+			{ participant_type: 'agent', participant_id: agentId, joined_at: timestamp(2) },
+			{ participant_type: 'agent', participant_id: 'project-secondary-test', joined_at: timestamp(2) },
+		],
+	};
+	const deletedMessages: number[] = [];
+	const cancelledTurns: string[] = [];
+	await mockApi(page, {
+		multipleAgents: true,
+		conversations: [conversation],
+		conversationMessages: [{
+			id: 41,
+			conversation_id: conversationId,
+			sender_type: 'user', sender_id: 'local', sender_name: 'You',
+			content: 'This message can be removed', message_type: 'message',
+			linked_task_id: null, metadata: {}, attachments: [], created_at: timestamp(10),
+		}],
+		conversationTurns: [
+			{
+				id: 'turn-failed', conversation_id: conversationId, agent_id: agentId,
+				trigger_message_id: 41, status: 'failed', result_message_id: null,
+				error_message: 'The harness refused to answer', context_used: null, context_size: null,
+				queued_at: timestamp(18), started_at: timestamp(19), completed_at: timestamp(20),
+				response_queued_at: timestamp(18), response_started_at: timestamp(19),
+			},
+			{
+				id: 'turn-running', conversation_id: conversationId, agent_id: 'project-secondary-test',
+				trigger_message_id: 41, status: 'running', result_message_id: null,
+				error_message: null, context_used: null, context_size: null,
+				queued_at: timestamp(18), started_at: timestamp(19), completed_at: null,
+				response_queued_at: timestamp(18), response_started_at: timestamp(19),
+			},
+		],
+		conversationMessageDeleteRequests: deletedMessages,
+		conversationTurnCancelRequests: cancelledTurns,
+	});
+	await page.goto(`/conversations/${conversationId}`);
+
+	await expect(page.getByText('The harness refused to answer')).toBeVisible();
+	await page.getByRole('button', { name: 'Dismiss' }).click();
+	await expect.poll(() => cancelledTurns).toEqual(['turn-failed']);
+	await expect(page.getByText('The harness refused to answer')).toHaveCount(0);
+
+	page.once('dialog', (dialog) => dialog.accept());
+	await page.getByRole('button', { name: 'Cancel' }).click();
+	await expect.poll(() => cancelledTurns).toEqual(['turn-failed', 'turn-running']);
+
+	page.once('dialog', (dialog) => dialog.accept());
+	await page.locator('[data-message-role="user"]', { hasText: 'This message can be removed' })
+		.getByRole('button', { name: 'Delete message' }).click();
+	await expect.poll(() => deletedMessages).toEqual([41]);
+	await expect(page.getByText('This message can be removed')).toHaveCount(0);
+});
+
+test('conversation refresh removes a deleted message from older loaded history', async ({ page }) => {
+	const conversation = {
+		id: conversationId,
+		project_id: projectId,
+		title: 'Recover missed deletions',
+		icon: null,
+		created_at: timestamp(1),
+		updated_at: timestamp(100),
+		last_message_at: timestamp(100),
+		participants: [
+			{ participant_type: 'user', participant_id: 'local', joined_at: timestamp(1) },
+			{ participant_type: 'agent', participant_id: agentId, joined_at: timestamp(2) },
+		],
+	};
+	const conversationMessages = Array.from({ length: 121 }, (_, index) => {
+		const id = index + 1;
+		return {
+			id,
+			conversation_id: conversationId,
+			sender_type: 'user', sender_id: 'local', sender_name: 'You',
+			content: id === 20 ? 'Deleted while disconnected' : `Retained message ${id}`,
+			message_type: 'message', linked_task_id: null, metadata: {}, attachments: [],
+			created_at: timestamp(id),
+		};
+	});
+	await mockApi(page, {
+		conversations: [conversation],
+		conversationMessages,
+		deleteConversationMessageAfterHistoryLoad: 20,
+	});
+	await page.goto(`/conversations/${conversationId}`);
+
+	await page.getByRole('button', { name: 'Load earlier messages' }).click();
+
+	await expect(page.getByText('Retained message 1', { exact: true })).toBeVisible();
+	await expect(page.getByText('Retained message 81', { exact: true })).toBeVisible();
+	await expect(page.getByText('Deleted while disconnected')).toBeVisible();
+	await expect(page.getByText('Deleted while disconnected')).toHaveCount(0, { timeout: 5_000 });
 });
 
 test('context usage is stateful and tool completion details stay on one row', async ({ page }) => {
@@ -464,6 +2236,8 @@ test('context usage is stateful and tool completion details stay on one row', as
 	await expect(diff).toContainText('src/example.ts');
 	await expect(diff).toContainText('const state = "before";');
 	await expect(diff).toContainText('const state = "after";');
+	await expect(diff.locator('[data-diff-before-content]')).toHaveCSS('color', 'rgb(153, 27, 27)');
+	await expect(diff.locator('[data-diff-after-content]')).toHaveCSS('color', 'rgb(6, 95, 70)');
 	await expect(page.getByText('Applied patch.', { exact: true })).toBeVisible();
 });
 
@@ -490,30 +2264,21 @@ test('new activity follows only while the transcript is at the bottom', async ({
 	await expect.poll(() => scroller.evaluate((element) => element.scrollHeight - element.scrollTop - element.clientHeight)).toBeLessThanOrEqual(24);
 });
 
-test('task messages accept selected and pasted images', async ({ page }) => {
+test('task messages accept selected files and pasted images', async ({ page }) => {
 	const postedMessages: Record<string, unknown>[] = [];
-	await page.addInitScript(() => {
-		Object.defineProperty(window, 'isTauri', { value: true });
-		(window as unknown as { __TAURI_INTERNALS__: { invoke: (command: string) => Promise<unknown> } }).__TAURI_INTERNALS__ = {
-			invoke: async (command: string) => {
-				if (command === 'plugin:clipboard-manager|read_image') return 42;
-				if (command === 'plugin:image|rgba') return [255, 0, 0, 255];
-				if (command === 'plugin:image|size') return { width: 1, height: 1 };
-				if (command === 'plugin:resources|close') return null;
-				throw new Error(`Unexpected Tauri command: ${command}`);
-			},
-		};
-	});
+	await installTauriClipboardImage(page);
 	await mockApi(page, { postedMessages });
 	await page.goto(`/tasks/${taskId}`);
 
-	const fileInput = page.locator('input[type="file"][accept*="image/png"]');
+	const fileInput = page.locator('input[type="file"]');
 	await fileInput.setInputFiles({
 		name: 'selected.png',
 		mimeType: 'image/png',
 		buffer: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
 	});
 	await expect(page.getByAltText('selected.png')).toBeVisible();
+	await fileInput.setInputFiles({ name: 'reference.pdf', mimeType: 'application/pdf', buffer: Buffer.from('%PDF-1.7\nfixture') });
+	await expect(page.getByRole('link', { name: 'Download reference.pdf' })).toBeVisible();
 
 	const composer = page.locator(`#task-message-input-${taskId}`);
 	await composer.evaluate((element) => {
@@ -555,8 +2320,1324 @@ test('task messages accept selected and pasted images', async ({ page }) => {
 	await expect.poll(() => postedMessages.length).toBe(1);
 	const attachments = postedMessages[0].attachments as { name: string; mime_type: string; data: string }[];
 	expect(postedMessages[0].content).toBe('');
-	expect(attachments.map((attachment) => attachment.name)).toEqual(['selected.png', 'pasted.png', 'pasted-image.png']);
-	expect(attachments.every((attachment) => attachment.mime_type === 'image/png' && attachment.data.length > 0)).toBe(true);
+	expect(attachments.map((attachment) => attachment.name)).toEqual(['selected.png', 'reference.pdf', 'pasted.png', 'pasted-image.png']);
+	expect(attachments[1].mime_type).toBe('application/pdf');
+	expect(attachments.every((attachment) => attachment.data.length > 0)).toBe(true);
+	expect(await page.evaluate(() => (
+		window as unknown as { __clipboardCommands: string[] }
+	).__clipboardCommands)).toContain('plugin:resources|close');
+});
+
+test('inline and fenced code stay readable in user and agent chat bubbles in both themes', async ({ page }) => {
+	const codeConversation = {
+		id: conversationId,
+		project_id: projectId,
+		title: 'Code contrast review',
+		icon: null,
+		created_at: timestamp(1),
+		updated_at: timestamp(20),
+		last_message_at: timestamp(20),
+		participants: [
+			{ participant_type: 'user', participant_id: 'local', joined_at: timestamp(1) },
+			{ participant_type: 'agent', participant_id: agentId, joined_at: timestamp(2) },
+		],
+	};
+	const conversationMessages = [
+		{
+			id: 1,
+			conversation_id: conversationId,
+			sender_type: 'user', sender_id: 'local', sender_name: 'You',
+			content: 'Conversation user `conversation-inline-user`.\n\n```ts\nconst conversationUserBlock = true;\n```',
+			message_type: 'message', linked_task_id: null, metadata: {}, attachments: [], created_at: timestamp(10),
+		},
+		{
+			id: 2,
+			conversation_id: conversationId,
+			sender_type: 'agent', sender_id: agentId, sender_name: 'Browser-tested workspace',
+			content: 'Conversation agent `conversation-inline-agent`.\n\n```ts\nconst conversationAgentBlock = true;\n```',
+			message_type: 'message', linked_task_id: null, metadata: {}, attachments: [], created_at: timestamp(20),
+		},
+	];
+	const taskMessages = [
+		{
+			id: 1, task_id: taskId, role: 'user', attachments: [], timestamp: timestamp(25),
+			content: 'Task user `task-inline-user`.\n\n```ts\nconst taskUserBlock = true;\n```',
+		},
+		{
+			id: 2, task_id: taskId, role: 'assistant', attachments: [], timestamp: timestamp(30),
+			content: 'Task agent `task-inline-agent`.\n\n```ts\nconst taskAgentBlock = true;\n```',
+		},
+	];
+	await mockApi(page, {
+		conversations: [codeConversation],
+		conversationMessages,
+		taskMessages,
+	});
+
+	await page.goto(`/conversations/${conversationId}`);
+	for (const dark of [false, true]) {
+		await page.evaluate((useDark) => {
+			document.documentElement.classList.toggle('dark', useDark);
+			document.documentElement.dataset.theme = useDark ? 'dark' : 'light';
+		}, dark);
+		await expectReadableCode(page.locator('[data-message-role="user"]', { hasText: 'conversation-inline-user' }));
+		await expectReadableCode(page.locator('[data-message-role="assistant"]', { hasText: 'conversation-inline-agent' }));
+	}
+
+	await page.goto(`/tasks/${taskId}`);
+	for (const dark of [false, true]) {
+		await page.evaluate((useDark) => {
+			document.documentElement.classList.toggle('dark', useDark);
+			document.documentElement.dataset.theme = useDark ? 'dark' : 'light';
+		}, dark);
+		await expectReadableCode(page.locator('[data-message-role="user"]', { hasText: 'task-inline-user' }));
+		await expectReadableCode(page.locator('[data-message-role="assistant"]', { hasText: 'task-inline-agent' }));
+	}
+});
+
+test('project conversations accept picker, browser, and native clipboard attachments', async ({ page }) => {
+	const conversationMessageRequests: Record<string, unknown>[] = [];
+	const attachmentConversation = {
+		id: conversationId,
+		project_id: projectId,
+		title: 'Image handoff',
+		icon: null,
+		created_at: timestamp(1),
+		updated_at: timestamp(20),
+		last_message_at: timestamp(20),
+		participants: [
+			{ participant_type: 'user', participant_id: 'local', joined_at: timestamp(1) },
+			{ participant_type: 'agent', participant_id: agentId, joined_at: timestamp(2) },
+		],
+	};
+	const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Z2QAAAABJRU5ErkJggg==', 'base64');
+	await installTauriClipboardImage(page);
+	await mockApi(page, {
+		conversations: [attachmentConversation],
+		conversationMessageRequests,
+	});
+	await page.route(new RegExp(`/api/conversations/${conversationId}/attachments/sent-attachment-(1|2)$`), async (route) => {
+		await route.fulfill({ status: 200, contentType: 'image/png', body: png });
+	});
+	await page.goto(`/conversations/${conversationId}`);
+
+	const fileInput = page.locator('[data-conversation-attachment-input]');
+	await fileInput.setInputFiles([
+		{ name: 'selected.png', mimeType: 'image/png', buffer: png },
+		{ name: 'notes.txt', mimeType: 'text/plain', buffer: Buffer.from('supporting notes') },
+	]);
+	const composer = page.getByPlaceholder('Message #Image handoff…');
+	const composerShell = page.locator('[data-conversation-composer]');
+	await expect(composerShell.getByAltText('selected.png')).toBeVisible();
+	await expect(composerShell.getByAltText('selected.png')).toHaveAttribute('src', /^data:image\/png;base64,/);
+	await expect(composerShell.getByText('notes.txt', { exact: true })).toBeVisible();
+
+	await composer.evaluate((element) => {
+		const transfer = new DataTransfer();
+		transfer.items.add(new File(
+			[new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])],
+			'pasted.png',
+			{ type: 'image/png' },
+		));
+		Object.defineProperty(transfer, 'files', { value: [] });
+		element.dispatchEvent(new ClipboardEvent('paste', {
+			clipboardData: transfer,
+			bubbles: true,
+			cancelable: true,
+		}));
+	});
+	await expect(composerShell.getByAltText('pasted.png')).toBeVisible();
+
+	await composer.evaluate((element) => {
+		element.dispatchEvent(new ClipboardEvent('paste', {
+			clipboardData: new DataTransfer(),
+			bubbles: true,
+			cancelable: true,
+		}));
+	});
+	await expect(composerShell.getByAltText('pasted-image.png')).toBeVisible();
+
+	const textPasteAllowed = await composer.evaluate((element) => {
+		const transfer = new DataTransfer();
+		transfer.setData('text/plain', 'ordinary text');
+		return element.dispatchEvent(new ClipboardEvent('paste', {
+			clipboardData: transfer,
+			bubbles: true,
+			cancelable: true,
+		}));
+	});
+	expect(textPasteAllowed).toBe(true);
+
+	await composer.fill('Keep this draft');
+	await composer.evaluate((element) => {
+		const transfer = new DataTransfer();
+		transfer.setData('text/plain', 'clipboard caption');
+		transfer.items.add(new File([new Uint8Array([1, 2, 3, 4])], 'mixed.png', { type: 'image/png' }));
+		Object.defineProperty(transfer, 'files', { value: [] });
+		element.dispatchEvent(new ClipboardEvent('paste', {
+			clipboardData: transfer,
+			bubbles: true,
+			cancelable: true,
+		}));
+	});
+	await expect(composer).toHaveValue('Keep this draft');
+	await expect(composerShell.getByAltText('mixed.png')).toBeVisible();
+
+	await fileInput.setInputFiles(Array.from({ length: 6 }, (_, index) => ({
+		name: `overflow-${index + 1}.txt`,
+		mimeType: 'text/plain',
+		buffer: Buffer.from('x'),
+	})));
+	await expect(composerShell.getByRole('alert')).toHaveText('A message can include up to 10 files.');
+	await expect(composerShell.getByAltText('selected.png')).toBeVisible();
+
+	await composerShell.getByRole('button', { name: 'Remove selected.png' }).click();
+	await composerShell.getByRole('button', { name: 'Remove mixed.png' }).click();
+	await expect(composerShell.getByRole('alert')).toHaveCount(0);
+	await expect(composerShell.getByAltText('selected.png')).toHaveCount(0);
+	await page.evaluate(() => {
+		const target = window as unknown as {
+			__clipboardCommands: string[];
+			__TAURI_INTERNALS__: { invoke: (command: string) => Promise<unknown> };
+		};
+		target.__TAURI_INTERNALS__.invoke = async (command: string) => {
+			target.__clipboardCommands.push(command);
+			if (command === 'plugin:clipboard-manager|read_image') throw new Error('Clipboard unavailable');
+			throw new Error(`Unexpected Tauri command: ${command}`);
+		};
+	});
+	await composer.evaluate((element) => {
+		element.dispatchEvent(new ClipboardEvent('paste', {
+			clipboardData: new DataTransfer(),
+			bubbles: true,
+			cancelable: true,
+		}));
+	});
+	await expect(composerShell.getByRole('alert')).toHaveText('Could not read an image from the system clipboard.');
+	await composer.fill('');
+	await page.getByRole('button', { name: 'Send', exact: true }).click();
+
+	await expect.poll(() => conversationMessageRequests.length).toBe(1);
+	const request = conversationMessageRequests[0];
+	const attachments = request.attachments as { name: string; mime_type: string; data: string }[];
+	expect(request.content).toBe('');
+	expect(attachments.map((attachment) => attachment.name)).toEqual(['notes.txt', 'pasted.png', 'pasted-image.png']);
+	expect(attachments.every((attachment) => attachment.data.length > 0)).toBe(true);
+	await expect(composerShell.locator('[data-image-attachments]')).toHaveCount(0);
+	await expect(composerShell.getByText('notes.txt', { exact: true })).toHaveCount(0);
+	await expect(composerShell.getByRole('alert')).toHaveCount(0);
+
+	const sentPastedImage = page.getByAltText('pasted.png');
+	const sentNativeImage = page.getByAltText('pasted-image.png');
+	await expect(sentPastedImage).toBeVisible();
+	await expect(sentNativeImage).toBeVisible();
+	await expect.poll(() => sentPastedImage.evaluate((image: HTMLImageElement) => image.naturalWidth)).toBeGreaterThan(0);
+	await expect.poll(() => sentNativeImage.evaluate((image: HTMLImageElement) => image.naturalWidth)).toBeGreaterThan(0);
+	expect(await page.evaluate(() => (
+		window as unknown as { __clipboardCommands: string[] }
+	).__clipboardCommands)).toContain('plugin:resources|close');
+});
+
+test('project conversations coordinate files and project-wide linked work', async ({ page }) => {
+	const conversationMessageRequests: Record<string, unknown>[] = [];
+	const conversationTaskRequests: Record<string, unknown>[] = [];
+	const collaborationConversation = {
+		id: conversationId,
+		project_id: projectId,
+		title: 'Release planning',
+		icon: null,
+		created_at: timestamp(1),
+		updated_at: timestamp(20),
+		last_message_at: timestamp(20),
+		participants: [
+			{ participant_type: 'user', participant_id: 'local', joined_at: timestamp(1) },
+			{ participant_type: 'agent', participant_id: agentId, joined_at: timestamp(2) },
+		],
+	};
+	await mockApi(page, {
+		multipleAgents: true,
+		conversations: [collaborationConversation],
+		conversationMessages: [{
+			id: 1,
+			conversation_id: conversationId,
+			sender_type: 'agent',
+			sender_id: agentId,
+			sender_name: 'Browser-tested workspace',
+			content: 'I finished the research while the implementation task kept running.',
+			message_type: 'message',
+			linked_task_id: null,
+			metadata: { source_task_id: taskId },
+			attachments: [{
+				id: 'published-findings',
+				message_id: 1,
+				name: 'findings.md',
+				mime_type: 'text/markdown',
+				size: 128,
+				source_task_id: taskId,
+				created_at: timestamp(20),
+			}],
+			created_at: timestamp(20),
+		}],
+		conversationMessageRequests,
+		conversationTaskRequests,
+	});
+	await page.goto(`/conversations/${conversationId}`);
+
+	await expect(page.getByRole('heading', { name: 'Release planning' })).toBeVisible();
+	await expect(page.getByRole('button', { name: '1 Agent' })).toBeVisible();
+	await expect(page.getByText('I finished the research while the implementation task kept running.')).toBeVisible();
+	const sidebar = page.locator('aside').first();
+	await expect(sidebar.locator(`a[href="/projects/${projectId}"]`).filter({ hasText: 'Browser collaboration project' })).toBeVisible();
+	await expect(sidebar.locator(`a[href="/conversations/${conversationId}"]`)).toBeVisible();
+
+	await page.getByRole('button', { name: /Files 1/ }).click();
+	await expect(page.getByRole('link', { name: /findings\.md/ })).toHaveAttribute(
+		'href',
+		`/api/conversations/${conversationId}/attachments/published-findings`,
+	);
+	await page.getByRole('button', { name: 'Conversation' }).click();
+
+	const composer = page.getByPlaceholder('Message #Release planning…');
+	await composer.fill('Keep this conversation draft');
+	const assistantMessage = page.locator('[data-message-role="assistant"]').first();
+	await assistantMessage.locator('.prose-chat').evaluate((element) => {
+		const selection = window.getSelection();
+		const range = document.createRange();
+		range.selectNodeContents(element);
+		selection?.removeAllRanges();
+		selection?.addRange(range);
+		element.dispatchEvent(new PointerEvent('pointerup', { bubbles: true }));
+	});
+	await assistantMessage.locator('[data-selection-actions]').getByRole('button', { name: 'Shorten' }).click();
+	await expect(composer).toHaveValue(/Keep this conversation draft\n\nShorten this passage:/);
+
+	await composer.fill('Please compare both approaches.');
+	await page.getByRole('button', { name: 'Send', exact: true }).click();
+	await expect.poll(() => conversationMessageRequests).toEqual([{
+		content: 'Please compare both approaches.',
+		attachments: [],
+	}]);
+
+	await page.getByRole('button', { name: 'Continue with task' }).click();
+	await page.getByLabel('Title', { exact: true }).fill('Implement the selected approach');
+	await page.getByLabel('Details', { exact: true }).fill('Use the decisions and files already published here.');
+	await expect(page.getByLabel('Agent', { exact: true }).locator('option')).toHaveCount(3);
+	await page.getByLabel('Agent', { exact: true }).selectOption('project-secondary-test');
+	await page.getByRole('button', { name: 'Create task' }).click();
+	await expect.poll(() => conversationTaskRequests).toEqual([{
+		title: 'Implement the selected approach',
+		description: 'Use the decisions and files already published here.',
+		agent_id: 'project-secondary-test',
+	}]);
+});
+
+for (const surface of ['conversation', 'task'] as const) {
+	test(`Markdown list links and inline formatting render safely in ${surface} messages`, async ({ page }, testInfo) => {
+		const execution = 'window.__rawHtmlExecuted = true';
+		const content = [
+			'- [PR #123](https://github.com/example/repo/pull/123)',
+			'- [**PR #124**](https://github.com/example/repo/pull/124)',
+			'  - [`Nested PR`](https://example.com/nested)',
+			'- Bare URL: https://example.com/bare?first=1&second=2',
+			'- **Bold item** with *emphasis*, ~~obsolete~~, and `inline_code`.',
+			'',
+			'1. [Ordered PR](https://github.com/example/repo/pull/125)',
+			'2. [`PR #126`](https://github.com/example/repo/pull/126)',
+			'   1. [Nested ordered PR](https://example.com/nested-ordered)',
+			'',
+			'[Another link](https://example.com/after)',
+			'',
+			'- Entities: &lt;tag&gt; &amp; &#65; and \\*literal stars\\*.',
+			'- `[literal link](https://example.com/inline-code)`',
+			`- <img src="missing-image" onerror="${execution}">`,
+			`- <a href="https://example.com/raw" onclick="${execution}">raw link</a>`,
+			'- [Unsafe script](javascript:alert(1))',
+			'- [Obfuscated script](java&#x73;cript:alert(1))',
+			'- [Unsafe data](data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==)',
+			'',
+			'```html',
+			'[fenced link](https://example.com/fenced-code)',
+			`<script>${execution}</script>`,
+			'```',
+		].join('\n');
+		await page.addInitScript(() => {
+			(window as typeof window & { __rawHtmlExecuted?: boolean }).__rawHtmlExecuted = false;
+		});
+		await mockApi(page, surface === 'conversation' ? {
+			conversations: [{
+				id: conversationId, project_id: projectId, title: 'Markdown list links', icon: null,
+				created_at: timestamp(1), updated_at: timestamp(20), last_message_at: timestamp(20),
+				participants: [
+					{ participant_type: 'user', participant_id: 'local', joined_at: timestamp(1) },
+					{ participant_type: 'agent', participant_id: agentId, joined_at: timestamp(2) },
+				],
+			}],
+			conversationMessages: ['user', 'agent'].map((sender_type, index) => ({
+				id: index + 1, conversation_id: conversationId, sender_type,
+				sender_id: sender_type === 'user' ? 'local' : agentId,
+				sender_name: sender_type === 'user' ? 'You' : 'Browser-tested workspace',
+				content, message_type: 'message', linked_task_id: null, metadata: {}, attachments: [],
+				created_at: timestamp(10 + index),
+			})),
+		} : {
+			taskDescription: content,
+			taskMessages: [{ id: 1, task_id: taskId, role: 'assistant', content, attachments: [], timestamp: timestamp(25) }],
+			// TaskView omits results that exactly duplicate an assistant message.
+			attemptResult: `Task result\n\n${content}`,
+		});
+		await page.goto(surface === 'conversation' ? `/conversations/${conversationId}` : `/tasks/${taskId}`);
+
+		const userContent = page.locator('[data-message-role="user"] .prose-chat');
+		const agentContent = page.locator('[data-message-role="assistant"] .prose-chat');
+		const renderedMessages = [
+			{ element: userContent, externalLinks: false },
+			{ element: agentContent, externalLinks: true },
+			...(surface === 'task' ? [{ element: page.locator('[data-task-result-content]'), externalLinks: true }] : []),
+		];
+		for (const { element, externalLinks } of renderedMessages) {
+			const links = [
+				['PR #123', 'https://github.com/example/repo/pull/123'],
+				['PR #124', 'https://github.com/example/repo/pull/124'],
+				['Nested PR', 'https://example.com/nested'],
+				['https://example.com/bare?first=1&second=2', 'https://example.com/bare?first=1&second=2'],
+				['Ordered PR', 'https://github.com/example/repo/pull/125'],
+				['PR #126', 'https://github.com/example/repo/pull/126'],
+				['Nested ordered PR', 'https://example.com/nested-ordered'],
+				['Another link', 'https://example.com/after'],
+			];
+			for (const [name, href] of links) {
+				const link = element.getByRole('link', { name, exact: true });
+				await expect(link).toHaveAttribute('href', href);
+				if (externalLinks) {
+					await expect(link).toHaveAttribute('target', '_blank');
+					await expect(link).toHaveAttribute('rel', 'noopener noreferrer');
+				} else {
+					await expect(link).not.toHaveAttribute('target');
+					await expect(link).not.toHaveAttribute('rel');
+				}
+			}
+			await expect(element.locator('a[href]')).toHaveCount(links.length);
+			await expect(element.locator('li > p')).toHaveCount(0);
+			await expect(element.locator('ul ul a code')).toHaveText('Nested PR');
+			await expect(element.locator('ol ol a')).toHaveText('Nested ordered PR');
+			await expect(element.locator('ul > li > a > strong')).toHaveText('PR #124');
+			await expect(element.locator('ol > li > a > code')).toHaveText('PR #126');
+			await expect(element.locator('li > strong')).toHaveText('Bold item');
+			await expect(element.locator('li > em')).toHaveText('emphasis');
+			await expect(element.locator('li > del')).toHaveText('obsolete');
+			await expect(element.locator('li > code')).toHaveText(['inline_code', '[literal link](https://example.com/inline-code)']);
+			await expect(element.locator('p > a')).toHaveText('Another link');
+			await expect(element).toContainText('Entities: &lt;tag&gt; &amp; &#65; and *literal stars*.');
+			await expect(element).toContainText(`<img src="missing-image" onerror="${execution}">`);
+			await expect(element).toContainText(`<a href="https://example.com/raw" onclick="${execution}">raw link</a>`);
+			await expect(element.locator('pre code')).toHaveText(`[fenced link](https://example.com/fenced-code)\n<script>${execution}</script>\n`);
+			await expect(element.locator('code a, script, img, [onclick], [onerror]')).toHaveCount(0);
+			for (const name of ['Unsafe script', 'Obfuscated script', 'Unsafe data']) {
+				const unsafeLink = element.locator('a', { hasText: name });
+				await expect(unsafeLink).toHaveCount(1);
+				await expect(unsafeLink).not.toHaveAttribute('href');
+				await expect(unsafeLink).not.toHaveAttribute('target');
+			}
+		}
+		await expect.poll(() => page.evaluate(() => (
+			window as typeof window & { __rawHtmlExecuted?: boolean }
+		).__rawHtmlExecuted)).toBe(false);
+
+		const prUrl = 'https://github.com/example/repo/pull/123';
+		await page.context().route(prUrl, (route) => route.fulfill({
+			contentType: 'text/html', body: '<!doctype html><title>Pull request</title>',
+		}));
+		const popupPromise = page.waitForEvent('popup');
+		await agentContent.getByRole('link', { name: 'PR #123', exact: true }).click();
+		const popup = await popupPromise;
+		await expect(popup).toHaveURL(prUrl);
+		expect(await popup.evaluate(() => window.opener)).toBeNull();
+		await popup.close();
+
+		await agentContent.locator('ul').first().scrollIntoViewIfNeeded();
+		await page.screenshot({ path: testInfo.outputPath(`markdown-lists-${surface}-desktop.png`) });
+		await page.setViewportSize({ width: 390, height: 844 });
+		await agentContent.locator('ul').first().scrollIntoViewIfNeeded();
+		await expect(agentContent.getByRole('link', { name: 'PR #123', exact: true })).toBeVisible();
+		await page.screenshot({ path: testInfo.outputPath(`markdown-lists-${surface}-phone.png`) });
+	});
+}
+
+test('raw HTML in user and agent conversation messages stays visible and inert', async ({ page }) => {
+	const userRawHtml = '<script>alert("wee");</script>';
+	const userReservedTags = '<think>literal user thinking</think> <tool_call name="demo">{"ok":true}</tool_call>';
+	const execution = 'window.__rawHtmlExecuted = true';
+	const agentRawHtml = [
+		'**Markdown stays bold.**',
+		'',
+		`<img src="missing-image" onerror="${execution}">`,
+		'',
+		`<svg onload="${execution}"><circle></circle></svg>`,
+		'',
+		`<iframe srcdoc="<script>${execution}</script>"></iframe>`,
+		'',
+		'<style>body { display: none; }</style>',
+		'',
+		'<custom-card data-kind="demo">custom content</custom-card>',
+		'',
+		'Mixed Markdown with <mark>benign HTML</mark> and <span data-raw-html="true">inline HTML</span>.',
+		'',
+		'<div data-raw-html="block">raw block</div>',
+		'**Adjacent Markdown stays bold.** and [adjacent link](https://example.com/adjacent)',
+		'',
+		'<broken attr="value"',
+		'',
+		`&lt;img src=x onerror="${execution}"&gt;`,
+		'',
+		'[Markdown link](https://example.com/safe)',
+	].join('\n');
+	const rawHtmlConversation = {
+		id: conversationId,
+		project_id: projectId,
+		title: 'Raw HTML safety',
+		icon: null,
+		created_at: timestamp(1),
+		updated_at: timestamp(20),
+		last_message_at: timestamp(20),
+		participants: [
+			{ participant_type: 'user', participant_id: 'local', joined_at: timestamp(1) },
+			{ participant_type: 'agent', participant_id: agentId, joined_at: timestamp(2) },
+		],
+	};
+	await page.addInitScript(() => {
+		(window as typeof window & { __rawHtmlExecuted?: boolean }).__rawHtmlExecuted = false;
+	});
+	await mockApi(page, {
+		conversations: [rawHtmlConversation],
+		conversationMessages: [
+			{
+				id: 1,
+				conversation_id: conversationId,
+				sender_type: 'user',
+				sender_id: 'local',
+				sender_name: 'You',
+				content: userRawHtml,
+				message_type: 'message',
+				linked_task_id: null,
+				metadata: {},
+				attachments: [],
+				created_at: timestamp(10),
+			},
+			{
+				id: 2,
+				conversation_id: conversationId,
+				sender_type: 'user',
+				sender_id: 'local',
+				sender_name: 'You',
+				content: userReservedTags,
+				message_type: 'message',
+				linked_task_id: null,
+				metadata: {},
+				attachments: [],
+				created_at: timestamp(15),
+			},
+			{
+				id: 3,
+				conversation_id: conversationId,
+				sender_type: 'agent',
+				sender_id: agentId,
+				sender_name: 'Browser-tested workspace',
+				content: agentRawHtml,
+				message_type: 'message',
+				linked_task_id: null,
+				metadata: {},
+				attachments: [],
+				created_at: timestamp(20),
+			},
+		],
+	});
+	await page.goto(`/conversations/${conversationId}`);
+
+	let userContent = page.locator('[data-message-role="user"] .prose-chat').first();
+	let userReservedContent = page.locator('[data-message-role="user"] .prose-chat').nth(1);
+	let agentContent = page.locator('[data-message-role="assistant"] .prose-chat');
+	await expect(userContent).toHaveText(userRawHtml);
+	expect(await userContent.textContent()).toBe(userRawHtml);
+	await expect(userReservedContent).toContainText('<think>literal user thinking</think>');
+	await expect(userReservedContent).toContainText('<tool_call name="demo">{"ok":true}</tool_call>');
+	await expect(userReservedContent.locator('details, tool_call, think')).toHaveCount(0);
+	await expect(agentContent.getByText('Markdown stays bold.', { exact: true })).toHaveCount(1);
+	await expect(agentContent.locator('strong', { hasText: /^Markdown stays bold\.$/ })).toHaveCount(1);
+	await expect(agentContent).toContainText('<img src="missing-image" onerror="window.__rawHtmlExecuted = true">');
+	await expect(agentContent).toContainText('<svg onload="window.__rawHtmlExecuted = true"><circle></circle></svg>');
+	await expect(agentContent).toContainText('<iframe srcdoc="<script>window.__rawHtmlExecuted = true</script>"></iframe>');
+	await expect(agentContent).toContainText('<style>body { display: none; }</style>');
+	await expect(agentContent).toContainText('<custom-card data-kind="demo">custom content</custom-card>');
+	await expect(agentContent).toContainText('<mark>benign HTML</mark>');
+	await expect(agentContent).toContainText('<span data-raw-html="true">inline HTML</span>');
+	await expect(agentContent).toContainText('<div data-raw-html="block">raw block</div>');
+	await expect(agentContent.locator('strong', { hasText: /^Adjacent Markdown stays bold\.$/ })).toHaveCount(1);
+	await expect(agentContent.getByRole('link', { name: 'adjacent link' })).toHaveAttribute('href', 'https://example.com/adjacent');
+	await expect(agentContent).toContainText('<broken attr="value"');
+	await expect(agentContent).toContainText('&lt;img src=x onerror="window.__rawHtmlExecuted = true"&gt;');
+	await expect(agentContent.locator('script, img, svg, iframe, style, custom-card, mark, div[data-raw-html], span[data-raw-html]')).toHaveCount(0);
+	await expect(agentContent.getByRole('link', { name: 'Markdown link' })).toHaveAttribute('href', 'https://example.com/safe');
+	await expect.poll(() => page.evaluate(() => (
+		window as typeof window & { __rawHtmlExecuted?: boolean }
+	).__rawHtmlExecuted)).toBe(false);
+
+	await page.reload();
+	userContent = page.locator('[data-message-role="user"] .prose-chat').first();
+	userReservedContent = page.locator('[data-message-role="user"] .prose-chat').nth(1);
+	agentContent = page.locator('[data-message-role="assistant"] .prose-chat');
+	await expect(userContent).toHaveText(userRawHtml);
+	expect(await userContent.textContent()).toBe(userRawHtml);
+	await expect(userContent).not.toContainText('&lt;script&gt;');
+	await expect(userReservedContent).toContainText(userReservedTags);
+	await expect(agentContent).toContainText('<custom-card data-kind="demo">custom content</custom-card>');
+
+	await page.setViewportSize({ width: 390, height: 844 });
+	await expect(userContent).toHaveText(userRawHtml);
+	await expect(agentContent.locator('script, img, svg, iframe, style, custom-card, mark, div[data-raw-html], span[data-raw-html]')).toHaveCount(0);
+});
+
+test('raw HTML stays literal across task messages, activity, results, and previews', async ({ page }) => {
+	const execution = 'window.__rawHtmlExecuted = true';
+	const taskPrompt = '<custom-prompt data-value="1">task prompt</custom-prompt>';
+	const taskReply = `**Task Markdown** with <img src=x onerror="${execution}">`;
+	const streamingUpdate = `<svg onload="${execution}">streaming update</svg>`;
+	const thought = `**Thought Markdown** with <iframe src="javascript:${execution}">thought</iframe>`;
+	const result = `**Result Markdown** with <custom-result>result body</custom-result>`;
+	await page.addInitScript(() => {
+		(window as typeof window & { __rawHtmlExecuted?: boolean }).__rawHtmlExecuted = false;
+	});
+	await mockApi(page, {
+		taskDescription: taskPrompt,
+		taskMessages: [{
+			id: 1,
+			task_id: taskId,
+			role: 'assistant',
+			content: taskReply,
+			attachments: [],
+			timestamp: timestamp(25),
+		}],
+		taskActivityEvents: [
+			timelineEvent(90, 30, 'runner_progress', streamingUpdate, { item_type: 'agent_message', message_id: 'raw-update' }),
+			timelineEvent(91, 35, 'agent_thought', thought, {}),
+		],
+		attemptResult: result,
+	});
+	await page.goto(`/tasks/${taskId}`);
+
+	const transcript = page.locator('[data-task-transcript]');
+	const promptContent = transcript.locator('[data-message-role="user"] .prose-chat');
+	const replyContent = transcript.locator('[data-message-role="assistant"] .prose-chat');
+	await expect(promptContent).toHaveText(taskPrompt);
+	await expect(promptContent.locator('custom-prompt')).toHaveCount(0);
+	await expect(replyContent.locator('strong')).toHaveText('Task Markdown');
+	await expect(replyContent).toContainText(`<img src=x onerror="${execution}">`);
+	await expect(replyContent.locator('img')).toHaveCount(0);
+
+	const updateContent = transcript.locator('[data-agent-update-content]');
+	await expect(updateContent).toContainText(streamingUpdate);
+	await expect(updateContent.locator('svg')).toHaveCount(0);
+
+	const thoughtActivity = transcript.locator('[data-transcript-kind="activity"]', { hasText: 'Thought Markdown' });
+	await thoughtActivity.getByRole('button').click();
+	const thoughtContent = thoughtActivity.locator('[data-activity-rich-content]');
+	await expect(thoughtContent.locator('strong')).toHaveText('Thought Markdown');
+	await expect(thoughtContent).toContainText(`<iframe src="javascript:${execution}">thought</iframe>`);
+	await expect(thoughtContent.locator('iframe')).toHaveCount(0);
+
+	const resultContent = page.locator('[data-task-result-content]');
+	await expect(resultContent.locator('strong')).toHaveText('Result Markdown');
+	await expect(resultContent).toContainText('<custom-result>result body</custom-result>');
+	await expect(resultContent.locator('custom-result')).toHaveCount(0);
+	await expect.poll(() => page.evaluate(() => (
+		window as typeof window & { __rawHtmlExecuted?: boolean }
+	).__rawHtmlExecuted)).toBe(false);
+
+	await page.goto('/tasks');
+	await page.getByRole('button', { name: 'Done 1' }).click();
+	const preview = page.locator('[data-task-row]', { has: page.locator(`a[href="/tasks/${taskId}"]`) });
+	await expect(preview).toContainText(taskPrompt);
+	await expect(preview.locator('custom-prompt')).toHaveCount(0);
+});
+
+test('task presentation attachments render as durable download cards', async ({ page }) => {
+	await mockApi(page, {
+		taskMessages: [{
+			id: 7,
+			task_id: taskId,
+			role: 'assistant',
+			content: 'The rendered and validated deck is attached.',
+			attachments: [{
+				id: 'presentation-browser-test',
+				name: 'Review deck.pptx',
+				mime_type: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+				size: 2_621_440,
+			}],
+			timestamp: timestamp(25),
+		}],
+	});
+	await page.goto(`/tasks/${taskId}`);
+
+	const message = page.locator('[data-message-role="assistant"]');
+	await expect(message).toContainText('The rendered and validated deck is attached.');
+	const attachment = message.getByRole('link', { name: 'Download Review deck.pptx' });
+	await expect(attachment).toHaveAttribute(
+		'href',
+		`/api/tasks/${taskId}/messages/7/attachments/presentation-browser-test`,
+	);
+	await expect(attachment).toContainText('PowerPoint presentation · 2.5 MB');
+	await expect(message.locator('[data-message-attachments] img')).toHaveCount(0);
+});
+
+test('task assistant visualizations render in order, stay isolated, and confirm follow-ups', async ({ page }) => {
+	const postedMessages: Record<string, unknown>[] = [];
+	const visualizationRequests: { path: string; token: string | undefined }[] = [];
+	const firstReference = 'visualize{"path":"/workspace/dependencies.html","title":"Task dependency map"}';
+	const wideReference = 'visualize{"path":"/workspace/timeline.html","mode":"wide"}';
+	const missingReference = 'visualize{"path":"/workspace/large.html"}';
+	const userReference = 'visualize{"path":"/workspace/user.html"}';
+	const firstPath = `/api/tasks/${taskId}/messages/2/visualizations/viz-task-one`;
+	const widePath = `/api/tasks/${taskId}/messages/2/visualizations/viz-task-wide`;
+	await mockApi(page, {
+		postedMessages,
+		visualizationRequests,
+		visualizationDocuments: {
+			[firstPath]: visualizationDocument('viz-task-one', 'Task visualization loaded', { prompt: 'Inspect dependency node A', title: 'Inspect dependency' }),
+			[widePath]: visualizationDocument('viz-task-wide', 'Wide timeline loaded'),
+		},
+		taskMessages: [
+			{ id: 1, task_id: taskId, role: 'user', content: userReference, attachments: [], visualizations: [], timestamp: timestamp(20) },
+			{
+				id: 2,
+				task_id: taskId,
+				role: 'assistant',
+				content: [
+					'**Dependency analysis**',
+					firstReference,
+					'Markdown between views.',
+					wideReference,
+					missingReference,
+					'\\visualize{"path":"/workspace/escaped.html"}',
+					'visualize{"path":"/workspace/bad.html","mode":"fullscreen"}',
+				].join('\n\n'),
+				attachments: [],
+				visualizations: [
+					{ id: 'viz-task-one', reference_index: 0, title: 'Task dependency map', mode: 'normal', status: 'ready', error_code: null, size: 120, retrieval_token: 'token-one' },
+					{ id: 'viz-task-wide', reference_index: 1, title: 'Timeline', mode: 'wide', status: 'ready', error_code: null, size: 130, retrieval_token: 'token-wide' },
+					{ id: 'viz-task-missing', reference_index: 2, title: 'Large view', mode: 'normal', status: 'unavailable', error_code: 'oversize', size: null, retrieval_token: 'token-missing' },
+				],
+				timestamp: timestamp(25),
+			},
+		],
+	});
+	await page.goto(`/tasks/${taskId}`);
+
+	const assistant = page.locator('[data-message-role="assistant"]');
+	await expect(assistant.locator('strong', { hasText: 'Dependency analysis' })).toBeVisible();
+	await expect(assistant).toContainText('Markdown between views.');
+	await expect(page.locator('[data-inline-visualization]')).toHaveCount(3);
+	await expect(page.locator('[data-inline-visualization][data-visualization-mode="wide"]')).toHaveCount(1);
+	await expect(page.getByText('The generated visualization exceeded the 1 MiB limit.')).toBeVisible();
+	await expect(page.locator('[data-message-role="user"] .prose-chat').filter({ hasText: userReference })).toHaveText(userReference);
+	await expect(assistant).toContainText('visualize{"path":"/workspace/escaped.html"}');
+	await expect(assistant).toContainText('visualize{"path":"/workspace/bad.html","mode":"fullscreen"}');
+
+	const firstFrameElement = page.locator('iframe[title="Task dependency map"]');
+	await expect(firstFrameElement).toHaveAttribute('sandbox', 'allow-scripts');
+	await expect(firstFrameElement).toHaveAttribute('referrerpolicy', 'no-referrer');
+	const firstOuterFrame = page.frameLocator('iframe[title="Task dependency map"]');
+	const firstFrame = firstOuterFrame.frameLocator('iframe[data-artifact-frame]');
+	await expect(firstFrame.getByText('Task visualization loaded')).toBeVisible();
+	await expect(firstFrame.locator('html')).toHaveAttribute('data-parent-blocked', 'true');
+	await expect(firstFrame.locator('html')).toHaveAttribute('data-storage-blocked', 'true');
+	await expect(firstFrame.locator('html')).toHaveAttribute('data-cookie-blocked', 'true');
+	await expect(firstFrame.locator('html')).toHaveAttribute('data-popup-blocked', 'true');
+	await expect(firstFrame.locator('html')).toHaveAttribute('data-navigation-blocked', 'true');
+	await expect(firstFrame.locator('html')).toHaveAttribute('data-network-blocked', 'true');
+	await expect(firstFrame.locator('html')).toHaveAttribute('data-form-blocked', 'true');
+	await page.evaluate(() => document.documentElement.classList.add('dark'));
+	await expect(firstFrame.locator('html')).toHaveAttribute('data-theme', 'dark');
+	await page.evaluate(() => document.documentElement.classList.remove('dark'));
+	await expect(firstFrame.locator('html')).toHaveAttribute('data-theme', 'light');
+	await expect(page.frameLocator('iframe[title="Timeline"]').frameLocator('iframe[data-artifact-frame]').getByText('Wide timeline loaded')).toBeVisible();
+	await expect.poll(() => visualizationRequests).toEqual(expect.arrayContaining([
+		{ path: firstPath, token: 'token-one' },
+		{ path: widePath, token: 'token-wide' },
+	]));
+
+	await firstFrame.getByRole('button', { name: 'Follow up' }).click();
+	const dialog = page.getByRole('dialog', { name: 'Inspect dependency' });
+	await expect(dialog).toContainText('Inspect dependency node A');
+	expect(postedMessages).toEqual([]);
+	await dialog.getByRole('button', { name: 'Cancel' }).click();
+	expect(postedMessages).toEqual([]);
+	await firstFrame.getByRole('button', { name: 'Follow up' }).click();
+	await page.getByRole('dialog', { name: 'Inspect dependency' }).getByRole('button', { name: 'Send follow-up' }).click();
+	await expect.poll(() => postedMessages).toEqual([expect.objectContaining({
+		role: 'user',
+		content: 'Inspect dependency node A',
+		delivery: 'after_tool',
+	})]);
+
+	await firstFrame.locator('html').evaluate((_, artifactId) => {
+		parent.postMessage({ source: 'xpressclaw-visualization', type: 'resize', artifactId, height: 260 }, '*');
+	}, 'viz-task-one');
+	await expect(firstFrameElement).toHaveCSS('height', '260px');
+	await page.setViewportSize({ width: 390, height: 844 });
+	const firstCard = page.locator('[data-inline-visualization]').first();
+	await firstCard.getByRole('button', { name: 'Expand visualization' }).click();
+	await expect(firstCard).toHaveCSS('position', 'fixed');
+	await firstFrame.locator('html').evaluate((_, artifactId) => {
+		parent.postMessage({ source: 'xpressclaw-visualization', type: 'resize', artifactId, height: 700 }, '*');
+	}, 'viz-task-one');
+	await firstCard.getByRole('button', { name: 'Exit expanded visualization' }).click();
+	await expect(firstCard).not.toHaveCSS('position', 'fixed');
+	await expect(firstFrameElement).toHaveCSS('height', '260px');
+
+	const selfNavigationRequests: string[] = [];
+	page.on('request', (request) => {
+		if (request.url().startsWith('https://example.invalid/visualization-self-navigation')) selfNavigationRequests.push(request.url());
+	});
+	await firstFrame.locator('html').evaluate(() => {
+		window.location.assign('https://example.invalid/visualization-self-navigation?artifact-data=secret');
+	});
+	await expect(firstOuterFrame.getByRole('status')).toHaveText('Navigation was blocked.');
+	expect(selfNavigationRequests).toEqual([]);
+});
+
+test('conversation visualizations persist on reload and route confirmed follow-ups to the conversation', async ({ page }) => {
+	const conversationMessageRequests: Record<string, unknown>[] = [];
+	const visualizationRequests: { path: string; token: string | undefined }[] = [];
+	const reference = 'visualize{"path":"/workspace/conversation-map.html","title":"Conversation map"}';
+	const path = `/api/conversations/${conversationId}/messages/3/visualizations/viz-conversation`;
+	const conversation = {
+		id: conversationId,
+		project_id: projectId,
+		title: 'Visualization review',
+		icon: null,
+		created_at: timestamp(1),
+		updated_at: timestamp(20),
+		last_message_at: timestamp(20),
+		participants: [
+			{ participant_type: 'user', participant_id: 'local', joined_at: timestamp(1) },
+			{ participant_type: 'agent', participant_id: agentId, joined_at: timestamp(2) },
+		],
+	};
+	await mockApi(page, {
+		conversations: [conversation],
+		conversationMessageRequests,
+		visualizationRequests,
+		visualizationDocuments: {
+			[path]: visualizationDocument('viz-conversation', 'Conversation visualization loaded', { prompt: 'Compare the highlighted paths' }),
+		},
+		conversationMessages: [
+			{ id: 1, conversation_id: conversationId, sender_type: 'user', sender_id: 'local', sender_name: 'You', content: reference, message_type: 'message', linked_task_id: null, metadata: {}, attachments: [], visualizations: [], created_at: timestamp(10) },
+			{ id: 2, conversation_id: conversationId, sender_type: 'system', sender_id: 'system', sender_name: 'System', content: reference, message_type: 'message', linked_task_id: null, metadata: {}, attachments: [], visualizations: [], created_at: timestamp(15) },
+			{ id: 3, conversation_id: conversationId, sender_type: 'agent', sender_id: agentId, sender_name: 'Browser-tested workspace', content: `Here is the map.\n\n${reference}`, message_type: 'message', linked_task_id: null, metadata: {}, attachments: [], visualizations: [{ id: 'viz-conversation', reference_index: 0, title: 'Conversation map', mode: 'normal', status: 'ready', error_code: null, size: 120, retrieval_token: 'conversation-token' }], created_at: timestamp(20) },
+		],
+	});
+	await page.goto(`/conversations/${conversationId}`);
+
+	await expect(page.locator('[data-inline-visualization]')).toHaveCount(1);
+	await expect(page.locator('[data-message-role="user"] .prose-chat')).toHaveText(reference);
+	await expect(page.locator('[data-message-role="system"] .prose-chat')).toHaveText(reference);
+	const frame = page.frameLocator('iframe[title="Conversation map"]').frameLocator('iframe[data-artifact-frame]');
+	await expect(frame.getByText('Conversation visualization loaded')).toBeVisible();
+	await frame.getByRole('button', { name: 'Follow up' }).click();
+	const dialog = page.getByRole('dialog', { name: 'Send this follow-up?' });
+	await expect(dialog).toContainText('Compare the highlighted paths');
+	expect(conversationMessageRequests).toEqual([]);
+	await dialog.getByRole('button', { name: 'Send follow-up' }).click();
+	await expect.poll(() => conversationMessageRequests).toEqual([{ content: 'Compare the highlighted paths', attachments: [] }]);
+
+	await page.reload();
+	await expect(page.locator('[data-inline-visualization]')).toHaveCount(1);
+	await expect(page.frameLocator('iframe[title="Conversation map"]').frameLocator('iframe[data-artifact-frame]').getByText('Conversation visualization loaded')).toBeVisible();
+	await expect.poll(() => visualizationRequests.filter((request) => request.path === path).length).toBeGreaterThanOrEqual(2);
+});
+
+test('project pages expose a copyable canonical ID', async ({ page }) => {
+	await page.addInitScript(() => {
+		Object.defineProperty(navigator, 'clipboard', {
+			configurable: true,
+			value: {
+				writeText: async (value: string) => {
+					(window as unknown as { __copiedProjectId: string }).__copiedProjectId = value;
+				},
+			},
+		});
+	});
+	await mockApi(page);
+	await page.goto(`/projects/${projectId}`);
+
+	await expect(page.locator('[data-project-id]')).toHaveText(projectId);
+	await page.getByRole('button', { name: 'Copy project ID' }).click();
+	await expect(page.getByRole('button', { name: 'Copy project ID' })).toHaveText('Copied');
+	await expect.poll(() => page.evaluate(() => (
+		window as unknown as { __copiedProjectId?: string }
+	).__copiedProjectId)).toBe(projectId);
+});
+
+test('project settings rename and delete a project', async ({ page }) => {
+	const projectUpdateRequests: { projectId: string; data: Record<string, unknown> }[] = [];
+	const projectDeleteRequests: string[] = [];
+	const projectDeleteAcknowledgements: (string | null)[] = [];
+	await mockApi(page, {
+		projectUpdateRequests,
+		projectDeleteRequests,
+		projectDeleteAcknowledgements,
+		projectDeletionCounts: {
+			agents: 1,
+			tasks: 3,
+			task_messages: 7,
+			conversations: 2,
+			conversation_messages: 11,
+			memory_notes: 4,
+			workflows: 8,
+			workflow_runs: 5,
+			schedules: 2,
+		},
+	});
+	await page.goto(`/projects/${projectId}`);
+
+	await page.getByRole('button', { name: 'Project settings' }).click();
+	let dialog = page.getByRole('dialog');
+	await expect(dialog).toHaveAccessibleName('Project settings');
+	await dialog.getByLabel('Project name').fill('Renamed collaboration project');
+	await dialog.getByLabel('Description').fill('A clearer project description.');
+	await dialog.getByRole('button', { name: 'Save changes' }).click();
+
+	await expect.poll(() => projectUpdateRequests).toEqual([{
+		projectId,
+		data: {
+			name: 'Renamed collaboration project',
+			description: 'A clearer project description.',
+		},
+	}]);
+	await expect(page.getByRole('heading', { name: 'Renamed collaboration project' })).toBeVisible();
+	await expect(page.getByText('A clearer project description.')).toBeVisible();
+	await expect(page.locator('[data-workspace-pane] [data-workspace-tab-title="Renamed collaboration project"]')).toBeVisible();
+	await expect(page.locator('aside').first().getByText('Renamed collaboration project', { exact: true })).toBeVisible();
+
+	await page.getByRole('button', { name: 'Project settings' }).click();
+	dialog = page.getByRole('dialog');
+	await dialog.getByRole('button', { name: 'Delete project' }).click();
+	await expect(dialog.getByRole('heading', { name: 'Delete project?' })).toBeVisible();
+	await expect(dialog.getByText('This permanently deletes “Renamed collaboration project” and cannot be undone.')).toBeVisible();
+	await expect(dialog.getByText('7 task messages', { exact: false })).toBeVisible();
+	await expect(dialog.getByText('11 conversation messages', { exact: false })).toBeVisible();
+	await expect(dialog.getByText('local collaboration access', { exact: false })).toBeVisible();
+	await expect(dialog.getByText('8 Project workflow definitions, including paused and scheduled workflows')).toBeVisible();
+	await expect(dialog.getByText('including steps and waits', { exact: false })).toBeVisible();
+	await expect(dialog.getByText('source repositories, workspace folders, and reusable workflow definitions', { exact: false })).toBeVisible();
+	const permanentDelete = dialog.getByRole('button', { name: 'Permanently delete project' });
+	await expect(permanentDelete).toBeDisabled();
+	await dialog.getByLabel('Type Renamed collaboration project to confirm').fill('Renamed collaboration project');
+	await permanentDelete.click();
+
+	await expect.poll(() => projectDeleteRequests).toEqual([projectId]);
+	await expect.poll(() => projectDeleteAcknowledgements).toEqual(['confirmed']);
+	await expect(page).toHaveURL(/\/projects$/);
+	await expect(page.getByRole('heading', { name: 'Projects' })).toBeVisible();
+	await expect(page.getByRole('heading', { name: 'Create your first project' })).toBeVisible();
+	await expect(page.locator(`[data-workspace-tab][data-workspace-tab-title="Renamed collaboration project"]`)).toHaveCount(0);
+});
+
+test('project deletion refreshes the authoritative name and counts before confirmation', async ({ page }) => {
+	const projectGetRequests: string[] = [];
+	const sharedProjectState: SharedProjectState = {};
+	await mockApi(page, { projectGetRequests, sharedProjectState });
+	await page.goto(`/projects/${projectId}`);
+	await expect.poll(() => projectGetRequests).toHaveLength(1);
+
+	sharedProjectState.project = {
+		...sharedProjectState.project!,
+		name: 'Current Project name',
+		updated_at: timestamp(120),
+		deletion_counts: {
+			agents: 2,
+			tasks: 9,
+			task_messages: 13,
+			conversations: 4,
+			conversation_messages: 17,
+			memory_notes: 3,
+			workflows: 1,
+			workflow_runs: 5,
+			schedules: 6,
+		},
+	};
+
+	await page.getByRole('button', { name: 'Project settings' }).click();
+	const dialog = page.getByRole('dialog');
+	await dialog.getByRole('button', { name: 'Delete project' }).click();
+
+	await expect.poll(() => projectGetRequests).toHaveLength(2);
+	await expect(dialog.getByRole('heading', { name: 'Delete project?' })).toBeVisible();
+	await expect(dialog.getByText('This permanently deletes “Current Project name” and cannot be undone.')).toBeVisible();
+	await expect(dialog.getByText('9 tasks', { exact: false })).toBeVisible();
+	await expect(dialog.getByText('13 task messages', { exact: false })).toBeVisible();
+	await expect(dialog.getByText('17 conversation messages', { exact: false })).toBeVisible();
+	await expect(dialog.getByText('1 Project workflow definition, including paused and scheduled workflows')).toBeVisible();
+	await expect(dialog.getByLabel('Type Current Project name to confirm')).toBeVisible();
+	await expect(dialog.getByLabel('Type Browser collaboration project to confirm')).toHaveCount(0);
+});
+
+test('project mutations synchronize split panes and separate workspace windows', async ({ page, context }) => {
+	const projectUpdateRequests: { projectId: string; data: Record<string, unknown> }[] = [];
+	const projectDeleteRequests: string[] = [];
+	const sharedProjectState: SharedProjectState = {};
+	await mockApi(page, { projectUpdateRequests, projectDeleteRequests, sharedProjectState });
+	await page.goto(`/projects/${projectId}`);
+
+	await page.getByRole('button', { name: 'Split active tab right' }).click();
+	const panes = page.locator('[data-workspace-pane]');
+	await expect(panes).toHaveCount(2);
+	await expect(panes.getByRole('heading', { name: 'Browser collaboration project' })).toHaveCount(2);
+
+	let releaseProjectGet!: () => void;
+	const projectGetGate = new Promise<void>((resolve) => (releaseProjectGet = resolve));
+	const projectGetRequests: string[] = [];
+	const otherPage = await context.newPage();
+	await otherPage.addInitScript(() => {
+		window.addEventListener('xpressclaw:project-mutation', (event) => {
+			const mutation = (event as CustomEvent<{ kind: string; project?: { name?: string } }>).detail;
+			(window as typeof window & { __latestProjectMutation?: string }).__latestProjectMutation = mutation.project?.name;
+		});
+	});
+	await mockApi(otherPage, { preserveWorkspace: true, projectGetRequests, projectGetGate, sharedProjectState });
+	const otherNavigation = otherPage.goto(`/projects/${projectId}?_xpressclaw_window=workspace-12345-1`);
+	await expect.poll(() => projectGetRequests.length).toBeGreaterThan(0);
+	expect(projectGetRequests.every((requestedProjectId) => requestedProjectId === projectId)).toBe(true);
+
+	let releaseProjectList!: () => void;
+	const projectListGate = new Promise<void>((resolve) => (releaseProjectList = resolve));
+	const projectListRequests: string[] = [];
+	const indexPage = await context.newPage();
+	await mockApi(indexPage, {
+		preserveWorkspace: true,
+		projectCount: 2,
+		projectListRequests,
+		projectListGate,
+		projectListTargetLast: true,
+		secondaryProjectName: 'Éclair project',
+		secondaryProjectUpdatedAt: timestamp(120),
+		sharedProjectState,
+	});
+	const indexNavigation = indexPage.goto('/projects?_xpressclaw_window=workspace-12345-2');
+	await expect.poll(() => projectListRequests.length).toBeGreaterThan(1);
+
+	const newWorkPage = await context.newPage();
+	await mockApi(newWorkPage, { preserveWorkspace: true, sharedProjectState });
+	await newWorkPage.goto('/?_xpressclaw_window=workspace-12345-3');
+	const newWorkProject = newWorkPage.getByLabel('Project').locator(`option[value="${projectId}"]`);
+	await expect(newWorkProject).toHaveText('Browser collaboration project');
+
+	const syncPage = await context.newPage();
+	await mockApi(syncPage, {
+		preserveWorkspace: true,
+		sharedProjectState,
+		projectSyncStatuses: [{
+			project_id: projectId,
+			project_name: 'Browser collaboration project',
+			project_icon: null,
+			status: 'ready',
+			project_dir: '/srv/repos/xpressclaw',
+			remote: 'git@github.com:XpressAI/project-data.git',
+			branch: 'main',
+			store_path: `projects/${projectId}`,
+			share_project_memory: true,
+			last_commit: null,
+			last_synced_at: null,
+			message: null,
+			warnings: [],
+		}],
+	});
+	await syncPage.goto('/settings/sync?_xpressclaw_window=workspace-12345-4');
+	const syncProject = syncPage.locator(`[data-project-sync="${projectId}"]`);
+	await expect(syncProject.getByRole('heading', { name: 'Browser collaboration project' })).toBeVisible();
+
+	const conversationPage = await context.newPage();
+	await mockApi(conversationPage, {
+		preserveWorkspace: true,
+		sharedProjectState,
+		conversations: [{
+			id: conversationId,
+			project_id: projectId,
+			title: 'Mounted project conversation',
+			icon: null,
+			created_at: timestamp(1),
+			updated_at: timestamp(61),
+			last_message_at: timestamp(61),
+			participants: [],
+		}],
+	});
+	await conversationPage.goto(`/conversations/${conversationId}?_xpressclaw_window=workspace-12345-5`);
+	const conversationProjectLink = conversationPage.locator('header p a');
+	await expect(conversationProjectLink).toHaveText('Browser collaboration project');
+
+	await panes.first().getByRole('button', { name: 'Project settings' }).click();
+	let dialog = page.getByRole('dialog');
+	await dialog.getByLabel('Project name').fill('Synchronized project');
+	await dialog.getByLabel('Description').fill('Visible in every project view.');
+	await dialog.getByRole('button', { name: 'Save changes' }).click();
+
+	await expect.poll(() => projectUpdateRequests).toHaveLength(1);
+	await expect(panes.getByRole('heading', { name: 'Synchronized project' })).toHaveCount(2);
+	await expect(panes.getByText('Visible in every project view.', { exact: true })).toHaveCount(2);
+	await expect.poll(() => otherPage.evaluate(() => (
+		window as typeof window & { __latestProjectMutation?: string }
+	).__latestProjectMutation)).toBe('Synchronized project');
+	releaseProjectGet();
+	releaseProjectList();
+	await otherNavigation;
+	await indexNavigation;
+	const otherPane = otherPage.locator('[data-workspace-pane]');
+	await expect(otherPane.getByRole('heading', { name: 'Synchronized project' })).toBeVisible();
+	await expect(otherPane.getByText('Visible in every project view.', { exact: true })).toBeVisible();
+	await expect(otherPage.locator('[data-workspace-pane] [data-workspace-tab-title="Synchronized project"]')).toBeVisible();
+	await expect(indexPage.getByRole('heading', { name: 'Synchronized project' })).toBeVisible();
+	await expect(indexPage.getByText('Visible in every project view.', { exact: true })).toBeVisible();
+	const projectCards = indexPage.locator('[data-projects-scroll] a[href^="/projects/"]');
+	await expect(projectCards).toHaveCount(2);
+	await expect(projectCards.first().getByRole('heading', { name: 'Synchronized project' })).toBeVisible();
+	await expect(indexPage.locator('aside').first().getByText('Synchronized project', { exact: true })).toBeVisible();
+	await expect(indexPage.locator('aside').first().getByText('Éclair project', { exact: true })).toBeVisible();
+	await expect(indexPage.locator('aside').first().getByText('Browser collaboration project', { exact: true })).toHaveCount(0);
+	await expect(indexPage.locator('aside').first().locator(`a[href="/projects/${projectId}"]`)).toContainText('Synchronized project');
+	await expect(newWorkProject).toHaveText('Synchronized project');
+	await expect(syncProject.getByRole('heading', { name: 'Synchronized project' })).toBeVisible();
+	await expect(conversationProjectLink).toHaveText('Synchronized project');
+
+	await otherPage.evaluate(async (id) => {
+		const response = await fetch(`/api/projects/${id}`, {
+			method: 'PATCH',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				name: 'Authoritative project',
+				description: 'The final concurrent update.',
+			}),
+		});
+		const authoritativeProject = await response.json();
+		const channel = new BroadcastChannel('xpressclaw:project-mutations:v1');
+		channel.postMessage({ mutation: { kind: 'updated', project: authoritativeProject } });
+		channel.postMessage({
+			mutation: {
+				kind: 'updated',
+				project: {
+					...authoritativeProject,
+					name: 'Stale concurrent project',
+					description: 'This delayed response must not win.',
+				},
+			},
+		});
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		channel.close();
+	}, projectId);
+
+	await expect(panes.getByRole('heading', { name: 'Authoritative project' })).toHaveCount(2);
+	await expect(otherPane.getByRole('heading', { name: 'Authoritative project' })).toBeVisible();
+	await expect(indexPage.getByRole('heading', { name: 'Authoritative project' })).toBeVisible();
+	await expect(indexPage.locator('aside').first().getByText('Authoritative project', { exact: true })).toBeVisible();
+	await expect(newWorkProject).toHaveText('Authoritative project');
+	await expect(syncProject.getByRole('heading', { name: 'Authoritative project' })).toBeVisible();
+	await expect(conversationProjectLink).toHaveText('Authoritative project');
+	expect(context.pages()).toHaveLength(6);
+	for (const openPage of context.pages()) {
+		await expect(openPage.getByText('Stale concurrent project', { exact: true })).toHaveCount(0);
+	}
+
+	await panes.first().getByRole('button', { name: 'Project settings' }).click();
+	dialog = page.getByRole('dialog');
+	await dialog.getByLabel('Project name').fill('Unsaved local project name');
+	await dialog.getByLabel('Description').fill('Keep this draft while remote updates arrive.');
+	await otherPage.evaluate(async (id) => {
+		const response = await fetch(`/api/projects/${id}`, {
+			method: 'PATCH',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				name: 'Remote project rename',
+				description: 'The remote update should not dismiss an active editor.',
+			}),
+		});
+		const remoteProject = await response.json();
+		const channel = new BroadcastChannel('xpressclaw:project-mutations:v1');
+		channel.postMessage({ mutation: { kind: 'updated', project: remoteProject } });
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		channel.close();
+	}, projectId);
+
+	await expect(dialog).toBeVisible();
+	await expect(dialog.getByLabel('Project name')).toHaveValue('Unsaved local project name');
+	await expect(dialog.getByLabel('Description')).toHaveValue('Keep this draft while remote updates arrive.');
+	await expect(panes.getByRole('heading', { name: 'Remote project rename' })).toHaveCount(2);
+	await expect(conversationProjectLink).toHaveText('Remote project rename');
+	await dialog.getByRole('button', { name: 'Cancel' }).click();
+	await conversationPage.close();
+
+	await panes.first().getByRole('button', { name: 'Project settings' }).click();
+	dialog = page.getByRole('dialog');
+	await dialog.getByRole('button', { name: 'Delete project' }).click();
+	await dialog.getByLabel('Type Remote project rename to confirm').fill('Remote project rename');
+	await dialog.getByRole('button', { name: 'Permanently delete project' }).click();
+
+	await expect.poll(() => projectDeleteRequests).toEqual([projectId]);
+	await expect(page).toHaveURL(/\/projects$/);
+	await expect(otherPage).toHaveURL(/\/projects$/);
+	await expect(otherPage.getByRole('heading', { name: 'Projects' })).toBeVisible();
+	await expect(indexPage.getByRole('heading', { name: 'Éclair project' })).toBeVisible();
+	await expect(indexPage.getByRole('heading', { name: 'Create your first project' })).toHaveCount(0);
+	await expect(indexPage.locator(`a[href="/projects/${projectId}"]`)).toHaveCount(0);
+	await expect(newWorkProject).toHaveCount(0);
+	await expect(syncProject).toHaveCount(0);
+	await expect(syncPage.getByText('No Projects yet', { exact: true })).toBeVisible();
+	await expect(page.locator(`[data-workspace-tab][data-workspace-tab-title="Synchronized project"]`)).toHaveCount(0);
+	await expect(otherPage.locator('[data-workspace-tab-title="Synchronized project"], [data-workspace-tab-title="Browser collaboration project"]')).toHaveCount(0);
+	await expect(otherPage.locator('[data-workspace-pane] [data-workspace-tab-title="Projects"]')).toBeVisible();
+
+	const lateProjectGetRequests: string[] = [];
+	const lateNewWorkPage = await context.newPage();
+	await mockApi(lateNewWorkPage, {
+		preserveWorkspace: true,
+		projectGetRequests: lateProjectGetRequests,
+		sharedProjectState,
+	});
+	await lateNewWorkPage.goto('/?_xpressclaw_window=workspace-12345-6');
+	const lateNewWorkProject = lateNewWorkPage.getByLabel('Project').locator(`option[value="${projectId}"]`);
+	await expect(lateNewWorkProject).toHaveCount(0);
+
+	await lateNewWorkPage.evaluate(async ({ id, staleProject }) => {
+		const modulePath = '/src/lib/projectEvents.ts';
+		const projectEvents = await import(modulePath);
+		projectEvents.publishProjectMutation({
+			kind: 'updated',
+			project: { ...staleProject, id, name: 'Delayed deleted project' },
+		});
+	}, { id: projectId, staleProject: sharedProjectState.project! });
+
+	await expect.poll(() => lateProjectGetRequests).toContain(projectId);
+	await expect(lateNewWorkProject).toHaveCount(0);
+	await expect(newWorkProject).toHaveCount(0);
+	await expect(syncProject).toHaveCount(0);
+	await expect(indexPage.locator(`a[href="/projects/${projectId}"]`)).toHaveCount(0);
+	await lateNewWorkPage.close();
+	await syncPage.close();
+	await newWorkPage.close();
+	await indexPage.close();
+	await otherPage.close();
+});
+
+test('project settings keep deletion errors visible and actionable', async ({ page }) => {
+	const projectDeleteRequests: string[] = [];
+	const projectDeleteError = 'Project work was cancelled, but Docker or Podman is unavailable. Start it and retry deletion.';
+	await mockApi(page, {
+		projectDeleteRequests,
+		projectDeleteError,
+		projectDeletionStartedAt: timestamp(60),
+	});
+	await page.goto(`/projects/${projectId}`);
+	await expect(page.getByText('Deletion was interrupted after this Project stopped accepting new work.', { exact: false })).toBeVisible();
+
+	await page.getByRole('button', { name: 'Project settings' }).click();
+	const dialog = page.getByRole('dialog');
+	await dialog.getByRole('button', { name: 'Delete project' }).click();
+	await expect(dialog.getByText('A previous deletion attempt was interrupted', { exact: false })).toBeVisible();
+	await dialog.getByLabel('Type Browser collaboration project to confirm').fill('Browser collaboration project');
+	await dialog.getByRole('button', { name: 'Permanently delete project' }).click();
+
+	await expect.poll(() => projectDeleteRequests).toEqual([projectId]);
+	await expect(dialog.getByRole('alert')).toHaveText(projectDeleteError);
+	await expect(page).toHaveURL(new RegExp(`/projects/${projectId}$`));
+	await expect(dialog.getByRole('button', { name: 'Permanently delete project' })).toBeEnabled();
+});
+
+test('project deletion shows progress, ignores duplicate confirmation, and opens the next project', async ({ page }) => {
+	let releaseDelete!: () => void;
+	const projectDeleteGate = new Promise<void>((resolve) => (releaseDelete = resolve));
+	const projectDeleteRequests: string[] = [];
+	await mockApi(page, {
+		projectCount: 2,
+		secondaryProjectName: 'Next project',
+		projectDeleteRequests,
+		projectDeleteGate,
+	});
+	await page.goto(`/projects/${projectId}`);
+
+	await page.getByRole('button', { name: 'Project settings' }).click();
+	const dialog = page.getByRole('dialog');
+	await dialog.getByRole('button', { name: 'Delete project' }).click();
+	await dialog.getByLabel('Type Browser collaboration project to confirm').fill('Browser collaboration project');
+	const deleteButton = dialog.getByRole('button', { name: 'Permanently delete project' });
+	await deleteButton.evaluate((element) => {
+		(element as HTMLButtonElement).click();
+		(element as HTMLButtonElement).click();
+	});
+
+	await expect.poll(() => projectDeleteRequests).toEqual([projectId]);
+	await expect(dialog.getByRole('status')).toHaveText('Cancelling active work and removing Project data…');
+	await expect(dialog.getByRole('button', { name: 'Deleting…' })).toBeDisabled();
+
+	releaseDelete();
+	await expect(page).toHaveURL(/\/projects\/project-mobile-2$/);
+});
+
+test('opening a conversation reveals its newest messages after media loads', async ({ page }) => {
+	const conversation = {
+		id: conversationId,
+		project_id: projectId,
+		title: 'Long release history',
+		icon: null,
+		created_at: timestamp(1),
+		updated_at: timestamp(60),
+		last_message_at: timestamp(60),
+		participants: [
+			{ participant_type: 'user', participant_id: 'local', joined_at: timestamp(1) },
+			{ participant_type: 'agent', participant_id: agentId, joined_at: timestamp(2) },
+		],
+	};
+	const conversationMessages = Array.from({ length: 40 }, (_, index) => ({
+		id: index + 1,
+		conversation_id: conversationId,
+		sender_type: index % 2 === 0 ? 'agent' : 'user',
+		sender_id: index % 2 === 0 ? agentId : 'local',
+		sender_name: index % 2 === 0 ? 'Browser-tested workspace' : 'You',
+		content: `Conversation entry ${index + 1}. ${'This history is long enough to require scrolling. '.repeat(3)}`,
+		message_type: 'message',
+		linked_task_id: null,
+		metadata: {},
+		attachments: index === 39 ? [{
+			id: 'delayed-history-image',
+			message_id: index + 1,
+			name: 'delayed-history.png',
+			mime_type: 'image/png',
+			size: 68,
+			source_task_id: null,
+			created_at: timestamp(index + 1),
+		}] : [],
+		created_at: timestamp(index + 1),
+	}));
+	await mockApi(page, { conversations: [conversation], conversationMessages });
+	await page.route(`**/api/conversations/${conversationId}/attachments/delayed-history-image`, async (route) => {
+		await new Promise((resolve) => setTimeout(resolve, 300));
+		await route.fulfill({
+			status: 200,
+			contentType: 'image/png',
+			body: Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2nH0AAAAASUVORK5CYII=', 'base64'),
+		});
+	});
+	await page.goto(`/projects/${projectId}`);
+	await page.locator(`[data-project-conversation="${conversationId}"]`).click();
+
+	const messagePane = page.locator('[data-conversation-message-pane]');
+	const delayedImage = page.getByAltText('delayed-history.png');
+	await expect(messagePane).toBeVisible();
+	await expect.poll(() => messagePane.evaluate((element) => element.scrollHeight > element.clientHeight)).toBe(true);
+	await expect.poll(() => delayedImage.evaluate((element) => {
+		const image = element as HTMLImageElement;
+		return image.complete && image.naturalHeight > 0;
+	})).toBe(true);
+	await expect.poll(() => messagePane.evaluate((element) => (
+		element.scrollHeight - element.clientHeight - element.scrollTop
+	))).toBeLessThan(2);
+	await expect.poll(() => messagePane.evaluate((element) => element.scrollTop)).toBeGreaterThan(0);
 });
 
 test('running agents can be guided at a safe break or interrupted immediately', async ({ page }) => {
@@ -581,6 +3662,190 @@ test('running agents can be guided at a safe break or interrupted immediately', 
 	await expect.poll(() => interruptedAttempts).toEqual(['attempt-browser-test']);
 });
 
+test('Codex plugin install elicitations can be accepted', async ({ page }) => {
+	const elicitationResponses: { elicitationId: string; payload: Record<string, unknown> }[] = [];
+	await mockApi(page, {
+		pendingElicitation: {
+			mode: 'form',
+			message: 'The Stripe plugin can verify coupon and promotion-code configuration.',
+			requestedSchema: {
+				type: 'object',
+				properties: {},
+			},
+			_meta: {
+				codex_approval_kind: 'tool_suggestion',
+				persist: 'always',
+				tool_type: 'plugin',
+				suggest_type: 'install',
+				suggest_reason: 'The Stripe plugin can verify coupon and promotion-code configuration.',
+				tool_id: 'stripe@openai-curated-remote',
+				tool_name: 'Stripe',
+				remote_plugin_id: 'stripe',
+				app_connector_ids: ['stripe'],
+			},
+		},
+		elicitationResponses,
+	});
+	await page.goto(`/tasks/${taskId}`);
+
+	const request = page.locator('[data-tool-install-elicitation]');
+	await expect(request).toBeVisible();
+	await expect(request).toContainText('Plugin installation requested');
+	await expect(request).toContainText('Install Stripe?');
+	await expect(request).toContainText('The Stripe plugin can verify coupon and promotion-code configuration.');
+	await expect(page.locator('[data-unsupported-elicitation]')).toHaveCount(0);
+	await expect(page.locator(`#task-message-input-${taskId}`)).toBeDisabled();
+	await request.getByRole('button', { name: 'Install plugin' }).click();
+	await expect.poll(() => elicitationResponses).toEqual([{
+		elicitationId: 'elicitation-browser-test',
+		payload: {
+			action: 'accept',
+			content: {},
+			message: 'Approved installing the Stripe plugin.',
+		},
+	}]);
+	await expect(request).toHaveCount(0);
+});
+
+test('Codex connector install elicitations can be declined', async ({ page }) => {
+	const elicitationResponses: { elicitationId: string; payload: Record<string, unknown> }[] = [];
+	await mockApi(page, {
+		pendingElicitation: {
+			mode: 'form',
+			message: 'Connect GitHub to inspect pull requests.',
+			requestedSchema: {
+				type: 'object',
+				properties: {},
+			},
+			_meta: {
+				codex_approval_kind: 'tool_suggestion',
+				persist: 'always',
+				tool_type: 'connector',
+				suggest_type: 'install',
+				suggest_reason: 'Connect GitHub to inspect pull requests.',
+				tool_id: 'github',
+				tool_name: 'GitHub',
+			},
+		},
+		elicitationResponses,
+	});
+	await page.goto(`/tasks/${taskId}`);
+
+	const request = page.locator('[data-tool-install-elicitation]');
+	await expect(request).toContainText('Connector installation requested');
+	await expect(request.getByRole('button', { name: 'Install connector' })).toBeVisible();
+	await request.getByRole('button', { name: 'Not now' }).click();
+	await expect.poll(() => elicitationResponses).toEqual([{
+		elicitationId: 'elicitation-browser-test',
+		payload: { action: 'decline' },
+	}]);
+	await expect(request).toHaveCount(0);
+});
+
+test('unsupported ACP elicitations stay visible and actionable', async ({ page }) => {
+	const elicitationResponses: { elicitationId: string; payload: Record<string, unknown> }[] = [];
+	const interruptedAttempts: string[] = [];
+	const postedMessages: Record<string, unknown>[] = [];
+	await mockApi(page, {
+		pendingElicitation: {
+			mode: 'form',
+			message: 'Install the Figma plugin to continue?',
+			requestedSchema: {
+				type: 'object',
+				properties: {
+					plugin: { type: 'string', oneOf: [null] },
+				},
+			},
+		},
+		elicitationResponses,
+		interruptedAttempts,
+		postedMessages,
+	});
+	await page.goto(`/tasks/${taskId}`);
+
+	const fallback = page.locator('[data-unsupported-elicitation]');
+	await expect(fallback).toBeVisible();
+	await expect(fallback).toContainText('Install the Figma plugin to continue?');
+	await expect(fallback).toContainText('cannot display safely');
+	await expect(fallback.getByRole('button', { name: 'Cancel request' })).toBeVisible();
+	await expect(fallback.getByRole('button', { name: 'Decline request' })).toBeVisible();
+	await expect(page.getByRole('button', { name: 'Start' })).toHaveCount(0);
+
+	// Stopping with an empty composer remains a pure interruption. It does not
+	// turn the elicitation into a task message or silently enqueue more work.
+	await page.getByRole('button', { name: 'Interrupt agent now' }).click();
+	await expect.poll(() => interruptedAttempts).toEqual(['attempt-browser-test']);
+	expect(postedMessages).toEqual([]);
+
+	await fallback.getByRole('button', { name: 'Decline request' }).click();
+	await expect.poll(() => elicitationResponses).toEqual([{
+		elicitationId: 'elicitation-browser-test',
+		payload: { action: 'decline' },
+	}]);
+	await expect(fallback).toHaveCount(0);
+});
+
+test('a normal reply can replace an unsupported elicitation', async ({ page }) => {
+	const postedMessages: Record<string, unknown>[] = [];
+	await mockApi(page, {
+		pendingElicitation: {
+			mode: '_codex_plugin_install',
+			message: 'Install a plugin to continue?',
+		},
+		postedMessages,
+	});
+	await page.goto(`/tasks/${taskId}`);
+
+	const composer = page.locator(`#task-message-input-${taskId}`);
+	await expect(composer).toBeEnabled();
+	await expect(composer).toHaveAttribute('placeholder', 'Reply to continue with different guidance...');
+	await composer.fill('Continue without installing the plugin.');
+	await page.getByRole('button', { name: 'Send message' }).click();
+	await expect.poll(() => postedMessages).toHaveLength(1);
+	expect(postedMessages[0]).toMatchObject({
+		content: 'Continue without installing the plugin.',
+		delivery: 'after_tool',
+	});
+});
+
+test('supported ACP forms still require structured answers', async ({ page }) => {
+	const elicitationResponses: { elicitationId: string; payload: Record<string, unknown> }[] = [];
+	await mockApi(page, {
+		pendingElicitation: {
+			mode: 'form',
+			message: 'Choose an approach',
+			requestedSchema: {
+				type: 'object',
+				properties: {
+					approach: {
+						type: 'string',
+						title: 'Approach',
+						description: 'Which approach should the agent use?',
+						oneOf: [{ const: 'safe', title: 'Safe approach' }],
+					},
+				},
+			},
+		},
+		elicitationResponses,
+	});
+	await page.goto(`/tasks/${taskId}`);
+
+	await expect(page.locator('[data-unsupported-elicitation]')).toHaveCount(0);
+	await expect(page.locator('[data-approval-card]')).toBeVisible();
+	await expect(page.getByText('Agent question')).toBeVisible();
+	await expect(page.locator(`#task-message-input-${taskId}`)).toBeDisabled();
+	await page.getByRole('button', { name: 'Safe approach' }).click();
+	await page.getByRole('button', { name: 'Review' }).click();
+	await page.getByRole('button', { name: 'Send answers' }).click();
+	await expect.poll(() => elicitationResponses).toEqual([{
+		elicitationId: 'elicitation-browser-test',
+		payload: expect.objectContaining({
+			action: 'accept',
+			content: { approach: 'safe' },
+		}),
+	}]);
+});
+
 test('task drafts survive reloads and clear after a successful send', async ({ page }) => {
 	const postedMessages: Record<string, unknown>[] = [];
 	await mockApi(page, { postedMessages });
@@ -598,13 +3863,16 @@ test('task drafts survive reloads and clear after a successful send', async ({ p
 	await expect(composer).toHaveValue('');
 });
 
-test('new-work drafts restore the project they were written for', async ({ page }) => {
+test('new-work drafts restore the agent they were written for', async ({ page }) => {
 	const queuedSessionMessages: { agentId: string; payload: Record<string, unknown> }[] = [];
 	await mockApi(page, { multipleAgents: true, queuedSessionMessages });
 	await page.goto('/');
 
 	const composer = page.getByPlaceholder('Describe the outcome you want…');
-	const projectPicker = page.getByRole('combobox');
+	const projectPicker = page.getByLabel('Agent', { exact: true });
+	await expect(composer).toBeVisible();
+	await expect(page.locator('[data-new-work-composer]').getByLabel('Project', { exact: true })).toHaveCount(0);
+	await expect(page.locator('[data-new-work-context]').getByLabel('Project', { exact: true })).toBeVisible();
 	await projectPicker.selectOption('project-secondary-test');
 	await composer.fill('Keep this work with the secondary project');
 	await page.reload();
@@ -617,7 +3885,173 @@ test('new-work drafts restore the project they were written for', async ({ page 
 	expect(queuedSessionMessages[0].payload.content).toBe('Keep this work with the secondary project');
 });
 
-test('project Work shows only the five most recently updated tasks', async ({ page }) => {
+test('new work binds reusable workflow agent roles across projects', async ({ page }) => {
+	const queuedSessionMessages: { agentId: string; payload: Record<string, unknown> }[] = [];
+	const workflowRunRequests: { id: string; inputs: Record<string, unknown>; projectId?: string }[] = [];
+	await mockApi(page, {
+		multipleAgents: true,
+		queuedSessionMessages,
+		workflowRunRequests,
+		workflows: [{
+			id: 'workflow-review-loop',
+			name: 'Code Review Loop',
+			description: 'Implement, review, and repeat until approved.',
+			yaml_content: `name: code-review-loop
+inputs:
+  goal:
+    type: string
+    required: true
+  prompt_fragment:
+    type: string
+    required: true
+  implementer:
+    type: agent
+    required: true
+    primary: true
+  reviewer:
+    type: agent
+    required: true
+  retries:
+    type: number
+    required: true
+  review_context:
+    type: json
+    required: true
+  notify:
+    type: boolean
+    default: false
+flows:
+  main:
+    steps:
+      - id: implement
+        agent: "@implementer"
+        prompt: "Implement @goal"
+      - id: review
+        agent: "@reviewer"
+        prompt: "Review @goal"
+`,
+			enabled: true,
+			version: 1,
+			created_at: timestamp(1),
+			updated_at: timestamp(2),
+			last_triggered_at: null,
+			trigger_count: 0,
+			trigger_error: null,
+		}],
+	});
+	await page.goto('/');
+
+	await expect(page.getByRole('button', { name: 'Agent mode' })).toHaveAttribute('aria-pressed', 'true');
+	await page.getByRole('button', { name: 'Workflow mode' }).click();
+	await expect(page.getByRole('button', { name: 'Workflow mode' })).toHaveAttribute('aria-pressed', 'true');
+	const agentPicker = page.getByLabel('Agent role implementer');
+	const workflowPicker = page.getByLabel('Workflow', { exact: true });
+	await expect(workflowPicker).toHaveValue('workflow-review-loop');
+	await expect(workflowPicker.locator('option')).toHaveText(['Code Review Loop']);
+
+	await expect(page.getByLabel('Agent role reviewer')).toHaveValue('project-secondary-test');
+	await agentPicker.selectOption('project-secondary-test');
+	await expect(workflowPicker).toHaveValue('workflow-review-loop');
+	await expect(workflowPicker.locator('option')).toHaveText(['Code Review Loop']);
+
+	await agentPicker.selectOption(agentId);
+	await page.getByLabel('Agent role reviewer').selectOption('project-secondary-test');
+	await page.getByPlaceholder('Describe the outcome you want…').fill('Add workflow selection to New Work');
+	await page.getByLabel('Workflow input prompt_fragment').fill('  Keep this spacing.  ');
+	await page.getByLabel('Workflow input retries').fill('3');
+	await page.getByLabel('Workflow input review_context').fill('{"focus":"accessibility"}');
+	await page.getByLabel('Workflow input notify').selectOption('true');
+	await page.reload();
+	await expect(page.getByRole('button', { name: 'Workflow mode' })).toHaveAttribute('aria-pressed', 'true');
+	await expect(agentPicker).toHaveValue(agentId);
+	await expect(workflowPicker).toHaveValue('workflow-review-loop');
+	await expect(page.getByPlaceholder('Describe the outcome you want…')).toHaveValue('Add workflow selection to New Work');
+	await expect(page.getByLabel('Workflow input prompt_fragment')).toHaveValue('  Keep this spacing.  ');
+	await expect(page.getByLabel('Workflow input retries')).toHaveValue('3');
+	await expect(page.getByLabel('Workflow input review_context')).toHaveValue('{"focus":"accessibility"}');
+	await expect(page.getByLabel('Workflow input notify')).toHaveValue('true');
+	await page.setViewportSize({ width: 390, height: 844 });
+	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+	await expectVerticalScroll(page.locator('[data-new-work-scroll]'));
+	await expect(page.locator('[data-new-work-context]').getByLabel('Project', { exact: true })).toBeVisible();
+	await page.getByPlaceholder('Describe the outcome you want…').press('Enter');
+
+	await expect.poll(() => workflowRunRequests).toEqual([{
+		id: 'workflow-review-loop',
+		projectId,
+		inputs: {
+			goal: 'Add workflow selection to New Work',
+			prompt_fragment: '  Keep this spacing.  ',
+			implementer: agentId,
+			reviewer: 'project-secondary-test',
+			retries: 3,
+			review_context: { focus: 'accessibility' },
+			notify: true,
+		},
+	}]);
+	expect(queuedSessionMessages).toEqual([]);
+	await expect(page).toHaveURL(`/tasks/${taskId}`);
+});
+
+test('new work opens the task created by a conversation workflow', async ({ page }) => {
+	const conversationTaskRequests: Record<string, unknown>[] = [];
+	await mockApi(page, {
+		conversations: [{
+			id: conversationId,
+			project_id: projectId,
+			title: 'Release planning',
+			icon: null,
+			created_at: timestamp(1),
+			updated_at: timestamp(2),
+			last_message_at: timestamp(2),
+			participants: [
+				{ participant_type: 'user', participant_id: 'local', joined_at: timestamp(1) },
+				{ participant_type: 'agent', participant_id: agentId, joined_at: timestamp(1) },
+			],
+		}],
+		conversationTaskRequests,
+		workflows: [{
+			id: 'workflow-review-loop',
+			name: 'Code Review Loop',
+			description: 'Implement and review linked Conversation work.',
+			yaml_content: `name: code-review-loop
+inputs:
+  goal:
+    type: string
+    required: true
+flows:
+  main:
+    steps:
+      - id: implement
+        agent: "${agentId}"
+        prompt: "Implement @goal"
+`,
+			enabled: true,
+			version: 1,
+			created_at: timestamp(1),
+			updated_at: timestamp(2),
+			last_triggered_at: null,
+			trigger_count: 0,
+			trigger_error: null,
+		}],
+	});
+	await page.goto('/');
+
+	await page.getByLabel('Conversation', { exact: true }).selectOption(conversationId);
+	await page.getByRole('button', { name: 'Workflow mode' }).click();
+	await page.getByLabel('Workflow', { exact: true }).selectOption('workflow-review-loop');
+	await page.getByPlaceholder('Describe the outcome you want…').fill('Review the release changes');
+	await page.getByPlaceholder('Describe the outcome you want…').press('Enter');
+
+	await expect.poll(() => conversationTaskRequests).toEqual([{
+		title: 'Review the release changes',
+		workflow_id: 'workflow-review-loop',
+		workflow_inputs: { goal: 'Review the release changes' },
+	}]);
+	await expect(page).toHaveURL(`/tasks/${taskId}`);
+});
+
+test('agent Work shows only the five most recently updated tasks', async ({ page }) => {
 	await mockApi(page, { projectTaskUpdates: [10, 70, 30, 90, 50, 110, 20] });
 	const recentRequest = page.waitForRequest((request) => {
 		const url = new URL(request.url());
@@ -638,7 +4072,706 @@ test('project Work shows only the five most recently updated tasks', async ({ pa
 		'/tasks/project-task-4',
 		'/tasks/project-task-2',
 	]);
-	await expect(page.getByRole('link', { name: 'All tasks' })).toHaveAttribute('href', '/tasks');
+	await expect(page.getByRole('link', { name: 'All tasks' })).toHaveAttribute('href', `/tasks?view=list&agent=${agentId}&status=all&sort=newest`);
+});
+
+for (const source of ['project', 'agent'] as const) {
+	test(`All tasks links scope history to the ${source} with newest tasks first`, async ({ page }, info) => {
+		await page.setViewportSize(source === 'agent' ? { width: 390, height: 844 } : { width: 1440, height: 1000 });
+		await mockApi(page, { completedTaskCount: 45, projectCount: 2 });
+		await page.addInitScript(() => localStorage.setItem('xpressclaw.tasks.view', 'board'));
+		await page.goto(source === 'project' ? `/projects/${projectId}` : `/agents/${agentId}`);
+		const request = page.waitForRequest((request) => new URL(request.url()).pathname === '/api/tasks/planning');
+		await page.locator('[data-workspace-pane]').getByRole('link', { name: 'All tasks', exact: true }).click();
+		const params = new URL((await request).url()).searchParams;
+		expect(params.get(source === 'project' ? 'project_id' : 'agent_id')).toBe(source === 'project' ? projectId : agentId);
+		expect(params.get('status')).toBe('all');
+		expect(params.get('sort')).toBe('newest');
+		const planner = page.locator('.task-planner:visible');
+		const rows = planner.locator('[data-task-row]');
+		await expect(planner.locator('.planner-header p')).toContainText('23 tasks');
+		await expect(planner.getByLabel('Task order')).toHaveValue('newest');
+		await expect(rows).toHaveCount(20);
+		await expect(rows.first()).toContainText('Completed task 45');
+		await expect(rows.last()).toContainText('Completed task 7');
+		await page.screenshot({ path: info.outputPath(`all-tasks-${source}.png`) });
+		await planner.getByRole('button', { name: 'Next', exact: true }).click();
+		await expect(rows).toHaveCount(3);
+		await expect(rows.locator('.title a')).toHaveText(['Completed task 5', 'Completed task 3', 'Completed task 1']);
+		await page.reload();
+		await expect(rows).toHaveCount(20);
+		await expect(rows.first()).toContainText('Completed task 45');
+		await expect(planner.locator('.filter-summary')).toContainText(source === 'project' ? 'Browser collaboration project' : 'Browser-tested workspace');
+		await planner.getByLabel('Task order').selectOption('planning');
+		await expect(rows.first()).toContainText('Completed task 1');
+		await planner.getByRole('button', { name: 'Clear filters', exact: true }).click();
+		await expect(planner.locator('.planner-header p')).toContainText('45 tasks');
+	});
+}
+
+test('runner preparation errors survive session polling and clear on successful retry', async ({ page }) => {
+	await page.clock.install();
+	await mockApi(page);
+	const missing = { ready: false, docker_available: true, image_present: false, auth_present: true, issues: ['Runner image has not been pulled'] };
+	let preparations = 0;
+	let sessionLoads = 0;
+	await page.route(`**/api/sessions/${agentId}`, async (route) => {
+		await route.fulfill({ json: {
+			session: { id: agentId, status: ++sessionLoads === 1 ? 'idle' : 'queued' },
+			active_attempts: [], queued_attempts: [], recent_attempts: [], recent_events: [], artifacts: [],
+		} });
+	});
+	await page.route(`**/api/sessions/${agentId}/readiness`, async (route) => {
+		if (route.request().method() === 'POST') {
+			preparations++;
+			if (preparations === 1) {
+				await route.fulfill({ status: 503, json: { error: 'Registry is unavailable' } });
+			} else {
+				await route.fulfill({ json: { ...missing, ready: true, image_present: true, issues: [] } });
+			}
+		} else await route.fulfill({ json: missing });
+	});
+	await page.goto(`/agents/${agentId}`);
+	await page.getByRole('button', { name: 'Prepare runner', exact: true }).click();
+	const failure = page.getByText('Registry is unavailable', { exact: false });
+	await expect(failure).toBeVisible();
+	await page.clock.fastForward(3500);
+	const composer = page.locator('section').filter({ has: page.getByPlaceholder('Send work or ask a question…') });
+	await expect(composer.getByText('Queued', { exact: true })).toBeVisible();
+	await expect(failure).toBeVisible();
+	await page.getByRole('button', { name: 'Prepare runner', exact: true }).click();
+	await expect(page.getByText('Runner is ready.', { exact: true })).toBeVisible();
+	await expect(failure).toHaveCount(0);
+	await expect(page.getByText('This agent is not ready to run')).toHaveCount(0);
+	expect(preparations).toBe(2);
+});
+
+test('runner preparation shows download progress and ignores a stale readiness response', async ({ page }) => {
+	await page.clock.install();
+	await mockApi(page);
+	const missing = { ready: false, docker_available: true, image_present: false, can_prepare: true, auth_present: true, issues: ['Runner image has not been pulled'] };
+	let gets = 0;
+	let preparations = 0;
+	let delayedReadiness: Route | undefined;
+	let delayedPreparation: Route | undefined;
+	await page.route(`**/api/sessions/${agentId}/readiness`, async (route) => {
+		if (route.request().method() === 'POST') {
+			preparations++;
+			delayedPreparation = route;
+		} else if (++gets === 1) await route.fulfill({ json: missing });
+		else delayedReadiness = route;
+	});
+	await page.goto(`/agents/${agentId}`);
+	const prepare = page.getByRole('button', { name: 'Prepare runner', exact: true });
+	await expect(prepare).toBeVisible();
+	await page.clock.fastForward(10_100);
+	await expect.poll(() => Boolean(delayedReadiness)).toBe(true);
+	await prepare.click();
+	await expect.poll(() => Boolean(delayedPreparation)).toBe(true);
+	await page.clock.fastForward(15_000);
+	await expect(page.getByRole('button', { name: 'Downloading…', exact: true })).toBeDisabled();
+	await expect(page.getByText(/Downloading runner image… 1[5-9]s elapsed/)).toBeVisible();
+	expect(preparations).toBe(1);
+	expect(gets).toBe(2);
+	await delayedPreparation!.fulfill({ json: { ...missing, ready: true, image_present: true, can_prepare: false, issues: [] } });
+	await expect(page.getByText('Runner is ready.', { exact: true })).toBeVisible();
+	const stale = page.waitForResponse((response) => response.request().method() === 'GET' && response.url().endsWith('/readiness'));
+	await delayedReadiness!.fulfill({ json: missing });
+	await stale;
+	await expect(page.getByText('This agent is not ready to run')).toHaveCount(0);
+	await expect(page.getByText('Runner is ready.', { exact: true })).toBeVisible();
+});
+
+test('runner readiness notices a shared image prepared by another Agent', async ({ page }) => {
+	await page.clock.install();
+	const readiness = { ready: false, docker_available: true, image_present: false, can_prepare: true, auth_present: true, issues: ['Runner image has not been pulled'] };
+	await mockApi(page, { runnerReadiness: readiness });
+	await page.goto(`/agents/${agentId}`);
+	await expect(page.getByRole('button', { name: 'Prepare runner', exact: true })).toBeVisible();
+	Object.assign(readiness, { ready: true, image_present: true, can_prepare: false, issues: [] });
+	await page.clock.fastForward(10_100);
+	await expect(page.getByText('This agent is not ready to run')).toHaveCount(0);
+});
+
+test('runner readiness does not offer a download for an incompatible retained environment', async ({ page }) => {
+	await mockApi(page, { runnerReadiness: {
+		ready: false, docker_available: true, image_present: false, can_prepare: false, auth_present: true,
+		issues: ['The retained environment uses a different harness. Restore its settings or rebuild it.'],
+	} });
+	await page.goto(`/agents/${agentId}`);
+	await expect(page.getByText('The retained environment uses a different harness.', { exact: false })).toBeVisible();
+	await expect(page.getByRole('button', { name: 'Prepare runner', exact: true })).toHaveCount(0);
+});
+
+test('a downloaded harness upgrade is a quiet link to settings while the Agent stays ready', async ({ page }, testInfo) => {
+	const writes: string[] = [];
+	page.on('request', (request) => {
+		if (request.method() !== 'GET' && new URL(request.url()).pathname.startsWith('/api/agents/')) writes.push(request.url());
+	});
+	await mockApi(page, { runnerReadiness: {
+		ready: true, kind: 'codex', using_retained: true,
+		runner_update: { current_version: '2.1.1', available_version: '2.2.2' },
+	} });
+	await page.goto(`/agents/${agentId}`);
+	const notice = page.locator('[data-runner-upgrade]');
+	await expect(notice).toContainText('Harness update available');
+	await expect(notice).toContainText('2.1.1 → 2.2.2 downloaded');
+	await expect(page.getByText('This agent is not ready to run')).toHaveCount(0);
+	await expect(page.getByRole('button', { name: 'Prepare runner', exact: true })).toHaveCount(0);
+	await expect(page.getByRole('alert')).toHaveCount(0);
+	await page.getByPlaceholder('Send work or ask a question…').fill('Keep working on this draft');
+	await page.setViewportSize({ width: 390, height: 844 });
+	await expect(notice.getByRole('link', { name: 'Review update' })).toBeVisible();
+	await page.screenshot({ path: testInfo.outputPath('runner-upgrade-mobile.png') });
+	await notice.getByRole('link', { name: 'Review update' }).click();
+	await expect(page).toHaveURL(`/agents/${agentId}?tab=runner`);
+	await expect(page.locator('[data-runner-upgrade-details]')).toContainText('current environment 2.1.1; downloaded 2.2.2');
+	await expect(page.locator('[data-runner-upgrade-details]')).toContainText('after an environment rebuild');
+	await expect(page.getByRole('button', { name: 'Discard environment and rebuild' })).toHaveCount(0);
+	expect(writes).toEqual([]);
+});
+
+test('a ready Agent refreshes its upgrade notice without replacing the composer draft', async ({ page }) => {
+	await page.clock.install();
+	const readiness: Record<string, unknown> = { ready: true, kind: 'codex', runner_update: null };
+	await mockApi(page, { runnerReadiness: readiness });
+	await page.goto(`/agents/${agentId}`);
+	const composer = page.getByPlaceholder('Send work or ask a question…');
+	await composer.fill('Unsent work');
+	await expect(page.locator('[data-runner-upgrade]')).toHaveCount(0);
+	readiness.runner_update = { current_version: '2.1.1', available_version: '2.2.2' };
+	await page.clock.fastForward(61_000);
+	await expect(page.locator('[data-runner-upgrade]')).toBeVisible();
+	await expect(composer).toHaveValue('Unsent work');
+	await expect(composer).toBeFocused();
+	readiness.runner_update = null;
+	await page.clock.fastForward(61_000);
+	await expect(page.locator('[data-runner-upgrade]')).toHaveCount(0);
+	await expect(composer).toHaveValue('Unsent work');
+});
+
+test('Harness settings refresh the version notice after downloading an update', async ({ page }) => {
+	const runnerImageUpdateRequests: string[] = [];
+	await mockApi(page, { runnerImageUpdateRequests });
+	let initialReadiness: Route | undefined;
+	await page.route(`**/api/sessions/${agentId}/readiness`, (route) => {
+		if (!runnerImageUpdateRequests.length) { initialReadiness = route; return; }
+		return route.fulfill({ json: { ready: true, kind: 'codex', runner_update: { current_version: '2.1.1', available_version: '9.9.9' } } });
+	});
+	await page.goto(`/agents/${agentId}?tab=runner`);
+	await expect(page.getByRole('button', { name: 'Download harness update' })).toBeVisible();
+	await expect(page.locator('[data-runner-upgrade-details]')).toHaveCount(0);
+	await expect.poll(() => Boolean(initialReadiness)).toBe(true);
+	await page.getByRole('button', { name: 'Download harness update' }).click();
+	await expect(page.locator('[data-runner-upgrade-details]')).toContainText('current environment 2.1.1; downloaded 9.9.9');
+	const oldResponse = page.waitForResponse((response) => response.url().endsWith('/readiness'));
+	await initialReadiness!.fulfill({ json: { ready: true, runner_update: null } });
+	await oldResponse;
+	await expect(page.locator('[data-runner-upgrade-details]')).toContainText('current environment 2.1.1; downloaded 9.9.9');
+});
+
+test('agent Work keeps internal presentation capability out of the user interface', async ({ page }) => {
+	await mockApi(page, {
+		runnerReadiness: {
+			ready: true,
+			kind: 'codex',
+			presentation_artifacts: {
+				supported: true,
+				available: true,
+				capability: 'xpressclaw-pptx-v1',
+				runtime: 'PptxGenJS 4.0.1',
+				reason: null,
+			},
+		},
+	});
+	await page.goto(`/agents/${agentId}`);
+
+	await expect(page.getByText('PowerPoint artifacts ready')).toHaveCount(0);
+	await expect(page.getByText('PptxGenJS 4.0.1 is pinned in this runner', { exact: false })).toHaveCount(0);
+});
+
+test('agent files browse Git changes and save Monaco edits with a revision', async ({ page }) => {
+	const workspaceSaveRequests: { path: string; content: string; expected_revision: string }[] = [];
+	await mockApi(page, { workspaceSaveRequests });
+	await page.goto(`/agents/${agentId}?tab=files&path=src%2Fmain.ts`);
+
+	await expect(page.locator('[data-workspace-files]')).toBeVisible();
+	await expect(page.getByText('feature/workspace-browser · 2 changed')).toBeVisible();
+	await expect(page.getByRole('button', { name: 'src/main.ts' })).toBeVisible();
+	await expect(page.locator('[data-monaco-editor]')).toBeVisible({ timeout: 20_000 });
+	await expect(page.getByText('Loading editor…')).toBeHidden({ timeout: 20_000 });
+
+	const editor = page.locator('[data-monaco-editor]');
+	await editor.locator('.view-lines').click();
+	await page.keyboard.press('Control+A');
+	await page.keyboard.type('export const greeting = "edited";');
+	const saveButton = page.getByRole('button', { name: 'Save' });
+	await expect(saveButton).toBeEnabled();
+	await saveButton.click();
+
+	await expect.poll(() => workspaceSaveRequests).toEqual([{
+		path: 'src/main.ts',
+		content: 'export const greeting = "edited";',
+		expected_revision: 'revision-before-save',
+	}]);
+	await expect(page.getByText('Saved')).toBeVisible();
+
+	await page.getByRole('button', { name: 'Diff' }).click();
+	await expect(page.locator('[data-monaco-editor]')).toBeVisible();
+	const tree = page.locator('[data-workspace-tree]');
+	await tree.locator('button[title="src"]').click();
+	await expect(tree.locator('button[title="src/main.ts"]')).toBeVisible();
+
+	await page.setViewportSize({ width: 390, height: 844 });
+	await expect(tree).toBeVisible();
+	await expect(page.locator('[data-monaco-editor]')).toBeVisible();
+	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+});
+
+test('workspace save preserves edits typed while the request is in flight', async ({ page }) => {
+	const workspaceSaveRequests: { path: string; content: string; expected_revision: string }[] = [];
+	await mockApi(page, { workspaceSaveRequests, workspaceSaveDelayMs: 400 });
+	await page.goto(`/agents/${agentId}?tab=files&path=src%2Fmain.ts`);
+
+	const editor = page.locator('[data-monaco-editor]');
+	await expect(editor).toBeVisible({ timeout: 20_000 });
+	await expect(page.getByText('Loading editor…')).toBeHidden({ timeout: 20_000 });
+	await editor.locator('.view-lines').click();
+	await page.keyboard.press('Control+A');
+	await page.keyboard.insertText('export const greeting = "submitted";');
+	await page.getByRole('button', { name: 'Save' }).click();
+	await expect.poll(() => workspaceSaveRequests.length).toBe(1);
+
+	await editor.locator('.view-lines').click();
+	await page.keyboard.press('Control+End');
+	await page.keyboard.insertText('\nexport const typedDuringSave = true;');
+	await expect(page.getByText('Saved')).toBeVisible();
+	await expect(page.getByRole('button', { name: 'Save' })).toBeEnabled();
+
+	await page.getByRole('button', { name: 'Save' }).click();
+	await expect.poll(() => workspaceSaveRequests).toHaveLength(2);
+	expect(workspaceSaveRequests[0]).toEqual({
+		path: 'src/main.ts',
+		content: 'export const greeting = "submitted";',
+		expected_revision: 'revision-before-save',
+	});
+	expect(workspaceSaveRequests[1]).toEqual({
+		path: 'src/main.ts',
+		content: 'export const greeting = "submitted";\nexport const typedDuringSave = true;',
+		expected_revision: 'revision-after-save',
+	});
+});
+
+test('deleted workspace changes remain available as diff-only selections', async ({ page }) => {
+	await mockApi(page, { includeDeletedWorkspaceFile: true });
+	await page.goto(`/agents/${agentId}?tab=files`);
+
+	await expect(page.getByText('feature/workspace-browser · 3 changed')).toBeVisible();
+	await page.getByRole('button', { name: 'src/removed.ts' }).click();
+	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&path=src%2Fremoved.ts`);
+	await expect(page.getByRole('button', { name: 'Code' })).toBeDisabled();
+	await expect(page.locator('[data-monaco-editor]')).toContainText('deleted file mode', { timeout: 20_000 });
+	await expect(page.getByText('workspace path was not found')).toBeHidden();
+});
+
+test('task changed files open beside the task with the file tree collapsed', async ({ page }) => {
+	await mockApi(page);
+	await page.goto(`/tasks/${taskId}`);
+
+	const changedFiles = page.locator('[data-task-changed-files]');
+	await expect(changedFiles.getByRole('heading', { name: 'Changed files' })).toBeVisible();
+	await expect(changedFiles.getByRole('link', { name: 'src/main.ts' })).toHaveAttribute(
+		'href',
+		`/agents/${agentId}?tab=files&path=src%2Fmain.ts`,
+	);
+	await changedFiles.getByRole('link', { name: 'src/main.ts' }).click();
+	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&path=src%2Fmain.ts&tree=collapsed`);
+	await expect(page.locator('[data-workspace-pane]')).toHaveCount(2);
+	await expect(page.locator(`#task-message-input-${taskId}`)).toBeVisible();
+	await expect(page.locator('[data-task-details-sidebar]')).toBeHidden();
+	await page.getByRole('button', { name: 'Show task details' }).click();
+	const details = page.getByRole('dialog', { name: 'Task details', exact: true });
+	await expect(details.getByRole('heading', { name: 'Changed files' })).toBeVisible();
+	await details.getByRole('button', { name: 'Close task details' }).click();
+	await expect(page.locator('[data-workspace-tree]')).toHaveCount(0);
+	await expect(page.locator('[data-monaco-editor]')).toBeVisible({ timeout: 20_000 });
+	await expect(page.getByText('Loading editor…')).toBeHidden({ timeout: 20_000 });
+	await page.getByRole('button', { name: 'Show files' }).click();
+	await expect(page.locator('[data-workspace-tree]')).toBeVisible();
+});
+
+test('keyboard-activated task files open beside their source pane', async ({ page }) => {
+	await page.setViewportSize({ width: 1800, height: 900 });
+	await mockApi(page);
+	await page.goto(`/tasks/${taskId}`);
+
+	await page.getByRole('button', { name: 'Split active tab right' }).click();
+	const panes = page.locator('[data-workspace-pane]');
+	await expect(panes).toHaveCount(2);
+
+	const changedFile = panes.first().locator('[data-task-changed-files]').getByRole('link', { name: 'src/main.ts' });
+	await changedFile.focus();
+	await page.keyboard.press('Enter');
+
+	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&path=src%2Fmain.ts&tree=collapsed`);
+	await expect(panes).toHaveCount(3);
+	await expect(panes.nth(0).locator(`#task-message-input-${taskId}`)).toBeVisible();
+	await expect(panes.nth(1).locator('[data-monaco-editor]')).toBeVisible({ timeout: 20_000 });
+	await expect(panes.nth(2).locator(`#task-message-input-${taskId}`)).toBeVisible();
+});
+
+test('task changed files use normal navigation when the workspace is too narrow to split', async ({ page }) => {
+	await page.setViewportSize({ width: 1024, height: 768 });
+	await mockApi(page);
+	await page.goto(`/tasks/${taskId}`);
+
+	const changedFile = page.locator('[data-task-changed-files]').getByRole('link', { name: 'src/main.ts' });
+	await expect(changedFile).toBeVisible();
+	await changedFile.click();
+
+	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&path=src%2Fmain.ts&tree=collapsed`);
+	await expect(page.locator('[data-workspace-pane]')).toHaveCount(1);
+	await expect(page.locator('[data-monaco-editor]')).toBeVisible({ timeout: 20_000 });
+	await expect(page.getByRole('button', { name: 'Show files' })).toBeVisible();
+	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+});
+
+test('task changed-file modified clicks retain normal link behavior', async ({ page }) => {
+	await mockApi(page);
+	await page.goto(`/tasks/${taskId}`);
+
+	const changedFile = page.locator('[data-task-changed-files]').getByRole('link', { name: 'src/main.ts' });
+	const preserved = await changedFile.evaluate((element) => [
+		{ ctrlKey: true },
+		{ metaKey: true },
+		{ shiftKey: true },
+		{ altKey: true },
+	].every((modifiers) => {
+		let defaultPreventedByHandler = true;
+		const observeThenSuppressNavigation = (event: MouseEvent) => {
+			defaultPreventedByHandler = event.defaultPrevented;
+			event.preventDefault();
+		};
+		document.addEventListener('click', observeThenSuppressNavigation, { once: true });
+		element.dispatchEvent(new MouseEvent('click', {
+			bubbles: true,
+			cancelable: true,
+			...modifiers,
+		}));
+		return !defaultPreventedByHandler;
+	}));
+
+	expect(preserved).toBe(true);
+	await expect(page).toHaveURL(`/tasks/${taskId}`);
+	await expect(page.locator('[data-workspace-pane]')).toHaveCount(1);
+});
+
+test('task changed files use normal navigation at the workspace pane limit', async ({ page }) => {
+	const workspaceReadRequests: string[] = [];
+	const workspaceReadDelaysMs: Record<string, number> = {};
+	await page.setViewportSize({ width: 2200, height: 1000 });
+	await mockApi(page, { workspaceReadRequests, workspaceReadDelaysMs });
+	await page.goto(`/tasks/${taskId}`);
+
+	for (let paneCount = 2; paneCount <= 4; paneCount += 1) {
+		await page.getByRole('button', { name: 'Split active tab right' }).last().click();
+		await expect(page.locator('[data-workspace-pane]')).toHaveCount(paneCount);
+	}
+	await expect(page.getByRole('button', { name: 'Split active tab right' }).last()).toBeDisabled();
+
+	const focusedPane = page.locator('[data-workspace-pane]').first();
+	await focusedPane.getByRole('button', { name: 'Show task details' }).click();
+	const changedFile = page.getByRole('dialog', { name: 'Task details', exact: true }).getByRole('link', { name: 'src/main.ts' });
+	await changedFile.focus();
+	await page.keyboard.press('Enter');
+
+	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&path=src%2Fmain.ts&tree=collapsed`);
+	await expect(page.locator('[data-workspace-pane]')).toHaveCount(4);
+	await expect(focusedPane.locator('[data-monaco-editor]')).toBeVisible({ timeout: 20_000 });
+	await expect(page.locator('[data-workspace-pane]').last().locator(`#task-message-input-${taskId}`)).toBeVisible();
+	await focusedPane.getByRole('button', { name: 'Show files' }).click();
+	await expect(focusedPane.locator('[data-workspace-tree]')).toBeVisible();
+
+	const editor = focusedPane.locator('[data-monaco-editor]');
+	await editor.locator('.view-lines').click({ position: { x: 20, y: 20 } });
+	await page.keyboard.press('Control+A');
+	await page.keyboard.insertText('export const unsaved = true;');
+	await expect(focusedPane.getByRole('button', { name: 'Save' })).toBeEnabled();
+
+	const requestFile = (path?: string) => page.evaluate(({ requestedAgentId, requestedPath }) => {
+		window.dispatchEvent(new CustomEvent('xpressclaw:workspace-open-split', {
+			detail: {
+				path: `/agents/${requestedAgentId}?tab=files${requestedPath ? `&path=${encodeURIComponent(requestedPath)}` : ''}&tree=collapsed`,
+			},
+		}));
+	}, { requestedAgentId: agentId, requestedPath: path });
+
+	page.once('dialog', (dialog) => void dialog.dismiss());
+	await requestFile('README.md');
+	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&path=src%2Fmain.ts`);
+	await expect(focusedPane.locator('[data-workspace-files] span[title="src/main.ts"]')).toBeVisible();
+	await expect(focusedPane.locator('[data-workspace-tree]')).toBeVisible();
+	await expect(focusedPane.getByRole('button', { name: 'Save' })).toBeEnabled();
+
+	page.once('dialog', (dialog) => void dialog.accept());
+	await requestFile('README.md');
+
+	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&path=README.md&tree=collapsed`);
+	await expect(page.locator('[data-workspace-pane]')).toHaveCount(4);
+	await expect(focusedPane.locator('[data-workspace-files] span[title="README.md"]')).toBeVisible();
+	await expect(focusedPane.locator('[data-workspace-tree]')).toHaveCount(0);
+
+	workspaceReadDelaysMs['src/main.ts'] = 500;
+	const mainReadCount = workspaceReadRequests.filter((path) => path === 'src/main.ts').length;
+	await requestFile('src/main.ts');
+	await expect.poll(() => workspaceReadRequests.filter((path) => path === 'src/main.ts').length).toBe(mainReadCount + 1);
+	await focusedPane.getByRole('button', { name: 'Show files' }).click();
+	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&path=src%2Fmain.ts`);
+	await expect(focusedPane.locator('[data-workspace-files] span[title="src/main.ts"]')).toBeVisible();
+	await expect(focusedPane.locator('[data-workspace-tree]')).toBeVisible();
+
+	workspaceReadDelaysMs['README.md'] = 500;
+	const readmeReadCount = workspaceReadRequests.filter((path) => path === 'README.md').length;
+	await requestFile('README.md');
+	await expect.poll(() => workspaceReadRequests.filter((path) => path === 'README.md').length).toBe(readmeReadCount + 1);
+	await requestFile('docs/guide.md');
+	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&path=docs%2Fguide.md&tree=collapsed`);
+	await expect(focusedPane.locator('[data-workspace-files] span[title="docs/guide.md"]')).toBeVisible();
+	await page.waitForTimeout(600);
+	await expect(focusedPane.locator('[data-workspace-files] span[title="docs/guide.md"]')).toBeVisible();
+
+	await requestFile();
+	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&tree=collapsed`);
+	await expect(focusedPane.getByText('Choose a file to browse or edit it with Monaco.')).toBeVisible();
+	await expect(focusedPane.locator('[data-monaco-editor]')).toHaveCount(0);
+});
+
+test('task and agent headers always link back to their project', async ({ page }) => {
+	await page.setViewportSize({ width: 1280, height: 900 });
+	await mockApi(page);
+	const projectHref = `/projects/${projectId}`;
+
+	await page.goto(`/tasks/${taskId}`);
+	const taskCrumbs = page.locator('.task-breadcrumbs');
+	await expect(taskCrumbs.getByRole('link', { name: 'Browser collaboration project' })).toHaveAttribute('href', projectHref);
+	await expect(taskCrumbs.getByRole('link', { name: 'Tasks' })).toHaveAttribute('href', `/tasks?project=${projectId}`);
+	await expect(page.locator('.task-compact-project')).toBeHidden();
+
+	await page.goto(`/agents/${agentId}`);
+	const agentCrumbs = page.locator('.agent-breadcrumbs');
+	await expect(agentCrumbs.getByRole('link', { name: 'Browser collaboration project' })).toHaveAttribute('href', projectHref);
+	await expect(page.locator('.agent-compact-project')).toBeHidden();
+});
+
+test('phone headers fold the project link into the title line', async ({ page }) => {
+	await page.setViewportSize({ width: 390, height: 844 });
+	await mockApi(page, {
+		conversations: [{
+			id: conversationId, project_id: projectId, title: 'Phone header conversation', icon: null,
+			created_at: timestamp(1), updated_at: timestamp(61), last_message_at: timestamp(61), participants: [],
+		}],
+	});
+	const projectHref = `/projects/${projectId}`;
+	const sameLine = async (link: Locator, heading: Locator) => {
+		const [linkBox, headingBox] = await Promise.all([link.boundingBox(), heading.boundingBox()]);
+		expect(linkBox && headingBox).toBeTruthy();
+		// Same row: the two boxes overlap vertically instead of stacking.
+		expect(Math.min(linkBox!.y + linkBox!.height, headingBox!.y + headingBox!.height) - Math.max(linkBox!.y, headingBox!.y), JSON.stringify({ linkBox, headingBox })).toBeGreaterThan(8);
+	};
+
+	await page.goto(`/tasks/${taskId}`);
+	await expect(page.locator('.task-breadcrumbs')).toBeHidden();
+	const taskLink = page.locator('.task-compact-project').getByRole('link', { name: 'Browser collaboration project' });
+	await expect(taskLink).toHaveAttribute('href', projectHref);
+	await sameLine(taskLink, page.locator('.task-title-row h1'));
+	await sameLine(page.locator('.task-title-row h1'), page.locator('[data-task-header-actions]'));
+	await expect(page.locator('[data-task-activity-status]').first()).toBeVisible();
+
+	await page.goto(`/agents/${agentId}`);
+	await expect(page.locator('.agent-breadcrumbs')).toBeHidden();
+	const agentLink = page.locator('.agent-compact-project').getByRole('link', { name: 'Browser collaboration project' });
+	await expect(agentLink).toHaveAttribute('href', projectHref);
+	await sameLine(agentLink, page.locator('.agent-header h1'));
+
+	await page.goto(`/conversations/${conversationId}`);
+	await expect(page.locator('.conversation-breadcrumbs')).toBeHidden();
+	const conversationLink = page.locator('.conversation-compact-project').getByRole('link', { name: 'Browser collaboration project' });
+	await expect(conversationLink).toHaveAttribute('href', projectHref);
+	await sameLine(conversationLink, page.locator('.conversation-header h1'));
+	await sameLine(page.locator('.conversation-header h1'), page.getByRole('button', { name: 'Continue with task' }));
+});
+
+test('narrow manual task splits preserve the compact task layout', async ({ page }) => {
+	await page.setViewportSize({ width: 1024, height: 768 });
+	await mockApi(page);
+	await page.goto(`/tasks/${taskId}`);
+
+	await page.getByRole('button', { name: 'Split active tab right' }).click();
+	const panes = page.locator('[data-workspace-pane]');
+	await expect(panes).toHaveCount(2);
+	await expect(panes.locator('[data-task-details-sidebar]')).toHaveCount(2);
+	await expect(panes.locator('[data-task-details-sidebar]').first()).toBeHidden();
+	await expect(panes.locator('[data-task-details-sidebar]').last()).toBeHidden();
+	await expect(panes.locator(`#task-message-input-${taskId}`)).toHaveCount(2);
+
+	const transcriptWidths = await panes.locator('[data-task-transcript-scroll]').evaluateAll((elements) =>
+		elements.map((element) => element.getBoundingClientRect().width),
+	);
+	expect(transcriptWidths.every((width) => width >= 350)).toBe(true);
+	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+});
+
+test('ambiguous cloned repositories require an explicit durable selection', async ({ page }) => {
+	const repositorySelections: (string | null)[] = [];
+	await mockApi(page, {
+		repositorySelections,
+		repositoryStatus: {
+			state: 'ambiguous',
+			message: 'Multiple repositories were found. Select the one this Agent should use.',
+			bootstrap_root: '/srv/workspaces/browser-tested',
+			active: null,
+			candidates: [
+				{ relative_path: 'alpha', root: '/srv/workspaces/browser-tested/alpha', github_repository: 'example/alpha' },
+				{ relative_path: 'product', root: '/srv/workspaces/browser-tested/product', github_repository: 'XpressAI/product' },
+			],
+			discovery_truncated: false,
+			selected_relative_path: null,
+			pending_relative_path: null,
+			pending_action: null,
+			github_status: 'unavailable',
+			github_repository: null,
+			restart_required: false,
+		},
+	});
+	await page.goto(`/agents/${agentId}?tab=workspace`);
+
+	const card = page.locator('[data-active-repository]');
+	await expect(card.getByText('Multiple repositories were found. Select the one this Agent should use.')).toBeVisible();
+	await card.getByText('product', { exact: true }).locator('..').locator('..').getByRole('button', { name: 'Use' }).click();
+	await expect.poll(() => repositorySelections).toEqual(['product']);
+	await expect(card.getByText('The repository change is pending and will be applied at the next safe turn boundary.')).toBeVisible();
+	await expect(card.getByText('The current turn keeps its existing process. The next turn starts a fresh session with the pending repository change.')).toBeVisible();
+});
+
+test('clearing an active repository is queued for a safe turn boundary', async ({ page }) => {
+	const repositorySelections: (string | null)[] = [];
+	await mockApi(page, { repositorySelections });
+	await page.goto(`/agents/${agentId}?tab=workspace`);
+
+	const card = page.locator('[data-active-repository]');
+	await card.getByRole('button', { name: 'Clear active repository' }).click();
+	await expect.poll(() => repositorySelections).toEqual([null]);
+	await expect(card.getByText('The repository change is pending and will be applied at the next safe turn boundary.')).toBeVisible();
+});
+
+test('active repository reports a missing GitHub credential without hiding Git access', async ({ page }) => {
+	await mockApi(page, {
+		repositoryStatus: {
+			state: 'attached',
+			message: 'The active GitHub repository has no matching connector, GH_TOKEN, or host gh credential.',
+			bootstrap_root: '/srv/workspaces/browser-tested',
+			active: { relative_path: 'product', root: '/srv/workspaces/browser-tested/product', github_repository: 'XpressAI/product' },
+			candidates: [
+				{ relative_path: 'product', root: '/srv/workspaces/browser-tested/product', github_repository: 'XpressAI/product' },
+			],
+			discovery_truncated: false,
+			selected_relative_path: 'product',
+			pending_relative_path: null,
+			pending_action: null,
+			github_status: 'missing_credential',
+			github_repository: 'XpressAI/product',
+			restart_required: false,
+		},
+	});
+	await page.goto(`/agents/${agentId}?tab=workspace`);
+
+	const card = page.locator('[data-active-repository]');
+	await expect(card.getByText('GitHub credential missing')).toBeVisible();
+	await expect(card.getByText('XpressAI/product').first()).toBeVisible();
+	await expect(card.getByText('The active GitHub repository has no matching connector, GH_TOKEN, or host gh credential.')).toBeVisible();
+	await expect(card.getByText('/srv/workspaces/browser-tested/product')).toBeVisible();
+});
+
+test('DeepSeek Harness is preserved in Agent runner settings', async ({ page }) => {
+	await mockApi(page, { agentRunnerKind: 'deepseek-harness' });
+	await page.goto(`/agents/${agentId}?tab=runner`);
+
+	await expect(page.getByRole('heading', { name: 'Browser-tested workspace' })).toBeVisible();
+	await expect(page.locator('#runner-kind')).toHaveValue('deepseek-harness');
+	await expect(page.locator('#runner-image')).toHaveValue(
+		'ghcr.io/xpressai/xpressclaw-runner-deepseek-harness:latest',
+	);
+	await expect(page.getByLabel('Share my host SSH access')).not.toBeChecked();
+	await expect(page.getByText(/Start ssh-agent/)).toHaveCount(0);
+	await page.getByLabel('Host Docker or Podman access').check();
+	await expect(page.locator('#runner-image')).toHaveValue(
+		'ghcr.io/xpressai/xpressclaw-runner-deepseek-harness-docker:latest',
+	);
+});
+
+const SSH_FORWARDING_UNSUPPORTED =
+	'Podman on macOS cannot forward a host SSH agent into a container, because virtiofs does not proxy Unix socket connections into the Podman machine VM';
+
+test('an unsupported host SSH agent is explained but still configurable in Agent settings', async ({ page }) => {
+	await mockApi(page, { sshAgentForwardingUnsupportedReason: SSH_FORWARDING_UNSUPPORTED });
+	let saved: { runner: { ssh_agent_forwarding: boolean } } | null = null;
+	await page.route(`**/api/agents/${agentId}/config`, async (route) => {
+		saved = route.request().postDataJSON();
+		await route.fulfill({ json: { agent: saved } });
+	});
+	await page.goto(`/agents/${agentId}?tab=runner`);
+	const checkbox = page.getByLabel('Share my host SSH access', { exact: true });
+	await expect(checkbox).toBeEnabled();
+	await expect(page.getByText(SSH_FORWARDING_UNSUPPORTED, { exact: false })).toBeVisible();
+	await expect(page.getByRole('dialog')).toHaveCount(0);
+	await checkbox.check();
+	await page.getByRole('button', { name: 'Save Changes' }).click();
+	await expect.poll(() => saved?.runner.ssh_agent_forwarding).toBe(true);
+	await expect(checkbox).toBeChecked();
+});
+
+test('a supported host shows no SSH forwarding limitation in Agent settings', async ({ page }) => {
+	await mockApi(page, { sshAgentForwarding: true });
+	await page.goto(`/agents/${agentId}?tab=runner`);
+	const checkbox = page.getByLabel('Share my host SSH access', { exact: true });
+	await expect(checkbox).toBeEnabled();
+	await expect(checkbox).toBeChecked();
+	await expect(page.getByText('cannot forward a host SSH agent', { exact: false })).toHaveCount(0);
+	await checkbox.uncheck();
+	await expect(checkbox).not.toBeChecked();
+});
+
+test('harness image downloads preserve the existing environment', async ({ page }) => {
+	const runnerImageUpdateRequests: string[] = [];
+	await mockApi(page, { runnerImageUpdateRequests });
+	await page.goto(`/agents/${agentId}?tab=runner`);
+
+	await page.getByRole('button', { name: 'Download harness update' }).click();
+	await expect.poll(() => runnerImageUpdateRequests).toEqual([agentId]);
+	await expect(page.locator('#runner-image')).toHaveValue(
+		`ghcr.io/xpressai/xpressclaw-runner-codex@sha256:${'a'.repeat(64)}`,
+	);
+	// Drag-and-drop keeps its own live regions, so target this message's own.
+	const status = page
+		.getByRole('status')
+		.filter({ has: page.getByRole('button', { name: 'Dismiss harness update message' }) });
+	await expect(status).toContainText('Downloaded the latest published harness 9.9.9');
+	await expect(status).toContainText('Your existing environment is preserved');
+	await status.getByRole('button', { name: 'Dismiss harness update message' }).click();
+	await expect(status).toHaveCount(0);
+});
+
+test('custom runner kinds containing a built-in name stay custom in Agent settings', async ({ page }) => {
+	await mockApi(page, { agentRunnerKind: 'codex-proxy' });
+	await page.goto(`/agents/${agentId}?tab=runner`);
+
+	await expect(page.getByRole('heading', { name: 'Browser-tested workspace' })).toBeVisible();
+	await expect(page.locator('#runner-kind')).toHaveValue('codex-proxy');
+	await expect(page.locator('#runner-kind').locator('option:checked')).toHaveText(
+		'Other ACP harness (codex-proxy)',
+	);
+	await expect(page.locator('#runner-image')).toHaveValue('xpressclaw-runner-codex-proxy:latest');
+	await expect(page.getByRole('button', { name: 'Download harness update' })).toHaveCount(0);
 });
 
 test('mobile connection recovery stays non-blocking and does not reload the workspace', async ({ page }) => {
@@ -684,14 +4817,18 @@ test('workspace panes split on wide screens and collapse cleanly on mobile', asy
 	await expect(mobile.getByRole('button', { name: 'Interrupt agent now' })).toBeVisible();
 	expect(await mobile.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 
-	await mobile.getByRole('button', { name: 'Open project switcher' }).click();
+	await mobile.getByRole('button', { name: 'Open agent switcher' }).click();
+	await mobile.locator('aside:visible').getByRole('button', { name: 'Close', exact: true }).click();
+	await mobile.locator('nav a[href="/projects"]').click();
+	await expect(mobile).toHaveURL('/projects');
+	await mobile.getByRole('button', { name: 'Open agent switcher' }).click();
 	let mobileProject = mobile.locator(`aside a[href="/agents/${agentId}"]:visible`);
 	await mobileProject.click();
 	await expect(mobile).toHaveURL(`/agents/${agentId}`);
 	await mobile.getByRole('tab', { name: 'Automations' }).click();
 	await expect(mobile).toHaveURL(`/agents/${agentId}?tab=schedules`);
 
-	await mobile.getByRole('button', { name: 'Open project switcher' }).click();
+	await mobile.getByRole('button', { name: 'Open agent switcher' }).click();
 	mobileProject = mobile.locator(`aside a[href="/agents/${agentId}"]:visible`);
 	await mobileProject.evaluate((element) => element.dispatchEvent(new MouseEvent('contextmenu', {
 		bubbles: true,
@@ -717,7 +4854,7 @@ test('workspace panes split on wide screens and collapse cleanly on mobile', asy
 	await expect(mobile).toHaveURL(`/agents/${agentId}?tab=workspace`);
 
 	const mobileTabs = mobile.locator('[data-workspace-tab]:visible');
-	await expect(mobileTabs).toHaveCount(2);
+	await expect(mobileTabs).toHaveCount(3);
 	await mobileTabs.nth(1).evaluate((element) => element.dispatchEvent(new MouseEvent('contextmenu', {
 		bubbles: true,
 		cancelable: true,
@@ -729,6 +4866,110 @@ test('workspace panes split on wide screens and collapse cleanly on mobile', asy
 	await expect(mobileTabs).toHaveCount(1);
 	expect(await mobile.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 	await mobile.close();
+});
+
+test('workspace keeps the ten most recently used tabs and clearly marks the active tab', async ({ page }) => {
+	const conversation = {
+		id: conversationId,
+		project_id: projectId,
+		title: 'Release planning',
+		icon: null,
+		created_at: timestamp(1),
+		updated_at: timestamp(2),
+		last_message_at: timestamp(2),
+		participants: [],
+	};
+	const workflow = {
+		id: 'workflow-limit-test',
+		name: 'Limit test workflow',
+		description: 'Exercises the workspace tab limit.',
+		yaml_content: 'name: limit-test\nflows:\n  main:\n    steps: []\n',
+		enabled: true,
+		version: 1,
+		created_at: timestamp(1),
+		updated_at: timestamp(2),
+	};
+	await page.addInitScript(({ storageKey, state }) => {
+		if (!localStorage.getItem(storageKey)) localStorage.setItem(storageKey, JSON.stringify(state));
+	}, {
+		storageKey: 'xpressclaw.workspace.v1',
+		state: {
+			focusedPaneId: 'seed-pane',
+			panes: [{
+				id: 'seed-pane',
+				activeTabId: 'seed-tab-10',
+				width: 1,
+				tabs: [
+					{ id: 'seed-tab-1', path: '/', kind: 'home', title: 'New work', resourceId: null, status: null, lastActiveAt: 1 },
+					{ id: 'seed-tab-2', path: '/projects', kind: 'projects', title: 'Projects', resourceId: null, status: null, lastActiveAt: 2 },
+					{ id: 'seed-tab-3', path: `/projects/${projectId}`, kind: 'project', title: 'Browser collaboration project', resourceId: projectId, status: null, lastActiveAt: 3 },
+					{ id: 'seed-tab-4', path: `/conversations/${conversationId}`, kind: 'conversation', title: 'Release planning', resourceId: conversationId, status: null, lastActiveAt: 4 },
+					{ id: 'seed-tab-5', path: '/agents', kind: 'agents', title: 'Agents', resourceId: null, status: null, lastActiveAt: 5 },
+					{ id: 'seed-tab-6', path: `/agents/${agentId}`, kind: 'agent', title: 'Browser-tested workspace', resourceId: agentId, status: null, lastActiveAt: 6 },
+					{ id: 'seed-tab-7', path: '/tasks', kind: 'tasks', title: 'Tasks', resourceId: null, status: null, lastActiveAt: 7 },
+					{ id: 'seed-tab-8', path: `/tasks/${taskId}`, kind: 'task', title: 'Browser-tested workspace', resourceId: taskId, status: null, lastActiveAt: 8 },
+					{ id: 'seed-tab-9', path: '/workflows/new', kind: 'workflow-new', title: 'New workflow', resourceId: null, status: null, lastActiveAt: 9 },
+					{ id: 'seed-tab-10', path: '/workflows/workflow-limit-test', kind: 'workflow', title: 'Limit test workflow', resourceId: 'workflow-limit-test', status: null, lastActiveAt: 10 },
+				],
+			}],
+		},
+	});
+	await mockApi(page, {
+		preserveWorkspace: true,
+		conversations: [conversation],
+		workflows: [workflow],
+	});
+	await page.goto('/workflows/workflow-limit-test');
+
+	const tabs = page.locator('[data-workspace-pane] [data-workspace-tab]');
+	await expect(tabs).toHaveCount(10);
+	await tabs.filter({ has: page.locator('button[title="New work"]') }).locator('button').first().click();
+	await expect(page).toHaveURL('/');
+
+	await page.locator('aside').first().locator('a[href="/settings"]').click();
+	await expect(page).toHaveURL('/settings');
+	await expect(tabs).toHaveCount(10);
+	await expect(page.locator('[data-workspace-pane] [data-workspace-tab][data-workspace-tab-title="New work"]')).toHaveCount(1);
+	await expect(page.locator('[data-workspace-pane] [data-workspace-tab][data-workspace-tab-title="Projects"]')).toHaveCount(0);
+
+	const activeTab = page.locator('[data-workspace-pane] [data-workspace-tab][data-workspace-tab-active="true"]');
+	const inactiveTab = page.locator('[data-workspace-pane] [data-workspace-tab][data-workspace-tab-active="false"]').first();
+	await expect(activeTab).toHaveCount(1);
+	await expect(activeTab).toHaveAttribute('data-workspace-tab-title', 'Settings');
+	await expect(activeTab.locator('button').first()).toHaveAttribute('aria-current', 'page');
+	await expect(activeTab.locator('[data-active-tab-indicator]')).toBeVisible();
+	const tabStrip = page.locator('[data-workspace-pane] [data-workspace-tab-strip]');
+	await expect.poll(async () => {
+		const [stripBounds, activeBounds] = await Promise.all([tabStrip.boundingBox(), activeTab.boundingBox()]);
+		return Boolean(stripBounds && activeBounds
+			&& activeBounds.x >= stripBounds.x
+			&& activeBounds.x + activeBounds.width <= stripBounds.x + stripBounds.width + 1);
+	}).toBe(true);
+	const [activeStyle, inactiveStyle] = await Promise.all([
+		activeTab.evaluate((element) => ({
+			background: getComputedStyle(element).backgroundColor,
+			color: getComputedStyle(element).color,
+		})),
+		inactiveTab.evaluate((element) => ({
+			background: getComputedStyle(element).backgroundColor,
+			color: getComputedStyle(element).color,
+		})),
+	]);
+	expect(activeStyle).not.toEqual(inactiveStyle);
+
+	const persistedTabs = await page.evaluate(() => {
+		const state = JSON.parse(localStorage.getItem('xpressclaw.workspace.v1') ?? '{}') as {
+			panes?: { tabs?: { lastActiveAt?: number }[] }[];
+		};
+		return state.panes?.flatMap((pane) => pane.tabs ?? []) ?? [];
+	});
+	expect(persistedTabs).toHaveLength(10);
+	expect(persistedTabs.every((tab) => Number.isFinite(tab.lastActiveAt))).toBe(true);
+
+	await page.reload();
+	await expect(tabs).toHaveCount(10);
+	await expect(page.locator('[data-workspace-pane] [data-workspace-tab][data-workspace-tab-title="New work"]')).toHaveCount(1);
+	await expect(page.locator('[data-workspace-pane] [data-workspace-tab][data-workspace-tab-title="Projects"]')).toHaveCount(0);
 });
 
 test('workspace renders when session storage is unavailable', async ({ page }) => {
@@ -749,7 +4990,7 @@ test('workspace renders when session storage is unavailable', async ({ page }) =
 	await expect.poll(() => page.evaluate(() => localStorage.getItem('xpressclaw.workspace.v1') !== null)).toBe(true);
 });
 
-test('project context menus open sections and separate windows', async ({ page }) => {
+test('agent context menus open sections and separate windows', async ({ page }) => {
 	await mockApi(page);
 	await page.goto('/');
 
@@ -761,7 +5002,7 @@ test('project context menus open sections and separate windows', async ({ page }
 		'Open in New Window',
 		'Open Tasks',
 		'Open Automations',
-		'Open Agent',
+		'Open Harness',
 		'Open Environment',
 	]);
 	await projectMenu.getByRole('menuitem', { name: 'Open Automations' }).click();
@@ -783,7 +5024,7 @@ test('tab context menus close one, other, or all tabs within a pane', async ({ p
 	const sidebar = page.locator('aside').first();
 	const tabs = page.locator('[data-workspace-pane] [data-workspace-tab]');
 
-	await sidebar.locator('a[href="/agents"]').click();
+	await sidebar.locator('a[href="/projects"]').click();
 	await sidebar.locator('a[href="/settings"]').click();
 	await expect(tabs).toHaveCount(3);
 
@@ -791,7 +5032,7 @@ test('tab context menus close one, other, or all tabs within a pane', async ({ p
 	await page.getByRole('menuitem', { name: 'Close Other Tabs' }).click();
 	await expect(tabs).toHaveCount(1);
 	await expect(tabs).toHaveAttribute('data-workspace-tab-title', 'Projects');
-	await expect(page).toHaveURL('/agents');
+	await expect(page).toHaveURL('/projects');
 
 	await tabs.click({ button: 'right' });
 	await expect(page.getByRole('menuitem', { name: 'Close Other Tabs' })).toBeDisabled();
@@ -801,7 +5042,7 @@ test('tab context menus close one, other, or all tabs within a pane', async ({ p
 	await tabs.filter({ has: page.locator('[title="Settings"]') }).click({ button: 'right' });
 	await page.getByRole('menuitem', { name: 'Close Tab', exact: true }).click();
 	await expect(tabs).toHaveCount(1);
-	await expect(page).toHaveURL('/agents');
+	await expect(page).toHaveURL('/projects');
 
 	await sidebar.locator('a[href="/settings"]').click();
 	await tabs.filter({ has: page.locator('[title="Settings"]') }).click({ button: 'right' });
@@ -832,6 +5073,9 @@ test('tab context menus create native webview windows in the desktop app', async
 			__TAURI_INTERNALS__: { invoke: (command: string, args: unknown) => Promise<unknown> };
 		}).__TAURI_INTERNALS__ = {
 			invoke: async (command: string, args: unknown) => {
+				if (command === 'get_active_instance_profile') {
+					return { identity_status: 'matched', local: true };
+				}
 				(window as unknown as { __workspaceWindowCalls: unknown[] }).__workspaceWindowCalls.push({ command, args });
 				return null;
 			},
@@ -852,6 +5096,293 @@ test('tab context menus create native webview windows in the desktop app', async
 	expect(call.args.options.label).toMatch(/^workspace-/);
 	expect(new URL(call.args.options.url).pathname).toBe(`/tasks/${taskId}`);
 	expect(new URL(call.args.options.url).searchParams.get('_xpressclaw_window')).toBe(call.args.options.label);
+});
+
+const TAB_NEW_WORK = { id: 'seed-tab-home', path: '/', kind: 'home', title: 'New work', resourceId: null, status: null, lastActiveAt: 1 };
+const TAB_PROJECTS = { id: 'seed-tab-projects', path: '/projects', kind: 'projects', title: 'Projects', resourceId: null, status: null, lastActiveAt: 2 };
+const TAB_SETTINGS = { id: 'seed-tab-settings', path: '/settings', kind: 'settings', title: 'Settings', resourceId: null, status: null, lastActiveAt: 3 };
+
+async function seedWorkspace(page: Page, workspace: Record<string, unknown>) {
+	await page.addInitScript(({ storageKey, state }) => {
+		if (!localStorage.getItem(storageKey)) localStorage.setItem(storageKey, JSON.stringify(state));
+	}, { storageKey: 'xpressclaw.workspace.v1', state: workspace });
+	await mockApi(page, { preserveWorkspace: true });
+}
+
+/**
+ * Tab titles in strip order.
+ *
+ * Mid-drag the strip also holds the overlay copy that tracks the cursor; it is
+ * excluded so the order reads as the landing preview, which is where the
+ * placeholder sits.
+ */
+async function tabTitles(scope: Locator): Promise<string[]> {
+	return scope.locator('[data-workspace-tab]:not([data-dnd-dragging])').evaluateAll((elements) =>
+		elements.map((element) => element.getAttribute('data-workspace-tab-title') ?? ''),
+	);
+}
+
+/** Wait for the page to paint, so frame-driven work has a chance to run. */
+async function settleFrames(page: Page, frames = 2): Promise<void> {
+	await page.evaluate(
+		(count) =>
+			new Promise<void>((resolve) => {
+				let remaining = count;
+				const step = () => (remaining-- > 0 ? requestAnimationFrame(step) : resolve());
+				step();
+			}),
+		frames,
+	);
+}
+
+/**
+ * Drag a tab with real pointer travel.
+ *
+ * Tabs activate on pointer distance rather than native drag events, so a drag
+ * has to clear the activation threshold before it travels; Playwright's dragTo
+ * moves too directly to engage the sensor.
+ */
+async function dragTab(page: Page, source: Locator, target: Locator, land: 'start' | 'end' = 'end') {
+	const from = await source.boundingBox();
+	const to = await target.boundingBox();
+	if (!from || !to) throw new Error('drag source or target has no bounding box');
+	const originX = from.x + from.width / 2;
+	const originY = from.y + from.height / 2;
+	await page.mouse.move(originX, originY);
+	await page.mouse.down();
+	await page.mouse.move(originX + 12, originY, { steps: 5 });
+	await page.mouse.move(land === 'start' ? to.x + 6 : to.x + to.width - 6, to.y + to.height / 2, { steps: 15 });
+	// Playwright dispatches its moves back to back, so without giving the page a
+	// rendered frame the button can come up before the drag has resolved a target
+	// for the final position. A real pointer interleaves moves with frames.
+	await settleFrames(page);
+	return async () => {
+		await page.mouse.up();
+		// The drop animation keeps the overlay and placeholder around for a beat,
+		// and both carry the tab's own attributes.
+		await expect(page.locator('[data-dnd-dragging], [data-dnd-placeholder]')).toHaveCount(0);
+	};
+}
+
+async function dragTabAndDrop(page: Page, source: Locator, target: Locator, land: 'start' | 'end' = 'end') {
+	const drop = await dragTab(page, source, target, land);
+	await drop();
+}
+
+test('dragging a tab reorders it inside its pane and survives a reload', async ({ page }) => {
+	await seedWorkspace(page, {
+		focusedPaneId: 'seed-pane',
+		panes: [{ id: 'seed-pane', activeTabId: TAB_PROJECTS.id, width: 1, tabs: [TAB_NEW_WORK, TAB_PROJECTS, TAB_SETTINGS] }],
+	});
+	await page.goto('/projects');
+
+	const pane = page.locator('[data-workspace-pane]').first();
+	const tabs = pane.locator('[data-workspace-tab]');
+	await expect(tabs).toHaveCount(3);
+	expect(await tabTitles(pane)).toEqual(['New work', 'Projects', 'Settings']);
+
+	await dragTabAndDrop(page, tabs.nth(0), tabs.nth(1));
+
+	await expect.poll(() => tabTitles(pane)).toEqual(['Projects', 'New work', 'Settings']);
+	await expect(page).toHaveURL('/projects');
+	await expect(pane.locator('[data-workspace-tab][data-workspace-tab-active="true"]'))
+		.toHaveAttribute('data-workspace-tab-title', 'Projects');
+
+	await page.reload();
+	await expect.poll(() => tabTitles(pane)).toEqual(['Projects', 'New work', 'Settings']);
+});
+
+test('dragging a tab onto another pane moves it there and focuses it', async ({ page }) => {
+	await seedWorkspace(page, {
+		focusedPaneId: 'pane-left',
+		panes: [
+			{ id: 'pane-left', activeTabId: TAB_NEW_WORK.id, width: 1, tabs: [TAB_NEW_WORK, TAB_PROJECTS] },
+			{ id: 'pane-right', activeTabId: TAB_SETTINGS.id, width: 1, tabs: [TAB_SETTINGS] },
+		],
+	});
+	await page.goto('/');
+
+	const panes = page.locator('[data-workspace-pane]');
+	await expect(panes).toHaveCount(2);
+	expect(await tabTitles(panes.nth(1))).toEqual(['Settings']);
+
+	await dragTabAndDrop(
+		page,
+		panes.nth(0).locator('[data-workspace-tab][data-workspace-tab-title="Projects"]'),
+		panes.nth(1).locator('[data-workspace-tab][data-workspace-tab-title="Settings"]'),
+		'start',
+	);
+
+	await expect.poll(() => tabTitles(panes.nth(0))).toEqual(['New work']);
+	await expect.poll(() => tabTitles(panes.nth(1))).toEqual(['Projects', 'Settings']);
+	await expect(panes.nth(1).locator('[data-workspace-tab][data-workspace-tab-active="true"]'))
+		.toHaveAttribute('data-workspace-tab-title', 'Projects');
+	await expect(page).toHaveURL('/projects');
+});
+
+test('dragging the last tab out of a pane closes the emptied pane', async ({ page }) => {
+	await seedWorkspace(page, {
+		focusedPaneId: 'pane-left',
+		panes: [
+			{ id: 'pane-left', activeTabId: TAB_NEW_WORK.id, width: 1, tabs: [TAB_NEW_WORK, TAB_PROJECTS] },
+			{ id: 'pane-right', activeTabId: TAB_SETTINGS.id, width: 1, tabs: [TAB_SETTINGS] },
+		],
+	});
+	await page.goto('/');
+
+	const panes = page.locator('[data-workspace-pane]');
+	await expect(panes).toHaveCount(2);
+
+	// Land on the empty strip space past the left pane's tabs, which appends.
+	const strip = panes.nth(0).locator('[data-workspace-tab-strip]');
+	await dragTabAndDrop(
+		page,
+		panes.nth(1).locator('[data-workspace-tab][data-workspace-tab-title="Settings"]'),
+		strip,
+	);
+
+	await expect(panes).toHaveCount(1);
+	await expect.poll(() => tabTitles(panes.nth(0))).toEqual(['New work', 'Projects', 'Settings']);
+	await expect(panes.nth(0).locator('[data-workspace-tab][data-workspace-tab-active="true"]'))
+		.toHaveAttribute('data-workspace-tab-title', 'Settings');
+	await expect(page).toHaveURL('/settings');
+});
+
+test('dragging a tab marks where it will land', async ({ page }) => {
+	await seedWorkspace(page, {
+		focusedPaneId: 'seed-pane',
+		panes: [{ id: 'seed-pane', activeTabId: TAB_PROJECTS.id, width: 1, tabs: [TAB_NEW_WORK, TAB_PROJECTS, TAB_SETTINGS] }],
+	});
+	await page.goto('/projects');
+
+	const pane = page.locator('[data-workspace-pane]').first();
+	const tabs = pane.locator('[data-workspace-tab]');
+	await expect(tabs).toHaveCount(3);
+
+	const drop = await dragTab(page, tabs.nth(0), tabs.nth(1));
+	// An indicator marks the landing slot. The tabs themselves do not move,
+	// so nothing else in the workspace can observe a drag in flight.
+	await expect(pane.locator('[data-tab-drop-indicator]')).toHaveCount(1);
+	expect(await tabTitles(pane)).toEqual(['New work', 'Projects', 'Settings']);
+
+	await drop();
+
+	await expect(pane.locator('[data-tab-drop-indicator]')).toHaveCount(0);
+	await expect.poll(() => tabTitles(pane)).toEqual(['Projects', 'New work', 'Settings']);
+});
+
+test('abandoning a tab drag restores the original order', async ({ page }) => {
+	await seedWorkspace(page, {
+		focusedPaneId: 'seed-pane',
+		panes: [{ id: 'seed-pane', activeTabId: TAB_PROJECTS.id, width: 1, tabs: [TAB_NEW_WORK, TAB_PROJECTS, TAB_SETTINGS] }],
+	});
+	await page.goto('/projects');
+
+	const pane = page.locator('[data-workspace-pane]').first();
+	const tabs = pane.locator('[data-workspace-tab]');
+	await expect(tabs).toHaveCount(3);
+
+	await dragTab(page, tabs.nth(0), tabs.nth(1));
+	await page.keyboard.press('Escape');
+	await page.mouse.up();
+
+	await expect.poll(() => tabTitles(pane)).toEqual(['New work', 'Projects', 'Settings']);
+});
+
+test('tab context menus move tabs left, right, and into a new split', async ({ page }) => {
+	await seedWorkspace(page, {
+		focusedPaneId: 'seed-pane',
+		panes: [{ id: 'seed-pane', activeTabId: TAB_NEW_WORK.id, width: 1, tabs: [TAB_NEW_WORK, TAB_PROJECTS, TAB_SETTINGS] }],
+	});
+	await page.goto('/');
+
+	const pane = page.locator('[data-workspace-pane]').first();
+	await pane.locator('[data-workspace-tab][data-workspace-tab-title="New work"]').click({ button: 'right' });
+	const firstMenu = page.getByRole('menu', { name: 'New work tab actions' });
+	await expect(firstMenu).toBeVisible();
+	await expect(firstMenu.getByRole('menuitem')).toHaveText([
+		'Move Left',
+		'Move Right',
+		'Move to New Split',
+		'Close Tab',
+		'Close Other Tabs',
+		'Close All Tabs',
+		'Open in New Window',
+	]);
+	await expect(firstMenu.getByRole('menuitem', { name: 'Move Left' })).toBeDisabled();
+	await firstMenu.getByRole('menuitem', { name: 'Move Right' }).click();
+	await expect.poll(() => tabTitles(pane)).toEqual(['Projects', 'New work', 'Settings']);
+
+	await pane.locator('[data-workspace-tab][data-workspace-tab-title="Settings"]').click({ button: 'right' });
+	const lastMenu = page.getByRole('menu', { name: 'Settings tab actions' });
+	await expect(lastMenu.getByRole('menuitem', { name: 'Move Right' })).toBeDisabled();
+	await lastMenu.getByRole('menuitem', { name: 'Move to New Split' }).click();
+
+	const panes = page.locator('[data-workspace-pane]');
+	await expect(panes).toHaveCount(2);
+	await expect.poll(() => tabTitles(panes.nth(0))).toEqual(['Projects', 'New work']);
+	await expect.poll(() => tabTitles(panes.nth(1))).toEqual(['Settings']);
+	await expect(page).toHaveURL('/settings');
+});
+
+test('tab move menu items stay disabled when there is nowhere to move', async ({ page }) => {
+	await mockApi(page);
+	await page.goto('/');
+
+	const tab = page.locator('[data-workspace-pane] [data-workspace-tab]');
+	await expect(tab).toHaveCount(1);
+	await tab.click({ button: 'right' });
+
+	const menu = page.getByRole('menu', { name: 'New work tab actions' });
+	await expect(menu.getByRole('menuitem', { name: 'Move Left' })).toBeDisabled();
+	await expect(menu.getByRole('menuitem', { name: 'Move Right' })).toBeDisabled();
+	await expect(menu.getByRole('menuitem', { name: 'Move to New Split' })).toBeDisabled();
+});
+
+test('the compact tab strip reorders tabs by drag on narrow screens', async ({ page }) => {
+	await page.setViewportSize({ width: 700, height: 700 });
+	await seedWorkspace(page, {
+		focusedPaneId: 'seed-pane',
+		panes: [{ id: 'seed-pane', activeTabId: TAB_PROJECTS.id, width: 1, tabs: [TAB_NEW_WORK, TAB_PROJECTS, TAB_SETTINGS] }],
+	});
+	await page.goto('/projects');
+
+	const strip = page.locator('[data-workspace-tab-strip]:visible');
+	await expect(strip).toHaveCount(1);
+	const tabs = strip.locator('[data-workspace-tab]');
+	await expect(tabs).toHaveCount(3);
+
+	await dragTabAndDrop(page, tabs.nth(0), tabs.nth(1));
+
+	await expect.poll(() => tabTitles(strip)).toEqual(['Projects', 'New work', 'Settings']);
+	await expect(page).toHaveURL('/projects');
+});
+
+test('the compact strip appends into the last pane on empty space', async ({ page }) => {
+	await page.setViewportSize({ width: 700, height: 700 });
+	await seedWorkspace(page, {
+		focusedPaneId: 'pane-left',
+		panes: [
+			{ id: 'pane-left', activeTabId: TAB_NEW_WORK.id, width: 1, tabs: [TAB_NEW_WORK, TAB_PROJECTS] },
+			{ id: 'pane-right', activeTabId: TAB_SETTINGS.id, width: 1, tabs: [TAB_SETTINGS] },
+		],
+	});
+	await page.goto('/');
+
+	const strip = page.locator('[data-workspace-tab-strip]:visible');
+	await expect(strip.locator('[data-workspace-tab]')).toHaveCount(3);
+
+	// Every pane's tabs share this strip, so its trailing space belongs to the
+	// last pane, matching where a tab dropped there lands.
+	await dragTabAndDrop(
+		page,
+		strip.locator('[data-workspace-tab][data-workspace-tab-title="New work"]'),
+		strip,
+	);
+
+	await expect.poll(() => tabTitles(strip)).toEqual(['Projects', 'Settings', 'New work']);
+	await expect(page.locator('[data-workspace-pane]')).toHaveCount(2);
+	await expect(page).toHaveURL('/');
 });
 
 test('task pages show five recent tasks per project in the sidebar', async ({ page }) => {
@@ -914,28 +5445,20 @@ test('task pages show five recent tasks per project in the sidebar', async ({ pa
 	const taskSidebar = sidebar.locator('[data-sidebar-mode="tasks"]');
 	await expect(taskSidebar).toBeVisible();
 
-	const primaryGroup = taskSidebar.locator(`[data-sidebar-project-group="${agentId}"]`);
-	await expect(primaryGroup.getByRole('heading', { name: 'Browser-tested workspace' })).toBeVisible();
-	const primaryTasks = primaryGroup.locator('[data-sidebar-task]');
-	await expect(primaryTasks).toHaveCount(5);
-	expect(await primaryTasks.evaluateAll((items) => items.map((item) => item.getAttribute('href')))).toEqual([
+	const projectGroup = taskSidebar.locator(`[data-sidebar-project-group="${projectId}"]`);
+	await expect(projectGroup.getByRole('heading', { name: 'Browser collaboration project' })).toBeVisible();
+	const projectTasks = projectGroup.locator('[data-sidebar-task]');
+	await expect(projectTasks).toHaveCount(5);
+	expect(await projectTasks.evaluateAll((items) => items.map((item) => item.getAttribute('href')))).toEqual([
 		'/tasks/primary-newest',
 		'/tasks/primary-second',
 		'/tasks/primary-recent',
-		'/tasks/primary-middle',
-		`/tasks/${taskId}`,
-	]);
-	await expect(primaryGroup.locator(`a[href="/tasks/${taskId}"]`)).toHaveAttribute('aria-current', 'page');
-	await expect(primaryGroup.locator(`a[href="/tasks/${taskId}"] [data-task-status="in_progress"]`)).toBeVisible();
-
-	const secondaryGroup = taskSidebar.locator('[data-sidebar-project-group="project-secondary-test"]');
-	await expect(secondaryGroup.getByRole('heading', { name: 'Secondary browser workspace' })).toBeVisible();
-	expect(await secondaryGroup.locator('[data-sidebar-task]').evaluateAll((items) => items.map((item) => item.getAttribute('href')))).toEqual([
 		'/tasks/secondary-newest',
-		'/tasks/secondary-older',
+		'/tasks/primary-middle',
 	]);
+	await expect(projectGroup.locator(`a[href="/tasks/${taskId}"]`)).toHaveCount(0);
 
-	await sidebar.locator('a[href="/agents"]').click();
+	await sidebar.locator('a[href="/projects"]').click();
 	await expect(sidebar.locator('[data-sidebar-mode="tasks"]')).toHaveCount(0);
 	await expect(sidebar.locator(`a[href="/agents/${agentId}"]`)).toBeVisible();
 });
@@ -956,8 +5479,8 @@ test('task list scrolls and requests one filtered page at a time', async ({ page
 
 	const secondPageRequest = page.waitForRequest((request) => {
 		const url = new URL(request.url());
-		return url.pathname === '/api/tasks'
-			&& url.searchParams.get('statuses') === 'completed,cancelled'
+		return url.pathname === '/api/tasks/planning'
+			&& url.searchParams.get('status') === 'done'
 			&& url.searchParams.get('offset') === '20';
 	});
 	await page.getByRole('button', { name: 'Next' }).click();
@@ -968,8 +5491,8 @@ test('task list scrolls and requests one filtered page at a time', async ({ page
 
 	const finalPageRequest = page.waitForRequest((request) => {
 		const url = new URL(request.url());
-		return url.pathname === '/api/tasks'
-			&& url.searchParams.get('statuses') === 'completed,cancelled'
+		return url.pathname === '/api/tasks/planning'
+			&& url.searchParams.get('status') === 'done'
 			&& url.searchParams.get('offset') === '40';
 	});
 	await page.getByRole('button', { name: 'Next' }).click();
@@ -979,7 +5502,402 @@ test('task list scrolls and requests one filtered page at a time', async ({ page
 	await expect(page.getByRole('button', { name: 'Next' })).toBeDisabled();
 });
 
-test('workflow and settings pages show context-specific sidebar lists', async ({ page }) => {
+test('idle completed turns do not look active and future plan items are deferred', async ({ page }) => {
+	await mockApi(page, {
+		taskStatus: 'in_progress',
+		taskActivityStatus: 'idle',
+		taskSubtasks: [{
+			id: 'future-plan-step',
+			title: 'Address any further review feedback through approval or merge',
+			description: null,
+			status: 'cancelled',
+			priority: -1,
+			agent_id: null,
+			parent_task_id: taskId,
+			sop_id: null,
+			conversation_id: null,
+			created_at: timestamp(10),
+			updated_at: timestamp(61),
+			completed_at: null,
+			context: { origin: 'native_plan', plan_disposition: 'deferred' },
+			provenance: 'native_plan',
+			blocks_parent: false,
+			activity_status: 'cancelled',
+		}],
+	});
+
+	await page.goto('/tasks');
+	const row = page.locator('[data-task-row]').filter({has:page.locator(`a[href="/tasks/${taskId}"]`)});
+	await expect(row).toHaveAttribute('data-task-activity-status', 'idle');
+	await expect(row.getByText('Not running')).toBeVisible();
+	await expect(row.getByText('Working')).toHaveCount(0);
+
+	await row.getByRole('link').first().click();
+	await expect(page.locator('[data-task-activity-status="idle"]').first()).toBeVisible();
+	await expect(page.locator('[data-agent-loading]')).toHaveCount(0);
+	await expect(page.getByText('No worker or required subtask is currently running.')).toBeVisible();
+	await expect(page.getByText('Deferred · does not block completion')).toBeVisible();
+});
+
+test('task search filters the full history with server-side counts', async ({ page }) => {
+	await mockApi(page, { completedTaskCount: 45 });
+	await page.goto('/tasks');
+	await page.getByRole('button', { name: 'Done 45' }).click();
+
+	const searchRequest = page.waitForRequest((request) => {
+		const url = new URL(request.url());
+		return url.pathname === '/api/tasks/planning' && url.searchParams.get('search') === 'COMPLETED 42';
+	});
+	await page.getByRole('searchbox', { name: 'Search tasks' }).fill('COMPLETED 42');
+	const searchUrl = new URL((await searchRequest).url());
+	expect(searchUrl.searchParams.get('status')).toBe('done');
+
+	await expect(page.locator('[data-task-list] [data-task-row]')).toHaveCount(1);
+	await expect(page.locator('[data-task-list] [data-task-row] a').first()).toHaveAttribute('href', '/tasks/completed-task-42');
+	await expect(page.getByText('1 matching task')).toBeVisible();
+	await expect(page.getByRole('button', { name: 'Done 1' })).toBeVisible();
+
+	await page.getByRole('button', { name: 'Clear task search' }).click();
+	await expect(page.getByRole('button', { name: 'Done 45' })).toBeVisible();
+	await expect(page.locator('[data-task-list] [data-task-row]')).toHaveCount(20);
+});
+
+test('task search waits for Japanese IME composition to finish', async ({ page }) => {
+	await mockApi(page, {
+		taskTitle: '日本語の検索を確認',
+		taskDescription: '入力メソッドで見つけるタスク',
+	});
+	const searches: string[] = [];
+	page.on('request', (request) => {
+		const url = new URL(request.url());
+		if (url.pathname === '/api/tasks/planning' && url.searchParams.has('search')) {
+			searches.push(url.searchParams.get('search') ?? '');
+		}
+	});
+	await page.goto('/tasks');
+	await page.getByRole('button', { name: 'Done 1' }).click();
+	const search = page.getByRole('searchbox', { name: 'Search tasks' });
+
+	await search.dispatchEvent('compositionstart', { data: '' });
+	await search.evaluate((element) => {
+		const input = element as HTMLInputElement;
+		input.value = 'けんさく';
+		input.dispatchEvent(new InputEvent('input', {
+			bubbles: true,
+			data: 'けんさく',
+			inputType: 'insertCompositionText',
+			isComposing: true,
+		}));
+	});
+	await search.dispatchEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 229, isComposing: true });
+	await page.waitForTimeout(350);
+	expect(searches).toEqual([]);
+
+	const searchRequest = page.waitForRequest((request) => {
+		const url = new URL(request.url());
+		return url.pathname === '/api/tasks/planning' && url.searchParams.get('search') === '検索';
+	});
+	await search.evaluate((element) => {
+		const input = element as HTMLInputElement;
+		input.value = '検索';
+		input.dispatchEvent(new InputEvent('input', {
+			bubbles: true,
+			data: '検索',
+			inputType: 'insertCompositionText',
+			isComposing: true,
+		}));
+		input.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: '検索' }));
+		input.dispatchEvent(new InputEvent('input', {
+			bubbles: true,
+			data: '検索',
+			inputType: 'insertText',
+			isComposing: false,
+		}));
+	});
+	await searchRequest;
+	const resultRows = page.locator('[data-task-list] [data-task-row]');
+	await expect(resultRows).toHaveCount(1);
+	await expect(resultRows).toContainText('日本語の検索を確認');
+	expect(searches).toEqual(['検索']);
+});
+
+test('agent, task, and automation lists remain scrollable on mobile', async ({ browser }) => {
+	const mobile = await browser.newPage({
+		viewport: { width: 390, height: 844 },
+		isMobile: true,
+		hasTouch: true,
+	});
+	const mobileWorkflows = Array.from({ length: 30 }, (_, index) => ({
+		id: `workflow-mobile-${index + 1}`,
+		name: `Mobile workflow ${index + 1}`,
+		description: `Workflow ${index + 1} verifies the mobile list can scroll.`,
+		yaml_content: 'flows: {}',
+		enabled: index % 2 === 0,
+		version: 1,
+		created_at: timestamp(index),
+		updated_at: timestamp(index),
+	}));
+	await mockApi(mobile, {
+		completedTaskCount: 45,
+		projectCount: 30,
+		workflows: mobileWorkflows,
+	});
+
+	await mobile.goto('/agents');
+	await expect(mobile.locator('[data-projects-scroll] [data-project-card]')).toHaveCount(30);
+	await expect(mobile.locator('[data-project-card]').first()).toContainText('Codex · xpressclaw');
+	await expectVerticalScroll(mobile.locator('[data-projects-scroll]'));
+	await mobile.getByRole('button', { name: 'Open agent switcher' }).click();
+	await expectVerticalScroll(mobile.locator('aside:visible [data-mobile-sidebar-scroll]'));
+	await mobile.locator('aside:visible').getByRole('button', { name: 'Close', exact: true }).click();
+
+	await mobile.goto('/tasks');
+	await mobile.getByRole('combobox', { name: 'Task status' }).selectOption('done');
+	await expect(mobile.locator('[data-task-list] [data-task-row]')).toHaveCount(20);
+	await expectVerticalScroll(mobile.locator('[data-tasks-scroll]'));
+	await mobile.getByRole('button', { name: 'Open agent switcher' }).click();
+	await expectVerticalScroll(mobile.locator('aside:visible [data-mobile-sidebar-scroll]'));
+	await mobile.locator('aside:visible').getByRole('button', { name: 'Close', exact: true }).click();
+
+	await mobile.goto('/automations');
+	await expect(mobile.locator('[data-workflows-scroll] [data-workflow-card]')).toHaveCount(30);
+	await expectVerticalScroll(mobile.locator('[data-workflows-scroll]'));
+	await mobile.getByRole('button', { name: 'Open agent switcher' }).click();
+	await expectVerticalScroll(mobile.locator('aside:visible [data-mobile-sidebar-scroll]'));
+
+	expect(await mobile.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+	await mobile.close();
+});
+
+test('MCP verification reports authentication and runner executable failures in context', async ({ page }) => {
+	const verificationRequests: { name: string; agent_id: string | null }[] = [];
+	await mockApi(page, {
+		mcpServers: [
+			{
+				name: 'JIRA',
+				type: 'http',
+				command: null,
+				args: [],
+				url: 'https://mcp.atlassian.com/v1/mcp/authv2',
+				env: {},
+				headers: {},
+			},
+			{
+				name: 'playwright',
+				type: 'stdio',
+				command: '/usr/bin/npx',
+				args: ['playwright', 'run-test-mcp-server'],
+				url: null,
+				env: {},
+				headers: {},
+			},
+		],
+		mcpVerificationRequests: verificationRequests,
+		mcpVerificationResults: {
+			JIRA: {
+				ok: false,
+				status: 'authentication_required',
+				message: 'The MCP endpoint responded with 401 Unauthorized; authentication is required.',
+				suggestion: 'Add a valid Authorization header, then verify again.',
+			},
+			playwright: {
+				ok: false,
+				status: 'command_path_incorrect',
+				message: "/usr/bin/npx is not executable in this project's runner image.",
+				suggestion: 'Use /usr/local/bin/npx instead.',
+			},
+		},
+	});
+
+	await page.goto('/settings/mcp');
+	const jira = page.locator('[data-mcp-server="JIRA"]');
+	await jira.getByRole('button', { name: 'Verify' }).click();
+	await expect(jira).toContainText('authentication is required');
+
+	await page.goto(`/agents/${agentId}?tab=runner`);
+	const playwright = page.locator('[data-mcp-server="playwright"]');
+	await playwright.getByRole('button', { name: 'Verify' }).click();
+	await expect(playwright).toContainText('Use /usr/local/bin/npx instead.');
+
+	expect(verificationRequests).toEqual([
+		{ name: 'JIRA', agent_id: null },
+		{ name: 'playwright', agent_id: agentId },
+	]);
+
+	await page.setViewportSize({ width: 390, height: 844 });
+	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+});
+
+test('skills and MCP settings surface official discovery documentation', async ({ page }) => {
+	const openUrlRequests: string[] = [];
+	await mockApi(page, { mcpServers: [], openUrlRequests, agentKind: { value: 'claude' } });
+
+	await page.setViewportSize({ width: 390, height: 844 });
+	await page.goto('/settings/mcp');
+	await expect(page.getByRole('button', { name: 'Official MCP Registry' })).toBeVisible();
+	await expect(page.getByRole('button', { name: 'Add server' })).toBeVisible();
+	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+	await expectExternalPopup(page, 'Official MCP Registry', 'https://registry.modelcontextprotocol.io/');
+	await expect(page.getByText('Find published packages and remote endpoints')).toBeVisible();
+
+	await page.goto(`/agents/${agentId}?tab=runner`);
+	await expectExternalPopup(page, 'Registry', 'https://registry.modelcontextprotocol.io/');
+	await expectExternalPopup(page, 'Claude Agent skills guide', 'https://code.claude.com/docs/en/skills');
+
+	expect(openUrlRequests).toEqual([]);
+	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+});
+
+test('Harness discovery links use the identity-checked opener for remote Desktop profiles', async ({ page }) => {
+	await page.addInitScript(() => {
+		Object.defineProperty(window, 'isTauri', { value: true });
+		(window as unknown as { __externalOpenCalls: { command: string; args: Record<string, unknown> }[] }).__externalOpenCalls = [];
+		(window as unknown as {
+			__TAURI_INTERNALS__: { invoke: (command: string, args: Record<string, unknown>) => Promise<unknown> };
+		}).__TAURI_INTERNALS__ = {
+			invoke: async (command: string, args: Record<string, unknown>) => {
+				if (command === 'get_active_instance_profile') {
+					return { identity_status: 'matched', navigation_status: 'ready', local: false };
+				}
+				(window as unknown as { __externalOpenCalls: { command: string; args: Record<string, unknown> }[] }).__externalOpenCalls.push({ command, args });
+				return null;
+			},
+		};
+	});
+	await mockApi(page, { mcpServers: [] });
+	await page.goto(`/agents/${agentId}?tab=runner`);
+	await page.getByRole('button', { name: 'Registry', exact: true }).click();
+
+	await expect.poll(() => page.evaluate(() => (
+		window as unknown as { __externalOpenCalls: { command: string; args: Record<string, unknown> }[] }
+	).__externalOpenCalls)).toEqual([{
+		command: 'open_external_url',
+		args: { url: 'https://registry.modelcontextprotocol.io/' },
+	}]);
+});
+
+for (const local of [true, false]) {
+	test(`external links open in the browser for ${local ? 'local' : 'remote'} Desktop profiles`, async ({ page }) => {
+		const opened = await mockDesktopExternalLinks(page, local);
+		const content = [
+			'[**Pull request**](https://github.com/example/repo/pull/123?tab=files#diff)',
+			'[Other service](http://127.0.0.1:8936/docs)',
+			'[Protocol-relative](//example.com/docs)',
+			'[Control center](/dashboard)',
+		].join('\n\n');
+		await mockApi(page, {
+			taskDescription: content,
+			taskMessages: [{ id: 1, task_id: taskId, role: 'assistant', content, attachments: [], timestamp: timestamp(25) }],
+		});
+		await page.goto(`/tasks/${taskId}`);
+		const taskUrl = page.url();
+		const userLink = page.locator('[data-message-role="user"] a', { hasText: 'Pull request' });
+		const assistantLink = page.locator('[data-message-role="assistant"] a', { hasText: 'Pull request' });
+		await expect(userLink).not.toHaveAttribute('target');
+		await expect(assistantLink).toHaveAttribute('target', '_blank');
+		await userLink.locator('strong').click();
+		await assistantLink.locator('strong').click();
+		await assistantLink.click({ modifiers: ['Control'] });
+		await assistantLink.click({ modifiers: ['Meta'] });
+		await assistantLink.click({ modifiers: ['Shift'] });
+		await assistantLink.click({ button: 'middle' });
+		await assistantLink.focus();
+		await page.keyboard.press('Enter');
+		await expect.poll(() => opened).toEqual(Array(7).fill('https://github.com/example/repo/pull/123?tab=files#diff'));
+		await page.locator('[data-message-role="user"]').getByRole('link', { name: 'Other service' }).click();
+		await page.locator('[data-message-role="user"]').getByRole('link', { name: 'Protocol-relative' }).click();
+		await expect.poll(() => opened.slice(7)).toEqual(['http://127.0.0.1:8936/docs', 'http://example.com/docs']);
+		await expect(page).toHaveURL(taskUrl);
+		expect(page.context().pages()).toHaveLength(1);
+		await page.locator('[data-message-role="user"]').getByRole('link', { name: 'Control center' }).click();
+		await expect(page).toHaveURL(/\/dashboard$/);
+		expect(opened).toHaveLength(9);
+	});
+}
+
+test('external links show native opener errors and can be retried', async ({ page }) => {
+	const opened = await mockDesktopExternalLinks(page);
+	await mockApi(page, { taskDescription: '[Documentation](https://example.com/docs)' });
+	await page.goto(`/tasks/${taskId}`);
+	const taskUrl = page.url();
+	const link = page.locator('[data-message-role="user"]').getByRole('link', { name: 'Documentation' });
+	await expect(link).toBeVisible();
+	await page.evaluate(() => {
+		const desktop = window as unknown as { __TAURI_INTERNALS__: { invoke: (...args: unknown[]) => Promise<unknown> } };
+		const invoke = desktop.__TAURI_INTERNALS__.invoke;
+		let fail = true;
+		desktop.__TAURI_INTERNALS__.invoke = async (...args) => {
+			if (args[0] === 'open_external_url' && fail) {
+				fail = false;
+				throw new Error('Browser could not be started');
+			}
+			return invoke(...args);
+		};
+	});
+	await link.click();
+	await expect(page.getByRole('alert')).toContainText('Could not open link: Browser could not be started');
+	await expect(page).toHaveURL(taskUrl);
+	await link.click();
+	await expect.poll(() => opened).toEqual(['https://example.com/docs']);
+	await expect(page.getByRole('alert')).toHaveCount(0);
+});
+
+test('external links without a target open a new browser tab', async ({ page }) => {
+	await mockApi(page, { taskDescription: '[Documentation](https://example.com/docs)' });
+	await page.goto(`/tasks/${taskId}`);
+	const taskUrl = page.url();
+	await page.context().route('https://example.com/docs', route => route.fulfill({ body: '<title>Documentation</title>' }));
+	const popupPromise = page.waitForEvent('popup');
+	await page.locator('[data-message-role="user"]').getByRole('link', { name: 'Documentation' }).click();
+	const popup = await popupPromise;
+	await expect(popup).toHaveURL('https://example.com/docs');
+	await expect(page).toHaveURL(taskUrl);
+	await popup.close();
+});
+
+test('every supported harness resolves the intended documentation and custom stays neutral', async ({ page }) => {
+	const agentKind = { value: 'codex' };
+	const catalog = [
+		['codex', 'Codex', 'https://developers.openai.com/codex/cli/'],
+		['claude', 'Claude Agent', 'https://docs.anthropic.com/en/docs/claude-code/setup'],
+		['github-copilot', 'GitHub Copilot', 'https://docs.github.com/en/copilot/github-copilot-in-the-cli'],
+		['opencode', 'OpenCode', 'https://opencode.ai/docs/'],
+		['qwen', 'Qwen Code', 'https://qwenlm.github.io/qwen-code-docs/'],
+		['cline', 'Cline', 'https://docs.cline.bot/'],
+		['cursor', 'Cursor', 'https://docs.cursor.com/agent/overview'],
+	].map(([kind, name, install_url]) => ({
+		kind,
+		name,
+		install_url,
+		image: `ghcr.io/xpressai/xpressclaw-runner-${kind}:latest`,
+		host_image: `ghcr.io/xpressai/xpressclaw-runner-${kind}-docker:latest`,
+	}));
+	await mockApi(page, { agentCatalog: catalog, agentKind });
+
+	const expected = [
+		['codex', 'Codex skills guide', 'https://learn.chatgpt.com/docs/build-skills'],
+		['claude', 'Claude Agent skills guide', 'https://code.claude.com/docs/en/skills'],
+		['github-copilot', 'GitHub Copilot skills guide', 'https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-skills'],
+		['opencode', 'OpenCode skills guide', 'https://opencode.ai/docs/skills/'],
+		['qwen', 'Qwen Code skills guide', 'https://qwenlm.github.io/qwen-code-docs/en/users/features/skills/'],
+		['cline', 'Cline skills guide', 'https://docs.cline.bot/customization/skills'],
+		['cursor', 'Cursor docs', 'https://docs.cursor.com/agent/overview'],
+	] as const;
+
+	for (const [kind, buttonName, url] of expected) {
+		agentKind.value = kind;
+		await page.goto(`/agents/${agentId}?tab=runner`);
+		await expect(page.locator('#runner-kind')).toHaveValue(kind);
+		await expectExternalPopup(page, buttonName, url);
+	}
+
+	agentKind.value = 'custom';
+	await page.goto(`/agents/${agentId}?tab=runner`);
+	await expect(page.locator('#runner-kind')).toHaveValue('custom');
+	await expect(page.getByRole('button', { name: /(?:skills guide|docs)$/ })).toHaveCount(0);
+});
+
+test('automation and settings pages show context-specific sidebar lists', async ({ page }) => {
 	await mockApi(page, {
 		workflows: [
 			{
@@ -1003,17 +5921,36 @@ test('workflow and settings pages show context-specific sidebar lists', async ({
 				updated_at: timestamp(20),
 			},
 		],
+		schedules: [{
+			id: 'schedule-nightly',
+			name: 'Nightly task sweep',
+			cron: '0 2 * * *',
+			agent_id: agentId,
+			title: 'Sweep queued tasks',
+			description: null,
+			enabled: true,
+			last_run: null,
+			run_count: 0,
+			created_at: timestamp(30),
+			schedule_type: 'cron',
+			run_at: null,
+			continuation_task_id: null,
+			conversation_id: null,
+		}],
 	});
-	await page.goto('/workflows');
+	await page.goto('/automations');
 
 	const sidebar = page.locator('aside').first();
-	const workflowSidebar = sidebar.locator('[data-sidebar-mode="workflows"]');
-	await expect(workflowSidebar).toBeVisible();
-	expect(await workflowSidebar.locator('[data-sidebar-workflow]').evaluateAll((items) =>
+	const automationSidebar = sidebar.locator('[data-sidebar-mode="automations"]');
+	await expect(automationSidebar).toBeVisible();
+	expect(await automationSidebar.locator('[data-sidebar-workflow]').evaluateAll((items) =>
 		items.map((item) => item.getAttribute('href'))
 	)).toEqual(['/workflows/workflow-newer', '/workflows/workflow-older']);
+	await expect(automationSidebar.locator('[data-sidebar-schedule]')).toContainText('Nightly task sweep');
 	await expect(sidebar.locator(`a[href="/agents/${agentId}"]`)).toHaveCount(0);
-	await expect(page.locator('[data-workflows-scroll]')).toHaveCSS('overflow-y', 'auto');
+	await expect(page.locator('[data-automations-scroll]')).toHaveCSS('overflow-y', 'auto');
+	await expect(page.locator('[data-workflow-card]')).toHaveCount(2);
+	await expect(page.locator('[data-schedule-card]')).toHaveCount(1);
 
 	await sidebar.locator('a[href="/settings"]').click();
 	await expect(page).toHaveURL('/settings');
@@ -1021,8 +5958,13 @@ test('workflow and settings pages show context-specific sidebar lists', async ({
 	await expect(settingsSidebar).toBeVisible();
 	await expect(settingsSidebar.locator('[data-sidebar-setting]')).toHaveText([
 		'P Profile',
+		'S Speech',
+		'X Xpress AI Connect',
+		'↕ Project sync',
+		'C Local collaboration',
+		'N Proxy',
 		'M MCP servers',
-		'S Server',
+		'I Instance',
 	]);
 	await expect(settingsSidebar.locator('[data-sidebar-setting="settings"]')).toHaveAttribute('aria-current', 'page');
 	await expect(page.getByRole('navigation', { name: 'Settings sections' })).toHaveCount(0);
@@ -1033,13 +5975,3349 @@ test('workflow and settings pages show context-specific sidebar lists', async ({
 	await expect(sidebar.locator(`a[href="/agents/${agentId}"]`)).toHaveCount(0);
 
 	await page.setViewportSize({ width: 390, height: 844 });
-	await page.goto('/workflows');
-	await page.getByRole('button', { name: 'Open project switcher' }).click();
-	await expect(page.locator('aside:visible [data-sidebar-mode="workflows"] [data-sidebar-workflow]')).toHaveCount(2);
-	await page.locator('aside:visible').getByRole('button', { name: 'Close' }).click();
+	await page.goto('/automations');
+	await page.getByRole('button', { name: 'Open agent switcher' }).click();
+	await expect(page.locator('aside:visible [data-sidebar-mode="automations"] [data-sidebar-workflow]')).toHaveCount(2);
+	await expect(page.locator('aside:visible [data-sidebar-mode="automations"] [data-sidebar-schedule]')).toHaveCount(1);
+	await page.locator('aside:visible').getByRole('button', { name: 'Close', exact: true }).click();
 	await page.locator('nav a[href="/settings"]:visible').click();
-	await page.getByRole('button', { name: 'Open project switcher' }).click();
-	await expect(page.locator('aside:visible [data-sidebar-mode="settings"] [data-sidebar-setting]')).toHaveCount(3);
+	await page.getByRole('button', { name: 'Open agent switcher' }).click();
+	await expect(page.locator('aside:visible [data-sidebar-mode="settings"] [data-sidebar-setting]')).toHaveCount(8);
 	await expect(page.getByRole('navigation', { name: 'Settings sections' })).toHaveCount(0);
 	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 });
+
+test('the new-schedule sidebar shortcut remains reusable after cancellation and creation', async ({ page }) => {
+	await mockApi(page);
+	await page.goto('/automations');
+
+	const sidebar = page.locator('aside').first();
+	const shortcut = sidebar.getByTitle('New schedule');
+	await shortcut.click();
+	await expect(page.locator('[data-schedule-form]')).toBeVisible();
+	await expect(page).toHaveURL('/automations?new=schedule#schedules');
+
+	await page.locator('[data-schedule-form]').getByRole('button', { name: 'Cancel' }).click();
+	await expect(page.locator('[data-schedule-form]')).toHaveCount(0);
+	await expect(page).toHaveURL('/automations#schedules');
+
+	await shortcut.click();
+	const reopenedForm = page.locator('[data-schedule-form]');
+	await expect(reopenedForm).toBeVisible();
+	await expect(page).toHaveURL('/automations?new=schedule#schedules');
+	await reopenedForm.getByLabel('Name').fill('Reusable shortcut');
+	await reopenedForm.getByRole('textbox', { name: 'Cron', exact: true }).fill('0 9 * * 1');
+	await reopenedForm.getByLabel('Task title').fill('Check the queue');
+	await reopenedForm.getByRole('button', { name: 'Create schedule' }).click();
+	await expect(reopenedForm).toHaveCount(0);
+	await expect(page).toHaveURL('/automations#schedules');
+});
+
+test('workflow gallery has six primary templates, distinct selection, and unique default names', async ({ page }) => {
+	const existing = (name: string, index: number) => ({
+		id: `existing-workflow-${index}`,
+		name,
+		description: null,
+		yaml_content: 'name: existing\nflows:\n  main:\n    steps: []',
+		enabled: true,
+		version: 1,
+		created_at: timestamp(index),
+		updated_at: timestamp(index),
+		last_triggered_at: null,
+		trigger_count: 0,
+		trigger_error: null,
+	});
+	await mockApi(page, {
+		workflows: [
+			existing('Goal Loop', 1),
+			existing('Goal Loop 2', 2),
+			existing('Implement Alternatives → Choose Best', 3),
+		],
+	});
+	await page.goto('/workflows/new');
+
+	const cards = page.locator('[data-workflow-template-card]');
+	await expect(cards).toHaveCount(6);
+	expect(await cards.evaluateAll((items) => items.map((item) => item.getAttribute('data-workflow-template-card')))).toEqual([
+		'goal-loop',
+		'code-review',
+		'repository-caretaker',
+		'backlog-processor',
+		'requirements-specification',
+		'choose-best',
+	]);
+	await expect(cards.filter({ hasText: 'Goal loop' })).toHaveAttribute('aria-pressed', 'true');
+	await expect(page.getByLabel('Name')).toHaveValue('Goal Loop 3');
+	await expect(page.getByRole('button', { name: /Start blank/ })).not.toHaveAttribute('data-workflow-template-card');
+
+	const reviewCard = cards.filter({ hasText: 'Implementation + independent review' });
+	await reviewCard.focus();
+	await page.keyboard.press('Enter');
+	await expect(reviewCard).toHaveAttribute('aria-pressed', 'true');
+	await expect(page.getByLabel('Name')).toHaveValue('Code Review Loop');
+
+	await page.getByRole('button', { name: /Implement alternatives → choose best/ }).click();
+	await expect(cards.filter({ hasText: 'Implement alternatives → choose best' })).toHaveAttribute('aria-pressed', 'true');
+	await expect(cards.filter({ hasText: 'Goal loop' })).toHaveAttribute('aria-pressed', 'false');
+	await expect(page.getByLabel('Name')).toHaveValue('Implement Alternatives → Choose Best 2');
+
+	await page.getByRole('button', { name: /Start blank/ }).click();
+	await expect(page.locator('[data-workflow-template-card][aria-pressed="true"]')).toHaveCount(0);
+	await expect(page.getByLabel('Name')).toHaveValue('New Workflow');
+	await expect(page.getByText('One-step starter')).toBeVisible();
+});
+
+test.describe('project workflow schedules', () => {
+	// Keep navigation requests in Playwright's API mocks after the first page.
+	test.use({ timezoneId: 'Asia/Tokyo', serviceWorkers: 'block' });
+	test('one-off dates remain visible and survive visual editing and trigger changes', async ({ page }) => {
+		const workflow = {
+			id: 'project-checkpoint', name: 'Project checkpoint', description: 'Quarterly check',
+			project_id: projectId, enabled: true, default_for_tasks: false, version: 1, revision: 0,
+			created_at: timestamp(1), updated_at: timestamp(2), last_triggered_at: null, trigger_count: 0, trigger_error: null,
+			yaml_content: `name: Project checkpoint
+inputs:
+  worker: {type: agent, required: true}
+schedule:
+  run_at: '2099-06-01T00:00:00Z'
+  inputs: {worker: ${agentId}}
+flows:
+  main:
+    steps:
+      - id: audit
+        agent: '@worker'
+        prompt: Review project progress
+`,
+		};
+		await mockApi(page, { workflows: [workflow] });
+		await page.route('**/api/workflows/project-checkpoint', async route => {
+			if (route.request().method() === 'PUT') {
+				Object.assign(workflow, route.request().postDataJSON());
+				workflow.revision++;
+			}
+			await route.fulfill({ json: workflow });
+		});
+		await page.goto('/automations');
+		await expect(page.locator('[data-workflow-card]')).toContainText('Scheduled · Once');
+		await page.goto('/workflows/project-checkpoint');
+		const trigger = page.getByLabel(/AUTOMATIC TRIGGER/);
+		await expect(trigger).toHaveValue('once');
+		await expect(page.getByLabel('Workflow run time')).toHaveValue('2099-06-01T09:00');
+		async function save() {
+			const sent = page.waitForRequest(request => request.url().endsWith('/api/workflows/project-checkpoint') && request.method() === 'PUT');
+			await page.getByRole('button', { name: 'Save', exact: true }).click();
+			const content = (await sent).postDataJSON().yaml_content;
+			await expect(page.getByRole('button', { name: 'Save', exact: true })).toBeEnabled();
+			return yaml.load(content) as { schedule: { run_at?: string; cron?: string; inputs: Record<string,string> } };
+		}
+		let saved = await save();
+		expect(saved.schedule.run_at).toBe('2099-06-01T00:00:00Z');
+		expect(saved.schedule.inputs.worker).toBe(agentId);
+		await page.getByLabel('Workflow run time').fill('2099-06-02T13:45');
+		saved = await save();
+		expect(saved.schedule.run_at).toBe('2099-06-02T04:45:00.000Z');
+		await trigger.selectOption('schedule');
+		await page.getByLabel('Workflow cron schedule').fill('0 9 * * 1');
+		saved = await save();
+		expect(saved.schedule.cron).toBe('0 9 * * 1');
+		expect(saved.schedule.run_at).toBeUndefined();
+		expect(saved.schedule.inputs.worker).toBe(agentId);
+	});
+});
+
+test('scheduled workflow templates bind a real agent and editable cron schedule', async ({ page }) => {
+	const workflowCreateRequests: { name: string; description?: string; yaml_content: string }[] = [];
+	await mockApi(page, { workflowCreateRequests });
+	await page.goto('/workflows/new');
+
+	await page.getByRole('button', { name: /Scheduled repository caretaker/ }).click();
+	await expect(page.getByLabel('Workflow schedule')).toHaveValue('0 9 * * 1');
+	await expect(page.getByLabel('Scheduled agent')).toHaveValue(agentId);
+	await page.getByLabel('Workflow schedule').fill('30 8 * * 2');
+	await page.getByRole('button', { name: 'Create scheduled workflow' }).click();
+
+	await expect.poll(() => workflowCreateRequests.length).toBe(1);
+	const yaml = workflowCreateRequests[0].yaml_content;
+	expect(yaml).toContain('cron: "30 8 * * 2"');
+	expect(yaml).toContain(`caretaker: "${agentId}"`);
+	expect(yaml).toContain('agent: "@caretaker"');
+	expect(yaml).toContain('match: healthy');
+	expect(yaml).toContain('match: changes');
+	expect(yaml).toContain('match: blocked');
+	expect(yaml).not.toContain('trigger:');
+	expect(yaml).not.toContain('type: sink');
+});
+
+test('specialized templates generate bounded backlog, specification, and Implement alternatives → choose best flows', async ({ page }) => {
+	const workflowCreateRequests: { name: string; description?: string; yaml_content: string }[] = [];
+	await mockApi(page, { workflowCreateRequests });
+
+	await page.goto('/workflows/new');
+	await page.getByRole('button', { name: /Periodic issue\/backlog processor/ }).click();
+	await page.getByRole('button', { name: 'Create scheduled workflow' }).click();
+	await expect.poll(() => workflowCreateRequests.length).toBe(1);
+	const backlog = workflowCreateRequests[0].yaml_content;
+	expect(backlog).toContain(`processor: "${agentId}"`);
+	expect(backlog).toContain('type: loop');
+	expect(backlog).toContain('over: "@fetch_batch.items"');
+	expect(backlog).toContain('Jira, GitHub, Linear, or another system');
+	expect(backlog).toContain('write_back: false');
+	expect(backlog).not.toContain('trigger:');
+	expect(backlog).not.toContain('type: sink');
+
+	await page.goto('/workflows/new');
+	await page.getByRole('button', { name: /Requirements → detailed specification/ }).click();
+	await page.getByRole('button', { name: 'Create workflow' }).click();
+	await expect.poll(() => workflowCreateRequests.length).toBe(2);
+	const specification = workflowCreateRequests[1].yaml_content;
+	expect(specification).toContain('drafter:\n    type: agent');
+	expect(specification).toContain('challenger:\n    type: agent');
+	expect(specification).toContain('new_session: true');
+	expect(specification).toContain('acceptance_criteria:');
+	expect(specification).toContain('implementation_slices:');
+
+	await page.goto('/workflows/new');
+	await page.getByRole('button', { name: /Implement alternatives → choose best/ }).click();
+	await page.getByRole('button', { name: 'Create workflow' }).click();
+	await expect.poll(() => workflowCreateRequests.length).toBe(3);
+	const selection = workflowCreateRequests[2].yaml_content;
+	expect(selection).toContain('verification_command:\n    type: string');
+	expect(selection).toContain('type: parallel');
+	expect(selection).toContain('new_session: true');
+	expect(selection).toContain('allow_failure: true');
+	expect(selection).toContain('switch: "@evaluate.winner"');
+	expect(selection).toContain('label: Verify the adopted result');
+	expect(selection).toContain('id: rubric');
+	expect(selection).toContain('id: remember');
+	expect(selection).toContain('id: deliver');
+	expect(selection.match(/type: command/g)).toHaveLength(6);
+
+});
+
+test('goal-loop workflow template is bounded and reusable across agents', async ({ page }) => {
+	const workflowCreateRequests: { name: string; description?: string; yaml_content: string }[] = [];
+	await mockApi(page, { workflowCreateRequests });
+	await page.goto('/workflows/new');
+
+	await page.getByRole('button', { name: /Goal loop/ }).click();
+	await expect(page.getByText('Each run chooses one worker Agent. The same definition can be reused in any Project.')).toBeVisible();
+	await page.getByRole('button', { name: 'Create workflow' }).click();
+
+	await expect.poll(() => workflowCreateRequests.length).toBe(1);
+	const created = workflowCreateRequests[0];
+	expect(created.name).toBe('Goal Loop');
+	expect(created.description).toContain('bounded loop');
+	expect(created.yaml_content).toContain('type: agent');
+	expect(created.yaml_content).toContain('primary: true');
+	expect(created.yaml_content).toContain('agent: "@worker"');
+	expect(created.yaml_content).toContain('switch: "@pursue_goal.status"');
+	expect(created.yaml_content).toContain('goto: step pursue_goal');
+	expect(created.yaml_content).toContain('inputs:');
+	expect(created.yaml_content).toContain('required: true');
+	await expect(page).toHaveURL('/workflows/workflow-created');
+});
+
+test('code-review template waits durably for human GitHub activity', async ({ page }) => {
+	const workflowCreateRequests: { name: string; description?: string; yaml_content: string }[] = [];
+	await mockApi(page, { workflowCreateRequests });
+	await page.goto('/workflows/new');
+
+	await page.getByRole('button', { name: /Implementation \+ independent review/ }).click();
+	await page.getByRole('button', { name: 'Create workflow' }).click();
+	await expect.poll(() => workflowCreateRequests.length).toBe(1);
+	const yaml = workflowCreateRequests[0].yaml_content;
+	expect(yaml).toContain('implementer:\n    type: agent');
+	expect(yaml).toContain('reviewer:\n    type: agent');
+	expect(yaml).toContain('agent: "@implementer"');
+	expect(yaml).toContain('agent: "@reviewer"');
+	expect(yaml).toContain('new_session: true');
+	expect(yaml).toContain('create or\n          update a DRAFT GitHub pull request');
+	expect(yaml).toContain('Independently review the actual pull request at:');
+	expect(yaml).toContain('@implement.pull_request_url');
+	expect(yaml).toContain('id: revise');
+	expect(yaml).toContain('target: step review');
+	expect(yaml).toContain('type: wait');
+	expect(yaml).toContain('event: github.pull_request.activity');
+	expect(yaml).toContain('resource: "@mark_ready.pull_request_url"');
+	expect(yaml).toContain('on_timeout: flow timed_out');
+	expect(yaml).toContain('goto: step wait_for_review');
+});
+
+test('workflows can be run with typed inputs and show their automatic trigger', async ({ page }) => {
+	const workflowRunRequests: { id: string; inputs: Record<string, unknown> }[] = [];
+	await mockApi(page, {
+		workflowRunRequests,
+		workflows: [{
+			id: 'workflow-report',
+			name: 'Release report',
+			description: 'Build a release-readiness report.',
+			yaml_content: `name: release-report
+inputs:
+  goal:
+    type: string
+    description: What should the report investigate?
+    required: true
+  retries:
+    type: number
+    default: 2
+  options:
+    type: json
+  worker:
+    type: agent
+    required: true
+    primary: true
+variables:
+  internal_retry_delay: 30
+schedule:
+  cron: "0 9 * * 1"
+  inputs:
+    goal: Weekly release report
+    worker: ${agentId}
+flows:
+  main:
+    steps:
+      - id: report
+        agent: "@worker"
+        prompt: "Build @goal with @options"
+`,
+			enabled: true,
+			version: 1,
+			created_at: timestamp(1),
+			updated_at: timestamp(2),
+			last_triggered_at: null,
+			trigger_count: 0,
+			trigger_error: null,
+		}],
+	});
+
+	await page.goto('/automations');
+	const card = page.locator('[data-workflow-card]');
+	await expect(card).toContainText('Scheduled · 0 9 * * 1');
+	await expect(card).toContainText('4 inputs');
+	await expect(card).toContainText('1 flow');
+	await card.getByRole('link', { name: 'Run' }).click();
+
+	await expect(page).toHaveURL('/workflows/workflow-report');
+	await expect(page.locator('[data-workflow-configuration]')).toContainText('0 9 * * 1');
+	await expect(page.getByLabel(/internal retry delay/i)).toHaveCount(0);
+	await page.getByLabel(/goal/i).fill('Prepare version 0.3');
+	await expect(page.getByLabel(/retries/i)).toHaveValue('2');
+	await page.getByLabel(/options/i).fill('{"include_ci":true}');
+	await expect(page.getByLabel(/worker/i)).toHaveValue(agentId);
+	await page.getByRole('button', { name: 'Start workflow' }).click();
+
+	await expect.poll(() => workflowRunRequests).toEqual([{
+		id: 'workflow-report',
+		inputs: { goal: 'Prepare version 0.3', retries: 2, options: { include_ci: true }, worker: agentId },
+	}]);
+});
+
+test('workflow editor can default a workflow and add a once-per-task fixed prompt', async ({ page }) => {
+	const workflowDefaultRequests: { id: string; defaultForTasks: boolean }[] = [];
+	await mockApi(page, {
+		workflowDefaultRequests,
+		workflows: [{
+			id: 'workflow-ui-policy',
+			name: 'Final UI policy',
+			description: 'Review user-facing UI before finishing.',
+			yaml_content: `name: final-ui-policy
+flows:
+  main:
+    steps: []
+`,
+			enabled: true,
+			default_for_tasks: false,
+			version: 1,
+			created_at: timestamp(100),
+			updated_at: timestamp(100),
+		}],
+	});
+
+	await page.goto('/workflows/workflow-ui-policy');
+	const defaultToggle = page.getByLabel('Run for every new task');
+	await expect(defaultToggle).not.toBeChecked();
+	await defaultToggle.check();
+	await expect.poll(() => workflowDefaultRequests).toEqual([{
+		id: 'workflow-ui-policy',
+		defaultForTasks: true,
+	}]);
+	await expect(defaultToggle).toBeChecked();
+
+	await page.getByRole('button', { name: 'Continue task', exact: true }).click();
+	await page.getByLabel('Fixed prompt').fill('Ensure that there are no messages in the UI that are unnecessary to the end user.');
+	await expect(page.getByRole('button', { name: 'Run', exact: true })).toBeDisabled();
+	await page.getByRole('button', { name: 'YAML', exact: true }).click();
+	const yamlEditor = page.locator('textarea[spellcheck="false"]');
+	await expect(yamlEditor).toHaveValue(/type: continue/);
+	await expect(yamlEditor).toHaveValue(/Ensure that there are no messages in the UI that are unnecessary to the end user\./);
+});
+
+test('appearance follows the saved light, dark, and system preference', async ({ page }) => {
+	await page.emulateMedia({ colorScheme: 'light' });
+	await mockApi(page);
+	await page.goto('/settings');
+
+	const root = page.locator('html');
+	const system = page.locator('[data-theme-option="system"] input');
+	const light = page.locator('[data-theme-option="light"] input');
+	const dark = page.locator('[data-theme-option="dark"] input');
+
+	await expect(system).toBeChecked();
+	await expect(root).not.toHaveClass(/dark/);
+	await expect(root).toHaveAttribute('data-theme', 'system');
+
+	const secondPage = await page.context().newPage();
+	await mockApi(secondPage);
+	await secondPage.goto('/settings');
+	await secondPage.locator('[data-theme-option="dark"]').click();
+	await expect(dark).toBeChecked();
+	await expect(root).toHaveClass(/dark/);
+	await secondPage.evaluate(() => localStorage.removeItem('xpressclaw.theme'));
+	await expect(system).toBeChecked();
+	await expect(root).not.toHaveClass(/dark/);
+	await secondPage.close();
+
+	await page.locator('[data-theme-option="dark"]').click();
+	await expect(dark).toBeChecked();
+	await expect(root).toHaveClass(/dark/);
+	await expect(root).toHaveAttribute('data-theme', 'dark');
+	expect(await page.evaluate(() => localStorage.getItem('xpressclaw.theme'))).toBe('dark');
+
+	await page.reload();
+	await expect(dark).toBeChecked();
+	await expect(root).toHaveClass(/dark/);
+
+	await page.locator('[data-theme-option="light"]').click();
+	await expect(light).toBeChecked();
+	await expect(root).not.toHaveClass(/dark/);
+	await page.emulateMedia({ colorScheme: 'dark' });
+	await expect(root).not.toHaveClass(/dark/);
+
+	await page.locator('[data-theme-option="system"]').click();
+	await expect(system).toBeChecked();
+	await expect(root).toHaveClass(/dark/);
+	await page.emulateMedia({ colorScheme: 'light' });
+	await expect(root).not.toHaveClass(/dark/);
+
+	await page.setViewportSize({ width: 390, height: 844 });
+	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+});
+
+test('project sync settings fetch, acknowledge conflicts, and publish explicitly', async ({ page }) => {
+	const projectSyncRequests: { projectId: string; operation: 'fetch' | 'publish'; force: boolean }[] = [];
+	await mockApi(page, {
+		projectSyncRequests,
+		projectSyncFetchConflictOnce: true,
+		projectSyncStatuses: [
+			{
+				project_id: projectId,
+				project_name: 'Browser collaboration project',
+				project_icon: null,
+				status: 'ready',
+				project_dir: '/srv/repos/xpressclaw',
+				remote: 'git@github.com:XpressAI/project-data.git',
+				branch: 'main',
+				store_path: `projects/${projectId}`,
+				share_project_memory: true,
+				last_commit: 'abcdef1234567890',
+				last_synced_at: '2026-07-19 00:01:01',
+				message: null,
+				warnings: [
+					'No .xpressclaw.yml was found in these assigned Agent workspaces: /srv/repos/temporary-clone.',
+				],
+			},
+			{
+				project_id: 'project-without-manifest',
+				project_name: 'Local-only project',
+				project_icon: 'L',
+				status: 'unconfigured',
+				project_dir: '/srv/repos/local-only',
+				remote: null,
+				branch: null,
+				store_path: null,
+				share_project_memory: null,
+				last_commit: null,
+				last_synced_at: null,
+				message: 'No .xpressclaw.yml was found in this Project workspace. Run `xpressclaw sync init` there first.',
+				warnings: [],
+			},
+			{
+				project_id: 'project-with-conflict',
+				project_name: 'Conflicting project',
+				project_icon: null,
+				status: 'conflict',
+				project_dir: null,
+				remote: null,
+				branch: null,
+				store_path: null,
+				share_project_memory: null,
+				last_commit: null,
+				last_synced_at: null,
+				message: 'Project sync configuration conflict. Differing fields: store.branch.\n- branch=main: /srv/repos/one\n- branch=release: /srv/repos/two',
+				warnings: [],
+			},
+		],
+	});
+	await page.goto('/settings/sync');
+
+	await expect(page.getByRole('heading', { name: 'Project sync' })).toBeVisible();
+	await expect(page.locator('[data-sidebar-setting="settings-sync"]')).toHaveAttribute('aria-current', 'page');
+	const ready = page.locator(`[data-project-sync="${projectId}"]`);
+	await expect(ready).toContainText('git@github.com:XpressAI/project-data.git');
+	await expect(ready).toContainText(`projects/${projectId}`);
+	await expect(ready).toContainText('Included');
+	await expect(ready).toContainText('Ready');
+	await expect(ready.locator('[data-project-sync-warnings]')).toContainText('/srv/repos/temporary-clone');
+
+	const unconfigured = page.locator('[data-project-sync="project-without-manifest"]');
+	await expect(unconfigured).toContainText('Needs setup');
+	await expect(unconfigured.getByRole('button', { name: 'Fetch' })).toBeDisabled();
+	await expect(unconfigured.getByRole('button', { name: 'Publish' })).toBeDisabled();
+
+	const conflict = page.locator('[data-project-sync="project-with-conflict"]');
+	await expect(conflict).toContainText('Configuration conflict');
+	await expect(conflict).toContainText('Differing fields: store.branch');
+	await expect(conflict).toContainText('/srv/repos/one');
+	await expect(conflict.getByRole('button', { name: 'Fetch' })).toBeDisabled();
+	await expect(conflict.getByRole('button', { name: 'Publish' })).toBeDisabled();
+
+	await ready.getByRole('button', { name: 'Fetch' }).click();
+	await expect(ready).toContainText('rerun with --force');
+	await ready.getByRole('button', { name: 'Merge remote changes' }).click();
+	await expect.poll(() => projectSyncRequests).toEqual([
+		{ projectId, operation: 'fetch', force: false },
+		{ projectId, operation: 'fetch', force: true },
+	]);
+	await expect(ready).toContainText('Fetched 2 Agents, 8 tasks, 3 Conversations, and 1 workflow at 12345678.');
+
+	await ready.getByRole('button', { name: 'Publish' }).click();
+	await expect.poll(() => projectSyncRequests.at(-1)).toEqual({ projectId, operation: 'publish', force: false });
+	await expect(ready).toContainText('Published 2 Agents, 8 tasks, 3 Conversations, and 1 workflow at 87654321.');
+
+	await page.setViewportSize({ width: 390, height: 844 });
+	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+});
+
+test('local collaboration settings stay opt-in and expose safe lifecycle controls', async ({ page }) => {
+	const collaborationActions: string[] = [];
+	const collaborationSettings = {
+		config: {
+			enabled: true, bind_address: '127.0.0.1', gitbucket_port: 8088, jenkins_port: 8089,
+			gitbucket_image: 'ghcr.io/gitbucket/gitbucket:4.46.1', jenkins_image: 'jenkins/jenkins:2.568.1-jdk21',
+			authorized_agents: ['browser-tested-workspace'],
+		},
+		status: {
+			configured: true, docker_available: true, network: 'xpressclaw-collaboration-test-network', data_path: '/data/collaboration',
+			gitbucket: { state: 'running', health: 'healthy', image: 'ghcr.io/gitbucket/gitbucket:4.46.1', version: '4.46.1', host_url: 'http://127.0.0.1:8088', internal_url: 'http://gitbucket:8080', volume: 'gitbucket-data', error: null },
+			jenkins: { state: 'running', health: 'healthy', image: 'jenkins/jenkins:2.568.1-jdk21', version: '2.568.1-jdk21', host_url: 'http://127.0.0.1:8089', internal_url: 'http://jenkins:8080', volume: 'jenkins-data', error: null },
+		},
+		credentials_configured: true,
+		reset_confirmation: 'RESET LOCAL COLLABORATION',
+	};
+	await mockApi(page, { collaborationActions, collaborationSettings });
+	await page.goto('/settings/collaboration');
+
+	await expect(page.getByRole('heading', { name: 'Local collaboration services' })).toBeVisible();
+	await expect(page.locator('[data-sidebar-setting="settings-collaboration"]')).toHaveAttribute('aria-current', 'page');
+	await expect(page.getByText('Healthy', { exact: true })).toHaveCount(2);
+	await expect(page.getByText('http://gitbucket:8080')).toBeVisible();
+	await expect(page.getByText('http://jenkins:8080')).toBeVisible();
+	await expect(page.getByText('browser-tested-workspace', { exact: true })).toBeVisible();
+	await expect(page.getByText(/no host Docker socket/i)).toBeVisible();
+
+	await page.getByRole('button', { name: 'stop', exact: true }).click();
+	await expect.poll(() => collaborationActions).toContain('stop');
+	await page.getByText('Permanently reset local collaboration data').click();
+	const destructive = page.getByRole('button', { name: 'Delete services and persistent data' });
+	await expect(destructive).toBeDisabled();
+	await page.getByLabel(/Type RESET LOCAL COLLABORATION/).fill('RESET LOCAL COLLABORATION');
+	await expect(destructive).toBeEnabled();
+
+	await page.setViewportSize({ width: 390, height: 844 });
+	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+});
+
+test('local collaboration install persists the visible enabled configuration first', async ({ page }) => {
+	const collaborationActions: string[] = [];
+	const collaborationSettings = {
+		config: {
+			enabled: false, bind_address: '127.0.0.1', gitbucket_port: 8088, jenkins_port: 8089,
+			gitbucket_image: 'ghcr.io/gitbucket/gitbucket:4.46.1', jenkins_image: 'jenkins/jenkins:2.568.1-jdk21',
+			authorized_agents: [],
+		},
+		status: {
+			configured: false, docker_available: true, network: 'xpressclaw-collaboration-test-network', data_path: '/data/collaboration',
+			gitbucket: { state: 'not_installed', health: 'unknown', image: 'ghcr.io/gitbucket/gitbucket:4.46.1', version: '4.46.1', host_url: 'http://127.0.0.1:8088', internal_url: 'http://gitbucket:8080', volume: 'gitbucket-data', error: null },
+			jenkins: { state: 'not_installed', health: 'unknown', image: 'jenkins/jenkins:2.568.1-jdk21', version: '2.568.1-jdk21', host_url: 'http://127.0.0.1:8089', internal_url: 'http://jenkins:8080', volume: 'jenkins-data', error: null },
+		},
+		credentials_configured: false,
+		reset_confirmation: 'RESET LOCAL COLLABORATION',
+	};
+	await mockApi(page, { collaborationActions, collaborationSettings });
+	await page.goto('/settings/collaboration');
+
+	const install = page.getByRole('button', { name: 'Install services' });
+	const restart = page.getByRole('button', { name: 'Restart & apply configuration' });
+	const upgrade = page.getByRole('button', { name: 'Upgrade pinned images' });
+	await expect(install).toBeDisabled();
+	await expect(restart).toBeDisabled();
+	await expect(upgrade).toBeDisabled();
+	await page.getByLabel('Enable local collaboration configuration').check();
+	await expect(install).toBeEnabled();
+	await expect(restart).toBeEnabled();
+	await expect(upgrade).toBeEnabled();
+	await install.click();
+
+	await expect.poll(() => collaborationActions).toEqual(['save', 'install']);
+	await expect(page.getByText('Install completed.')).toBeVisible();
+});
+
+test('local collaboration restart saves and applies visible port changes', async ({ page }) => {
+	const collaborationActions: string[] = [];
+	const collaborationSettings = {
+		config: {
+			enabled: true, bind_address: '127.0.0.1', gitbucket_port: 8088, jenkins_port: 8089,
+			gitbucket_image: 'ghcr.io/gitbucket/gitbucket:4.46.1', jenkins_image: 'jenkins/jenkins:2.568.1-jdk21',
+			authorized_agents: [],
+		},
+		status: {
+			configured: true, docker_available: true, network: 'xpressclaw-collaboration-test-network', data_path: '/data/collaboration',
+			gitbucket: { state: 'running', health: 'healthy', image: 'ghcr.io/gitbucket/gitbucket:4.46.1', version: '4.46.1', host_url: 'http://127.0.0.1:8088', internal_url: 'http://gitbucket:8080', volume: 'gitbucket-data', error: null },
+			jenkins: { state: 'running', health: 'healthy', image: 'jenkins/jenkins:2.568.1-jdk21', version: '2.568.1-jdk21', host_url: 'http://127.0.0.1:8089', internal_url: 'http://jenkins:8080', volume: 'jenkins-data', error: null },
+		},
+		credentials_configured: true,
+		reset_confirmation: 'RESET LOCAL COLLABORATION',
+	};
+	await mockApi(page, { collaborationActions, collaborationSettings });
+	await page.goto('/settings/collaboration');
+
+	await page.getByLabel('Jenkins port').fill('9089');
+	await page.getByRole('button', { name: 'Restart & apply configuration' }).click();
+
+	await expect.poll(() => collaborationActions).toEqual(['save', 'restart']);
+	await expect(page.getByLabel('Jenkins port')).toHaveValue('9089');
+	await expect(page.getByText('Restart completed.')).toBeVisible();
+});
+
+test('local collaboration upgrade saves the visible pinned images first', async ({ page }) => {
+	const collaborationActions: string[] = [];
+	const collaborationSettings = {
+		config: {
+			enabled: true, bind_address: '127.0.0.1', gitbucket_port: 8088, jenkins_port: 8089,
+			gitbucket_image: 'ghcr.io/gitbucket/gitbucket:4.46.1', jenkins_image: 'jenkins/jenkins:2.568.1-jdk21',
+			authorized_agents: [],
+		},
+		status: {
+			configured: true, docker_available: true, network: 'xpressclaw-collaboration-test-network', data_path: '/data/collaboration',
+			gitbucket: { state: 'running', health: 'healthy', image: 'ghcr.io/gitbucket/gitbucket:4.46.1', version: '4.46.1', host_url: 'http://127.0.0.1:8088', internal_url: 'http://gitbucket:8080', volume: 'gitbucket-data', error: null },
+			jenkins: { state: 'running', health: 'healthy', image: 'jenkins/jenkins:2.568.1-jdk21', version: '2.568.1-jdk21', host_url: 'http://127.0.0.1:8089', internal_url: 'http://jenkins:8080', volume: 'jenkins-data', error: null },
+		},
+		credentials_configured: true,
+		reset_confirmation: 'RESET LOCAL COLLABORATION',
+	};
+	await mockApi(page, { collaborationActions, collaborationSettings });
+	await page.goto('/settings/collaboration');
+
+	await page.getByText('Pinned images and upgrade policy').click();
+	await page.getByLabel('GitBucket image').fill('ghcr.io/gitbucket/gitbucket:4.47.0');
+	await page.getByRole('button', { name: 'Upgrade pinned images' }).click();
+
+	await expect.poll(() => collaborationActions).toEqual(['save', 'upgrade']);
+	await expect(page.getByLabel('GitBucket image')).toHaveValue('ghcr.io/gitbucket/gitbucket:4.47.0');
+	await expect(page.getByText('Upgrade completed.')).toBeVisible();
+});
+
+test('container files browse outside the workspace and download folders', async ({ page }) => {
+	await mockApi(page);
+	const environmentHandler = async (route: import('@playwright/test').Route) => {
+		const url = new URL(route.request().url());
+		if (url.pathname.endsWith('/tree')) {
+			await route.fulfill({ json: { path: '/tmp', truncated: false, entries: [{ name: 'results', path: '/tmp/results', kind: 'directory', symlink: false, size: null, modified_at: null }, { name: 'report.txt', path: '/tmp/report.txt', kind: 'file', symlink: false, size: 7, modified_at: null }] } });
+		} else if (url.pathname.endsWith('/file')) {
+			await route.fulfill({ json: { path: '/tmp/report.txt', content: 'Results', revision: 'revision-1', size: 7 } });
+		} else if (url.pathname.endsWith('/download')) {
+			await route.fulfill({ body: 'folder archive', headers: { 'content-type': 'application/gzip', 'content-disposition': 'attachment; filename="results.tar.gz"' } });
+		} else await route.fulfill({ json: {} });
+	};
+	await page.route('**/api/environments/**', environmentHandler);
+	await page.goto(`/agents/${agentId}?tab=files`);
+	await page.getByLabel('File location').selectOption('container');
+	await expect(page.getByLabel('Container directory')).toHaveValue('/tmp');
+	await page.getByRole('button', { name: '▧ report.txt' }).click();
+	await expect(page.locator('[data-container-files] [data-monaco-editor]')).toBeVisible();
+	await expect(page.locator('[data-container-files] .view-lines')).toContainText('Results');
+	await page.screenshot({ path: test.info().outputPath('container-files.png') });
+	const link = page.getByRole('link', { name: 'Download results', exact: true });
+	await expect(link).toHaveAttribute('href', `/api/environments/${agentId}/download?path=%2Ftmp%2Fresults`);
+	await expect(link).toHaveAttribute('download', '');
+	// Chromium bypasses request routing for the download attribute (Playwright #22650).
+	// Use the server's Content-Disposition to exercise the same download response.
+	await link.evaluate(element => { element.removeAttribute('download'); element.setAttribute('data-sveltekit-reload', ''); });
+	const downloaded = page.waitForEvent('download');
+	await link.click();
+	expect((await downloaded).suggestedFilename()).toBe('results.tar.gz');
+});
+
+test('file source switches guard unsaved workspace and container edits', async ({ page }) => {
+	await mockApi(page);
+	await page.route('**/api/environments/**', async route => {
+		const url = new URL(route.request().url());
+		await route.fulfill({ json: url.pathname.endsWith('/tree')
+			? { path: '/tmp', entries: [{ name: 'report.txt', path: '/tmp/report.txt', kind: 'file', symlink: false, size: 7, modified_at: null }], truncated: false }
+			: { path: '/tmp/report.txt', content: 'Results', revision: 'revision-1', size: 7 } });
+	});
+	await page.goto('/agents/' + agentId + '?tab=files&path=src%2Fmain.ts');
+	const location = page.getByLabel('File location');
+	const editor = page.locator('[data-monaco-editor]');
+	await expect(editor).toBeVisible({ timeout: 20_000 });
+	await expect(page.getByText('Loading editor…')).toBeHidden({ timeout: 20_000 });
+	await editor.locator('.view-lines').click();
+	await page.keyboard.press('Control+A');
+	await page.keyboard.insertText('unsaved workspace text');
+	await expect(page.getByRole('button', { name: 'Save', exact: true })).toBeEnabled();
+	page.once('dialog', dialog => dialog.dismiss());
+	await location.selectOption('container');
+	await expect(location).toHaveValue('workspace');
+	await expect(editor.locator('.view-lines')).toContainText('unsaved workspace text');
+	page.once('dialog', dialog => dialog.accept());
+	await location.selectOption('container');
+	await expect(page.getByLabel('Container directory')).toBeVisible();
+	await page.getByRole('button', { name: '▧ report.txt' }).click();
+	await expect(editor.locator('.view-lines')).toContainText('Results');
+	await editor.locator('.view-lines').click();
+	await page.keyboard.press('Control+A');
+	await page.keyboard.insertText('unsaved container text');
+	await expect(page.getByRole('button', { name: 'Save', exact: true })).toBeEnabled();
+	page.once('dialog', dialog => dialog.dismiss());
+	await location.selectOption('workspace');
+	await expect(location).toHaveValue('container');
+	await expect(editor.locator('.view-lines')).toContainText('unsaved container text');
+	page.once('dialog', dialog => dialog.accept());
+	await location.selectOption('workspace');
+	await expect(page.getByRole('button', { name: 'Save', exact: true })).toBeDisabled();
+	await expect(editor.locator('.view-lines')).not.toContainText('unsaved workspace text');
+});
+
+test('environment port forwarding saves both directions and removes mappings', async ({ page }) => {
+	await mockApi(page);
+	const ports: Record<string, unknown>[] = [];
+	await page.route('**/api/environments/**', async (route) => {
+		if (route.request().method() === 'POST') {
+			const value = { ...route.request().postDataJSON(), id: String(ports.length + 1), active: true };
+			ports.push(value); await route.fulfill({ json: value });
+		} else if (route.request().method() === 'DELETE') {
+			ports.splice(ports.findIndex(port => port.id === route.request().url().split('/').pop()), 1); await route.fulfill({ json: { removed: true } });
+		} else await route.fulfill({ json: { ports } });
+	});
+	await page.goto(`/agents/${agentId}?tab=workspace`);
+	const panel = page.locator('[data-environment-ports]');
+	await panel.getByRole('button', { name: 'Add forward' }).click();
+	await expect.poll(() => ports.length).toBe(1);
+	expect(ports[0]).toMatchObject({ direction: 'host_to_container', host_port: 8080, container_port: 8080 });
+	await panel.getByLabel('Direction').selectOption('container_to_host');
+	await panel.getByLabel('Host port', { exact: true }).fill('3000');
+	await panel.getByLabel('Container port', { exact: true }).fill('3000');
+	await panel.getByRole('button', { name: 'Add forward' }).click();
+	await expect.poll(() => ports.length).toBe(2);
+	expect(ports[1]).toMatchObject({ direction: 'container_to_host', host_port: 3000, container_port: 3000 });
+	await page.screenshot({ path: test.info().outputPath('environment-ports.png') });
+	await panel.getByRole('button', { name: 'Remove' }).first().click();
+	await expect.poll(() => ports.length).toBe(1);
+});
+
+test('terminal external links use the Desktop browser opener', async ({ page }) => {
+	const opened = await mockDesktopExternalLinks(page);
+	await mockApi(page);
+	await page.route('**/api/environments/**/terminal-sessions', route => route.fulfill({ json: { sessions: ['login'] } }));
+	await page.routeWebSocket('**/api/workspaces/**/terminal?**', websocket => {
+		websocket.send(JSON.stringify({ type: 'ready' }));
+		websocket.send('\r\nhttps://example.com/terminal\r\n');
+	});
+	await page.goto(`/agents/${agentId}?tab=files&terminal=login`);
+	const terminal = page.locator('[data-project-terminal]');
+	const link = terminal.getByText('https://example.com/terminal', { exact: true });
+	await expect(link).toBeVisible();
+	// xterm handles pointer input on a screen over the rendered text.
+	const bounds = (await link.boundingBox())!;
+	const point = { x: bounds.x + 5, y: bounds.y + bounds.height / 2 };
+	await page.mouse.move(point.x, point.y);
+	await expect(terminal.locator('.xterm-screen')).toHaveClass(/xterm-cursor-pointer/);
+	await page.mouse.click(point.x, point.y);
+	await expect.poll(() => opened).toEqual(['https://example.com/terminal']);
+	expect(page.context().pages()).toHaveLength(1);
+});
+
+test('shared terminals join named sessions, send interactive input and share the connected session', async ({ page }) => {
+	await mockApi(page);
+	await page.route('**/api/environments/**/terminal-sessions', route => route.fulfill({ json: { sessions: ['login', 'build'] } }));
+	await page.addInitScript(() => {
+		Object.defineProperty(navigator, 'clipboard', { value: {
+			writeText: async (value: string) => { document.documentElement.dataset.sharedTerminal = value; },
+		} });
+	});
+	const connections: string[] = [];
+	const input: string[] = [];
+	await page.routeWebSocket('**/api/workspaces/**/terminal?**', websocket => {
+		connections.push(new URL(websocket.url()).searchParams.get('session') || '');
+		websocket.onMessage(message => { if (typeof message !== 'string') input.push(message.toString()); });
+		websocket.send(JSON.stringify({ type: 'ready' }));
+	});
+	await page.goto(`/agents/${agentId}?tab=files&terminal=login`);
+	const terminal = page.locator('[data-project-terminal]');
+	await expect(terminal.getByText('Container terminal', { exact: true })).toBeVisible();
+	await expect.poll(() => connections).toEqual(['login']);
+	await terminal.locator('.xterm-helper-textarea').pressSequentially('example-input');
+	await terminal.locator('.xterm-helper-textarea').press('Enter');
+	await expect.poll(() => input.join('')).toBe('example-input\r');
+	await terminal.getByLabel('tmux session name').fill('build');
+	await terminal.getByRole('button', { name: 'Share', exact: true }).click();
+	await expect(page.locator('html')).toHaveAttribute('data-shared-terminal', new RegExp(`/agents/${agentId}\\?tab=files&terminal=login$`));
+	await terminal.getByRole('button', { name: 'Join / create' }).click();
+	await expect.poll(() => connections).toEqual(['login', 'build']);
+	await expect(terminal.getByRole('button', { name: 'Share', exact: true })).toBeEnabled();
+	await terminal.getByRole('button', { name: 'Share', exact: true }).click();
+	await expect(page.locator('html')).toHaveAttribute('data-shared-terminal', new RegExp(`/agents/${agentId}\\?tab=files&terminal=build$`));
+});
+
+test('task details can be hidden and stay hidden across live updates, resizing, and reloads', async ({ page }, testInfo) => {
+	await page.setViewportSize({ width: 1440, height: 900 });
+	await mockApi(page, { live: true });
+	await page.goto(`/tasks/${taskId}`);
+	const details = page.locator('[data-task-details-sidebar]');
+	const transcript = page.locator('[data-task-transcript-scroll]');
+	await expect(details).toBeVisible();
+	const originalWidth = (await transcript.boundingBox())!.width;
+	await page.getByRole('button', { name: 'Hide task details' }).focus();
+	await page.keyboard.press('Space');
+	await expect(details).toBeHidden();
+	await expect(page.getByRole('button', { name: 'Show task details' })).toHaveAttribute('aria-expanded', 'false');
+	expect((await transcript.boundingBox())!.width).toBeGreaterThan(originalWidth + 250);
+	await page.waitForResponse((response) => new URL(response.url()).pathname === `/api/tasks/${taskId}/activity`);
+	await page.setViewportSize({ width: 1280, height: 800 });
+	await expect(details).toBeHidden();
+	await page.reload();
+	await expect(page.getByRole('button', { name: 'Show task details' })).toBeVisible();
+	await expect(details).toBeHidden();
+	await page.screenshot({ path: testInfo.outputPath('task-desktop-details-hidden.png') });
+	await page.getByRole('button', { name: 'Show task details' }).click();
+	await expect(details).toBeVisible();
+	await page.screenshot({ path: testInfo.outputPath('task-desktop-details-visible.png') });
+});
+
+test('narrow task panes open details in a modal without losing the conversation draft', async ({ page }) => {
+	await page.setViewportSize({ width: 1024, height: 768 });
+	await mockApi(page, { live: true });
+	await page.goto(`/tasks/${taskId}`);
+	await page.getByRole('button', { name: 'Split active tab right' }).click();
+	const pane = page.locator('[data-workspace-pane]').first();
+	const composer = pane.locator(`#task-message-input-${taskId}`);
+	await composer.fill('Keep my follow-up draft.');
+	const toggle = pane.getByRole('button', { name: 'Show task details' });
+	await toggle.click();
+	const dialog = page.getByRole('dialog', { name: 'Task details', exact: true });
+	await expect(dialog).toBeVisible();
+	await expect(dialog.getByText('CHANGED FILES', { exact: false })).toBeVisible();
+	await page.keyboard.press('Escape');
+	await expect(dialog).toBeHidden();
+	await expect(toggle).toBeFocused();
+	await expect(composer).toHaveValue('Keep my follow-up draft.');
+	await expect(pane.locator('[data-task-details-sidebar]')).toBeHidden();
+});
+
+for (const viewport of [{ width: 1440, height: 900 }, { width: 390, height: 844 }]) {
+	test(`task settings combine edit and scheduling at ${viewport.width}px`, async ({ page }, testInfo) => {
+		await page.setViewportSize(viewport);
+		const taskUpdateRequests: Record<string, unknown>[] = [];
+		const taskPlanRequests: Record<string, unknown>[] = [];
+		await mockApi(page, { taskStatus: 'pending', taskUpdateRequests, taskUpdateFailureOnce: true, taskPlanRequests });
+		await page.goto(`/tasks/${taskId}`);
+		const gear = page.getByRole('button', { name: 'Task settings', exact: true });
+		await expect(page.getByRole('button', { name: 'Plan / schedule', exact: true })).toHaveCount(0);
+		await gear.click();
+		await expect(page.getByRole('menuitem', { name: 'Edit details' })).toBeFocused();
+		await page.keyboard.press('ArrowDown');
+		await expect(page.getByRole('menuitem', { name: 'Plan / schedule' })).toBeFocused();
+		await page.keyboard.press('Escape');
+		await expect(gear).toBeFocused();
+		await gear.click();
+		await gear.click();
+		await expect(page.getByRole('menu', { name: 'Task settings' })).toBeHidden();
+		await gear.click();
+		await page.getByRole('menuitem', { name: 'Edit details' }).click();
+		const editor = page.getByRole('dialog', { name: 'Edit task details', exact: true });
+		await expect(editor.getByLabel('Agent', { exact: true }).getByRole('option', { name: 'Unassigned' })).toBeDisabled();
+		await expect(editor.getByText('Use Plan / schedule → Backlog to park work.')).toBeVisible();
+		await editor.getByLabel('Title', { exact: true }).fill('Streamlined task controls');
+		await editor.getByLabel('Description', { exact: true }).fill('A draft worth preserving.');
+		await editor.getByLabel('Priority', { exact: true }).selectOption('5');
+		await editor.getByRole('button', { name: 'Save', exact: true }).click();
+		await expect(editor.getByRole('alert')).toContainText('Could not save task details.');
+		await expect(editor.getByLabel('Title', { exact: true })).toHaveValue('Streamlined task controls');
+		if (viewport.width < 640) {
+			await page.evaluate(() => {
+				Object.defineProperty(window.visualViewport!, 'height', { configurable: true, value: 430 });
+				Object.defineProperty(window.visualViewport!, 'offsetTop', { configurable: true, value: 24 });
+				window.visualViewport!.dispatchEvent(new Event('resize'));
+			});
+			await expect.poll(async () => { const rect = await editor.boundingBox(); return rect!.y + rect!.height; }).toBeLessThanOrEqual(455);
+			await editor.getByRole('button', { name: 'Save', exact: true }).scrollIntoViewIfNeeded();
+		}
+		await page.screenshot({ path: testInfo.outputPath(`task-editor-${viewport.width}.png`) });
+		await editor.getByRole('button', { name: 'Save', exact: true }).click();
+		await expect(editor).toBeHidden();
+		await expect(gear).toBeFocused();
+		await expect(page.getByRole('heading', { name: 'Streamlined task controls', exact: true })).toBeVisible();
+		expect(taskUpdateRequests).toHaveLength(2);
+		expect(taskUpdateRequests[1]).toEqual({ title: 'Streamlined task controls', description: 'A draft worth preserving.', priority: 5 });
+		await gear.click();
+		await page.getByRole('menuitem', { name: 'Plan / schedule' }).click();
+		const planning = page.getByRole('dialog', { name: 'Plan Streamlined task controls', exact: true });
+		await planning.getByLabel('Start no earlier than').fill('2030-10-12T14:30');
+		await planning.getByRole('button', { name: 'Save schedule', exact: true }).click();
+		await expect.poll(() => taskPlanRequests.length).toBe(1);
+		expect(taskPlanRequests[0]).toMatchObject({ action: 'schedule', expected_revision: 1, start_after: '2030-10-12T14:30:00.000Z' });
+		await planning.getByRole('button', { name: 'Clear schedule' }).click();
+		await expect.poll(() => taskPlanRequests.length).toBe(2);
+		expect(taskPlanRequests[1]).toMatchObject({ action: 'schedule', expected_revision: 2, start_after: null });
+		await planning.getByRole('button', { name: 'Done', exact: true }).click();
+		await expect(planning).toBeHidden();
+		await expect(gear).toBeFocused();
+		expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+	});
+}
+
+for (const viewport of [{ width: 390, height: 844 }, { width: 1440, height: 900 }]) {
+	for (const taskStatus of ['pending', 'in_progress', 'completed']) {
+		test(`connected task keeps lifecycle controls in Xpress AI at ${viewport.width}px (${taskStatus})`, async ({ page }) => {
+			await page.setViewportSize(viewport);
+			const taskStatusRequests: string[] = [];
+			const postedMessages: Record<string, unknown>[] = [];
+			const interruptedAttempts: string[] = [];
+			await mockApi(page, { connectedTask: true, live: taskStatus === 'in_progress', taskStatus, taskStatusRequests, postedMessages, interruptedAttempts });
+			await page.goto(`/tasks/${taskId}`);
+			await expect(page.getByText('This task is managed in Xpress AI. Continue or cancel it there.')).toBeVisible();
+			for (const name of ['Task settings', 'Start task', 'Complete task', 'Stop and cancel task', 'Cancel task', 'Interrupt agent now', 'Send message']) {
+				await expect(page.getByRole('button', { name, exact: true })).toHaveCount(0);
+			}
+			await expect(page.locator(`#task-message-input-${taskId}`)).toHaveCount(0);
+			await expect(page.locator('[data-task-transcript-scroll]')).toBeVisible();
+			await expect(page.getByRole('button', { name: /^(Show|Hide) task details$/ })).toBeVisible();
+			expect(taskStatusRequests).toEqual([]);
+			expect(postedMessages).toEqual([]);
+			expect(interruptedAttempts).toEqual([]);
+		});
+	}
+}
+
+test('connected task can still answer a local approval request', async ({ page }) => {
+	const elicitationResponses: { elicitationId: string; payload: Record<string, unknown> }[] = [];
+	await mockApi(page, {
+		connectedTask: true,
+		pendingElicitation: {
+			mode: 'form',
+			message: 'Approve the local operation?',
+			requestedSchema: { type: 'object', properties: { approved: { type: 'boolean', title: 'Approve' } } },
+		},
+		elicitationResponses,
+	});
+	await page.goto(`/tasks/${taskId}`);
+	await expect(page.getByText('This task is managed in Xpress AI. Continue or cancel it there.')).toBeVisible();
+	await expect(page.getByText('Approve the local operation?', { exact: true })).toBeVisible();
+	await page.getByRole('checkbox', { name: 'Approve', exact: true }).check();
+	await page.getByRole('button', { name: 'Review', exact: true }).click();
+	await page.getByRole('button', { name: 'Send answers', exact: true }).click();
+	await expect.poll(() => elicitationResponses).toEqual([{
+		elicitationId: 'elicitation-browser-test', payload: expect.objectContaining({ action: 'accept', content: { approved: true } }),
+	}]);
+});
+
+test('task status icons keep lifecycle errors visible and support retry', async ({ page }) => {
+	const taskStatusRequests: string[] = [];
+	await mockApi(page, { live: true, taskStatusRequests, taskStatusFailureOnce: true });
+	await page.goto(`/tasks/${taskId}`);
+	await expect(page.getByRole('button', { name: 'Stop and cancel task' })).toBeVisible();
+	await page.getByRole('button', { name: 'Complete task', exact: true }).click();
+	await expect(page.getByRole('alert')).toContainText('Task still requires review.');
+	await expect(page.getByRole('button', { name: 'Complete task', exact: true })).toBeEnabled();
+	await page.getByRole('button', { name: 'Complete task', exact: true }).click();
+	await expect(page.getByRole('button', { name: 'Complete task', exact: true })).toBeHidden();
+	expect(taskStatusRequests).toEqual(['completed', 'completed']);
+});
+
+test('start and stop task icons call the existing lifecycle actions', async ({ page }) => {
+	const taskStatusRequests: string[] = [];
+	await mockApi(page, { taskStatus: 'pending', taskStatusRequests });
+	await page.goto(`/tasks/${taskId}`);
+	await page.getByRole('button', { name: 'Start task', exact: true }).click();
+	await page.getByRole('button', { name: 'Stop and cancel task' }).click();
+	await expect.poll(() => taskStatusRequests).toEqual(['in_progress', 'cancelled']);
+	await expect(page.getByRole('button', { name: 'Stop and cancel task' })).toBeHidden();
+});
+
+for (const viewport of [{ width: 390, height: 844 }, { width: 820, height: 900 }]) {
+	test(`compact navigation is modal and keeps the workspace in place at ${viewport.width}px`, async ({ page }, testInfo) => {
+		await page.setViewportSize(viewport);
+		await mockApi(page, { live: true, projectCount: 15, completedTaskCount: 45 });
+		await page.goto(`/tasks/${taskId}`);
+		await expect(page.locator('[data-workspace-sidebar]')).toBeHidden();
+		await expect(page.locator('[data-task-details-sidebar]')).toBeVisible({ visible: viewport.width >= 668 });
+		const transcript = page.locator('[data-task-transcript-scroll]');
+		await expect(transcript).toBeVisible();
+		const transcriptWidth = (await transcript.boundingBox())!.width;
+		expect(transcriptWidth).toBeGreaterThan(viewport.width - (viewport.width >= 668 ? 293 : 5));
+		const composer = page.locator(`#task-message-input-${taskId}`);
+		await composer.fill('Do not lose this draft when browsing tasks.');
+		const browse = page.getByRole('button', { name: 'Browse workspace', exact: true });
+		const dialog = page.getByRole('dialog', { name: 'Browse workspace', exact: true });
+		await expect(dialog).toBeHidden();
+		expect((await browse.boundingBox())!.y).toBeGreaterThan(viewport.height - 100);
+		await page.screenshot({ path: testInfo.outputPath(`task-compact-${viewport.width}.png`) });
+		await browse.click();
+		await expect(dialog).toBeVisible();
+		expect(await dialog.evaluate((element) => element.matches(':modal'))).toBe(true);
+		await expect(dialog.getByRole('link', { name: 'Board', exact: true })).toBeVisible();
+		await dialog.getByRole('button', { name: 'Close navigation' }).focus();
+		await page.keyboard.press('Tab');
+		expect(await dialog.evaluate((element) => element.contains(document.activeElement))).toBe(true);
+		await page.screenshot({ path: testInfo.outputPath(`task-navigation-${viewport.width}.png`) });
+		await page.keyboard.press('Escape');
+		await expect(dialog).toBeHidden();
+		await expect(browse).toBeFocused();
+		await expect(composer).toHaveValue('Do not lose this draft when browsing tasks.');
+		expect((await transcript.boundingBox())!.width).toBe(transcriptWidth);
+		await browse.click();
+		await page.mouse.click(viewport.width - 4, 4);
+		await expect(dialog).toBeHidden();
+		await browse.click();
+		await dialog.getByRole('link', { name: 'Board', exact: true }).click();
+		await expect(dialog).toBeHidden();
+		await expect(page).toHaveURL('/tasks?view=board');
+		await page.goto(`/tasks/${taskId}`);
+		if (viewport.width >= 668) {
+			await page.getByRole('button', { name: 'Hide task details' }).click();
+			await expect(page.locator('[data-task-details-sidebar]')).toBeHidden();
+			await page.getByRole('button', { name: 'Show task details' }).click();
+			await expect(page.locator('[data-task-details-sidebar]')).toBeVisible();
+		} else {
+			await page.getByRole('button', { name: 'Show task details' }).click();
+			const details = page.getByRole('dialog', { name: 'Task details', exact: true });
+			await expect(details).toBeVisible();
+			await page.screenshot({ path: testInfo.outputPath(`task-details-sheet-${viewport.width}.png`) });
+			await details.getByRole('button', { name: 'Close task details' }).click();
+		}
+		await browse.click();
+		await page.setViewportSize({ width: 1280, height: 900 });
+		await expect(dialog).toBeHidden();
+		await expect(page.locator('[data-workspace-sidebar]')).toBeVisible();
+	});
+}
+
+test('unassigned tasks can be edited and assigned without enabling later unassignment', async ({ page }) => {
+	const taskUpdateRequests: Record<string, unknown>[] = [];
+	await mockApi(page, { taskStatus: 'pending', taskAgentId: null, taskUpdateRequests });
+	await page.goto(`/tasks/${taskId}`);
+	const editor = page.getByRole('dialog', { name: 'Edit task details', exact: true });
+	const openEditor = async () => {
+		await page.getByRole('button', { name: 'Task settings', exact: true }).click();
+		await page.getByRole('menuitem', { name: 'Edit details', exact: true }).click();
+	};
+	await openEditor();
+	const assignment = editor.getByLabel('Agent', { exact: true });
+	await expect(assignment).toHaveValue('');
+	await expect(assignment.getByRole('option', { name: 'Unassigned' })).toBeEnabled();
+	await editor.getByLabel('Title', { exact: true }).fill('Work waiting for an agent');
+	await editor.getByRole('button', { name: 'Save', exact: true }).click();
+	await expect(editor).toBeHidden();
+	expect(taskUpdateRequests).toHaveLength(1);
+	expect(taskUpdateRequests[0]).not.toHaveProperty('agent_id');
+
+	await openEditor();
+	await assignment.selectOption(agentId);
+	await editor.getByRole('button', { name: 'Save', exact: true }).click();
+	await expect(editor).toBeHidden();
+	expect(taskUpdateRequests).toHaveLength(2);
+	expect(taskUpdateRequests[1].agent_id).toBe(agentId);
+
+	await openEditor();
+	await expect(assignment).toHaveValue(agentId);
+	await expect(assignment.getByRole('option', { name: 'Unassigned' })).toBeDisabled();
+	await editor.getByRole('button', { name: 'Cancel', exact: true }).click();
+	await expect(editor).toBeHidden();
+	expect(taskUpdateRequests).toHaveLength(2);
+});
+
+
+
+test('clicking a tab label or its close control never starts a drag', async ({ page }) => {
+	await seedWorkspace(page, {
+		focusedPaneId: 'seed-pane',
+		panes: [{ id: 'seed-pane', activeTabId: TAB_PROJECTS.id, width: 1, tabs: [TAB_NEW_WORK, TAB_PROJECTS, TAB_SETTINGS] }],
+	});
+	await page.goto('/projects');
+
+	const pane = page.locator('[data-workspace-pane]').first();
+	const tabs = pane.locator('[data-workspace-tab]');
+	await expect(tabs).toHaveCount(3);
+
+	// Pressing directly on the label text must activate, not drag.
+	await pane.locator('[data-workspace-tab][data-workspace-tab-title="Settings"]').getByText('Settings').click();
+	await expect(page).toHaveURL('/settings');
+	await expect(pane.locator('[data-workspace-tab][data-workspace-tab-active="true"]'))
+		.toHaveAttribute('data-workspace-tab-title', 'Settings');
+	expect(await tabTitles(pane)).toEqual(['New work', 'Projects', 'Settings']);
+
+	// The active tab's close control must close it, not drag it.
+	await pane.locator('[data-workspace-tab][data-workspace-tab-title="Settings"] button[aria-label="Close Settings"]').click();
+	await expect.poll(() => tabTitles(pane)).toEqual(['New work', 'Projects']);
+
+	// And an inactive tab's close control still closes it.
+	await pane.locator('[data-workspace-tab][data-workspace-tab-title="New work"] button[aria-label="Close New work"]').click();
+	await expect.poll(() => tabTitles(pane)).toEqual(['Projects']);
+});
+
+
+test('a tab can be dropped into the empty strip of a freshly split pane', async ({ page }) => {
+	await seedWorkspace(page, {
+		focusedPaneId: 'seed-pane',
+		panes: [{ id: 'seed-pane', activeTabId: TAB_PROJECTS.id, width: 1, tabs: [TAB_NEW_WORK, TAB_PROJECTS, TAB_SETTINGS] }],
+	});
+	await page.goto('/projects');
+
+	const panes = page.locator('[data-workspace-pane]');
+	await expect(panes).toHaveCount(1);
+
+	// Splitting copies the active tab into a new pane, which then holds a single
+	// tab beside a full-width strip.
+	await page.getByRole('button', { name: 'Split active tab right' }).first().click();
+	await expect(panes).toHaveCount(2);
+	await expect.poll(() => tabTitles(panes.nth(1))).toEqual(['Projects']);
+
+	// That empty run has to accept a drop, otherwise filling a split pane means
+	// hitting the one tab already in it.
+	await dragTabAndDrop(
+		page,
+		panes.nth(0).locator('[data-workspace-tab][data-workspace-tab-title="Settings"]'),
+		panes.nth(1).locator('[data-workspace-tab-strip]'),
+	);
+
+	await expect.poll(() => tabTitles(panes.nth(1))).toEqual(['Projects', 'Settings']);
+	await expect.poll(() => tabTitles(panes.nth(0))).toEqual(['New work', 'Projects']);
+	await expect(page).toHaveURL('/settings');
+});
+
+
+
+test('keyboard tab dragging moves by its requested delta and can be cancelled', async ({ page }) => {
+	await seedWorkspace(page, {
+		focusedPaneId: 'seed-pane',
+		panes: [{ id: 'seed-pane', activeTabId: TAB_PROJECTS.id, width: 1, tabs: [TAB_NEW_WORK, TAB_PROJECTS, TAB_SETTINGS] }],
+	});
+	await page.goto('/projects');
+	const pane = page.locator('[data-workspace-pane]').first();
+	const firstTab = pane.locator('[data-workspace-tab]').first();
+	await firstTab.focus();
+	await page.keyboard.press('Space');
+	await settleFrames(page);
+	await page.keyboard.press('Shift+ArrowDown');
+	await settleFrames(page);
+	await expect(pane.locator('[data-tab-drop-indicator]')).toHaveCount(0);
+	await page.keyboard.press('Escape');
+	await expect(page.locator('[data-dnd-dragging], [data-dnd-placeholder]')).toHaveCount(0);
+	await expect.poll(() => tabTitles(pane)).toEqual(['New work', 'Projects', 'Settings']);
+	await firstTab.focus();
+	await page.keyboard.press('Space');
+	await settleFrames(page);
+	await page.keyboard.press('Shift+ArrowRight');
+	await settleFrames(page);
+	await page.keyboard.press('Space');
+	await expect(page.locator('[data-dnd-dragging], [data-dnd-placeholder]')).toHaveCount(0);
+	await expect.poll(() => tabTitles(pane)).toEqual(['Projects', 'New work', 'Settings']);
+	await expect(page).toHaveURL('/projects');
+});
+
+for (const settleBeforeRelease of [true, false]) {
+	test(`releasing a tab outside every strip abandons the drag (${settleBeforeRelease ? 'settled' : 'immediate'} release)`, async ({ page }) => {
+		await seedWorkspace(page, {
+			focusedPaneId: 'seed-pane',
+			panes: [{ id: 'seed-pane', activeTabId: TAB_PROJECTS.id, width: 1, tabs: [TAB_NEW_WORK, TAB_PROJECTS, TAB_SETTINGS] }],
+		});
+		await page.goto('/projects');
+
+		const pane = page.locator('[data-workspace-pane]').first();
+		const tabs = pane.locator('[data-workspace-tab]');
+		await expect(tabs).toHaveCount(3);
+
+		const origin = await tabs.nth(0).boundingBox();
+		const over = await tabs.nth(2).boundingBox();
+		if (!origin || !over) throw new Error('tab has no bounding box');
+
+		await page.mouse.move(origin.x + origin.width / 2, origin.y + origin.height / 2);
+		await page.mouse.down();
+		await page.mouse.move(origin.x + origin.width / 2 + 12, origin.y + origin.height / 2, { steps: 5 });
+		await page.mouse.move(over.x + over.width / 2, over.y + over.height / 2, { steps: 10 });
+		await settleFrames(page);
+		// The landing slot is marked, so the release is what decides the outcome.
+		await expect(pane.locator('[data-tab-drop-indicator]')).toHaveCount(1);
+
+		// One movement models pointer events coalesced into a single frame. The
+		// destination must clear the previous target even without another move.
+		await page.mouse.move(640, 500);
+		if (settleBeforeRelease) {
+			await settleFrames(page);
+			await expect(pane.locator('[data-tab-drop-indicator]')).toHaveCount(0);
+		}
+		await page.mouse.up();
+		await expect(page.locator('[data-dnd-dragging], [data-dnd-placeholder]')).toHaveCount(0);
+
+		await expect.poll(() => tabTitles(pane)).toEqual(['New work', 'Projects', 'Settings']);
+		await expect(page).toHaveURL('/projects');
+	});
+}
+
+test('the compact strip drops a tab into the pane that owns the tab under it', async ({ page }) => {
+	await page.setViewportSize({ width: 700, height: 700 });
+	await seedWorkspace(page, {
+		focusedPaneId: 'pane-left',
+		panes: [
+			{ id: 'pane-left', activeTabId: TAB_NEW_WORK.id, width: 1, tabs: [TAB_NEW_WORK, TAB_PROJECTS] },
+			{ id: 'pane-right', activeTabId: TAB_SETTINGS.id, width: 1, tabs: [TAB_SETTINGS] },
+		],
+	});
+	await page.goto('/');
+
+	const strip = page.locator('[data-workspace-tab-strip]:visible');
+	await expect(strip.locator('[data-workspace-tab]')).toHaveCount(3);
+
+	// Every pane's tabs share this strip, and the strip itself is labelled with
+	// the last pane. Dropping onto a tab must still land in that tab's own pane
+	// rather than the one the strip is labelled with.
+	await dragTabAndDrop(
+		page,
+		strip.locator('[data-workspace-tab][data-workspace-tab-title="Settings"]'),
+		strip.locator('[data-workspace-tab][data-workspace-tab-title="New work"]'),
+		'start',
+	);
+
+	await expect.poll(() => tabTitles(strip)).toEqual(['Settings', 'New work', 'Projects']);
+	// pane-right is emptied by the move, so only pane-left survives.
+	await expect(page.locator('[data-workspace-pane]')).toHaveCount(1);
+});
+
+test('the pane a tab leaves keeps the neighbour at that position active', async ({ page }) => {
+	await seedWorkspace(page, {
+		focusedPaneId: 'pane-left',
+		panes: [
+			// The active tab sits last, so activating the first tab would be wrong.
+			{ id: 'pane-left', activeTabId: TAB_SETTINGS.id, width: 1, tabs: [TAB_NEW_WORK, TAB_PROJECTS, TAB_SETTINGS] },
+			{ id: 'pane-right', activeTabId: 'seed-tab-tasks', width: 1, tabs: [{ id: 'seed-tab-tasks', path: '/tasks', kind: 'tasks', title: 'Tasks', resourceId: null, status: null, lastActiveAt: 4 }] },
+		],
+	});
+	await page.goto('/settings');
+
+	const panes = page.locator('[data-workspace-pane]');
+	await expect(panes).toHaveCount(2);
+
+	await dragTabAndDrop(
+		page,
+		panes.nth(0).locator('[data-workspace-tab][data-workspace-tab-title="Settings"]'),
+		panes.nth(1).locator('[data-workspace-tab-strip]'),
+	);
+
+	await expect.poll(() => tabTitles(panes.nth(0))).toEqual(['New work', 'Projects']);
+	// Settings was at index 2; the source pane falls back to the preceding tab.
+	await expect(panes.nth(0).locator('[data-workspace-tab][data-workspace-tab-active="true"]'))
+		.toHaveAttribute('data-workspace-tab-title', 'Projects');
+});
+
+test('a drag in flight leaves the workspace untouched', async ({ page }) => {
+	await seedWorkspace(page, {
+		focusedPaneId: 'pane-left',
+		panes: [
+			{ id: 'pane-left', activeTabId: TAB_NEW_WORK.id, width: 1, tabs: [TAB_NEW_WORK, TAB_SETTINGS] },
+			{ id: 'pane-right', activeTabId: TAB_PROJECTS.id, width: 1, tabs: [TAB_PROJECTS] },
+		],
+	});
+	await page.goto('/');
+
+	const panes = page.locator('[data-workspace-pane]');
+	await expect(panes).toHaveCount(2);
+
+	await dragTab(
+		page,
+		panes.nth(0).locator('[data-workspace-tab][data-workspace-tab-id="seed-tab-home"]'),
+		panes.nth(1).locator('[data-workspace-tab][data-workspace-tab-title="Projects"]'),
+		'start',
+	);
+
+	// Nothing observable changes until the drop: membership, selection and the
+	// route all still describe the pre-drag workspace. Anything that reads panes
+	// mid-drag — a refresh, a deletion, a persist — therefore sees the truth.
+	expect(await tabTitles(panes.nth(0))).toEqual(['New work', 'Settings']);
+	expect(await tabTitles(panes.nth(1))).toEqual(['Projects']);
+	// The overlay and placeholder both carry the tab's attributes mid-drag.
+	await expect(panes.nth(0).locator('[data-workspace-tab][data-workspace-tab-active="true"]:not([data-dnd-dragging]):not([data-dnd-placeholder])'))
+		.toHaveCount(0);
+	await expect(panes.nth(0).locator('[data-workspace-tab][data-dnd-placeholder][data-workspace-tab-active="true"]'))
+		.toHaveAttribute('data-workspace-tab-title', 'New work');
+	await expect(page).toHaveURL('/');
+
+	await page.mouse.up();
+	await expect(page.locator('[data-dnd-dragging], [data-dnd-placeholder]')).toHaveCount(0);
+	await expect.poll(() => tabTitles(panes.nth(1))).toEqual(['New work', 'Projects']);
+});
+
+test('a project deleted mid-drag is handled normally and the drop still lands', async ({ page }) => {
+	const projectTab = { id: 'seed-tab-project', path: '/projects/doomed', kind: 'project', title: 'Doomed', resourceId: 'doomed', status: null, lastActiveAt: 2 };
+	await seedWorkspace(page, {
+		focusedPaneId: 'pane-left',
+		panes: [
+			{ id: 'pane-left', activeTabId: TAB_NEW_WORK.id, width: 1, tabs: [TAB_NEW_WORK, projectTab] },
+			{ id: 'pane-right', activeTabId: TAB_SETTINGS.id, width: 1, tabs: [TAB_SETTINGS] },
+		],
+	});
+	await page.goto('/');
+
+	const panes = page.locator('[data-workspace-pane]');
+	const drop = await dragTab(
+		page,
+		panes.nth(0).locator('[data-workspace-tab][data-workspace-tab-id="seed-tab-home"]'),
+		panes.nth(1).locator('[data-workspace-tab][data-workspace-tab-title="Settings"]'),
+		'start',
+	);
+
+	// The deletion handler sees the real workspace, so it removes the project
+	// from a pane that still holds the dragged tab. No stand-in is invented.
+	await page.evaluate(() => {
+		window.dispatchEvent(new CustomEvent('xpressclaw:project-mutation', {
+			detail: { kind: 'deleted', projectId: 'doomed' },
+		}));
+	});
+	await expect.poll(() => tabTitles(panes.nth(0))).toEqual(['New work']);
+
+	await drop();
+
+	// The drag still lands, and the emptied source pane closes as usual.
+	await expect(panes).toHaveCount(1);
+	await expect.poll(() => tabTitles(panes.nth(0))).toEqual(['New work', 'Settings']);
+});
+
+test('a touch swipe scrolls the compact tab strip instead of picking up a tab', async ({ page, browserName }, testInfo) => {
+	// Only meaningful on a touch profile at phone width, where the compact strip
+	// is the visible one and overflows; real touch input needs CDP, so Chromium.
+	test.skip(!testInfo.project.use.hasTouch || browserName !== 'chromium', 'needs the touch-chromium project');
+	// Enough tabs, with titles wide enough, that the strip overflows a
+	// phone-width viewport while staying under the open-tab cap.
+	const tabs = Array.from({ length: 8 }, (_, i) => ({
+		id: `seed-tab-${i}`, path: i === 0 ? '/' : `/projects/p${i}`, kind: i === 0 ? 'home' : 'project',
+		title: `Long project title number ${i}`, resourceId: i === 0 ? null : `p${i}`, status: null, lastActiveAt: i + 1,
+	}));
+	await seedWorkspace(page, { focusedPaneId: 'seed-pane', panes: [{ id: 'seed-pane', activeTabId: tabs[0].id, width: 1, tabs }] });
+	await page.goto('/');
+
+	const strip = page.locator('[data-workspace-tab-strip]:visible');
+	await expect(strip.locator('[data-workspace-tab]')).toHaveCount(8);
+	await expect.poll(() => strip.evaluate((el) => el.scrollWidth > el.clientWidth)).toBe(true);
+
+	// A real flick across a tab, injected as touch input so the browser runs
+	// its own scroll-versus-gesture arbitration. Synthetic pointer events never
+	// reach the drag sensor's activation path and cannot pan natively.
+	const tab = strip.locator('[data-workspace-tab]').nth(2);
+	const b = (await tab.boundingBox())!;
+	const y = b.y + b.height / 2, from = b.x + b.width / 2;
+	const cdp = await page.context().newCDPSession(page);
+	await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: from, y }] });
+	for (let step = 1; step <= 12; step += 1) {
+		await cdp.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: from - step * 10, y }] });
+		await page.waitForTimeout(8);
+	}
+	// While the finger is still down, the flick must not have picked up a tab.
+	await expect(page.locator('[data-dnd-dragging]')).toHaveCount(0);
+	await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+
+	await expect.poll(() => strip.evaluate((el) => el.scrollLeft)).toBeGreaterThan(0);
+	await expect(page.locator('[data-dnd-dragging]')).toHaveCount(0);
+});
+
+function delegatedFixture(overrides: Record<string, unknown> = {}) {
+	return {
+		task_id: 'review-child', title: 'Review authorized recovery and SDK retries',
+		agent_id: 'senior-reviewer', status: 'in_progress', activity_status: 'running', blocks_parent: true,
+		created_at: recentSqliteTimestamp(12 * 60_000), updated_at: recentSqliteTimestamp(5_000),
+		started_at: recentSqliteTimestamp(10 * 60_000), finished_at: null,
+		latest_event_type: 'tool_call', latest_event_at: recentSqliteTimestamp(5_000),
+		...overrides,
+	};
+}
+
+async function delegatedApi(page: Page, options: { parentStatus?: string; parentActivity?: string; parentAttempt?: string; child?: Record<string, unknown>; pendingInput?: boolean } = {}) {
+	const state = {
+		attempts: [attempt(options.parentAttempt ?? 'queued', 10_000, null, null, { trigger_message_id: 2 })],
+		children: [delegatedFixture(options.child)],
+	};
+	await mockApi(page, {
+		taskStatus: options.parentStatus ?? 'in_progress', taskActivityStatus: options.parentActivity ?? options.parentStatus ?? 'in_progress',
+		pendingElicitation: options.pendingInput ? { mode: 'form', message: 'Approve this operation?', requestedSchema: { type: 'object', properties: {} } } : undefined,
+		taskSubtasks: [
+			{ id: 'plan-only', title: 'Validate the implementation', provenance: 'native_plan', status: 'completed', parent_task_id: taskId },
+			{ id: 'review-child', title: 'Review authorized recovery and SDK retries', provenance: 'durable', status: 'in_progress', parent_task_id: taskId },
+		],
+	});
+	await page.route(`**/api/tasks/${taskId}/activity*`, async (route) => {
+		const after = new URL(route.request().url()).searchParams.has('after');
+		await route.fulfill({ json: {
+			attempts: state.attempts,
+			events: after ? [] : options.pendingInput ? [timelineEvent(1, 0, 'elicitation_pending', 'Approval needed', {
+				elicitationId: 'delegated-approval', status: 'pending', mode: 'form', message: 'Approve this operation?',
+				requestedSchema: { type: 'object', properties: { approved: { type: 'boolean', title: 'Approve' } } },
+			})] : [timelineEvent(1, 0, 'attempt_queued', 'Work queued', {})],
+			has_more_before: false, has_more_after: false, delegated_work: state.children,
+		} });
+	});
+	return state;
+}
+
+for (const width of [390, 1440]) {
+	test(`delegated work keeps coordination replies runnable at ${width}px`, async ({ page }, testInfo) => {
+		await page.setViewportSize({ width, height: 900 });
+		await delegatedApi(page, { parentActivity: 'queued' });
+		await page.goto(`/tasks/${taskId}`);
+		const composer = page.locator(`#task-message-input-${taskId}`);
+		await composer.fill('Keep this draft while checking delegated work.');
+		await expect(page.locator('[data-task-transcript-scroll] [data-delegated-task]')).toHaveCount(0);
+		await expect(page.locator('[data-delegation-wait]')).toHaveCount(0);
+		await expect(page.getByText('The agent is queued to respond', { exact: true })).toBeVisible();
+		await expect(page.locator('[data-task-activity-status="queued"]').first()).toBeVisible();
+		if (width === 390) {
+			await expect(page.getByRole('region', { name: 'Delegated work', exact: true })).toHaveCount(0);
+			await page.getByRole('button', { name: 'Show task details' }).click();
+		}
+		const details = width === 390
+			? page.getByRole('dialog', { name: 'Task details', exact: true })
+			: page.locator('[data-task-details-sidebar]');
+		await expect(details.getByRole('region', { name: 'Delegated work', exact: true })).toBeVisible();
+		const panel = page.getByRole('region', { name: 'Delegated work', exact: true });
+		await expect(panel).toBeVisible();
+		await expect(panel.getByText('senior-reviewer', { exact: true })).toBeVisible();
+		await expect(panel.getByText('Working', { exact: true })).toBeVisible();
+		await expect(panel.getByText('Required by this task')).toBeVisible();
+		await expect(panel.locator('[data-delegated-duration]')).toContainText('Elapsed: 10m');
+		await expect(panel.getByText(/Tool activity ·/)).toBeVisible();
+		await expect(panel.getByRole('link')).toHaveAttribute('href', '/tasks/review-child');
+		await expect(panel.getByText('Validate the implementation')).toHaveCount(0);
+		await expect(details.getByRole('heading', { name: 'Steps (1 complete)', exact: true })).toBeVisible();
+		await page.screenshot({ path: testInfo.outputPath(`delegated-details-${width}.png`) });
+		if (width === 390) await page.getByRole('button', { name: 'Close task details' }).click();
+		await expect(composer).toHaveValue('Keep this draft while checking delegated work.');
+	});
+}
+
+for (const width of [390, 1440]) {
+	test(`prerequisite waits explain queued messages at ${width}px`, async ({ page }) => {
+		await page.setViewportSize({ width, height: 900 });
+		await mockApi(page, {
+			taskStatus: 'in_progress', taskActivityStatus: 'waiting_for_dependencies',
+			taskDependency: { id: 'approval-prerequisite', title: 'Approve prerequisite', status: 'blocked' },
+			taskAttempts: [attempt('queued', 10_000, null, null, { trigger_message_id: 2 })],
+		});
+		await page.goto(`/tasks/${taskId}`);
+		await expect(page.locator('[data-task-activity-status="waiting_for_dependencies"]').first()).toBeVisible();
+		const notice = page.locator('[data-dependency-wait]');
+		await expect(notice).toBeVisible();
+		await expect(notice).toContainText('Your message is saved');
+		await expect(notice.getByRole('link', { name: 'Approve prerequisite' })).toHaveAttribute('href', '/tasks/approval-prerequisite');
+		await expect(page.getByText('The agent is queued to respond', { exact: true })).toHaveCount(0);
+	});
+}
+
+test('delegated work refreshes on quiet polls and freezes completed duration', async ({ page }) => {
+	const state = await delegatedApi(page);
+	await page.goto(`/tasks/${taskId}`);
+	await expect(page.locator('[data-delegation-wait]')).toBeVisible();
+	Object.assign(state.children[0], { status: 'completed', activity_status: 'completed', blocks_parent: false, finished_at: recentSqliteTimestamp(60_000) });
+	await expect(page.locator('[data-delegation-wait]')).toHaveCount(0, { timeout: 10_000 });
+	await expect(page.getByText('The agent is queued to respond', { exact: true })).toBeVisible();
+	await expect(page.locator('[data-task-transcript-scroll] [data-delegated-task]')).toHaveCount(0);
+	const sidebar = page.locator('[data-task-details-sidebar]');
+	await expect(sidebar.locator('[data-delegated-task]')).toBeHidden();
+	await page.getByText('Completed delegated work (1)', { exact: true }).click();
+	const duration = page.locator('[data-delegated-duration]');
+	await expect(duration).toContainText('Last run:');
+	const finished = await duration.innerText();
+	state.attempts = [attempt('running')];
+	await expect(page.getByText('The agent is responding', { exact: true })).toBeVisible({ timeout: 10_000 });
+	await expect(duration).toHaveText(finished);
+});
+
+for (const [activity, status, label] of [
+	['failed', 'in_progress', 'Failed'], ['cancelled', 'cancelled', 'Cancelled'],
+	['waiting_for_input', 'waiting_for_input', 'Needs input'], ['awaiting_review', 'in_progress', 'Awaiting review'],
+]) {
+	test(`delegated work keeps ${activity} children visible as blockers`, async ({ page }) => {
+		await delegatedApi(page, { child: { status, activity_status: activity, started_at: null } });
+		await page.goto(`/tasks/${taskId}`);
+		const panel = page.getByRole('region', { name: 'Delegated work', exact: true });
+		await expect(panel.getByText(label, { exact: true })).toBeVisible();
+		await expect(panel.getByText('Required by this task')).toBeVisible();
+		await expect(panel.getByText('Working', { exact: true })).toHaveCount(0);
+		await expect(page.locator('[data-delegation-wait]')).toBeVisible();
+	});
+}
+
+test('delegated work never replaces a running parent or makes optional work block it', async ({ page }) => {
+	const state = await delegatedApi(page, { parentAttempt: 'running' });
+	await page.goto(`/tasks/${taskId}`);
+	await expect(page.getByText('The agent is responding', { exact: true })).toBeVisible();
+	await expect(page.locator('[data-delegation-wait]')).toHaveCount(0);
+	state.children[0].blocks_parent = false;
+	state.attempts = [attempt('queued')];
+	await expect(page.getByText('The agent is queued to respond', { exact: true })).toBeVisible({ timeout: 10_000 });
+	await expect(page.locator('[data-delegation-wait]')).toHaveCount(0);
+	await expect(page.getByRole('region', { name: 'Delegated work', exact: true })).toBeVisible();
+});
+
+test('delegated work explains an idle parent without claiming a reply was saved', async ({ page }) => {
+	const state = await delegatedApi(page);
+	state.attempts = [];
+	await page.goto(`/tasks/${taskId}`);
+	await expect(page.locator('[data-delegation-wait]')).toBeVisible();
+	await expect(page.getByText(/Your message is saved/)).toHaveCount(0);
+});
+
+test('delegated work does not replace the parent approval prompt', async ({ page }) => {
+	await delegatedApi(page, { parentStatus: 'waiting_for_input', parentAttempt: 'waiting_for_input', pendingInput: true });
+	await page.goto(`/tasks/${taskId}`);
+	await expect(page.getByText('Approve this operation?', { exact: true })).toBeVisible();
+	await expect(page.getByRole('region', { name: 'Delegated work', exact: true })).toBeVisible();
+	await expect(page.locator('[data-delegation-wait]')).toHaveCount(0);
+});
+
+test('delegated work still refreshes optional children after the parent completes', async ({ page }) => {
+	const state = await delegatedApi(page, { parentStatus: 'completed', parentAttempt: 'completed', child: { blocks_parent: false } });
+	await page.goto(`/tasks/${taskId}`);
+	const panel = page.getByRole('region', { name: 'Delegated work', exact: true });
+	await expect(panel.getByText('Working', { exact: true })).toBeVisible();
+	Object.assign(state.children[0], { status: 'completed', activity_status: 'completed', blocks_parent: false, finished_at: recentSqliteTimestamp(0) });
+	await expect(panel.getByText('Completed delegated work (1)', { exact: true })).toBeVisible({ timeout: 10_000 });
+	await expect(page.locator('[data-delegation-wait]')).toHaveCount(0);
+});
+
+for (const mobile of [false, true]) {
+ test(`environment rebuild requires confirmation and preserves dependency errors (${mobile ? 'mobile' : 'desktop'})`, async ({ page }) => {
+  if (mobile) await page.setViewportSize({ width: 390, height: 844 });
+  await mockApi(page);
+  const requests: unknown[] = [];
+  let blocked = true;
+  const preserved = [{ name: 'previous-agent-environment', container_id: 'saved-environment-id', dependents: ['experiment'] }];
+  await page.route(`**/api/agents/${agentId}/environment`, route => route.fulfill({ json: { preserved_environments: blocked ? [] : preserved } }));
+  await page.route(`**/api/agents/${agentId}/environment/rebuild`, async route => {
+   requests.push(route.request().postDataJSON());
+   await route.fulfill(blocked ? { status: 409, json: { error: 'Cannot remove environment: dependent container experiment is still running. The environment has been preserved.' } } : { json: { rebuilt: true, preserved_environments: preserved } });
+  });
+  await page.goto(`/agents/${agentId}?tab=runner`);
+  await page.getByRole('button', { name: 'Rebuild environment…', exact: true }).click();
+  await expect(page.getByText('Rebuilding permanently deletes installed tools', { exact: false })).toBeVisible();
+  expect(requests).toHaveLength(0);
+  await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+  expect(requests).toHaveLength(0);
+  await page.getByRole('button', { name: 'Rebuild environment…', exact: true }).click();
+  await page.getByRole('button', { name: 'Discard environment and rebuild', exact: true }).click();
+  await expect(page.getByText('Cannot remove environment: dependent container experiment', { exact: false })).toBeVisible();
+  expect(requests).toEqual([{ discard_installed_tools: true }]);
+  blocked = false;
+  await page.getByRole('button', { name: 'Discard environment and rebuild', exact: true }).click();
+  await expect(page.getByText('Ready for a fresh environment.', { exact: false })).toBeVisible();
+  expect(requests).toEqual([{ discard_installed_tools: true }, { discard_installed_tools: true }]);
+  await page.getByText('Preserved environments (1)', { exact: true }).click();
+  await expect(page.getByText('experiment', { exact: true })).toBeVisible();
+  await expect(page.getByText('previous-agent-environment', { exact: true })).toBeVisible();
+  await page.reload();
+  await page.getByText('Preserved environments (1)', { exact: true }).click();
+  await expect(page.getByText('experiment', { exact: true })).toBeVisible();
+  await expect(page.getByText('previous-agent-environment', { exact: true })).toBeVisible();
+ });
+}
+
+for (const width of [390, 1440]) {
+ test(`delegated worker results await parent acceptance at ${width}px`, async ({ page }) => {
+  await page.setViewportSize({ width, height: 900 });
+  await mockApi(page, {
+   taskStatus: 'in_progress', taskActivityStatus: 'awaiting_parent_review',
+   taskParentId: 'manager-parent', taskParentReviewRequired: true,
+   taskAttempts: [attempt('completed', 10000, null, 'D1 remains incomplete; waiting for a login refresh.')],
+  });
+  await page.goto(`/tasks/${taskId}`);
+  await expect(page.locator('[data-task-activity-status="awaiting_parent_review"]').first()).toBeVisible();
+  await expect(page.locator('[data-parent-review-wait]')).toContainText('Waiting for the parent Agent to review and accept');
+  await expect(page.getByRole('button', { name: 'Complete task', exact: true })).toBeDisabled();
+  await expect(page.locator('[data-task-activity-status="completed"]')).toHaveCount(0);
+ });
+}
+
+for (const width of [390, 1440]) {
+ test(`blocked delegated work keeps its failure visible while a wakeup is queued at ${width}px`, async ({ page }) => {
+  await page.setViewportSize({ width, height: 900 });
+  const state = await delegatedApi(page, { parentActivity: 'queued', child: { status: 'blocked', activity_status: 'blocked', finished_at: recentSqliteTimestamp(5 * 60 * 60_000), error_message: 'The reviewer environment needs different container settings. Installed files are preserved.' } });
+  await page.goto(`/tasks/${taskId}`);
+  await expect(page.locator('[data-delegation-wait]')).toHaveCount(0);
+  await expect(page.getByText('The agent is queued to respond', { exact: true })).toBeVisible();
+  if (width === 390) await page.getByRole('button', { name: 'Show task details' }).click();
+  const panel = page.getByRole('region', { name: 'Delegated work', exact: true });
+  await expect(panel.locator('[data-delegated-error]')).toBeVisible();
+  await expect(panel.locator('[data-delegated-error]')).toContainText('Installed files are preserved');
+  if (width === 1440) await page.screenshot({ path: '/tmp/delegated-state-parent.png', fullPage: true });
+  // A quiet poll must remove the current error when retry starts, keeping history elsewhere.
+  Object.assign(state.children[0], { status: 'in_progress', activity_status: 'running', error_message: null });
+  await expect(panel.locator('[data-delegated-error]')).toHaveCount(0, { timeout: 10_000 });
+  if (width === 390) await page.getByRole('button', { name: 'Close task details' }).click();
+  await expect(page.getByText('The agent is queued to respond', { exact: true })).toBeVisible();
+ });
+
+ test(`delegated reviewer failure is visible from agent and project at ${width}px`, async ({ page }) => {
+  await page.setViewportSize({ width, height: 900 });
+  await mockApi(page, { projectTaskUpdates: [10, 20, 30, 40, 50, 60] });
+  const child = {
+   id: 'review-child', title: 'Blocked independent benchmark review', status: 'blocked', activity_status: 'blocked',
+   agent_id: agentId, project_id: projectId, parent_task_id: taskId, parent_title: 'Finished benchmark',
+   error_message: 'Reviewer could not start: environment settings mismatch.', provenance: 'durable',
+   created_at: timestamp(1), updated_at: timestamp(2), priority: 0, description: null,
+  };
+  let unresolved = true;
+  await page.route('**/api/tasks/attention*', route => route.fulfill({ json: { tasks: unresolved ? [child] : [] } }));
+  await page.goto(`/agents/${agentId}`);
+  await expect(page.getByRole('heading', { name: 'Needs attention', exact: true })).toBeVisible();
+  await expect(page.getByText(child.error_message, { exact: true })).toBeVisible();
+  await expect(page.getByText('Delegated from Finished benchmark', { exact: true })).toBeVisible();
+  await page.goto(`/projects/${projectId}`);
+  const panel = page.getByRole('region', { name: 'Project needs attention' });
+  await expect(panel.getByText(child.error_message, { exact: true })).toBeVisible();
+  await expect(panel.getByRole('link', { name: 'Parent: Finished benchmark' })).toHaveAttribute('href', `/tasks/${taskId}`);
+  await expect(panel.getByRole('link', { name: child.title })).toHaveAttribute('href', '/tasks/review-child');
+  const agentCard = page.locator('a.border.bg-card').filter({ hasText: 'Needs attention' });
+  await expect(agentCard).toHaveAttribute('href', `/agents/${agentId}`);
+  if (width === 1440) {
+   await expect(page.locator('aside').getByText('Needs attention', { exact: true })).toBeVisible();
+   await page.screenshot({ path: '/tmp/delegated-state-project.png', fullPage: true });
+  }
+  unresolved = false;
+  await expect(panel).toHaveCount(0, { timeout: 12_000 });
+  await expect(agentCard).toHaveCount(0);
+ });
+}
+
+for (const width of [390, 1440]) {
+ test(`global attention includes a cancelled-review blocker beyond task history at ${width}px`, async ({ page }) => {
+  await page.setViewportSize({ width, height: 900 });
+  await mockApi(page, { projectTaskUpdates: Array.from({ length: 110 }, (_, i) => i + 1) });
+  const parent = {
+   id: 'older-parent', title: 'Benchmark blocked by cancelled review', status: 'in_progress', activity_status: 'blocked',
+   agent_id: agentId, project_id: projectId, priority: 0, description: null,
+   created_at: timestamp(1), updated_at: timestamp(1),
+  };
+  let attention = [parent];
+  await page.route('**/api/tasks/attention*', route => route.fulfill({ json: { tasks: attention } }));
+  await page.goto(`/agents/${agentId}`);
+  await expect(page.getByRole('heading', { name: 'Needs attention', exact: true })).toBeVisible();
+  await expect(page.locator('section').filter({ has: page.getByRole('heading', { name: 'Needs attention', exact: true }) }).getByRole('link', { name: parent.title, exact: false })).toBeVisible();
+  await page.goto(`/projects/${projectId}`);
+  const projectAttention = page.getByRole('region', { name: 'Project needs attention' });
+  await expect(projectAttention.getByRole('link', { name: parent.title })).toBeVisible();
+  await expect(projectAttention).toContainText('Blocked');
+  await page.goto('/projects');
+  if (width === 390) await page.getByRole('button', { name: 'Browse workspace', exact: true }).click();
+  const sidebar = page.locator('aside:visible');
+  await expect(sidebar.getByText('Needs you', { exact: true })).toBeVisible();
+  await expect(sidebar.getByRole('link', { name: parent.title, exact: false })).toBeVisible();
+  const projectLink = sidebar.locator(`a[href="/projects/${projectId}"]`).filter({ hasText: 'Browser collaboration project' });
+  await expect(projectLink).toContainText('Needs attention');
+  // More than five blockers remain reachable from this panel.
+  attention = [...Array.from({ length: 6 }, (_, i) => ({ ...parent, id: `new-blocker-${i}`, title: `New blocker ${i}`, updated_at: timestamp(i + 10) })), parent];
+  await expect(sidebar.getByRole('button', { name: 'Show all 7 tasks', exact: true })).toBeVisible({ timeout: 12_000 });
+  await sidebar.getByRole('button', { name: 'Show all 7 tasks', exact: true }).click();
+  await expect(sidebar.getByRole('link', { name: parent.title, exact: false })).toBeVisible();
+  attention = [];
+  await expect(sidebar.getByText('Needs you', { exact: true })).toHaveCount(0, { timeout: 12_000 });
+  await expect(projectLink).not.toContainText('Needs attention');
+ });
+}
+
+test.describe('mobile editing', () => {
+	// Keep the PWA worker from bypassing the mocked API during later poll cycles.
+	test.use({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, serviceWorkers: 'block' });
+
+	async function setKeyboardViewport(page: Page, height: number, offsetTop = 0, scale = 1) {
+		await page.evaluate(({ height, offsetTop, scale }) => {
+			for (const [key, value] of Object.entries({ height, offsetTop, scale })) {
+				Object.defineProperty(window.visualViewport!, key, { configurable: true, value });
+			}
+			window.visualViewport!.dispatchEvent(new Event('resize'));
+			window.visualViewport!.dispatchEvent(new Event('scroll'));
+		}, { height, offsetTop, scale });
+	}
+
+	for (const surface of ['task', 'conversation', 'new work']) {
+		test(`${surface} keeps the composer above the keyboard while editing a long draft`, async ({ page }, testInfo) => {
+			const projectListRequests: string[] = [];
+			await mockApi(page, {
+				projectListRequests,
+				conversations: [{
+					id: conversationId, project_id: projectId, title: 'Mobile editing', icon: null,
+					created_at: timestamp(1), updated_at: timestamp(1), last_message_at: null,
+					participants: [{ participant_type: 'agent', participant_id: agentId, joined_at: timestamp(1) }],
+				}],
+			});
+			await page.goto(surface === 'task' ? `/tasks/${taskId}` : surface === 'conversation' ? `/conversations/${conversationId}` : '/');
+			const composer = surface === 'task' ? page.locator(`#task-message-input-${taskId}`)
+				: surface === 'conversation' ? page.getByPlaceholder('Message #Mobile editing…')
+				: page.getByPlaceholder('Describe the outcome you want…');
+			const sendButton = page.getByRole('button', { name: surface === 'task' ? 'Send message' : surface === 'conversation' ? 'Send' : 'Send work', exact: true });
+			const draft = Array.from({ length: 20 }, (_, i) => `Line ${i + 1}: Keep this draft editable.`).join('\n');
+			await composer.fill(draft);
+			const originalInput = await composer.elementHandle();
+			await composer.evaluate((input: HTMLTextAreaElement) => {
+				input.setSelectionRange(8, 12);
+				input.scrollTop = 0;
+			});
+
+			// Mobile keyboards resize the visual viewport without resizing the
+			// layout viewport. A short browser window alone cannot reproduce this.
+			await setKeyboardViewport(page, 440, 24);
+			const shell = page.getByRole('main').locator('..');
+			await expect.poll(async () => (await shell.boundingBox())!.height).toBe(440);
+			await expect.poll(async () => (await shell.boundingBox())!.y).toBe(24);
+			await expect(page.getByRole('navigation', { name: 'Workspace navigation' })).toBeHidden();
+			await expect.poll(async () => {
+				const bounds = (await composer.boundingBox())!;
+				return bounds.y >= 24 && bounds.y + bounds.height <= 464;
+			}).toBe(true);
+			await expect(composer).toBeFocused();
+			await expect(composer).toHaveCSS('font-size', '16px');
+			expect(await composer.evaluate((input) => input.scrollHeight > input.clientHeight)).toBe(true);
+
+			const polls = projectListRequests.length;
+			await expect.poll(() => projectListRequests.length, { timeout: 10_000 }).toBeGreaterThanOrEqual(polls + 2);
+			await expect(composer).toBeFocused();
+			expect(await originalInput!.evaluate((input) => input.isConnected)).toBe(true);
+			expect(await composer.evaluate((input: HTMLTextAreaElement) => [input.selectionStart, input.selectionEnd, input.scrollTop])).toEqual([8, 12, 0]);
+			await page.keyboard.insertText('Edit');
+			await expect(composer).toHaveValue(draft.slice(0, 8) + 'Edit' + draft.slice(12));
+			// Exercise the browser's actual clipboard insertion into a selection.
+			await composer.evaluate((input: HTMLTextAreaElement) => input.setSelectionRange(8, 12));
+			await page.keyboard.press('ControlOrMeta+c');
+			await composer.evaluate((input: HTMLTextAreaElement) => input.setSelectionRange(0, 4));
+			await page.keyboard.press('ControlOrMeta+v');
+			await expect(composer).toHaveValue('Edit' + draft.slice(4, 8) + 'Edit' + draft.slice(12));
+			await page.screenshot({ path: testInfo.outputPath(`${surface}-keyboard.png`) });
+
+			// Viewport panning must keep the composer visible without stealing its caret.
+			await setKeyboardViewport(page, 320, 42);
+			await expect.poll(async () => (await shell.boundingBox())!.y).toBe(42);
+			await expect.poll(async () => { const bounds = (await composer.boundingBox())!; return bounds.y + bounds.height; }).toBeLessThanOrEqual(362);
+			await expect.poll(async () => { const bounds = (await sendButton.boundingBox())!; return bounds.y + bounds.height; }).toBeLessThanOrEqual(362);
+			await page.screenshot({ path: testInfo.outputPath(`${surface}-small-keyboard.png`) });
+			await setKeyboardViewport(page, 844);
+			await expect.poll(async () => (await shell.boundingBox())!.height).toBe(844);
+			await expect(page.getByRole('navigation', { name: 'Workspace navigation' })).toBeVisible();
+			await expect(composer).toBeFocused();
+		});
+	}
+
+	for (const width of [390, 1024]) {
+		test(`background refresh preserves the tab strip and text selection at ${width}px`, async ({ page }) => {
+			await page.setViewportSize({ width, height: 844 });
+			const tabs = Array.from({ length: 8 }, (_, index) => ({
+				id: `editing-tab-${index}`, path: index === 0 ? `/tasks/${taskId}` : `/projects/p${index}`,
+				kind: index === 0 ? 'task' : 'project', title: `Long project title number ${index}`,
+				resourceId: index === 0 ? taskId : `p${index}`, status: null, lastActiveAt: index + 1,
+			}));
+			await page.addInitScript((tabs) => localStorage.setItem('xpressclaw.workspace.v1', JSON.stringify({
+				focusedPaneId: 'editing-pane', panes: [{ id: 'editing-pane', activeTabId: tabs[0].id, width: 1, tabs }],
+			})), tabs);
+			const projectListRequests: string[] = [];
+			await mockApi(page, { preserveWorkspace: true, projectListRequests });
+			await page.goto(`/tasks/${taskId}`);
+			const composer = page.locator(`#task-message-input-${taskId}`);
+			await composer.fill('Keep my selection during background updates.');
+			await composer.evaluate((input: HTMLTextAreaElement) => input.setSelectionRange(8, 17));
+			const strip = page.locator('[data-workspace-tab-strip]:visible');
+			await expect.poll(() => strip.evaluate((element) => element.scrollWidth > element.clientWidth)).toBe(true);
+			await strip.evaluate((element) => element.scrollLeft = element.scrollWidth);
+			const scrollLeft = await strip.evaluate((element) => element.scrollLeft);
+			expect(scrollLeft).toBeGreaterThan(0);
+			const polls = projectListRequests.length;
+			await expect.poll(() => projectListRequests.length, { timeout: 10_000 }).toBeGreaterThanOrEqual(polls + 2);
+			await expect(composer).toBeFocused();
+			expect(await composer.evaluate((input: HTMLTextAreaElement) => [input.selectionStart, input.selectionEnd])).toEqual([8, 17]);
+			expect(await strip.evaluate((element) => element.scrollLeft)).toBe(scrollLeft);
+			if (width === 1024) {
+				await strip.locator('[data-workspace-tab]').last().locator('button').first().click();
+				await page.setViewportSize({ width: 390, height: 844 });
+				const activeTab = page.locator('[data-workspace-tab-strip]:visible [data-workspace-tab-active="true"]');
+				await expect.poll(async () => {
+					const bounds = await activeTab.boundingBox();
+					return !!bounds && bounds.x >= -1 && bounds.x + bounds.width <= 391;
+				}).toBe(true);
+			}
+		});
+	}
+
+	test('pinch zoom preserves the layout and orientation changes update the available height', async ({ page }) => {
+		await mockApi(page);
+		await page.goto(`/tasks/${taskId}`);
+		const composer = page.locator(`#task-message-input-${taskId}`);
+		await composer.fill('Keep the zoom accessible.');
+		const shell = page.getByRole('main').locator('..');
+		await expect.poll(async () => (await shell.boundingBox())!.height).toBe(844);
+		await setKeyboardViewport(page, 422, 0, 2);
+		// Wait for the animation frame that handles a viewport update.
+		await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => resolve())));
+		expect((await shell.boundingBox())!.height).toBe(844);
+		await expect(page.getByRole('navigation', { name: 'Workspace navigation' })).toBeVisible();
+		await page.setViewportSize({ width: 844, height: 390 });
+		await setKeyboardViewport(page, 390);
+		await expect.poll(async () => (await shell.boundingBox())!.height).toBe(390);
+		await expect(composer).toHaveValue('Keep the zoom accessible.');
+	});
+});
+
+test.describe('adaptive workspace', () => {
+	test.use({ viewport: { width: 951, height: 620 }, isMobile: true, hasTouch: true, serviceWorkers: 'block' });
+	type Segment = { x: number; y: number; width: number; height: number };
+
+	async function prepare(page: Page, count = 2, focused = count - 1, foldAPI = false) {
+		await page.addInitScript(({ count, focused, foldAPI, taskId, conversationId }) => {
+			const resources = [
+				{ path: `/tasks/${taskId}`, kind: 'task', resourceId: taskId, title: 'Task' },
+				{ path: `/conversations/${conversationId}`, kind: 'conversation', resourceId: conversationId, title: 'Duo notes' },
+				{ path: '/', kind: 'home', resourceId: null, title: 'New work' },
+			];
+			localStorage.setItem('xpressclaw.workspace.v1', JSON.stringify({
+				focusedPaneId: `duo-pane-${focused}`,
+				panes: resources.slice(0, count).map((tab, index) => ({
+					id: `duo-pane-${index}`, activeTabId: `duo-tab-${index}`, width: 1,
+					tabs: [{ ...tab, id: `duo-tab-${index}`, status: null, lastActiveAt: index + 1 }],
+				})),
+			}));
+			const posture = Object.assign(new EventTarget(), { type: 'continuous' });
+			const viewport = { segments: null as DOMRect[] | null };
+			Object.defineProperty(window, 'viewport', { configurable: true, value: foldAPI ? viewport : undefined });
+			Object.defineProperty(navigator, 'devicePosture', { configurable: true, value: foldAPI ? posture : undefined });
+		}, { count, focused, foldAPI, taskId, conversationId });
+		await mockApi(page, {
+			preserveWorkspace: true,
+			conversations: [{
+				id: conversationId, project_id: projectId, title: 'Duo notes', icon: null,
+				created_at: timestamp(1), updated_at: timestamp(1), last_message_at: timestamp(30),
+				participants: [{ participant_type: 'agent', participant_id: agentId, joined_at: timestamp(1) }],
+			}],
+			conversationMessages: Array.from({ length: 30 }, (_, i) => ({
+				id: i + 1, conversation_id: conversationId, sender_type: 'agent', sender_id: agentId,
+				sender_name: 'Agent', content: `Conversation entry ${i + 1}`, message_type: 'message',
+				linked_task_id: null, metadata: {}, attachments: [], created_at: timestamp(i + 1),
+			})),
+		});
+		await page.goto(focused === 0 ? `/tasks/${taskId}` : focused === 1 ? `/conversations/${conversationId}` : '/');
+		await expect(page.locator('[data-workspace-pane]')).toHaveCount(count);
+	}
+
+	async function fold(page: Page, segments: Segment[] | null, event = 'change') {
+		await page.evaluate(({ segments, event }) => {
+			const viewport = (window as typeof window & { viewport: { segments: DOMRect[] | null } }).viewport;
+			const posture = (navigator as typeof navigator & { devicePosture: EventTarget & { type: string } }).devicePosture;
+			viewport.segments = segments?.map(segment => DOMRect.fromRect(segment)) ?? null;
+			posture.type = segments ? 'folded' : 'continuous';
+			if (event === 'resize') window.dispatchEvent(new Event('resize'));
+			else posture.dispatchEvent(new Event('change'));
+		}, { segments, event });
+	}
+
+	async function expectInside(locator: Locator, region: Segment) {
+		await expect.poll(async () => {
+			const rect = await locator.boundingBox();
+			return !!rect && rect.x >= region.x - 1 && rect.y >= region.y - 1
+				&& rect.x + rect.width <= region.x + region.width + 1 && rect.y + rect.height <= region.y + region.height + 1;
+		}).toBe(true);
+	}
+
+	test('Duo viewport changes preserve both drafts, focus, selection, and scroll without fold APIs', async ({ page }, testInfo) => {
+		await prepare(page);
+		const panes = page.locator('[data-workspace-pane]');
+		await expect(page.locator('[data-workspace-pane]:visible')).toHaveCount(2);
+		const task = panes.nth(0).locator('textarea').first();
+		const conversation = page.getByPlaceholder('Message #Duo notes…');
+		await task.fill('Keep the task draft.');
+		await conversation.fill('Keep the conversation draft and selection.');
+		const input = await conversation.elementHandle();
+		const transcript = page.locator('[data-conversation-message-pane]');
+		await transcript.dispatchEvent('pointerdown');
+		await transcript.evaluate(element => element.scrollTop = 200);
+		await conversation.focus();
+		await conversation.evaluate((element: HTMLTextAreaElement) => element.setSelectionRange(9, 21));
+		for (const size of [
+			{ width: 669, height: 902 }, { width: 382, height: 618 }, { width: 385, height: 609 },
+			{ width: 594, height: 406 }, { width: 951, height: 620 },
+		]) {
+			await page.setViewportSize(size);
+			await expect(page.locator('[data-workspace-pane]:visible')).toHaveCount(size.width === 951 ? 2 : 1);
+			await expect(conversation).toBeFocused();
+			expect(await input!.evaluate(element => element.isConnected)).toBe(true);
+			expect(await conversation.evaluate((element: HTMLTextAreaElement) => [element.selectionStart, element.selectionEnd])).toEqual([9, 21]);
+			await expect(task).toHaveValue('Keep the task draft.');
+			await expect(conversation).toHaveValue('Keep the conversation draft and selection.');
+			await expect.poll(() => transcript.evaluate(element => element.scrollTop)).toBe(200);
+			expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+		}
+		await page.screenshot({ path: testInfo.outputPath('duo-unfolded.png') });
+	});
+
+	for (const kind of ['task', 'conversation']) {
+		test(`${kind} details use the pane width on the 669px inner display`, async ({ page }, testInfo) => {
+			await page.setViewportSize({ width: 669, height: 902 });
+			await prepare(page, kind === 'task' ? 1 : 2, kind === 'task' ? 0 : 1);
+			const details = page.locator(kind === 'task' ? '[data-task-details-sidebar]' : '[data-conversation-tasks]');
+			await expect(details).toBeVisible();
+			await page.screenshot({ path: testInfo.outputPath(`duo-${kind}-details.png`) });
+			await page.setViewportSize({ width: 385, height: 609 });
+			await expect(details).toBeHidden();
+			if (kind === 'task') {
+				await page.getByRole('button', { name: 'Show task details' }).click();
+				await expect(page.getByRole('dialog', { name: 'Task details', exact: true })).toBeVisible();
+				await page.getByRole('button', { name: 'Close task details' }).click();
+			}
+			await page.setViewportSize({ width: 669, height: 902 });
+			await expect(details).toBeVisible();
+		});
+	}
+
+	test('posture events align panes to book and laptop segments, including keyboard occlusion', async ({ page }, testInfo) => {
+		await page.setViewportSize({ width: 669, height: 902 });
+		await prepare(page, 2, 1, true);
+		const composer = page.getByPlaceholder('Message #Duo notes…');
+		await composer.fill('Preserve this through every posture.');
+		await composer.evaluate((element: HTMLTextAreaElement) => element.setSelectionRange(9, 13));
+		const original = await composer.elementHandle();
+		const book = [{ x: 0, y: 0, width: 328, height: 902 }, { x: 340, y: 0, width: 329, height: 902 }];
+		await fold(page, book);
+		const panes = page.locator('[data-workspace-pane]');
+		await expect(page.locator('[data-workspace-layout]')).toHaveAttribute('data-workspace-layout', 'horizontal');
+		await expect(page.locator('[data-workspace-pane]:visible')).toHaveCount(2);
+		await expectInside(panes.nth(0), book[0]);
+		await expectInside(panes.nth(1), book[1]);
+		await expect(composer).toBeFocused();
+		await page.screenshot({ path: testInfo.outputPath('duo-book.png') });
+
+		await page.setViewportSize({ width: 951, height: 620 });
+		const laptop = [{ x: 0, y: 0, width: 951, height: 304 }, { x: 0, y: 316, width: 951, height: 304 }];
+		await fold(page, laptop, 'resize');
+		await expect(page.locator('[data-workspace-layout]')).toHaveAttribute('data-workspace-layout', 'vertical');
+		for (let i = 0; i < 2; i++) {
+			await expectInside(panes.nth(i), laptop[i]);
+			await expectInside(panes.nth(i).locator('textarea').first(), laptop[i]);
+			await expectInside(panes.nth(i).getByRole('button', { name: i ? 'Send' : 'Send message', exact: true }), laptop[i]);
+		}
+		await expect(composer).toBeFocused();
+		await page.screenshot({ path: testInfo.outputPath('duo-laptop.png') });
+
+		await page.evaluate(() => {
+			Object.defineProperty(visualViewport, 'height', { configurable: true, value: 280 });
+			Object.defineProperty(visualViewport, 'offsetTop', { configurable: true, value: 12 });
+			visualViewport!.dispatchEvent(new Event('resize'));
+		});
+		await expect(page.locator('[data-workspace-pane]:visible')).toHaveCount(1);
+		await expectInside(composer, { x: 0, y: 12, width: 951, height: 280 });
+		await expectInside(panes.nth(1).getByRole('button', { name: 'Send', exact: true }), { x: 0, y: 12, width: 951, height: 280 });
+		await expect(composer).toBeFocused();
+		expect(await original!.evaluate(element => element.isConnected)).toBe(true);
+		expect(await composer.evaluate((element: HTMLTextAreaElement) => [element.selectionStart, element.selectionEnd])).toEqual([9, 13]);
+		await page.evaluate(() => {
+			Reflect.deleteProperty(visualViewport!, 'height');
+			Reflect.deleteProperty(visualViewport!, 'offsetTop');
+			visualViewport!.dispatchEvent(new Event('resize'));
+		});
+		await fold(page, null);
+		await expect(page.locator('[data-workspace-layout]')).toHaveAttribute('data-workspace-layout', 'flow');
+		await expect(page.locator('[data-workspace-pane]:visible')).toHaveCount(2);
+		await expect(composer).toHaveValue('Preserve this through every posture.');
+		await expect(composer).toBeFocused();
+		expect(await page.evaluate(() => JSON.parse(localStorage.getItem('xpressclaw.workspace.v1')!).panes.map((pane: { id: string }) => pane.id))).toEqual(['duo-pane-0', 'duo-pane-1']);
+	});
+
+	test('a spare fold segment can open a pane without replacing the current task', async ({ page }) => {
+		await page.setViewportSize({ width: 669, height: 902 });
+		await prepare(page, 1, 0, true);
+		const task = page.locator(`#task-message-input-${taskId}`);
+		await task.fill('Retain the original task draft.');
+		const input = await task.elementHandle();
+		await fold(page, [{ x: 0, y: 0, width: 328, height: 902 }, { x: 340, y: 0, width: 329, height: 902 }]);
+		await page.getByRole('button', { name: 'Open another pane' }).click();
+		await expect(page.locator('[data-workspace-pane]:visible')).toHaveCount(2);
+		await expect(page.getByPlaceholder('Describe the outcome you want…')).toBeVisible();
+		await expectInside(page.getByRole('button', { name: 'Send work', exact: true }), { x: 340, y: 0, width: 329, height: 902 });
+		await expect(task).toHaveValue('Retain the original task draft.');
+		expect(await input!.evaluate(element => element.isConnected)).toBe(true);
+		await page.getByRole('button', { name: 'Browse workspace', exact: true }).first().click();
+		const navigation = page.getByRole('dialog', { name: 'Browse workspace', exact: true });
+		await expect(navigation).toBeVisible();
+		await expectInside(navigation.locator('aside'), { x: 0, y: 0, width: 328, height: 902 });
+	});
+
+	test('task details sheets stay in their segment and recover normal positioning when unfolded', async ({ page }, testInfo) => {
+		await page.setViewportSize({ width: 669, height: 902 });
+		await prepare(page, 2, 0, true);
+		const book = [{ x: 0, y: 0, width: 328, height: 902 }, { x: 340, y: 0, width: 329, height: 902 }];
+		await fold(page, book);
+		await page.getByRole('button', { name: 'Show task details' }).click();
+		const details = page.getByRole('dialog', { name: 'Task details', exact: true });
+		await expectInside(details, book[0]);
+		await page.screenshot({ path: testInfo.outputPath('duo-book-details-sheet.png') });
+		await page.setViewportSize({ width: 951, height: 620 });
+		const laptop = [{ x: 0, y: 0, width: 951, height: 304 }, { x: 0, y: 316, width: 951, height: 304 }];
+		await fold(page, laptop);
+		await expectInside(details, laptop[0]);
+		await fold(page, null);
+		await expect.poll(() => details.evaluate(element => element.style.left)).toBe('');
+		await expectInside(details, { x: 0, y: 0, width: 951, height: 620 });
+		await page.getByRole('button', { name: 'Close task details' }).click();
+		await expect(details).toBeHidden();
+	});
+
+	test('hidden panes stay accessible and focusing a visible neighbour does not rearrange them', async ({ page }) => {
+		await prepare(page, 3, 2);
+		const visibleIds = () => page.locator('[data-workspace-pane]:visible').evaluateAll(elements => elements.map(element => element.getAttribute('data-pane-id')));
+		await expect.poll(visibleIds).toEqual(['duo-pane-1', 'duo-pane-2']);
+		const home = page.getByPlaceholder('Describe the outcome you want…');
+		await home.fill('Keep the third pane draft.');
+		await page.getByPlaceholder('Message #Duo notes…').fill('Focus the visible neighbour.');
+		await expect.poll(visibleIds).toEqual(['duo-pane-1', 'duo-pane-2']);
+		await page.getByRole('group', { name: 'Open tabs', exact: true }).getByRole('button', { name: 'Browser-tested workspace', exact: true }).click();
+		await expect.poll(visibleIds).toEqual(['duo-pane-0', 'duo-pane-1']);
+		await page.setViewportSize({ width: 1700, height: 900 });
+		await expect(page.locator('[data-workspace-pane]:visible')).toHaveCount(3);
+		await expect(home).toHaveValue('Keep the third pane draft.');
+	});
+
+	test('unsaved file edits remain mounted when folding down to one pane', async ({ page }) => {
+		await page.setViewportSize({ width: 1440, height: 900 });
+		await mockApi(page);
+		await page.goto(`/tasks/${taskId}`);
+		await page.locator('[data-task-changed-files]').getByRole('link', { name: 'src/main.ts' }).click();
+		const editor = page.locator('[data-monaco-editor]');
+		await expect(editor).toBeVisible({ timeout: 20_000 });
+		await editor.locator('.view-lines').click({ position: { x: 20, y: 20 } });
+		await page.keyboard.press('Control+A');
+		await page.keyboard.insertText('export const preserved = "Duo draft";');
+		const original = await editor.elementHandle();
+		for (const size of [{ width: 951, height: 620 }, { width: 669, height: 902 }, { width: 382, height: 618 }, { width: 951, height: 620 }]) {
+			await page.setViewportSize(size);
+			await expect(editor).toBeVisible();
+			await expect(editor).toContainText('Duo draft');
+			await expect(page.getByRole('button', { name: 'Save', exact: true })).toBeEnabled();
+			expect(await original!.evaluate(element => element.isConnected)).toBe(true);
+		}
+	});
+});
+
+test('Implement alternatives → choose best workflow editor preserves branches and executable verification when saved', async ({ page }) => {
+	const workflowCreateRequests: { name: string; description?: string; yaml_content: string }[] = [];
+	await mockApi(page, { workflowCreateRequests });
+	await page.goto('/workflows/new');
+	await page.getByRole('button', { name: /Implement alternatives → choose best/ }).click();
+	await page.getByRole('button', { name: 'Create workflow' }).click();
+	await expect(page).toHaveURL('/workflows/workflow-created');
+	const group = page.locator('[data-step-id="implementations"]');
+	await expect(group).toContainText('PARALLEL');
+	await expect(group).toContainText('Implement alternative A');
+	await expect(group).toContainText('Implement alternative B');
+	await expect(page.locator('[data-step-id="improvement_gate"]')).toContainText('@refinement_assessment.after_score > @refinement_assessment.before_score');
+	await page.getByRole('button', { name: /^finish / }).click();
+	const verify = page.locator('[data-step-id="verify"]');
+	await verify.getByRole('button', { name: 'Expand command' }).click();
+	await expect(verify.getByLabel('Command Agent')).toHaveValue('@worker');
+	await expect(verify.getByRole('checkbox')).not.toBeChecked();
+	await verify.getByLabel('Command working directory').fill('checks');
+	await verify.getByLabel('Command timeout').fill('2m');
+	await verify.getByLabel('Shell command').fill('bash verify.sh');
+	const request = page.waitForRequest((request) => request.url().endsWith('/api/workflows/workflow-created') && request.method() === 'PUT');
+	await page.getByRole('button', { name: 'Save', exact: true }).click();
+	const saved = (await request).postDataJSON().yaml_content as string;
+	expect(saved).toContain('type: parallel');
+	expect(saved).toContain('id: alternative_a');
+	expect(saved).toContain('id: alternative_b');
+	expect(saved).toContain('new_session: true');
+	expect(saved).toContain('allow_failure: true');
+	expect(saved).toContain('command: bash verify.sh');
+	expect(saved).toContain('cwd: checks');
+	expect(saved).toContain('timeout: 2m');
+	expect(saved).toContain('@refinement_assessment.after_score > @refinement_assessment.before_score');
+	expect(saved).toContain('goto: flow adopt_refined');
+	expect(saved.match(/type: command/g)).toHaveLength(6);
+});
+
+test('choose-best workflow accepts rubric priorities and keeps memory writes opt-in', async ({ page }) => {
+	const workflowRunRequests: { id: string; inputs: Record<string, unknown> }[] = [];
+	await mockApi(page, { workflowRunRequests });
+	await page.goto('/workflows/new');
+	await page.getByRole('button', { name: /Implement alternatives → choose best/ }).click();
+	await page.getByRole('button', { name: 'Create workflow' }).click();
+	await expect(page).toHaveURL('/workflows/workflow-created');
+	await page.getByRole('button', { name: 'Run', exact: true }).click();
+	await expect(page.getByLabel(/remember decision/i)).toHaveValue('false');
+	await expect(page.getByLabel(/refine winner/i)).toHaveValue('true');
+	await expect(page.getByLabel(/verification command/i)).toHaveValue('');
+	await page.getByLabel(/goal/i).fill('Implement a faster parser');
+	await page.getByLabel(/priorities/i).fill('Correctness, then measured throughput');
+	await page.getByLabel(/remember decision/i).selectOption('true');
+	await page.getByRole('button', { name: 'Start workflow' }).click();
+	await expect.poll(() => workflowRunRequests.length).toBe(1);
+	expect(workflowRunRequests[0].inputs).toMatchObject({
+		goal: 'Implement a faster parser',
+		priorities: 'Correctness, then measured throughput',
+		remember_decision: true,
+		refine_winner: true,
+		coordinator: agentId,
+		candidate_a: agentId,
+		candidate_b: agentId,
+		worker: agentId,
+	});
+});
+
+
+test('Agent runner networking defaults to the instance proxy and saves a direct override', async ({ page }) => {
+    await mockApi(page);
+    let saved: { runner: { proxy: string } } | null = null;
+    await page.route(`**/api/agents/${agentId}/config`, async route => {
+        saved = route.request().postDataJSON();
+        await route.fulfill({ json: { agent: saved } });
+    });
+    await page.goto(`/agents/${agentId}?tab=runner`);
+    const mode = page.getByLabel('Network proxy', { exact: true });
+    await expect(mode).toHaveValue('inherit');
+    await mode.selectOption('direct');
+    await page.getByRole('button', { name: 'Save Changes' }).click();
+    await expect.poll(() => saved?.runner.proxy).toBe('direct');
+    await expect(mode).toHaveValue('direct');
+});
+
+test('task messages and completion keep updating while Git status is stalled', async ({ page }) => {
+    await page.clock.install();
+    const messages: Record<string, unknown>[] = [
+        { id: 1, task_id: taskId, role: 'assistant', content: 'Reply already saved in the database.', attachments: [], timestamp: timestamp(20) }
+    ];
+    const attempts: Record<string, unknown>[] = [attempt('running')];
+    await mockApi(page, { taskStatus: 'in_progress', taskMessages: messages, taskAttempts: attempts });
+    let releaseGit!: () => void;
+    const gitGate = new Promise<void>(resolve => { releaseGit = resolve; });
+    let gitRequests = 0;
+    await page.route(`**/api/workspaces/${agentId}/git/status`, async route => {
+        gitRequests++;
+        await gitGate;
+        await route.fulfill({ json: { repository: true, branch: 'main', files: [] } }).catch(() => {});
+    });
+    try {
+        await page.goto(`/tasks/${taskId}`);
+        await expect(page.getByText('Reply already saved in the database.', { exact: true })).toBeVisible();
+        await expect(page.locator('[data-agent-phase="loading"]')).toHaveCount(0);
+        await page.clock.runFor(6_000);
+        expect(gitRequests).toBe(1);
+        const task = await page.evaluate(async id => (await fetch(`/api/tasks/${id}`)).json(), taskId);
+        await page.route(`**/api/tasks/${taskId}`, route => route.fulfill({ json: { ...task, status: 'waiting_for_input', activity_status: 'waiting_for_input' } }));
+        messages.push({ id: 2, task_id: taskId, role: 'assistant', content: 'Completed while Git is still checking.', attachments: [], timestamp: timestamp(65) });
+        attempts.splice(0, 1, attempt('completed'));
+        await page.clock.runFor(3_000);
+        await expect(page.getByText('Completed while Git is still checking.', { exact: true })).toBeVisible();
+        await expect(page.locator('[data-task-activity-status="waiting_for_input"]')).toBeVisible();
+        expect(gitRequests).toBe(1);
+    } finally {
+        releaseGit();
+    }
+});
+
+test('stalled Git refresh times out and a later refresh recovers', async ({ page }) => {
+    await page.clock.install();
+    await page.setViewportSize({ width: 1600, height: 1000 });
+    await mockApi(page, { taskStatus: 'in_progress' });
+    let releaseGit!: () => void;
+    const gitGate = new Promise<void>(resolve => { releaseGit = resolve; });
+    let requests = 0;
+    const failedRequests: string[] = [];
+    page.on('requestfailed', request => {
+        if (new URL(request.url()).pathname.endsWith('/git/status')) failedRequests.push(request.url());
+    });
+    await page.route(`**/api/workspaces/${agentId}/git/status`, async route => {
+        if (++requests === 1) await gitGate;
+        await route.fulfill({ json: { repository: true, branch: 'git-recovered', files: [] } }).catch(() => {});
+    });
+    try {
+        await page.goto(`/tasks/${taskId}`);
+        await expect(page.locator('[data-task-transcript]')).toBeVisible();
+        await expect.poll(() => requests).toBe(1);
+        await page.clock.runFor(13_000);
+        await expect.poll(() => failedRequests.length).toBe(1);
+        await expect.poll(() => requests).toBe(2);
+        await expect(page.locator('[data-task-changed-files]')).toContainText('Working tree clean');
+    } finally {
+        releaseGit();
+    }
+});
+
+test('Agent sign-in opens from an authentication failure and retries only after success', async ({ page }) => {
+	const taskStatusRequests: string[] = [];
+	const postedMessages: Record<string, unknown>[] = [];
+	await mockApi(page, { taskStatus: 'blocked', attemptError: 'backend error: ACP turn failed: Authentication required', taskStatusRequests, postedMessages });
+	await page.route('**/api/sessions/**/authentication', route => route.fulfill({ json: {
+		kind: 'antigravity', status: 'required', methods: [{ id: 'terminal-login', name: 'Google account', description: null, kind: 'terminal', api_key: false }],
+	} }));
+	let input = '';
+	await page.routeWebSocket('**/api/sessions/**/authentication/terminal?**', websocket => {
+		expect(new URL(websocket.url()).searchParams.get('method_id')).toBe('terminal-login');
+		websocket.send(JSON.stringify({ type: 'ready' }));
+		websocket.send(Buffer.from('Enter the sign-in code:\r\n'));
+		websocket.onMessage(message => {
+			if (typeof message !== 'string') {
+				input += message.toString();
+				if (input.includes('1234\r')) websocket.send(JSON.stringify({ type: 'authenticated' }));
+			}
+		});
+	});
+	await page.goto(`/tasks/${taskId}`);
+	await page.locator('[data-attempt-error]').getByRole('button', { name: 'Sign in', exact: true }).click();
+	const dialog = page.getByRole('dialog', { name: 'Sign in to Agent' });
+	await expect(dialog.getByText('Enter the sign-in code:')).toBeVisible();
+	await expect(dialog.getByLabel('tmux session name')).toHaveCount(0);
+	await page.screenshot({ path: test.info().outputPath('agent-sign-in-terminal.png') });
+	await page.keyboard.type('1234');
+	await page.keyboard.press('Enter');
+	await expect(dialog.getByText('Signed in successfully.')).toBeVisible();
+	expect(taskStatusRequests).toEqual([]);
+	expect(postedMessages).toEqual([]);
+	await dialog.getByRole('button', { name: 'Retry task', exact: true }).click();
+	await expect.poll(() => taskStatusRequests).toEqual(['in_progress']);
+	await expect(dialog).not.toBeVisible();
+});
+
+test('Agent sign-in supports provider URLs and forms without writing them to task chat', async ({ page }) => {
+	const opened = await mockDesktopExternalLinks(page);
+	const postedMessages: Record<string, unknown>[] = [];
+	await mockApi(page, { postedMessages });
+	await page.route('**/api/sessions/**/authentication', route => route.fulfill({ json: {
+		kind: 'codex', status: 'required', methods: [{ id: 'device', name: 'Provider account', description: null, kind: 'agent', api_key: false }],
+	} }));
+	const responses: Record<string, unknown>[] = [];
+	await page.routeWebSocket('**/api/sessions/**/authentication/agent?**', websocket => {
+		websocket.onMessage(message => {
+			const data = JSON.parse(message.toString());
+			if (data.type === 'start') websocket.send(JSON.stringify({ type: 'prompt', id: 'url', request: { mode: 'url', message: 'Enter code ABCD on the provider page.', url: 'https://example.com/sign-in' } }));
+			else if (data.type === 'response') {
+				responses.push(data);
+				if (data.id === 'url') websocket.send(JSON.stringify({ type: 'prompt', id: 'form', request: { mode: 'form', message: 'Choose your account.', requestedSchema: { type: 'object', properties: { account: { type: 'string', title: 'Account', enum: ['Personal', 'Work'] } }, required: ['account'] } } }));
+				else websocket.send(JSON.stringify({ type: 'authenticated' }));
+			}
+		});
+	});
+	await page.goto(`/agents/${agentId}?tab=runner`);
+	await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+	const dialog = page.getByRole('dialog', { name: 'Sign in to Agent' });
+	await expect(dialog.getByText('Enter code ABCD on the provider page.')).toBeVisible();
+	await page.screenshot({ path: test.info().outputPath('agent-sign-in-provider.png') });
+	await dialog.getByRole('button', { name: 'Open provider sign-in' }).click();
+	await expect.poll(() => opened).toEqual(['https://example.com/sign-in']);
+	await dialog.getByRole('button', { name: "I've completed sign-in" }).click();
+	await dialog.getByRole('combobox', { name: 'Account', exact: true }).selectOption('Work');
+	await dialog.getByRole('button', { name: 'Continue', exact: true }).click();
+	await expect(dialog.getByText('Signed in successfully.')).toBeVisible();
+	expect(responses).toEqual([
+		{ type: 'response', id: 'url', response: { action: 'accept' } },
+		{ type: 'response', id: 'form', response: { action: 'accept', content: { account: 'Work' } } },
+	]);
+	expect(postedMessages).toEqual([]);
+});
+
+test('Agent sign-in cancels its connection and does not report failed login as success', async ({ page }) => {
+	await mockApi(page);
+	await page.route('**/api/sessions/**/authentication', route => route.fulfill({ json: {
+		kind: 'antigravity', status: 'required', methods: [{ id: 'terminal-login', name: 'Google account', description: null, kind: 'terminal', api_key: false }],
+	} }));
+	let closed = false;
+	await page.routeWebSocket('**/api/sessions/**/authentication/terminal?**', websocket => {
+		websocket.send(JSON.stringify({ type: 'ready' }));
+		websocket.send(JSON.stringify({ type: 'error', message: 'Sign-in did not complete (exit status 1). Try again.' }));
+		websocket.onClose(() => { closed = true; });
+	});
+	await page.goto(`/agents/${agentId}?tab=runner`);
+	await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+	const dialog = page.getByRole('dialog', { name: 'Sign in to Agent' });
+	await expect(dialog.getByText('Sign-in did not complete (exit status 1). Try again.').first()).toBeVisible();
+	await expect(dialog.getByText('Signed in successfully.')).toHaveCount(0);
+	await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
+	await expect(dialog).not.toBeVisible();
+	await expect.poll(() => closed).toBe(true);
+});
+
+test('Agent sign-in sends an API key only through the authentication connection', async ({ page }) => {
+	const postedMessages: Record<string, unknown>[] = [];
+	await mockApi(page, { postedMessages });
+	await page.route('**/api/sessions/**/authentication', route => route.fulfill({ json: {
+		kind: 'codex', status: 'required', methods: [{ id: 'api-key', name: 'API key', description: null, kind: 'agent', api_key: true }],
+	} }));
+	let received: unknown;
+	await page.routeWebSocket('**/api/sessions/**/authentication/agent?**', websocket => {
+		expect(websocket.url()).not.toContain('fixture-key');
+		websocket.onMessage(message => { received = JSON.parse(message.toString()); websocket.send(JSON.stringify({ type: 'authenticated' })); });
+	});
+	await page.goto(`/agents/${agentId}?tab=runner`);
+	await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+	const dialog = page.getByRole('dialog', { name: 'Sign in to Agent' });
+	const key = dialog.getByLabel('API key', { exact: true });
+	await expect(key).toHaveAttribute('type', 'password');
+	await key.fill('fixture-key');
+	await dialog.getByRole('button', { name: 'Sign in', exact: true }).click();
+	await expect(dialog.getByText('Signed in successfully.')).toBeVisible();
+	expect(received).toEqual({ type: 'start', api_key: 'fixture-key' });
+	expect(postedMessages).toEqual([]);
+});
+
+test('Agent sign-in URL requests during a task use the browser and require confirmation', async ({ page }) => {
+	const opened = await mockDesktopExternalLinks(page);
+	const elicitationResponses: { elicitationId: string; payload: Record<string, unknown> }[] = [];
+	const postedMessages: Record<string, unknown>[] = [];
+	await mockApi(page, {
+		pendingElicitation: { mode: 'url', message: 'Authorize the provider to continue.', url: 'https://example.com/authorize' },
+		elicitationResponses, postedMessages,
+	});
+	await page.goto(`/tasks/${taskId}`);
+	const prompt = page.locator('[data-url-elicitation]');
+	await expect(page.locator(`#task-message-input-${taskId}`)).toBeDisabled();
+	await prompt.getByRole('button', { name: 'Open sign-in page' }).click();
+	await expect.poll(() => opened).toEqual(['https://example.com/authorize']);
+	expect(elicitationResponses).toEqual([]);
+	await prompt.getByRole('button', { name: "I've completed sign-in" }).click();
+	await expect.poll(() => elicitationResponses).toEqual([{ elicitationId: 'elicitation-browser-test', payload: { action: 'accept' } }]);
+	await expect(prompt).toHaveCount(0);
+	expect(postedMessages).toEqual([]);
+});
+
+async function installMockUiStream(page: Page) {
+	await page.addInitScript(() => {
+		const originalFetch = window.fetch.bind(window);
+		const encoder = new TextEncoder();
+		const controllers = new Set<ReadableStreamDefaultController<Uint8Array>>();
+		let state = {
+			seq: 1,
+			projects: 1,
+			agents: 1,
+			conversations: 1,
+			tasks: 1,
+			sessions: 1,
+			schedules: 1,
+			workflows: 1,
+		};
+		const w = window as unknown as {
+			__mockUiStreamEmit?: (patch: Record<string, number>) => void;
+			__mockUiStreamSubscriberCount?: () => number;
+		};
+		w.__mockUiStreamSubscriberCount = () => controllers.size;
+		w.__mockUiStreamEmit = (patch: Record<string, number>) => {
+			state = { ...state, ...patch, seq: (patch.seq ?? state.seq + 1) };
+			const frame = encoder.encode(`event: revisions\ndata: ${JSON.stringify(state)}\n\n`);
+			for (const controller of controllers) {
+				try {
+					controller.enqueue(frame);
+				} catch {
+					controllers.delete(controller);
+				}
+			}
+		};
+		window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+			const rawUrl = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+			const parsed = new URL(rawUrl, window.location.origin);
+			if (parsed.pathname === '/api/ui/stream') {
+				let activeController: ReadableStreamDefaultController<Uint8Array> | null = null;
+				const stream = new ReadableStream<Uint8Array>({
+					start(controller) {
+						activeController = controller;
+						controllers.add(controller);
+						controller.enqueue(
+							encoder.encode(`event: revisions\ndata: ${JSON.stringify(state)}\n\n`),
+						);
+						init?.signal?.addEventListener('abort', () => {
+							controllers.delete(controller);
+							try { controller.close(); } catch {}
+						});
+					},
+					cancel() {
+						if (activeController) controllers.delete(activeController);
+					},
+				});
+				return new Response(stream, {
+					status: 200,
+					headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' },
+				});
+			}
+			return originalFetch(input, init);
+		};
+	});
+}
+
+test('scheduled wake-up updates a completed task via SSE without idle background polling', async ({ page }) => {
+	await installMockUiStream(page);
+	const messages: Record<string, unknown>[] = [
+		{ id: 1, task_id: taskId, role: 'user', content: 'Check status in 5 minutes.', attachments: [], timestamp: timestamp(10) },
+		{ id: 2, task_id: taskId, role: 'assistant', content: 'Scheduled a follow-up wake-up.', attachments: [], timestamp: timestamp(20) },
+	];
+	const attempts = [attempt('completed', 64_000, null, 'Scheduled a follow-up wake-up.')];
+	await mockApi(page, {
+		taskStatus: 'completed',
+		taskMessages: messages,
+		taskAttempts: attempts,
+		taskActivityEvents: [],
+	});
+
+	const seenRequests: string[] = [];
+	page.on('request', (req) => {
+		const url = new URL(req.url());
+		if (url.pathname.startsWith('/api/')) {
+			seenRequests.push(`${url.pathname}${url.search}`);
+		}
+	});
+
+	await page.goto(`/tasks/${taskId}`);
+	await expect(page.getByText('Scheduled a follow-up wake-up.', { exact: true })).toBeVisible();
+	await expect.poll(() =>
+		page.evaluate(() => (window as unknown as { __mockUiStreamSubscriberCount?: () => number }).__mockUiStreamSubscriberCount?.() ?? 0),
+	).toBeGreaterThan(0);
+
+	// Let initial load settle, then verify zero idle background polls while SSE is connected.
+	await page.waitForTimeout(200);
+	seenRequests.length = 0;
+	await page.waitForTimeout(3600);
+	expect(seenRequests).toEqual([]);
+
+	// Simulate a scheduled wake-up firing on the completed task in the backend.
+	const currentTask = await page.evaluate(async (id) => (await fetch(`/api/tasks/${id}`)).json(), taskId);
+	seenRequests.length = 0;
+	await page.route(`**/api/tasks/${taskId}`, (route) =>
+		route.fulfill({ json: { ...currentTask, status: 'in_progress', activity_status: 'in_progress', completed_at: null } }),
+	);
+	messages.push(
+		{ id: 3, task_id: taskId, role: 'user', content: 'Scheduled wake-up: Check deployment health', attachments: [], timestamp: timestamp(70) },
+		{ id: 4, task_id: taskId, role: 'assistant', content: 'Deployment is healthy after the scheduled check.', attachments: [], timestamp: timestamp(72) },
+	);
+
+	await page.evaluate(() => {
+		(window as unknown as { __mockUiStreamEmit?: (patch: Record<string, number>) => void }).__mockUiStreamEmit?.({
+			tasks: 2,
+			sessions: 2,
+		});
+	});
+
+	await expect(page.getByText('Scheduled wake-up: Check deployment health', { exact: true })).toBeVisible();
+	await expect(page.getByText('Deployment is healthy after the scheduled check.', { exact: true })).toBeVisible();
+	expect(seenRequests.some((entry) => entry.startsWith(`/api/tasks/${taskId}/messages?after_id=1`))).toBe(true);
+});
+
+test('completed one-shot wake-ups are hidden by default and revealed on demand', async ({ page }) => {
+	const scheduleRequests: string[] = [];
+	page.on('request', (req) => {
+		const url = new URL(req.url());
+		if (url.pathname === '/api/schedules') {
+			scheduleRequests.push(url.search);
+		}
+	});
+
+	await mockApi(page, {
+		schedules: [
+			{
+				id: 'schedule-recurring',
+				name: 'Morning digest',
+				cron: '0 8 * * *',
+				agent_id: agentId,
+				title: 'Send morning digest',
+				description: null,
+				enabled: true,
+				last_run: null,
+				run_count: 3,
+				created_at: timestamp(10),
+				schedule_type: 'cron',
+				run_at: null,
+				continuation_task_id: null,
+				conversation_id: null,
+			},
+			{
+				id: 'schedule-fired-wakeup',
+				name: 'Follow-up wake-up #1229',
+				cron: '',
+				agent_id: agentId,
+				title: 'Resume deployment check',
+				description: 'Historical fired one-shot continuation payload',
+				enabled: false,
+				last_run: timestamp(50),
+				run_count: 1,
+				created_at: timestamp(40),
+				schedule_type: 'once',
+				run_at: timestamp(50),
+				continuation_task_id: taskId,
+				conversation_id: null,
+			},
+		],
+	});
+
+	// Opening an Agent page must not fetch /api/schedules while Automations is not open.
+	await page.goto(`/agents/${agentId}`);
+	await expect(page.getByPlaceholder('Send work or ask a question…')).toBeVisible();
+	expect(scheduleRequests).toEqual([]);
+
+	// Opening Automations fetches only active/unfired schedules by default.
+	await page.goto('/automations');
+	await expect(page.getByText('Morning digest').first()).toBeVisible();
+	await expect(page.getByText('Follow-up wake-up #1229')).toHaveCount(0);
+
+	// Opting into completed wake-ups fetches with include_completed_once=true.
+	await page.locator('[data-include-completed-wakeups]').check();
+	await expect(page.getByText('Follow-up wake-up #1229')).toBeVisible();
+	expect(scheduleRequests.some((search) => search.includes('include_completed_once=true'))).toBe(true);
+});
+
+test('task view retries transient refresh errors while SSE stays connected and reads latest command snapshot', async ({ page }) => {
+	await installMockUiStream(page);
+	const messages: Record<string, unknown>[] = [
+		{ id: 1, task_id: taskId, role: 'user', content: 'Run full check.', attachments: [], timestamp: timestamp(10) },
+	];
+	const attempts = [attempt('running', 64_000, null, null)];
+	await mockApi(page, {
+		taskStatus: 'in_progress',
+		taskMessages: messages,
+		taskAttempts: attempts,
+		taskActivityEvents: [],
+	});
+
+	const commandSnapshots = [
+		{
+			...activityEvent(71),
+			event_type: 'available_commands',
+			payload: {
+				available_commands: [{ name: 'initial-cmd', description: 'Initial command' }],
+			},
+		},
+	];
+	await page.route(`**/api/sessions/${agentId}/events*`, (route) => {
+		const url = new URL(route.request().url());
+		const eventType = url.searchParams.get('event_type');
+		const after = url.searchParams.has('after') ? Number(url.searchParams.get('after')) : null;
+		const limit = url.searchParams.has('limit') ? Number(url.searchParams.get('limit')) : null;
+		let filtered = commandSnapshots.filter((event) => {
+			if (eventType && event.event_type !== eventType) return false;
+			if (after !== null && Number.isFinite(after) && event.id <= after) return false;
+			return true;
+		});
+		if (limit !== null && Number.isFinite(limit) && limit > 0) {
+			// Match SQLite list_events_filtered: ASC when after is set, DESC (latest) when omitted.
+			filtered = after !== null ? filtered.slice(0, limit) : filtered.slice(-limit);
+		}
+		return route.fulfill({ json: filtered });
+	});
+
+	await page.goto(`/tasks/${taskId}`);
+	await expect(page.getByText('Run full check.', { exact: true })).toBeVisible();
+	await expect.poll(() =>
+		page.evaluate(() => (window as unknown as { __mockUiStreamSubscriberCount?: () => number }).__mockUiStreamSubscriberCount?.() ?? 0),
+	).toBeGreaterThan(0);
+
+	// Queue TWO new available_commands snapshots and a task completion, while
+	// failing the first messages fetch transiently with 503 and emitting ONLY ONE SSE revision!
+	commandSnapshots.push(
+		{
+			...activityEvent(72),
+			event_type: 'available_commands',
+			payload: {
+				available_commands: [{ name: 'stale-middle-cmd', description: 'Superseded command' }],
+			},
+		},
+		{
+			...activityEvent(73),
+			event_type: 'available_commands',
+			payload: {
+				available_commands: [{ name: 'latest-deploy-cmd', description: 'Newest command snapshot' }],
+			},
+		},
+	);
+
+	const currentTask = await page.evaluate(async (id) => (await fetch(`/api/tasks/${id}`)).json(), taskId);
+	await page.route(`**/api/tasks/${taskId}`, (route) =>
+		route.fulfill({ json: { ...currentTask, status: 'completed', activity_status: 'completed', completed_at: timestamp(45) } }),
+	);
+	messages.push({
+		id: 2,
+		task_id: taskId,
+		role: 'assistant',
+		content: 'Final response delivered after transient 503 recovery.',
+		attachments: [],
+		timestamp: timestamp(45),
+	});
+
+	let failNextMessagesFetch = true;
+	await page.route(`**/api/tasks/${taskId}/messages*`, (route) => {
+		if (failNextMessagesFetch) {
+			failNextMessagesFetch = false;
+			return route.fulfill({
+				status: 503,
+				contentType: 'application/json',
+				body: JSON.stringify({ error: 'Temporary upstream timeout' }),
+			});
+		}
+		return route.fulfill({ json: messages });
+	});
+
+	await page.evaluate(() => {
+		(window as unknown as { __mockUiStreamEmit?: (patch: Record<string, number>) => void }).__mockUiStreamEmit?.({
+			tasks: 2,
+			sessions: 2,
+		});
+	});
+
+	// Without any further SSE events, bounded retry recovers the failed refresh.
+	await expect(page.getByText('Final response delivered after transient 503 recovery.', { exact: true })).toBeVisible({ timeout: 5000 });
+
+	// Typing `/` shows the newest command snapshot (#73), not the superseded #72 delta.
+	const composer = page.locator(`#task-message-input-${taskId}`);
+	await composer.fill('/');
+	await composer.focus();
+	await expect(page.getByText('/latest-deploy-cmd')).toBeVisible();
+	await expect(page.getByText('/stale-middle-cmd')).toHaveCount(0);
+});
+
+test('task view reconciles SSE completion that arrives while initial task load is still in flight', async ({ page }) => {
+	await installMockUiStream(page);
+	const messages: Record<string, unknown>[] = [
+		{ id: 1, task_id: taskId, role: 'user', content: 'Finish while loading.', attachments: [], timestamp: timestamp(10) },
+	];
+	let currentAttempts = [attempt('running', 64_000, null, null)];
+	await mockApi(page, {
+		taskStatus: 'in_progress',
+		taskMessages: messages,
+		taskAttempts: currentAttempts,
+		taskActivityEvents: [],
+	});
+
+	let taskGetServed = false;
+	let messagesServed = false;
+	let initialActivityGateHeld = false;
+	let releaseInitialActivity: (() => void) | null = null;
+	let taskCompleted = false;
+
+	await page.route(`**/api/tasks/${taskId}`, async (route) => {
+		taskGetServed = true;
+		await route.fulfill({
+			json: {
+				id: taskId,
+				title: 'Browser-tested workspace slice',
+				description: 'Verify task completion during initial load.',
+				status: taskCompleted ? 'completed' : 'in_progress',
+				activity_status: taskCompleted ? 'completed' : 'in_progress',
+				priority: 1,
+				agent_id: agentId,
+				project_id: projectId,
+				parent_task_id: null,
+				sop_id: null,
+				conversation_id: null,
+				created_at: timestamp(0),
+				updated_at: timestamp(taskCompleted ? 40 : 10),
+				completed_at: taskCompleted ? timestamp(40) : null,
+				context: null,
+			},
+		});
+	});
+	await page.route(`**/api/tasks/${taskId}/messages*`, async (route) => {
+		messagesServed = true;
+		const url = new URL(route.request().url());
+		const afterId = url.searchParams.has('after_id') ? Number(url.searchParams.get('after_id')) : null;
+		const body = afterId !== null
+			? messages.filter((m) => Number(m.id) > afterId)
+			: messages;
+		await route.fulfill({ json: body });
+	});
+	await page.route(`**/api/tasks/${taskId}/activity*`, async (route) => {
+		if (!initialActivityGateHeld) {
+			initialActivityGateHeld = true;
+			await new Promise<void>((resolve) => {
+				releaseInitialActivity = resolve;
+			});
+		}
+		await route.fulfill({
+			json: {
+				attempts: currentAttempts,
+				delegated_work: [],
+				events: [],
+				has_more_before: false,
+				has_more_after: false,
+			},
+		});
+	});
+
+	// Open the task directly with domcontentloaded so we can observe initial load mid-flight.
+	await page.goto(`/tasks/${taskId}`, { waitUntil: 'domcontentloaded' });
+	await expect.poll(() => taskGetServed && messagesServed && initialActivityGateHeld).toBe(true);
+	await expect.poll(() =>
+		page.evaluate(() => (window as unknown as { __mockUiStreamSubscriberCount?: () => number }).__mockUiStreamSubscriberCount?.() ?? 0),
+	).toBeGreaterThan(0);
+
+	// Transition the task to completed and emit the SSE revision BEFORE initial /activity resolves.
+	taskCompleted = true;
+	currentAttempts = [attempt('completed', 64_000, null, 'Completed while initial load was still awaiting activity.')];
+	messages.push({
+		id: 2,
+		task_id: taskId,
+		role: 'assistant',
+		content: 'Completed while initial load was still awaiting activity.',
+		attachments: [],
+		timestamp: timestamp(40),
+	});
+	await page.evaluate(() => {
+		(window as unknown as { __mockUiStreamEmit?: (patch: Record<string, number>) => void }).__mockUiStreamEmit?.({
+			tasks: 2,
+			sessions: 2,
+		});
+	});
+
+	// Now let initial /activity resolve; TaskView must immediately reconcile without another SSE event.
+	(releaseInitialActivity as (() => void) | null)?.();
+	await expect(
+		page.getByText('Completed while initial load was still awaiting activity.', { exact: true }),
+	).toBeVisible();
+});
+
+test('fresh page load reconciles completion occurring before the first SSE revision arrives', async ({ page }) => {
+	// Hold /api/ui/stream until after the initial task/messages load has returned pre-completion state,
+	// then complete the task BEFORE the very first SSE revisions event is delivered.
+	await page.addInitScript(() => {
+		const originalFetch = window.fetch.bind(window);
+		const encoder = new TextEncoder();
+		let releaseStream: ((initialRevisions: Record<string, number>) => void) | null = null;
+		let streamRequested = false;
+		const w = window as unknown as {
+			__streamRequested?: () => boolean;
+			__deliverFirstStreamRevision?: (revisions: Record<string, number>) => void;
+		};
+		w.__streamRequested = () => streamRequested;
+		w.__deliverFirstStreamRevision = (revisions) => {
+			releaseStream?.(revisions);
+		};
+		window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+			const rawUrl = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+			const parsed = new URL(rawUrl, window.location.origin);
+			if (parsed.pathname === '/api/ui/stream') {
+				streamRequested = true;
+				const initial = await new Promise<Record<string, number>>((resolve) => {
+					releaseStream = resolve;
+				});
+				const stream = new ReadableStream<Uint8Array>({
+					start(controller) {
+						controller.enqueue(
+							encoder.encode(`event: revisions\ndata: ${JSON.stringify(initial)}\n\n`),
+						);
+						init?.signal?.addEventListener('abort', () => {
+							try { controller.close(); } catch {}
+						});
+					},
+				});
+				return new Response(stream, {
+					status: 200,
+					headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' },
+				});
+			}
+			return originalFetch(input, init);
+		};
+	});
+
+	const messages: Record<string, unknown>[] = [
+		{ id: 1, task_id: taskId, role: 'user', content: 'Check before SSE connects.', attachments: [], timestamp: timestamp(10) },
+	];
+	let taskCompleted = false;
+	await mockApi(page, {
+		taskStatus: 'in_progress',
+		taskMessages: messages,
+		taskAttempts: [attempt('running', 64_000, null, null)],
+		taskActivityEvents: [],
+	});
+	await page.route(`**/api/tasks/${taskId}`, (route) =>
+		route.fulfill({
+			json: {
+				id: taskId,
+				title: 'Browser-tested workspace slice',
+				description: 'Verify pre-first-SSE completion.',
+				status: taskCompleted ? 'completed' : 'in_progress',
+				activity_status: taskCompleted ? 'completed' : 'in_progress',
+				priority: 1,
+				agent_id: agentId,
+				project_id: projectId,
+				parent_task_id: null,
+				sop_id: null,
+				conversation_id: null,
+				created_at: timestamp(0),
+				updated_at: timestamp(taskCompleted ? 40 : 10),
+				completed_at: taskCompleted ? timestamp(40) : null,
+				context: null,
+			},
+		}),
+	);
+	await page.route(`**/api/tasks/${taskId}/messages*`, (route) => {
+		const url = new URL(route.request().url());
+		const afterId = url.searchParams.has('after_id') ? Number(url.searchParams.get('after_id')) : null;
+		const body = afterId !== null ? messages.filter((m) => Number(m.id) > afterId) : messages;
+		return route.fulfill({ json: body });
+	});
+
+	await page.goto(`/tasks/${taskId}`, { waitUntil: 'domcontentloaded' });
+	await expect(page.getByText('Check before SSE connects.', { exact: true })).toBeVisible();
+	await expect.poll(() =>
+		page.evaluate(() => (window as unknown as { __streamRequested?: () => boolean }).__streamRequested?.() ?? false),
+	).toBe(true);
+
+	// Complete the task BEFORE the first SSE snapshot is delivered; emit NO subsequent SSE events.
+	taskCompleted = true;
+	messages.push({
+		id: 2,
+		task_id: taskId,
+		role: 'assistant',
+		content: 'Finished before first SSE snapshot arrived.',
+		attachments: [],
+		timestamp: timestamp(40),
+	});
+	await page.evaluate(() => {
+		(window as unknown as { __deliverFirstStreamRevision?: (rev: Record<string, number>) => void })
+			.__deliverFirstStreamRevision?.({
+				seq: 2,
+				projects: 1,
+				agents: 1,
+				conversations: 1,
+				tasks: 2,
+				sessions: 2,
+				schedules: 1,
+				workflows: 1,
+			});
+	});
+
+	await expect(
+		page.getByText('Finished before first SSE snapshot arrived.', { exact: true }),
+	).toBeVisible();
+});
+
+test('x-ui-revisions baseline avoids duplicate idle fetches while reconciling races before first SSE event', async ({ page }) => {
+	await page.addInitScript(() => {
+		const originalFetch = window.fetch.bind(window);
+		const encoder = new TextEncoder();
+		let releaseStream: ((initialRevisions: Record<string, number>) => void) | null = null;
+		const toHeader = (r: Record<string, number>) =>
+			`${r.seq},${r.projects},${r.agents},${r.conversations},${r.tasks},${r.sessions},${r.schedules},${r.workflows}`;
+		const w = window as unknown as {
+			__deliverFirstHeaderStreamRevision?: (revisions: Record<string, number>) => void;
+		};
+		w.__deliverFirstHeaderStreamRevision = (revisions) => {
+			releaseStream?.(revisions);
+		};
+		window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+			const rawUrl = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+			const parsed = new URL(rawUrl, window.location.origin);
+			if (parsed.pathname === '/api/ui/stream') {
+				const initial = await new Promise<Record<string, number>>((resolve) => {
+					releaseStream = resolve;
+				});
+				const stream = new ReadableStream<Uint8Array>({
+					start(controller) {
+						controller.enqueue(
+							encoder.encode(`event: revisions\ndata: ${JSON.stringify(initial)}\n\n`),
+						);
+						init?.signal?.addEventListener('abort', () => {
+							try { controller.close(); } catch {}
+						});
+					},
+				});
+				return new Response(stream, {
+					status: 200,
+					headers: {
+						'Content-Type': 'text/event-stream',
+						'Cache-Control': 'no-cache',
+						'x-ui-revisions': toHeader(initial),
+					},
+				});
+			}
+			return originalFetch(input, init);
+		};
+	});
+
+	let currentHeader = '1,1,1,1,1,1,1,1';
+	let taskGetCount = 0;
+	let taskCompleted = false;
+	const messages: Record<string, unknown>[] = [
+		{ id: 1, task_id: taskId, role: 'user', content: 'Verify header baseline.', attachments: [], timestamp: timestamp(10) },
+	];
+
+	await mockApi(page, {
+		taskStatus: 'in_progress',
+		taskMessages: messages,
+		taskAttempts: [attempt('running', 64_000, null, null)],
+		taskActivityEvents: [],
+	});
+	await page.route(`**/api/tasks/${taskId}`, (route) => {
+		taskGetCount += 1;
+		return route.fulfill({
+			headers: { 'x-ui-revisions': currentHeader },
+			json: {
+				id: taskId,
+				title: 'Browser-tested workspace slice',
+				description: 'Verify x-ui-revisions baseline.',
+				status: taskCompleted ? 'completed' : 'in_progress',
+				activity_status: taskCompleted ? 'completed' : 'in_progress',
+				priority: 1,
+				agent_id: agentId,
+				project_id: projectId,
+				parent_task_id: null,
+				sop_id: null,
+				conversation_id: null,
+				created_at: timestamp(0),
+				updated_at: timestamp(taskCompleted ? 40 : 10),
+				completed_at: taskCompleted ? timestamp(40) : null,
+				context: null,
+			},
+		});
+	});
+	await page.route(`**/api/tasks/${taskId}/messages*`, (route) => {
+		const url = new URL(route.request().url());
+		const afterId = url.searchParams.has('after_id') ? Number(url.searchParams.get('after_id')) : null;
+		const body = afterId !== null ? messages.filter((m) => Number(m.id) > afterId) : messages;
+		return route.fulfill({
+			headers: { 'x-ui-revisions': currentHeader },
+			json: body,
+		});
+	});
+
+	// 1. Idle load where GET x-ui-revisions matches first SSE revisions: zero extra task GETs.
+	await page.goto(`/tasks/${taskId}`, { waitUntil: 'domcontentloaded' });
+	await expect(page.getByText('Verify header baseline.', { exact: true })).toBeVisible();
+	expect(taskGetCount).toBe(1);
+
+	await page.evaluate(() => {
+		(window as unknown as { __deliverFirstHeaderStreamRevision?: (rev: Record<string, number>) => void })
+			.__deliverFirstHeaderStreamRevision?.({
+				seq: 1,
+				projects: 1,
+				agents: 1,
+				conversations: 1,
+				tasks: 1,
+				sessions: 1,
+				schedules: 1,
+				workflows: 1,
+			});
+	});
+	await page.waitForTimeout(250);
+	expect(taskGetCount).toBe(1);
+
+	// 2. Reload where GET returns revision 1, then task completes at revision 2 before first SSE frame.
+	taskGetCount = 0;
+	await page.reload({ waitUntil: 'domcontentloaded' });
+	await expect(page.getByText('Verify header baseline.', { exact: true })).toBeVisible();
+	expect(taskGetCount).toBe(1);
+
+	taskCompleted = true;
+	currentHeader = '2,1,1,1,2,2,1,1';
+	messages.push({
+		id: 2,
+		task_id: taskId,
+		role: 'assistant',
+		content: 'Reconciled via x-ui-revisions mismatch on first SSE frame.',
+		attachments: [],
+		timestamp: timestamp(40),
+	});
+	await page.evaluate(() => {
+		(window as unknown as { __deliverFirstHeaderStreamRevision?: (rev: Record<string, number>) => void })
+			.__deliverFirstHeaderStreamRevision?.({
+				seq: 2,
+				projects: 1,
+				agents: 1,
+				conversations: 1,
+				tasks: 2,
+				sessions: 2,
+				schedules: 1,
+				workflows: 1,
+			});
+	});
+
+	await expect(
+		page.getByText('Reconciled via x-ui-revisions mismatch on first SSE frame.', { exact: true }),
+	).toBeVisible();
+	expect(taskGetCount).toBe(2);
+});
+
+test('lazy-loaded workspace views and agent tabs evict failed chunk promises and recover on retry', async ({ page }) => {
+	await mockApi(page);
+
+	let failTaskView = true;
+	let taskViewRequests = 0;
+	await page.route('**/src/routes/tasks/\\[id\\]/TaskView.svelte*', async (route) => {
+		if (!route.request().url().includes('svelte&type=style')) {
+			taskViewRequests += 1;
+			if (failTaskView) {
+				failTaskView = false;
+				await route.abort('failed');
+				return;
+			}
+		}
+		await route.continue();
+	});
+
+	let failSchedulesTab = true;
+	let schedulesTabRequests = 0;
+	await page.route('**/src/routes/agents/\\[id\\]/SchedulesTab.svelte*', async (route) => {
+		if (!route.request().url().includes('svelte&type=style')) {
+			schedulesTabRequests += 1;
+			if (failSchedulesTab) {
+				failSchedulesTab = false;
+				await route.abort('failed');
+				return;
+			}
+		}
+		await route.continue();
+	});
+
+	let failServerSettings = true;
+	let serverSettingsRequests = 0;
+	await page.route('**/src/routes/settings/server/+page.svelte*', async (route) => {
+		if (!route.request().url().includes('svelte&type=style')) {
+			serverSettingsRequests += 1;
+			if (failServerSettings) {
+				failServerSettings = false;
+				await route.abort('failed');
+				return;
+			}
+		}
+		await route.continue();
+	});
+
+	let failProjectOverview = true;
+	let projectOverviewRequests = 0;
+	await page.route('**/src/routes/projects/\\[id\\]/ProjectOverview.svelte*', async (route) => {
+		if (!route.request().url().includes('svelte&type=style')) {
+			projectOverviewRequests += 1;
+			if (failProjectOverview) {
+				failProjectOverview = false;
+				await route.abort('failed');
+				return;
+			}
+		}
+		await route.continue();
+	});
+
+	// 1. WorkspaceContent lazy view recovery via Retry button (TaskView)
+	await page.goto(`/tasks/${taskId}`, { waitUntil: 'domcontentloaded' });
+	const viewAlert = page.locator('[data-view-load-error]');
+	await expect(viewAlert).toBeVisible();
+	expect(taskViewRequests).toBe(1);
+
+	await viewAlert.getByRole('button', { name: 'Retry' }).click();
+	await expect(viewAlert).toBeHidden();
+	await expect(page.getByRole('heading', { name: 'Browser-tested workspace' })).toBeVisible();
+	expect(taskViewRequests).toBe(2);
+
+	// 2. WorkspaceContent recovery when closing and reopening a failed tab after connectivity returns
+	await page.locator('h2').getByRole('link', { name: 'Browser collaboration project' }).click();
+	await expect(viewAlert).toBeVisible();
+	expect(projectOverviewRequests).toBe(1);
+
+	await page.getByRole('button', { name: 'Close Browser collaboration project', exact: true }).click();
+	await expect(viewAlert).toBeHidden();
+	await page.locator('h2').getByRole('link', { name: 'Browser collaboration project' }).click();
+	await expect(viewAlert).toBeHidden();
+	await expect(page.getByRole('heading', { level: 1, name: 'Browser collaboration project' })).toBeVisible();
+	expect(projectOverviewRequests).toBe(2);
+
+	// 3. ProjectView lazy sub-tab recovery (SchedulesTab)
+	await page.goto(`/agents/${agentId}?tab=schedules`, { waitUntil: 'domcontentloaded' });
+	const tabAlert = page.locator('[data-tab-load-error]');
+	await expect(tabAlert).toBeVisible();
+	expect(schedulesTabRequests).toBe(1);
+
+	await tabAlert.getByRole('button', { name: 'Retry' }).click();
+	await expect(tabAlert).toBeHidden();
+	await expect(page.getByText('Show completed wake-ups')).toBeVisible();
+	expect(schedulesTabRequests).toBe(2);
+
+	// 4. SettingsView lazy page recovery (/settings/server)
+	await page.goto('/settings/server', { waitUntil: 'domcontentloaded' });
+	const settingsAlert = page.locator('[data-settings-load-error]');
+	await expect(settingsAlert).toBeVisible();
+	expect(serverSettingsRequests).toBe(1);
+
+	await settingsAlert.getByRole('button', { name: 'Retry' }).click();
+	await expect(settingsAlert).toBeHidden();
+	await expect(page.getByRole('heading', { level: 1, name: 'Instance' })).toBeVisible();
+	expect(serverSettingsRequests).toBe(2);
+});
+
+test('opening an older completed task outside recent-by-agent resolves tab title and agent context while SSE is idle', async ({ page }) => {
+	await page.addInitScript(() => {
+		const originalFetch = window.fetch.bind(window);
+		const encoder = new TextEncoder();
+		window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+			const rawUrl = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+			const parsed = new URL(rawUrl, window.location.origin);
+			if (parsed.pathname === '/api/ui/stream') {
+				const initial = {
+					seq: 1,
+					projects: 1,
+					agents: 1,
+					conversations: 1,
+					tasks: 1,
+					sessions: 1,
+					schedules: 1,
+					workflows: 1,
+				};
+				const stream = new ReadableStream<Uint8Array>({
+					start(controller) {
+						controller.enqueue(
+							encoder.encode(`event: revisions\ndata: ${JSON.stringify(initial)}\n\n`),
+						);
+						init?.signal?.addEventListener('abort', () => {
+							try { controller.close(); } catch {}
+						});
+					},
+				});
+				return new Response(stream, {
+					status: 200,
+					headers: {
+						'Content-Type': 'text/event-stream',
+						'Cache-Control': 'no-cache',
+						'x-ui-revisions': '1,1,1,1,1,1,1,1',
+					},
+				});
+			}
+			return originalFetch(input, init);
+		};
+	});
+
+	await mockApi(page, { completedTaskCount: 7 });
+
+	const archivedTaskId = 'completed-task-1';
+	const archivedTask = {
+		id: archivedTaskId,
+		title: 'Completed task 1',
+		description: 'Older completed work outside the five most recent tasks.',
+		status: 'completed',
+		activity_status: 'completed',
+		priority: 0,
+		revision: 1,
+		agent_id: agentId,
+		project_id: projectId,
+		parent_task_id: null,
+		sop_id: null,
+		conversation_id: null,
+		created_at: timestamp(0),
+		updated_at: timestamp(0),
+		completed_at: timestamp(0),
+		context: null,
+	};
+	let archivedTaskGets = 0;
+	await page.route(`**/api/tasks/${archivedTaskId}`, (route) => {
+		archivedTaskGets += 1;
+		return route.fulfill({
+			headers: { 'x-ui-revisions': '1,1,1,1,1,1,1,1' },
+			json: archivedTask,
+		});
+	});
+	await page.route(`**/api/tasks/${archivedTaskId}/messages*`, (route) =>
+		route.fulfill({ headers: { 'x-ui-revisions': '1,1,1,1,1,1,1,1' }, json: [] }),
+	);
+	await page.route(`**/api/tasks/${archivedTaskId}/activity*`, (route) =>
+		route.fulfill({
+			headers: { 'x-ui-revisions': '1,1,1,1,1,1,1,1' },
+			json: { attempts: [], events: [], has_more_before: false, has_more_after: false },
+		}),
+	);
+	await page.route(`**/api/tasks/${archivedTaskId}/config*`, (route) =>
+		route.fulfill({
+			headers: { 'x-ui-revisions': '1,1,1,1,1,1,1,1' },
+			json: {
+				context: { agent_id: agentId, runner_kind: 'codex', native_session_id: null },
+				availability: 'cached',
+				revision: null,
+				event_id: null,
+				pending: {},
+				model_pending: false,
+				config_options: [],
+				modes: null,
+				notice: null,
+			},
+		}),
+	);
+
+	await page.goto('/tasks?view=list', { waitUntil: 'domcontentloaded' });
+	await page.getByRole('button', { name: /^Done\b/ }).click();
+	const archivedLink = page.getByRole('link', { name: /Completed task 1/ }).first();
+	await expect(archivedLink).toBeVisible();
+	expect(archivedTaskGets).toBe(0);
+
+	await archivedLink.click();
+	await expect(page.getByRole('heading', { level: 1, name: 'Completed task 1' })).toBeVisible();
+	await expect(
+		page
+			.getByRole('group', { name: 'Pane tabs' })
+			.locator('[data-workspace-tab-active="true"][data-workspace-tab-title="Completed task 1"]'),
+	).toBeVisible();
+	expect(archivedTaskGets).toBeGreaterThanOrEqual(1);
+});
+
+test('sessions SSE invalidations refresh shell agent tab busy indicator when agents domain stays unchanged', async ({ page }) => {
+	await page.addInitScript(() => {
+		const originalFetch = window.fetch.bind(window);
+		const encoder = new TextEncoder();
+		let pushStreamRevision: ((revisions: Record<string, number>) => void) | null = null;
+		(window as unknown as { __pushSessionRevision?: (rev: Record<string, number>) => void }).__pushSessionRevision = (
+			revisions,
+		) => {
+			pushStreamRevision?.(revisions);
+		};
+		window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+			const rawUrl = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+			const parsed = new URL(rawUrl, window.location.origin);
+			if (parsed.pathname === '/api/ui/stream') {
+				const initial = {
+					seq: 1,
+					projects: 1,
+					agents: 1,
+					conversations: 1,
+					tasks: 1,
+					sessions: 1,
+					schedules: 1,
+					workflows: 1,
+				};
+				const stream = new ReadableStream<Uint8Array>({
+					start(controller) {
+						controller.enqueue(
+							encoder.encode(`event: revisions\ndata: ${JSON.stringify(initial)}\n\n`),
+						);
+						pushStreamRevision = (next) => {
+							controller.enqueue(
+								encoder.encode(`event: revisions\ndata: ${JSON.stringify(next)}\n\n`),
+							);
+						};
+						init?.signal?.addEventListener('abort', () => {
+							try { controller.close(); } catch {}
+						});
+					},
+				});
+				return new Response(stream, {
+					status: 200,
+					headers: {
+						'Content-Type': 'text/event-stream',
+						'Cache-Control': 'no-cache',
+						'x-ui-revisions': '1,1,1,1,1,1,1,1',
+					},
+				});
+			}
+			return originalFetch(input, init);
+		};
+	});
+
+	await mockApi(page, { live: true, taskStatus: 'completed' });
+
+	let agentBusy = true;
+	await page.route('**/api/agents', async (route) => {
+		if (route.request().method() !== 'GET') {
+			await route.fallback();
+			return;
+		}
+		await route.fulfill({
+			headers: { 'x-ui-revisions': agentBusy ? '1,1,1,1,1,1,1,1' : '2,1,1,1,1,2,1,1' },
+			json: [
+				{
+					id: agentId,
+					name: 'browser-workspace',
+					title: 'Browser workspace',
+					project_id: projectId,
+					role: 'Implement browser-verified UX',
+					backend: 'codex',
+					model: 'codex-test',
+					workspace: '/workspace/browser',
+					tools: [],
+					max_turns: 25,
+					auto_approve: true,
+					status: agentBusy ? 'running' : 'idle',
+					current_task_id: null,
+					pid: null,
+					started_at: null,
+					restart_count: 0,
+				},
+			],
+		});
+	});
+
+	await page.goto(`/agents/${agentId}`, { waitUntil: 'domcontentloaded' });
+	const activeTabDot = page
+		.getByRole('group', { name: 'Pane tabs' })
+		.locator('[data-workspace-tab-active="true"] span.rounded-full')
+		.first();
+	await expect(activeTabDot).toHaveClass(/animate-pulse/);
+
+	agentBusy = false;
+	await page.evaluate(() => {
+		(window as unknown as { __pushSessionRevision?: (rev: Record<string, number>) => void })
+			.__pushSessionRevision?.({
+				seq: 2,
+				projects: 1,
+				agents: 1,
+				conversations: 1,
+				tasks: 1,
+				sessions: 2,
+				schedules: 1,
+				workflows: 1,
+			});
+	});
+
+	await expect(activeTabDot).not.toHaveClass(/animate-pulse/);
+});
+
+for (const width of [1280, 390]) {
+    test(`Project cleanup tracks worktrees and confirms selected removals at ${width}px`, async ({ page }) => {
+        await page.setViewportSize({ width, height: 900 });
+        await mockApi(page);
+        const report: ProjectStorage = {
+            policy: { enabled: false, days: 14 }, scanned_at: 1794835200, last_cleanup_at: null, errors: [],
+            engine_error: null, engine: { image_bytes: 140_000_000_000, volume_bytes: 48_000_000_000, unused_volume_bytes: 40_000_000_000, recovery_images: [
+                { id: 'snapshot', agent_id: agentId, name: 'localhost/xpressclaw-recovery:old', created_at: 1790000000, bytes: 100_000_000, eligible: true, reasons: [] },
+            ] },
+            worktrees: [
+                { id: 'finished', repository: '/workspace/project', path: '/workspace/project/.worktrees/finished', branch: 'finished-feature', head: 'abc', agent_ids: [agentId], bytes: 2_000_000_000, size_complete: true, missing: false, eligible: true, reasons: [], eligible_since: 1790000000, first_seen_at: 1790000000, fingerprint: 'preview-version' },
+                { id: 'dirty', repository: '/workspace/project', path: '/workspace/project/.worktrees/ongoing', branch: 'ongoing-feature', head: 'def', agent_ids: [agentId], bytes: 500_000_000, size_complete: true, missing: false, eligible: false, reasons: ['Uncommitted or untracked files'], eligible_since: null, first_seen_at: 1790000000, fingerprint: 'dirty-version' },
+            ],
+        };
+        const cleanups: unknown[] = [];
+        const policies: unknown[] = [];
+        await page.route(`**/api/projects/${projectId}/storage`, async route => {
+            if (route.request().method() === 'PATCH') {
+                report.policy = route.request().postDataJSON(); policies.push(report.policy);
+                await route.fulfill({ json: report.policy });
+            } else await route.fulfill({ json: report });
+        });
+        await page.route(`**/api/projects/${projectId}/storage/cleanup`, async route => {
+            cleanups.push(route.request().postDataJSON());
+            report.worktrees = report.worktrees.filter(tree => tree.id !== 'finished');
+            await route.fulfill({ json: { removed: ['finished'], kept: [], finished_at: 1794835200 } });
+        });
+        await page.goto(`/projects/${projectId}`);
+        await page.getByRole('button', { name: 'Clean up', exact: true }).click();
+        const dialog = page.getByRole('dialog', { name: 'Project storage and cleanup' });
+        await expect(dialog.getByLabel('Select worktree ongoing-feature')).toBeDisabled();
+        await expect(dialog.getByLabel('Enable automatic cleanup')).not.toBeChecked();
+        await dialog.getByLabel('Enable automatic cleanup').check();
+        await dialog.getByLabel('Retention days').fill('7');
+        await dialog.getByRole('button', { name: 'Save retention' }).click();
+        await expect.poll(() => policies).toEqual([{ enabled: true, days: 7 }]);
+        expect(cleanups).toEqual([]);
+        await dialog.getByRole('button', { name: 'Select eligible worktrees' }).click();
+        await expect(dialog.getByLabel('Select recovery snapshot localhost/xpressclaw-recovery:old')).not.toBeChecked();
+        await page.screenshot({ path: test.info().outputPath(`project-storage-${width}.png`) });
+        await dialog.getByRole('button', { name: 'Clean up selected' }).click();
+        expect(cleanups).toEqual([]);
+        await dialog.getByRole('button', { name: 'Confirm cleanup' }).click();
+        await expect.poll(() => cleanups).toEqual([{ worktrees: { finished: 'preview-version' }, recovery_images: [] }]);
+        await expect(dialog.getByText('Removed 1 item.')).toBeVisible();
+        await expect(dialog.getByLabel('Select worktree ongoing-feature')).toBeDisabled();
+    });
+}

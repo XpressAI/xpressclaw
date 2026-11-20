@@ -2,10 +2,12 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use xpressclaw_core::acp::{is_builtin_runner_image, is_host_runner_image};
+use xpressclaw_core::acp::{
+    is_builtin_runner_image, is_builtin_runner_image_for_kind, is_host_runner_image,
+};
 use xpressclaw_core::agents::registry::AgentRegistry;
 use xpressclaw_core::config::{default_native_runner_image, AgentConfig, ContainerEngineAccess};
 use xpressclaw_core::docker::manager::DockerManager;
@@ -15,15 +17,23 @@ use xpressclaw_core::tasks::board::{CreateTask, TaskBoard};
 use xpressclaw_core::tasks::conversation::TaskConversation;
 use xpressclaw_core::tasks::queue::TaskQueue;
 use xpressclaw_core::workers::native::{
-    local_runner_image_alias, resolve_runner_kind, resolved_runner_image, runner_image_compatible,
-    subscription_auth_available,
+    compatible_retained_runner_image, host_ssh_agent_socket, local_runner_image_alias,
+    presentation_runtime_available, resolve_runner_kind, resolved_runner_image,
+    runner_image_compatible,
 };
 
 use crate::state::AppState;
 
+#[derive(Debug, Default, Deserialize)]
+struct SessionQuery {
+    #[serde(default)]
+    include_details: bool,
+}
+
 #[derive(Debug, Deserialize)]
 struct EventsQuery {
     after: Option<i64>,
+    event_type: Option<String>,
     limit: Option<i64>,
 }
 
@@ -47,6 +57,7 @@ struct MessageInput {
 
 pub fn routes() -> Router<AppState> {
     Router::new()
+        .merge(super::agent_auth::routes())
         .route("/{id}", get(get_session))
         .route("/{id}/events", get(get_events))
         .route("/{id}/attempts", get(get_attempts))
@@ -62,11 +73,16 @@ pub fn routes() -> Router<AppState> {
 async fn get_session(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(query): Query<SessionQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     ensure_session(&state, &id)?;
-    let overview = SessionManager::new(state.db.clone())
-        .overview(&id)
-        .map_err(internal_error)?;
+    let sessions = SessionManager::new(state.db.clone());
+    let overview = if query.include_details {
+        sessions.overview(&id)
+    } else {
+        sessions.overview_summary(&id)
+    }
+    .map_err(internal_error)?;
     Ok(Json(json!(overview)))
 }
 
@@ -77,7 +93,12 @@ async fn get_events(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     ensure_session(&state, &id)?;
     let events = SessionManager::new(state.db.clone())
-        .list_events(&id, query.after, query.limit.unwrap_or(100).clamp(1, 500))
+        .list_events_filtered(
+            &id,
+            query.after,
+            query.event_type.as_deref(),
+            query.limit.unwrap_or(100).clamp(1, 500),
+        )
         .map_err(internal_error)?;
     Ok(Json(json!(events)))
 }
@@ -133,7 +154,8 @@ async fn prepare_runner(
             "host container-engine access requires a local Docker-compatible Unix socket",
         ));
     }
-    if available_runner_image(&docker, &image).await.is_none() {
+    let current = readiness(&state, &agent).await?;
+    if current["can_prepare"].as_bool().unwrap_or(false) {
         docker.pull_image(&image).await.map_err(internal_error)?;
     }
     let readiness = readiness(&state, &agent).await?;
@@ -158,23 +180,64 @@ async fn readiness(
     let workspace = session_workspace(state, agent);
     let workspace_present = workspace.is_dir();
     let command_present = kind != "custom" || !agent.runner.command.is_empty();
-    let auth_required =
-        agent.runner.subscription_auth && xpressclaw_core::acp::agent_definition(&kind).is_some();
-    let auth_present = !auth_required || subscription_auth_available(&kind);
+    let authentication = state
+        .project_processes
+        .connected_process(&agent.name, &kind)
+        .await
+        .map(|process| process.authentication())
+        .unwrap_or_default();
+    let auth_present =
+        authentication.status != xpressclaw_core::workers::acp::AcpAuthenticationStatus::Required;
     let docker = state.docker().await;
     let docker_available = docker.is_some();
     let container_engine_available = agent.runner.container_engine != ContainerEngineAccess::Host
         || docker
             .as_ref()
             .is_some_and(|docker| docker.host_engine_socket().is_some());
+    let ssh_agent_socket = host_ssh_agent_socket();
+    let ssh_agent_available = ssh_agent_socket.is_some();
+    let mut retained_issue = None;
+    let mut using_retained = false;
     let runtime_image = match docker.as_ref() {
-        Some(docker) => available_runner_image(docker, &image).await,
+        Some(docker) => match compatible_retained_runner_image(
+            docker,
+            agent,
+            is_builtin_runner_image_for_kind(&image, &kind),
+        )
+        .await
+        {
+            Ok(Some(image)) => {
+                using_retained = true;
+                Some(image)
+            }
+            Ok(None) => available_runner_image(docker, &image, &kind).await,
+            Err(error) => {
+                retained_issue = Some(error.to_string());
+                None
+            }
+        },
         None => None,
     };
+    let can_prepare = docker_available && runtime_image.is_none() && retained_issue.is_none();
     let image_present = runtime_image.is_some();
+    let runner_update = match (docker.as_ref(), runtime_image.as_deref()) {
+        (Some(docker), Some(current)) if using_retained => {
+            downloaded_runner_update(docker, current, &image, &kind).await
+        }
+        _ => None,
+    };
+    let presentation_supported = kind == "codex";
+    let presentation_available = match (docker.as_ref(), runtime_image.as_deref()) {
+        (Some(docker), Some(image)) if presentation_supported => {
+            presentation_runtime_available(docker, image).await
+        }
+        _ => false,
+    };
     let mut issues = Vec::new();
     if !docker_available {
         issues.push("Docker or Podman is not available".to_string());
+    } else if let Some(issue) = retained_issue {
+        issues.push(issue);
     } else if !image_present {
         let detail = if default_native_runner_image(&kind, agent.runner.container_engine)
             == Some(image.as_str())
@@ -202,9 +265,7 @@ async fn readiness(
         );
     }
     if !auth_present {
-        issues.push(format!(
-            "No host {kind} login was found; authenticate with {kind} on the host first"
-        ));
+        issues.push("Sign in to this Agent in XpressClaw to continue".into());
     }
     Ok(json!({
         "protocol": "acp",
@@ -216,27 +277,101 @@ async fn readiness(
         "image": image,
         "runtime_image": runtime_image,
         "image_present": image_present,
+        "using_retained": using_retained,
+        "can_prepare": can_prepare,
+        "runner_update": runner_update,
         "workspace": workspace.display().to_string(),
         "workspace_present": workspace_present,
         "model": agent.runner.model,
         "container_engine": agent.runner.container_engine,
         "container_engine_available": container_engine_available,
         "container_engine_socket": docker.as_ref().and_then(|docker| docker.host_engine_socket()).map(|path| path.display().to_string()),
+        "ssh_agent_forwarding": agent.runner.ssh_agent_forwarding,
+        "ssh_agent_available": ssh_agent_available,
+        "ssh_agent_socket": ssh_agent_socket.map(|path| path.display().to_string()),
         "command_present": command_present,
         "subscription_auth": agent.runner.subscription_auth,
         "auth_present": auth_present,
+        "authentication_status": authentication.status,
+        "presentation_artifacts": {
+            "supported": presentation_supported,
+            "available": presentation_available,
+            "capability": presentation_available.then_some(xpressclaw_core::workers::presentations::PRESENTATION_CAPABILITY),
+            "runtime": presentation_available.then_some(format!("PptxGenJS {}", xpressclaw_core::workers::presentations::PRESENTATION_RUNTIME_VERSION)),
+            "reason": if presentation_supported && !presentation_available {
+                Some("This runner image does not include the pinned XpressClaw presentation runtime; incompatible OpenAI desktop artifact skills are disabled")
+            } else {
+                None
+            },
+        },
         "issues": issues,
     }))
 }
 
-async fn available_runner_image(docker: &DockerManager, image: &str) -> Option<String> {
+#[derive(Debug, Serialize)]
+struct RunnerUpdate {
+    current_version: String,
+    available_version: String,
+}
+
+impl RunnerUpdate {
+    fn from_versions(current: &str, available: &str) -> Option<Self> {
+        let parse =
+            |value: &str| semver::Version::parse(value.strip_prefix('v').unwrap_or(value)).ok();
+        if !parse(available)?.cmp_precedence(&parse(current)?).is_gt() {
+            return None;
+        }
+        Some(Self {
+            current_version: current.to_string(),
+            available_version: available.to_string(),
+        })
+    }
+}
+
+// Compare version labels on the retained base and the locally available selected
+// image. Checking readiness never contacts the registry or changes an environment.
+async fn downloaded_runner_update(
+    docker: &DockerManager,
+    current: &str,
+    selected: &str,
+    kind: &str,
+) -> Option<RunnerUpdate> {
+    if !is_builtin_runner_image_for_kind(selected, kind) {
+        return None;
+    }
+    let available = available_runner_image(docker, selected, kind).await?;
+    if !docker
+        .image_has_label(&available, "io.xpressclaw.agent", kind)
+        .await
+    {
+        return None;
+    }
+    let current_version = docker
+        .image_label(current, "io.xpressclaw.runner.version")
+        .await?;
+    let available_version = docker
+        .image_label(&available, "io.xpressclaw.runner.version")
+        .await?;
+    RunnerUpdate::from_versions(&current_version, &available_version)
+}
+
+async fn available_runner_image(docker: &DockerManager, image: &str, kind: &str) -> Option<String> {
     let host_engine_image = is_host_runner_image(image);
     let built_in = is_builtin_runner_image(image);
-    if runner_image_compatible(docker, image, built_in, host_engine_image).await {
+    let pi_mcp_image = built_in && kind == "pi";
+    if runner_image_compatible(docker, image, built_in, host_engine_image, pi_mcp_image).await {
         return Some(image.to_string());
     }
     if let Some(local_image) = local_runner_image_alias(image) {
-        if runner_image_compatible(docker, local_image, built_in, host_engine_image).await {
+        if runner_image_compatible(
+            docker,
+            local_image,
+            built_in,
+            host_engine_image,
+            pi_mcp_image,
+        )
+        .await
+        {
             return Some(local_image.to_string());
         }
     }
@@ -335,6 +470,8 @@ async fn post_message(
     let board = TaskBoard::new(state.db.clone());
     let task = board
         .create(&CreateTask {
+            backlog: false,
+            start_after: None,
             title,
             description: (!content.is_empty()).then(|| content.clone()),
             agent_id: Some(id.clone()),
@@ -382,6 +519,11 @@ async fn cancel_attempt(
             Json(json!({ "error": "attempt does not belong to this session" })),
         ));
     }
+    if let Some(task_id) = &attempt.task_id {
+        TaskBoard::new(state.db.clone())
+            .ensure_locally_managed(task_id)
+            .map_err(bad_request)?;
+    }
     let cancelled = sessions
         .transition_attempt(
             &attempt_id,
@@ -396,6 +538,15 @@ async fn cancel_attempt(
     }
 
     state.elicitations.cancel_attempt(&attempt_id);
+    let mut container_stopped = cancelled.container_id.is_none();
+    if let Some(docker) = state.docker().await {
+        container_stopped = docker.stop_preserving(&cancelled.session_id).await.is_ok();
+    }
+    if container_stopped {
+        let _ = sessions.clear_container(&attempt_id);
+    }
+    // The running queue row is the lease on the shared Agent container.
+    // Release it only after the retained environment has stopped.
     state
         .db
         .with_conn(|conn| {
@@ -416,10 +567,6 @@ async fn cancel_attempt(
             Ok::<_, xpressclaw_core::error::Error>(())
         })
         .map_err(internal_error)?;
-
-    if let Some(docker) = state.docker().await {
-        let _ = docker.stop(&format!("attempt-{attempt_id}")).await;
-    }
     Ok(Json(json!(cancelled)))
 }
 
@@ -436,6 +583,11 @@ async fn interrupt_attempt(
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "attempt does not belong to this session" })),
         ));
+    }
+    if let Some(task_id) = &attempt.task_id {
+        TaskBoard::new(state.db.clone())
+            .ensure_locally_managed(task_id)
+            .map_err(bad_request)?;
     }
     let interrupted = state
         .interrupt_attempt(&attempt_id)
@@ -504,6 +656,26 @@ mod tests {
     use xpressclaw_core::tasks::board::TaskStatus;
 
     use super::*;
+
+    #[test]
+    fn upgrade_notice_requires_newer_version_precedence() {
+        for (current, available, expected) in [
+            ("2.1.1", "2.2.2", true),
+            ("2.9.0", "2.10.0", true),
+            ("2.2.2", "2.1.1", false),
+            ("2.2.2", "2.2.2", false),
+            ("2.2.2+old-image", "2.2.2+new-image", false),
+            ("2.2.2-rc.1", "2.2.2", true),
+            ("2.2.2", "2.2.2-rc.1", false),
+            ("v2.1.1", "v2.2.2", true),
+            ("", "2.2.2", false),
+            ("2.1.1", "latest", false),
+            ("custom", "2.2.2", false),
+        ] {
+            let update = RunnerUpdate::from_versions(current, available);
+            assert_eq!(update.is_some(), expected, "{current} -> {available}");
+        }
+    }
 
     fn test_app_with_db() -> (Router, Arc<Database>) {
         let db = Arc::new(Database::open_memory().unwrap());
@@ -614,7 +786,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn interrupt_stops_only_the_active_attempt() {
+    async fn interrupt_stops_only_the_waiting_attempt() {
         let (app, db) = test_app_with_db();
         let response = app
             .clone()
@@ -631,8 +803,22 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let value: Value = serde_json::from_slice(&body).unwrap();
         let attempt_id = value["attempt_id"].as_str().unwrap();
-        SessionManager::new(db.clone())
+        let sessions = SessionManager::new(db.clone());
+        sessions
             .transition_attempt(attempt_id, "running", "Working", None, None)
+            .unwrap();
+        sessions
+            .transition_attempt(
+                attempt_id,
+                "waiting_for_input",
+                "Waiting for your answer",
+                None,
+                None,
+            )
+            .unwrap();
+        let task_id = value["task"]["id"].as_str().unwrap();
+        TaskBoard::new(db.clone())
+            .update_status(task_id, "waiting_for_input", Some("builder"))
             .unwrap();
 
         let response = app
@@ -652,9 +838,10 @@ mod tests {
         assert_eq!(value["status"], "interrupted");
         let task_id = value["task_id"].as_str().unwrap();
         assert_eq!(
-            TaskBoard::new(db).get(task_id).unwrap().status,
+            TaskBoard::new(db.clone()).get(task_id).unwrap().status,
             TaskStatus::Pending
         );
+        assert_eq!(TaskQueue::new(db).pending_count("builder").unwrap(), 0);
     }
 
     #[tokio::test]
@@ -717,6 +904,138 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires Docker/Podman and XPRESSCLAW_RETENTION_TEST_IMAGE"]
+    async fn readiness_and_prepare_reuse_retained_environment_without_pulling() {
+        use futures_util::FutureExt;
+        use xpressclaw_core::docker::manager::ContainerSpec;
+
+        let Ok(image) = std::env::var("XPRESSCLAW_RETENTION_TEST_IMAGE") else {
+            eprintln!("skipping retained readiness integration test; set XPRESSCLAW_RETENTION_TEST_IMAGE to run it");
+            return;
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open_memory().unwrap());
+        let agent_id = format!("readiness-{}", uuid::Uuid::new_v4());
+        let mut agent = AgentConfig {
+            name: agent_id.clone(),
+            ..Default::default()
+        };
+        agent.runner.kind = "custom".into();
+        // No registry is listening here. A redundant Prepare pull must fail.
+        agent.runner.image = "127.0.0.1:1/runner:missing".into();
+        agent.runner.command = vec!["node".into()];
+        agent.runner.subscription_auth = false;
+        agent.runner.workspace = Some(directory.path().display().to_string());
+        let mut config = Config::default();
+        config.agents.push(agent);
+        AgentRegistry::new(db.clone())
+            .ensure(&agent_id, "custom")
+            .unwrap();
+        let state = AppState::new(
+            Arc::new(config.clone()),
+            db.clone(),
+            None,
+            directory.path().join("config.yaml"),
+            true,
+        );
+        let docker = Arc::new(
+            DockerManager::connect_for_installation(&db.installation_id().unwrap())
+                .await
+                .unwrap(),
+        );
+        *state.docker.write().unwrap() = Some(docker.clone());
+        let app = Router::new()
+            .nest("/sessions", routes())
+            .with_state(state.clone());
+        async fn request(app: &Router, agent: &str, method: &str) -> Value {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(format!("/sessions/{agent}/readiness"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+            serde_json::from_slice(&body).unwrap()
+        }
+        let missing = request(&app, &agent_id, "GET").await;
+        assert_eq!(missing["ready"], false);
+        assert_eq!(missing["can_prepare"], true);
+        let retained = docker
+            .launch_project_attached(
+                &agent_id,
+                &ContainerSpec {
+                    image,
+                    expose_port: None,
+                    cmd: Some(vec![
+                        "node".into(),
+                        "-e".into(),
+                        "setInterval(()=>{},1000)".into(),
+                    ]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let engine = bollard::Docker::connect_with_defaults().unwrap();
+        let result = std::panic::AssertUnwindSafe(async {
+            let before = engine
+                .inspect_container(&retained.info.container_id, None)
+                .await
+                .unwrap();
+            for method in ["GET", "POST", "POST"] {
+                let ready = request(&app, &agent_id, method).await;
+                assert_eq!(ready["ready"], true, "{ready}");
+                assert_eq!(ready["using_retained"], true);
+                assert_eq!(ready["can_prepare"], false);
+                assert_eq!(ready["runtime_image"].as_str(), before.image.as_deref());
+                assert_eq!(ready["issues"], json!([]));
+                assert!(ready["runner_update"].is_null());
+            }
+            // A retained custom image cannot satisfy a newly selected built-in
+            // harness. Pulling another tag would not repair that environment.
+            config.agents[0].runner.kind = "codex".into();
+            config.agents[0].runner.image = String::new();
+            state.apply_config(Arc::new(config), None);
+            for method in ["GET", "POST"] {
+                let incompatible = request(&app, &agent_id, method).await;
+                assert_eq!(incompatible["ready"], false);
+                assert_eq!(incompatible["can_prepare"], false);
+                assert!(incompatible["issues"][0]
+                    .as_str()
+                    .unwrap()
+                    .contains("retained environment"));
+            }
+            let after = engine
+                .inspect_container(&retained.info.container_id, None)
+                .await
+                .unwrap();
+            assert_eq!(before.id, after.id);
+            assert_eq!(before.image, after.image);
+            assert_eq!(
+                before.state.as_ref().unwrap().started_at,
+                after.state.as_ref().unwrap().started_at
+            );
+            assert_eq!(after.state.as_ref().unwrap().running, Some(true));
+            let containers = docker.list().await.unwrap();
+            assert_eq!(containers.len(), 1);
+            assert_eq!(containers[0].container_id, retained.info.container_id);
+        })
+        .catch_unwind()
+        .await;
+        docker.remove_owned_workload(&agent_id).await.unwrap();
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    #[tokio::test]
     async fn readiness_describes_the_resolved_acp_agent() {
         let response = test_app()
             .oneshot(
@@ -734,9 +1053,155 @@ mod tests {
         assert_eq!(value["kind"], "codex");
         assert_eq!(
             value["image"],
-            "ghcr.io/xpressai/xpressclaw-runner-codex:latest"
+            default_native_runner_image("codex", ContainerEngineAccess::None).unwrap()
         );
         assert!(value["workspace_present"].as_bool().is_some());
+        assert_eq!(value["presentation_artifacts"]["supported"], true);
+        assert_eq!(value["presentation_artifacts"]["available"], false);
+        assert!(value["presentation_artifacts"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("does not include the pinned XpressClaw presentation runtime"));
         assert!(value["issues"].is_array());
+    }
+
+    #[tokio::test]
+    async fn session_overview_defaults_to_summary_and_events_support_type_filter() {
+        let (app, db) = test_app_with_db();
+        let sessions = SessionManager::new(db.clone());
+        sessions.ensure("builder", Some("Builder")).unwrap();
+        sessions
+            .append_event(
+                "builder",
+                xpressclaw_core::sessions::NewEvent {
+                    attempt_id: None,
+                    task_id: None,
+                    source_type: "acp",
+                    source_id: Some("codex"),
+                    event_type: "tool_call",
+                    summary: "Ran rg",
+                    payload: json!({ "output": "x".repeat(2048) }),
+                },
+            )
+            .unwrap();
+        sessions
+            .append_event(
+                "builder",
+                xpressclaw_core::sessions::NewEvent {
+                    attempt_id: None,
+                    task_id: None,
+                    source_type: "acp",
+                    source_id: Some("codex"),
+                    event_type: "available_commands",
+                    summary: "Commands updated",
+                    payload: json!({ "available_commands": [{ "name": "review" }] }),
+                },
+            )
+            .unwrap();
+        TaskBoard::new(db)
+            .create(&CreateTask {
+                backlog: false,
+                start_after: None,
+                title: "Active work".to_string(),
+                description: None,
+                agent_id: Some("builder".to_string()),
+                parent_task_id: None,
+                sop_id: None,
+                conversation_id: None,
+                priority: None,
+                context: None,
+            })
+            .unwrap();
+
+        let summary_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/sessions/builder")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(summary_resp.status(), StatusCode::OK);
+        let summary_bytes = summary_resp.into_body().collect().await.unwrap().to_bytes();
+        let summary: Value = serde_json::from_slice(&summary_bytes).unwrap();
+        assert_eq!(summary["active_task_count"], 1);
+        assert_eq!(summary["recent_events"].as_array().unwrap().len(), 0);
+
+        let detail_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/sessions/builder?include_details=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(detail_resp.status(), StatusCode::OK);
+        let detail_bytes = detail_resp.into_body().collect().await.unwrap().to_bytes();
+        let detail: Value = serde_json::from_slice(&detail_bytes).unwrap();
+        assert_eq!(detail["recent_events"].as_array().unwrap().len(), 2);
+
+        let filtered_events = app
+            .oneshot(
+                Request::builder()
+                    .uri("/sessions/builder/events?event_type=available_commands&limit=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(filtered_events.status(), StatusCode::OK);
+        let events_bytes = filtered_events
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let events: Value = serde_json::from_slice(&events_bytes).unwrap();
+        let events_arr = events.as_array().unwrap();
+        assert_eq!(events_arr.len(), 1);
+        assert_eq!(events_arr[0]["event_type"], "available_commands");
+    }
+
+    #[tokio::test]
+    async fn session_get_endpoints_do_not_retrigger_ui_revisions_once_ensured() {
+        let (app, db) = test_app_with_db();
+
+        // First read ensures the logical session row once.
+        let initial = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/sessions/builder")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(initial.status(), StatusCode::OK);
+        let baseline = db.ui_revisions();
+
+        for uri in [
+            "/sessions/builder",
+            "/sessions/builder?include_details=true",
+            "/sessions/builder/events",
+            "/sessions/builder/attempts",
+            "/sessions/builder/readiness",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "failed GET {uri}");
+            assert_eq!(
+                db.ui_revisions(),
+                baseline,
+                "GET {uri} must not bump UI revisions"
+            );
+        }
     }
 }

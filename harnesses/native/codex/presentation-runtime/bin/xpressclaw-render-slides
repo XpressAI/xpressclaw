@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -lt 1 || $# -gt 2 ]]; then
+  echo "usage: xpressclaw-render-slides INPUT.pptx [OUTPUT_DIR]" >&2
+  exit 64
+fi
+
+input="$1"
+if [[ ! -f "$input" ]]; then
+  echo "presentation does not exist: $input" >&2
+  exit 66
+fi
+case "${input,,}" in
+  *.pptx) ;;
+  *) echo "presentation must use the .pptx extension: $input" >&2; exit 65 ;;
+esac
+
+readonly render_dpi=144
+readonly max_render_pages=200
+readonly max_render_dimension_points=1440
+readonly max_render_total_pixels=150000000
+
+input="$(realpath "$input")"
+if [[ $# -eq 2 ]]; then
+  output="$2"
+else
+  output="${input%.*}-rendered"
+fi
+mkdir -p "$output"
+output="$(realpath "$output")"
+
+runtime_dir="$(mktemp -d)"
+cleanup() {
+  rm -rf -- "$runtime_dir"
+}
+trap cleanup EXIT INT TERM
+mkdir -p "$runtime_dir/home" "$runtime_dir/profile" "$runtime_dir/pdf"
+
+HOME="$runtime_dir/home" timeout 120s libreoffice \
+  -env:UserInstallation="file://$runtime_dir/profile" \
+  --headless --nologo --nodefault --nolockcheck --norestore \
+  --convert-to pdf --outdir "$runtime_dir/pdf" "$input" >/dev/null
+
+pdf="$runtime_dir/pdf/$(basename "${input%.*}.pdf")"
+if [[ ! -s "$pdf" ]]; then
+  echo "LibreOffice did not produce a PDF preview for $input" >&2
+  exit 70
+fi
+
+if ! pdf_info="$(
+  (
+    ulimit -v 262144
+    LC_ALL=C timeout --signal=TERM --kill-after=2s 15s pdfinfo "$pdf"
+  )
+)"; then
+  echo "could not inspect the presentation preview PDF: $input" >&2
+  exit 70
+fi
+page_count="$(awk '/^Pages:[[:space:]]/ { print $2; exit }' <<<"$pdf_info")"
+page_size="$(awk '/^Page size:[[:space:]]/ { print $3, $5; exit }' <<<"$pdf_info")"
+read -r page_width page_height <<<"$page_size"
+number_pattern='^[0-9]+([.][0-9]+)?$'
+if [[ ! "$page_count" =~ ^[0-9]+$ ]] || (( page_count < 1 )) \
+  || [[ ! "$page_width" =~ $number_pattern ]] \
+  || [[ ! "$page_height" =~ $number_pattern ]]; then
+  echo "could not read bounded page metrics from the presentation preview: $input" >&2
+  exit 70
+fi
+if (( page_count > max_render_pages )); then
+  echo "presentation preview has $page_count pages; maximum is $max_render_pages" >&2
+  exit 70
+fi
+limit_error="$(awk \
+  -v pages="$page_count" \
+  -v width="$page_width" \
+  -v height="$page_height" \
+  -v dpi="$render_dpi" \
+  -v max_dimension="$max_render_dimension_points" \
+  -v max_pixels="$max_render_total_pixels" \
+  'BEGIN {
+    if (width <= 0 || height <= 0) {
+      print "presentation preview has invalid page dimensions"
+      exit
+    }
+    if (width > max_dimension || height > max_dimension) {
+      printf "presentation preview page dimensions %.2f x %.2f points exceed the %.0f-point limit\n", width, height, max_dimension
+      exit
+    }
+    pixel_width = int((width * dpi / 72) + 0.999999)
+    pixel_height = int((height * dpi / 72) + 0.999999)
+    total_pixels = pages * pixel_width * pixel_height
+    if (total_pixels > max_pixels) {
+      printf "presentation preview would render %.0f pixels; maximum is %.0f\n", total_pixels, max_pixels
+    }
+  }')"
+if [[ -n "$limit_error" ]]; then
+  echo "$limit_error" >&2
+  exit 70
+fi
+
+rm -f -- "$output"/slide-*.png
+if ! (
+  ulimit -v 1048576
+  ulimit -f 65536
+  timeout --signal=TERM --kill-after=5s 120s \
+    pdftoppm -png -r "$render_dpi" "$pdf" "$output/slide" >/dev/null
+); then
+  rm -f -- "$output"/slide-*.png
+  echo "presentation preview rendering exceeded its resource limits: $input" >&2
+  exit 70
+fi
+shopt -s nullglob
+slides=("$output"/slide-*.png)
+if (( ${#slides[@]} == 0 )); then
+  echo "presentation preview contains no slides: $input" >&2
+  exit 70
+fi
+for slide in "${slides[@]}"; do
+  [[ -s "$slide" ]] || { echo "empty rendered slide: $slide" >&2; exit 70; }
+done
+
+printf '%s\n' "${slides[@]}"

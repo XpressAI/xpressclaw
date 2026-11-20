@@ -5,7 +5,8 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
-const read = (path) => readFileSync(join(root, path), 'utf8').replace(/\r\n?/g, '\n');
+const read = (path) =>
+	readFileSync(join(root, path), 'utf8').replace(/\r\n?/g, '\n');
 const write = (path, contents) => writeFileSync(join(root, path), contents);
 
 const cargoToml = read('Cargo.toml');
@@ -14,13 +15,17 @@ const workspaceVersion = cargoToml.match(
 )?.[1];
 
 if (!workspaceVersion || !/^\d+\.\d+\.\d+$/.test(workspaceVersion)) {
-	throw new Error('Cargo.toml must declare a numeric workspace version such as 0.2.0');
+	throw new Error(
+		'Cargo.toml must declare a numeric workspace version such as 0.2.0'
+	);
 }
 
 const mismatches = [];
 const expectVersion = (label, actual) => {
 	if (actual !== workspaceVersion) {
-		mismatches.push(`${label}: expected ${workspaceVersion}, found ${actual ?? 'missing'}`);
+		mismatches.push(
+			`${label}: expected ${workspaceVersion}, found ${actual ?? 'missing'}`
+		);
 	}
 };
 
@@ -31,7 +36,10 @@ const frontendLock = JSON.parse(read('frontend/package-lock.json'));
 expectVersion('Tauri config', tauriConfig.version);
 expectVersion('frontend package', frontendPackage.version);
 expectVersion('frontend lockfile', frontendLock.version);
-expectVersion('frontend lockfile root package', frontendLock.packages?.['']?.version);
+expectVersion(
+	'frontend lockfile root package',
+	frontendLock.packages?.['']?.version
+);
 
 const cargoLock = read('Cargo.lock');
 const workspacePackages = new Set([
@@ -89,8 +97,14 @@ const releaseVersion = (build) => {
 	return `${major}.${minor}.${build}`;
 };
 
-const stampRelease = (build) => {
-	const version = releaseVersion(build);
+const numericVersion = (value) => {
+	if (!/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(value ?? '')) {
+		throw new Error('Release version must be numeric, such as 0.3.0');
+	}
+	return value;
+};
+
+const stampRelease = (version, build) => {
 	const stampedCargoToml = cargoToml.replace(
 		/^(\[workspace\.package\]\s*\nversion\s*=\s*")[^"]+(")/m,
 		(_match, prefix, suffix) => `${prefix}${version}${suffix}`
@@ -105,9 +119,11 @@ const stampRelease = (build) => {
 		.join('\n');
 
 	tauriConfig.version = version;
-	tauriConfig.bundle ??= {};
-	tauriConfig.bundle.macOS ??= {};
-	tauriConfig.bundle.macOS.bundleVersion = build;
+	if (build !== undefined) {
+		tauriConfig.bundle ??= {};
+		tauriConfig.bundle.macOS ??= {};
+		tauriConfig.bundle.macOS.bundleVersion = build;
+	}
 	frontendPackage.version = version;
 	frontendLock.version = version;
 	frontendLock.packages[''].version = version;
@@ -118,34 +134,61 @@ const stampRelease = (build) => {
 			path,
 			contents.replace(
 				componentVersionPattern,
-				(_match, prefix, _currentVersion, suffix) => `${prefix}${version}${suffix}`
+				(_match, prefix, _currentVersion, suffix) =>
+					`${prefix}${version}${suffix}`
 			)
 		];
 	});
 
 	write('Cargo.toml', stampedCargoToml);
 	write('Cargo.lock', stampedCargoLock);
-	write('crates/xpressclaw-tauri/tauri.conf.json', `${JSON.stringify(tauriConfig, null, 2)}\n`);
-	write('frontend/package.json', `${JSON.stringify(frontendPackage, null, 2)}\n`);
-	write('frontend/package-lock.json', `${JSON.stringify(frontendLock, null, 2)}\n`);
+	write(
+		'crates/xpressclaw-tauri/tauri.conf.json',
+		`${JSON.stringify(tauriConfig, null, 2)}\n`
+	);
+	write(
+		'frontend/package.json',
+		`${JSON.stringify(frontendPackage, null, 2)}\n`
+	);
+	write(
+		'frontend/package-lock.json',
+		`${JSON.stringify(frontendLock, null, 2)}\n`
+	);
 	for (const [path, contents] of stampedComponents) write(path, contents);
 
 	return version;
 };
 
-const [command, value] = process.argv.slice(2);
+const [command, value, option, override, ...extra] = process.argv.slice(2);
+if (
+	extra.length ||
+	(option !== undefined &&
+		(command !== '--build' || option !== '--version' || override === undefined))
+) {
+	throw new Error('Unexpected release metadata arguments');
+}
 if (command === '--check') {
-	console.log(`Release version metadata is synchronized at ${workspaceVersion}.`);
+	console.log(
+		`Release version metadata is synchronized at ${workspaceVersion}.`
+	);
 } else if (command === '--version') {
 	console.log(workspaceVersion);
 } else if (command === '--release-version') {
 	console.log(releaseVersion(buildNumber(value, '--release-version')));
 } else if (command === '--build') {
 	const build = buildNumber(value, '--build');
-	console.log(`Stamped XpressClaw ${stampRelease(build)} (build ${build}).`);
+	const version =
+		override === undefined ? releaseVersion(build) : numericVersion(override);
+	console.log(
+		`Stamped XpressClaw ${stampRelease(version, build)} (build ${build}).`
+	);
+} else if (command === '--set-version') {
+	console.log(
+		`Set XpressClaw release line to ${stampRelease(numericVersion(value))}.`
+	);
 } else {
 	console.error(
-		'Usage: release-metadata.mjs --check | --version | --release-version <build> | --build <number>'
+		'Usage: release-metadata.mjs --check | --version | --release-version <build> | --build <number> [--version <version>] | --set-version <version>'
 	);
 	process.exit(2);
 }

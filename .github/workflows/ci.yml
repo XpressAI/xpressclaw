@@ -24,12 +24,34 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check macOS app icon assets
+        run: python3 scripts/build-app-icon.py --check
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
 
       - name: Check formatting
         run: ./scripts/rustfmt.sh --check
+
+      - name: Test standalone installer
+        run: |
+          sh -n install.sh
+          bash scripts/test-install.sh
+
+  # Exercise Apple's catalog reader before a release, without compiling the app.
+  macos-icons:
+    name: macOS Icon Assets (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-26, macos-26-intel]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify adaptive icon catalog
+        run: python3 scripts/verify-app-icon.py --catalog-only
 
   # Frontend type checking (independent of Rust)
   frontend:
@@ -49,6 +71,7 @@ jobs:
 
       - name: Check release version metadata
         run: |
+          node --test ../scripts/release-*.test.mjs
           node ../scripts/release-metadata.mjs --check
           node ../scripts/release-metadata.mjs --build 1
           node ../scripts/release-metadata.mjs --check
@@ -56,10 +79,10 @@ jobs:
       - run: npm ci
       - run: npm run check
       - run: npm run build
-      - run: npx playwright install --with-deps chromium
+      - run: npx playwright install --with-deps chromium webkit
       - run: npm run test:e2e
 
-  # Build + test + clippy (only ubuntu — macOS is only needed for release)
+  # Build + test + clippy on Ubuntu
   build:
     name: Build & Test
     needs: lint
@@ -68,7 +91,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: true
-          token: ${{ secrets.PRIVATE_REPOS_TOKEN }}
 
       - uses: actions/setup-node@v4
         with:
@@ -91,8 +113,65 @@ jobs:
       - name: Build and test
         run: bash build.sh --skip-tauri --skip-docker --skip-check
 
+      - name: Test native control-plane MCP servers
+        run: node --test harnesses/native/common/*.test.mjs crates/xpressclaw-core/src/docker/workflow-command.test.mjs
+
+      - name: Build environment test image
+        run: docker build -f crates/xpressclaw-core/tests/fixtures/environment.Dockerfile -t xpressclaw-environment-test:local crates/xpressclaw-core/tests/fixtures
+
+      - name: Test HTTPS proxy and network permissions
+        run: |
+          docker run --rm --entrypoint python -v "$PWD:/work:ro" docker.io/mitmproxy/mitmproxy:12.2.1@sha256:743b6cdc817211d64bc269f5defacca8d14e76e647fc474e5c7244dbcb645141 /work/scripts/test-proxy.py
+          XPRESSCLAW_PROXY_TEST_ROOT="$PWD/target/proxy-tests" XPRESSCLAW_NETWORK_TEST_IMAGE=xpressclaw-environment-test:local cargo test -p xpressclaw-core --lib proxy:: -- --ignored --nocapture
+
+      - name: Test retained container access
+        run: |
+          test_name=docker::environment::tests::retained_environment_roundtrip
+          cargo test -p xpressclaw-core --lib "$test_name" -- --ignored --exact --list | grep -Fx "$test_name: test"
+          XPRESSCLAW_ENVIRONMENT_TEST_IMAGE=xpressclaw-environment-test:local cargo test -p xpressclaw-core --lib "$test_name" -- --ignored --exact --nocapture
+          test_name=docker::manager::recovery::tests::macos_user_recovery_restores_image_identity_and_keeps_files
+          XPRESSCLAW_ENVIRONMENT_TEST_IMAGE=xpressclaw-environment-test:local cargo test -p xpressclaw-core --lib "$test_name" -- --ignored --exact --nocapture
+          test_name=workers::native::tests::image_update_retains_installed_files_and_dependent_container
+          XPRESSCLAW_RETENTION_TEST_IMAGE=xpressclaw-environment-test:local cargo test -p xpressclaw-core --lib "$test_name" -- --ignored --exact --nocapture
+          # BuildKit's base-image cache does not load this tag into the daemon.
+          docker pull node:22-bookworm-slim
+          for test_name in \
+            docker::manager::recovery::tests::automatic_recovery_preserves_files_volumes_and_rolls_back_failures \
+            docker::manager::recovery::tests::stopped_helpers_preserve_their_files_without_blocking_recovery_or_rebuild \
+            workers::native::tests::automatic_recovery_waits_for_turns_and_rolls_back_failed_acp_initialization; do
+            cargo test -p xpressclaw-core --lib "$test_name" -- --ignored --exact --list | grep -Fx "$test_name: test"
+            XPRESSCLAW_RETENTION_TEST_IMAGE=node:22-bookworm-slim cargo test -p xpressclaw-core --lib "$test_name" -- --ignored --exact --nocapture
+          done
+          test_name=routes::agents::tests::rebuild_and_delete_preserve_session_and_container_boundaries
+          XPRESSCLAW_RETENTION_TEST_IMAGE=xpressclaw-environment-test:local cargo test -p xpressclaw-server --lib "$test_name" -- --ignored --exact --nocapture
+          test_name=routes::sessions::tests::readiness_and_prepare_reuse_retained_environment_without_pulling
+          XPRESSCLAW_RETENTION_TEST_IMAGE=xpressclaw-environment-test:local cargo test -p xpressclaw-server --lib "$test_name" -- --ignored --exact --nocapture
+
+      - name: Test managed Agent sign-in
+        run: XPRESSCLAW_AUTH_TEST_ROOT="$PWD/target/auth-tests" XPRESSCLAW_ENVIRONMENT_TEST_IMAGE=xpressclaw-environment-test:local cargo test -p xpressclaw-core --lib workers::native::authentication::tests::managed_sign_in_reconnects_without_tasks_and_cleans_up_cancelled_terminals -- --ignored --exact --nocapture
+
       - name: Clippy
         run: cargo clippy -p xpressclaw-core -p xpressclaw-server -p xpressclaw-cli -p xpressclaw-tauri --all-targets -- -D warnings
+
+  # Repository discovery invokes native Git and must retain Windows path
+  # semantics. Keep this pre-release gate focused on the core library.
+  windows-core:
+    name: Windows Core Tests
+    needs: lint
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-windows-core
+
+      - name: Test Windows core behavior
+        run: cargo test -p xpressclaw-core --lib
 
   # Integration tests that require API keys
   integration:
@@ -104,7 +183,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: true
-          token: ${{ secrets.PRIVATE_REPOS_TOKEN }}
 
       - uses: actions/setup-node@v4
         with:

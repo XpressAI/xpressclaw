@@ -1,7 +1,8 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { mcpServers } from '$lib/api';
-	import type { McpServerDefinition } from '$lib/api';
+	import { openExternal } from '$lib/utils';
+	import type { McpServerDefinition, McpVerificationResult } from '$lib/api';
 
 	let servers = $state<McpServerDefinition[]>([]);
 	let loading = $state(true);
@@ -17,6 +18,9 @@
 	let deleting = $state<string | null>(null);
 	let confirmDelete = $state<string | null>(null);
 	let error = $state('');
+	let verifying = $state<string | null>(null);
+	let verification = $state<Record<string, McpVerificationResult>>({});
+	const mcpRegistryUrl = 'https://registry.modelcontextprotocol.io/';
 
 	onMount(load);
 
@@ -80,8 +84,9 @@
 		saving = true;
 		error = '';
 		try {
+			const savedName = name.trim();
 			await mcpServers.upsert({
-				name: name.trim(),
+				name: savedName,
 				type: serverType,
 				command: serverType === 'stdio' ? commandOrUrl.trim() : null,
 				args: serverType === 'stdio' ? argsText.split('\n').map((line) => line.trim()).filter(Boolean) : [],
@@ -89,6 +94,7 @@
 				url: serverType === 'stdio' ? null : commandOrUrl.trim(),
 				headers: serverType === 'stdio' ? {} : parseKeyValueLines(headersText)
 			});
+			verification = Object.fromEntries(Object.entries(verification).filter(([key]) => key !== savedName));
 			resetForm();
 			await load();
 		} catch (reason) {
@@ -108,6 +114,7 @@
 		try {
 			await mcpServers.delete(serverName);
 			confirmDelete = null;
+			verification = Object.fromEntries(Object.entries(verification).filter(([key]) => key !== serverName));
 			await load();
 		} catch (reason) {
 			error = reason instanceof Error ? reason.message : 'Could not delete MCP server';
@@ -115,15 +122,40 @@
 			deleting = null;
 		}
 	}
+
+	async function verifyServer(server: McpServerDefinition) {
+		if (verifying) return;
+		verifying = server.name;
+		error = '';
+		verification = Object.fromEntries(Object.entries(verification).filter(([key]) => key !== server.name));
+		try {
+			verification = { ...verification, [server.name]: await mcpServers.verify(server.name) };
+		} catch (reason) {
+			error = reason instanceof Error ? reason.message : 'Could not verify MCP server';
+		} finally {
+			verifying = null;
+		}
+	}
+
+	function verificationTone(result: McpVerificationResult): string {
+		if (result.ok) return 'border-emerald-500/25 bg-emerald-500/10 text-emerald-600';
+		if (result.status === 'authentication_required' || result.status === 'project_required') {
+			return 'border-amber-500/25 bg-amber-500/10 text-amber-600';
+		}
+		return 'border-destructive/25 bg-destructive/5 text-destructive';
+	}
 </script>
 
 <div class="space-y-6 p-4 sm:p-6">
-	<div class="flex items-start justify-between gap-4">
+	<div class="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
 		<div>
 			<h1 class="text-2xl font-bold">MCP servers</h1>
-			<p class="mt-1 max-w-2xl text-sm text-muted-foreground">Create a shared catalog of tools that can be attached to any project from its Agent tab. Servers are never attached automatically.</p>
+			<p class="mt-1 max-w-2xl text-sm text-muted-foreground">Create a shared catalog of tools that can be attached to any agent from its Harness tab. Servers are never attached automatically.</p>
 		</div>
-		<button type="button" onclick={createServer} class="shrink-0 rounded-lg bg-primary px-3.5 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90">Add server</button>
+		<div class="flex flex-wrap gap-2 sm:shrink-0 sm:justify-end">
+			<button type="button" onclick={() => openExternal(mcpRegistryUrl)} class="rounded-lg border border-border px-3.5 py-2 text-sm font-medium hover:bg-accent">Official MCP Registry</button>
+			<button type="button" onclick={createServer} class="rounded-lg bg-primary px-3.5 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90">Add server</button>
+		</div>
 	</div>
 
 	<div class="rounded-xl border border-border bg-card">
@@ -135,21 +167,32 @@
 		{:else if servers.length === 0}
 			<div class="px-4 py-12 text-center">
 				<p class="text-sm font-medium text-foreground">No shared MCP servers yet</p>
-				<p class="mt-1 text-xs text-muted-foreground">Add a remote HTTP/SSE server or a stdio executable included in your runner images.</p>
+				<p class="mx-auto mt-1 max-w-3xl text-xs leading-relaxed text-muted-foreground">Find published packages and remote endpoints in the official registry. Add a remote HTTP/SSE server directly; for stdio, first include the package in each runner image and then enter its absolute executable path.</p>
 			</div>
 		{:else}
 			<div class="divide-y divide-border">
 				{#each servers as server}
-					<div class="flex items-start gap-3 px-4 py-4">
-						<span class="rounded-md bg-muted px-2 py-1 text-[10px] font-medium uppercase text-muted-foreground">{server.type}</span>
-						<div class="min-w-0 flex-1">
-							<p class="text-sm font-medium text-foreground">{server.name}</p>
-							<p class="mt-0.5 truncate font-mono text-xs text-muted-foreground">{server.command || server.url}</p>
+					<div class="px-4 py-4" data-mcp-server={server.name}>
+						<div class="flex items-start gap-3">
+							<span class="rounded-md bg-muted px-2 py-1 text-[10px] font-medium uppercase text-muted-foreground">{server.type}</span>
+							<div class="min-w-0 flex-1">
+								<p class="text-sm font-medium text-foreground">{server.name}</p>
+								<p class="mt-0.5 truncate font-mono text-xs text-muted-foreground">{server.command || server.url}</p>
+							</div>
+							<button type="button" onclick={() => verifyServer(server)} disabled={verifying !== null} class="text-xs text-muted-foreground hover:text-foreground disabled:opacity-50">
+								{verifying === server.name ? 'Verifying…' : 'Verify'}
+							</button>
+							<button type="button" onclick={() => editServer(server)} class="text-xs text-muted-foreground hover:text-foreground">Edit</button>
+							<button type="button" onclick={() => remove(server.name)} disabled={deleting === server.name} class="text-xs {confirmDelete === server.name ? 'font-medium text-destructive' : 'text-muted-foreground hover:text-destructive'} disabled:opacity-50">
+								{deleting === server.name ? 'Deleting…' : confirmDelete === server.name ? 'Confirm delete' : 'Delete'}
+							</button>
 						</div>
-						<button type="button" onclick={() => editServer(server)} class="text-xs text-muted-foreground hover:text-foreground">Edit</button>
-						<button type="button" onclick={() => remove(server.name)} disabled={deleting === server.name} class="text-xs {confirmDelete === server.name ? 'font-medium text-destructive' : 'text-muted-foreground hover:text-destructive'} disabled:opacity-50">
-							{deleting === server.name ? 'Deleting…' : confirmDelete === server.name ? 'Confirm delete' : 'Delete'}
-						</button>
+						{#if verification[server.name]}
+							{@const result = verification[server.name]}
+							<p aria-live="polite" class="mt-3 rounded-md border px-3 py-2 text-xs leading-relaxed {verificationTone(result)}">
+								{result.message}{#if result.suggestion} {result.suggestion}{/if}
+							</p>
+						{/if}
 					</div>
 				{/each}
 			</div>
@@ -182,7 +225,7 @@
 			{:else}
 				<div class="mt-4"><label for="mcp-headers" class="mb-1 block text-xs font-medium text-muted-foreground">HTTP headers</label><textarea id="mcp-headers" bind:value={headersText} rows="4" placeholder={'One Name=value per line\nAuthorization=Bearer …'} class="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs"></textarea></div>
 			{/if}
-			<p class="mt-3 text-[11px] leading-relaxed text-muted-foreground">Credentials are stored in the local XpressClaw configuration and supplied only to projects that explicitly attach this server.</p>
+			<p class="mt-3 text-[11px] leading-relaxed text-muted-foreground">Credentials are stored in the local XpressClaw configuration and supplied only to agents that explicitly attach this server.</p>
 			{#if error}<p class="mt-3 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">{error}</p>{/if}
 			<div class="mt-4 flex justify-end gap-2">
 				<button type="button" onclick={resetForm} class="rounded-md border border-border px-3 py-2 text-xs hover:bg-accent">Cancel</button>

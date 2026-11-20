@@ -1,6 +1,10 @@
 import { defineConfig, devices } from '@playwright/test';
 
-const executablePath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH;
+// The executable override is Chromium-specific. It is spread into the Chromium
+// projects only; putting it in the top-level `use` would hand the Chromium
+// binary to the WebKit browser type, which fails at launch.
+const chromiumExecutablePath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH;
+const chromiumLaunch = chromiumExecutablePath ? { launchOptions: { executablePath: chromiumExecutablePath } } : {};
 
 export default defineConfig({
 	testDir: './e2e',
@@ -11,12 +15,47 @@ export default defineConfig({
 	use: {
 		baseURL: 'http://127.0.0.1:4173',
 		trace: 'retain-on-failure',
-		launchOptions: executablePath ? { executablePath } : {},
+		// API mocks must stay in Playwright's request routing layer.
+		serviceWorkers: 'block',
 	},
 	projects: [
 		{
+			name: 'mermaid-webkit',
+			use: { ...devices['Desktop Safari'] },
+			testMatch: /mermaid\.spec\.ts/,
+		},
+		{
+			name: 'downloads-webkit',
+			use: { ...devices['Desktop Safari'] },
+			testMatch: /file-downloads\.spec\.ts/,
+		},
+		{
+			name: 'speech-webkit',
+			use: { ...devices['Desktop Safari'] },
+			testMatch: /speech\.spec\.ts/,
+		},
+		{
 			name: 'chromium',
-			use: { ...devices['Desktop Chrome'] },
+			use: { ...devices['Desktop Chrome'], ...chromiumLaunch },
+		},
+		// Safari and the desktop app's WKWebView are supported engines, and
+		// gesture handling is where engines differ most, so tab dragging and
+		// external links run on WebKit as well as Chromium.
+		{
+			name: 'webkit',
+			use: { ...devices['Desktop Safari'] },
+			testMatch: /workspace\.spec\.ts/,
+			// Tab gestures, mobile editing and external links run on both engines.
+			grep: /dragging a tab|keyboard tab dragging|abandons the drag|marks where it will land|compact tab strip|compact strip|never starts a drag|freshly split pane|drag in flight|deleted mid-drag|touch swipe|mobile editing|adaptive workspace|external links|project workflow schedules|delegated worker results await parent acceptance|delegated work keeps coordination replies runnable|prerequisite waits explain queued messages|Agent sign-in|Project cleanup/,
+		},
+		// Chromium can inject real touch input through CDP, including native
+		// panning, which WebKit's driver cannot; this profile reproduces phone
+		// scrolling faithfully enough to catch a drag sensor that blocks it.
+		{
+			name: 'touch-chromium',
+			use: { ...devices['iPhone 14'], browserName: 'chromium', ...chromiumLaunch },
+			testMatch: /workspace\.spec\.ts/,
+			grep: /touch swipe/,
 		},
 	],
 	webServer: {

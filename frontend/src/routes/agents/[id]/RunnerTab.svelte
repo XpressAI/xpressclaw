@@ -1,8 +1,12 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { mcpServers, sessions, setup } from '$lib/api';
+	import { agents, mcpServers, sessions, setup } from '$lib/api';
+	import { canonicalHarnessKind, harnessName, inferHarnessKindFromBackend, openExternal } from '$lib/utils';
 	import DirectoryPicker from '$lib/components/DirectoryPicker.svelte';
-	import type { AcpAgentCatalogEntry, AcpConfigOption, AcpModeState, LiveConfig, McpServerDefinition, NativeRunnerConfig } from '$lib/api';
+	import HostSshAccess from '$lib/components/HostSshAccess.svelte';
+	import AntigravityAuth from '$lib/components/AntigravityAuth.svelte';
+	import AgentSignIn from '$lib/components/AgentSignIn.svelte';
+	import type { AcpAgentCatalogEntry, AcpConfigOption, AcpModeState, LiveConfig, McpServerDefinition, McpVerificationResult, NativeRunnerConfig, PreservedEnvironment, RunnerReadiness } from '$lib/api';
 
 	interface Props {
 		agentConfig: LiveConfig['agents'][0] | null;
@@ -18,6 +22,10 @@
 	let projectName = $state('');
 	let model = $state('');
 	let subscriptionAuth = $state(true);
+	let showSignIn = $state(false);
+	let sshAgentForwarding = $state(false);
+	let sshAgentForwardingUnsupportedReason = $state<string | null>(null);
+	let proxyMode = $state<'inherit' | 'direct'>('inherit');
 	let containerEngine = $state<'none' | 'host'>('none');
 	let commandText = $state('');
 	let configOptions = $state<AcpConfigOption[]>([]);
@@ -39,13 +47,39 @@
 	let editingMcpName = $state<string | null>(null);
 	let confirmDeleteMcp = $state<string | null>(null);
 	let mcpError = $state('');
+	let verifyingMcp = $state<string | null>(null);
+	let mcpVerification = $state<Record<string, McpVerificationResult>>({});
+	let updatingRunnerImage = $state(false);
+	let confirmingRebuild = $state(false);
+	let preservedEnvironments = $state<PreservedEnvironment[]>([]);
+	let rebuildingEnvironment = $state(false);
+	let rebuildResult = $state<{ message: string; error: boolean } | null>(null);
+	let runnerImageUpdate = $state<{ message: string; error: boolean } | null>(null);
+	let runnerReadiness = $state<RunnerReadiness | null>(null);
+	let readinessRequest = 0;
+	let savedKind = $state('');
+	let savedContainerEngine = $state<'none' | 'host'>('none');
 	let modelOptions = $derived(selectChoices(configOptions.find((option) => option.category === 'model' || option.id === 'model')));
+	const mcpRegistryUrl = 'https://registry.modelcontextprotocol.io/';
+	const skillsDocumentation: Record<string, string> = {
+		codex: 'https://learn.chatgpt.com/docs/build-skills',
+		claude: 'https://code.claude.com/docs/en/skills',
+		'github-copilot': 'https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-skills',
+		opencode: 'https://opencode.ai/docs/skills/',
+		qwen: 'https://qwenlm.github.io/qwen-code-docs/en/users/features/skills/',
+		cline: 'https://docs.cline.bot/customization/skills'
+	};
 	const fallbackAgents = [
-		{ kind: 'codex', name: 'Codex', image: 'ghcr.io/xpressai/xpressclaw-runner-codex:latest', host_image: 'ghcr.io/xpressai/xpressclaw-runner-codex-docker:latest' },
-		{ kind: 'claude', name: 'Claude Agent', image: 'ghcr.io/xpressai/xpressclaw-runner-claude:latest', host_image: 'ghcr.io/xpressai/xpressclaw-runner-claude-docker:latest' },
-		{ kind: 'opencode', name: 'OpenCode', image: 'ghcr.io/xpressai/xpressclaw-runner-opencode:latest', host_image: 'ghcr.io/xpressai/xpressclaw-runner-opencode-docker:latest' }
+		{ kind: 'antigravity', name: 'Google Antigravity', install_url: 'https://antigravity.google/docs/cli/acp/', image: 'ghcr.io/xpressai/xpressclaw-runner-antigravity:latest', host_image: 'ghcr.io/xpressai/xpressclaw-runner-antigravity-docker:latest' },
+		{ kind: 'codex', name: 'Codex', install_url: 'https://developers.openai.com/codex/cli/', image: 'ghcr.io/xpressai/xpressclaw-runner-codex:latest', host_image: 'ghcr.io/xpressai/xpressclaw-runner-codex-docker:latest' },
+		{ kind: 'claude', name: 'Claude Agent', install_url: 'https://docs.anthropic.com/en/docs/claude-code/setup', image: 'ghcr.io/xpressai/xpressclaw-runner-claude:latest', host_image: 'ghcr.io/xpressai/xpressclaw-runner-claude-docker:latest' },
+		{ kind: 'opencode', name: 'OpenCode', install_url: 'https://opencode.ai/docs/', image: 'ghcr.io/xpressai/xpressclaw-runner-opencode:latest', host_image: 'ghcr.io/xpressai/xpressclaw-runner-opencode-docker:latest' },
+		{ kind: 'deepseek-harness', name: 'DeepSeek Harness', install_url: 'https://github.com/openma-ai/deepseek-harness-acp', image: 'ghcr.io/xpressai/xpressclaw-runner-deepseek-harness:latest', host_image: 'ghcr.io/xpressai/xpressclaw-runner-deepseek-harness-docker:latest' }
 	];
 	let agentOptions = $derived(agentCatalog.length > 0 ? agentCatalog : fallbackAgents);
+	let selectedAgent = $derived(agentOptions.find((agent) => agent.kind === kind));
+	let extensionDocumentationUrl = $derived(skillsDocumentation[kind] ?? selectedAgent?.install_url ?? '');
+	let hasSkillsGuide = $derived(Boolean(skillsDocumentation[kind]));
 
 	function defaultImage(): string {
 		const agent = agentOptions.find((option) => option.kind === kind);
@@ -53,13 +87,42 @@
 		return containerEngine === 'host' ? agent.host_image : agent.image;
 	}
 
-	function isBuiltInImage(candidate: string): boolean {
+	function isManagedDefaultImage(candidate: string): boolean {
 		return agentOptions.some((agent) => {
-			const localImage = agent.image.replace('ghcr.io/xpressai/', '');
-			const localHostImage = agent.host_image.replace('ghcr.io/xpressai/', '');
-			return [agent.image, agent.host_image, localImage, localHostImage].includes(candidate);
+			return [agent.image, agent.host_image].some((published) => {
+				const variants = [published, published.replace('ghcr.io/xpressai/', '')];
+				return variants.some((current) => {
+					if (candidate === current) return true;
+					const currentSeparator = current.lastIndexOf(':');
+					const candidateSeparator = candidate.lastIndexOf(':');
+					if (currentSeparator < 0 || candidateSeparator < 0) return false;
+					const sameRepository = candidate.slice(0, candidateSeparator) === current.slice(0, currentSeparator);
+					const tag = candidate.slice(candidateSeparator + 1);
+					return sameRepository && (tag === 'latest' || /^[0-9a-f]{40}$/.test(tag));
+				});
+			});
 		});
 	}
+
+	function imageRepository(candidate: string): string {
+		const digestSeparator = candidate.indexOf('@sha256:');
+		if (digestSeparator >= 0) return candidate.slice(0, digestSeparator);
+		const tagSeparator = candidate.lastIndexOf(':');
+		return tagSeparator >= 0 ? candidate.slice(0, tagSeparator) : candidate;
+	}
+
+	function isPublishedDigest(candidate: string): boolean {
+		if (!/@sha256:[0-9a-f]{64}$/.test(candidate)) return false;
+		return agentOptions.some((agent) => {
+			return [agent.image, agent.host_image]
+				.map(imageRepository)
+				.includes(imageRepository(candidate));
+		});
+	}
+
+	let canUpdateRunnerImage = $derived(Boolean(selectedAgent && kind !== 'custom'
+		&& kind === savedKind && containerEngine === savedContainerEngine
+		&& (!image.trim() || isManagedDefaultImage(image.trim()) || isPublishedDigest(image.trim()))));
 
 	function selectChoices(option: AcpConfigOption | undefined): { value: string; name: string; description?: string | null }[] {
 		if (!option || !Array.isArray(option.options)) return [];
@@ -72,9 +135,57 @@
 	}
 
 	function setContainerEngine(enabled: boolean) {
-		const replaceImage = !image.trim() || isBuiltInImage(image.trim());
+		const replaceImage = !image.trim() || isManagedDefaultImage(image.trim()) || canUpdateRunnerImage;
 		containerEngine = enabled ? 'host' : 'none';
 		if (kind !== 'custom' && replaceImage) image = defaultImage();
+	}
+
+	async function updateRunnerImage() {
+		if (updatingRunnerImage) return;
+		const id = agentId;
+		updatingRunnerImage = true;
+		runnerImageUpdate = null;
+		try {
+			const result = await agents.updateRunnerImage(id);
+			if (id !== agentId) return;
+			image = result.image;
+			void refreshRunnerReadiness(id);
+			const version = result.version ? ` ${result.version}` : '';
+			runnerImageUpdate = {
+				message: result.changed
+					? `Downloaded the latest published harness${version}. Your existing environment is preserved. Rebuild it explicitly to apply the image update.`
+					: `The latest published harness${version} is selected. Existing environments keep their installed image until rebuilt.`,
+				error: false
+			};
+		} catch (cause) {
+			if (id !== agentId) return;
+			runnerImageUpdate = {
+				message: cause instanceof Error ? cause.message : 'Could not update the harness image.',
+				error: true
+			};
+		} finally {
+			if (id === agentId) updatingRunnerImage = false;
+		}
+	}
+
+	async function rebuildEnvironment() {
+		if (!confirmingRebuild || rebuildingEnvironment) return;
+		const id = agentId;
+		rebuildingEnvironment = true;
+		rebuildResult = null;
+		try {
+			const result = await agents.rebuildEnvironment(id);
+			if (id !== agentId) return;
+			preservedEnvironments = result.preserved_environments;
+			confirmingRebuild = false;
+			void refreshRunnerReadiness(id);
+			rebuildResult = { message: 'Ready for a fresh environment. New work will use your saved settings and selected image.', error: false };
+		} catch (error) {
+			if (id !== agentId) return;
+			rebuildResult = { message: error instanceof Error ? error.message : String(error), error: true };
+		} finally {
+			if (id === agentId) rebuildingEnvironment = false;
+		}
 	}
 
 	function validConfigOptions(value: unknown): AcpConfigOption[] {
@@ -85,6 +196,14 @@
 			return typeof item.id === 'string' && typeof item.name === 'string'
 				&& (item.type === 'select' || item.type === 'boolean');
 		});
+	}
+
+	async function refreshRunnerReadiness(id: string) {
+		const request = ++readinessRequest;
+		try {
+			const result = await sessions.readiness(id);
+			if (id === agentId && request === readinessRequest) runnerReadiness = result;
+		} catch {}
 	}
 
 	function modeOption(value: unknown): AcpConfigOption | null {
@@ -110,14 +229,17 @@
 
 	onMount(async () => {
 		try {
-			const [events, catalog, agents] = await Promise.all([
-				sessions.events(agentId).catch(() => []),
+			const [events, catalog, agents, docker] = await Promise.all([
+				sessions.events(agentId, { eventType: 'session_config_options', limit: 1 }).catch(() => []),
 				mcpServers.list().catch(() => ({ servers: [] })),
-				setup.agentCatalog().catch(() => ({ agents: [] }))
+				setup.agentCatalog().catch(() => ({ agents: [] })),
+				setup.checkDocker().catch(() => null)
 			]);
 			applyAdvertisedControls(events);
 			serverCatalog = catalog.servers;
 			agentCatalog = agents.agents;
+			sshAgentForwardingUnsupportedReason =
+				docker?.ssh_agent_forwarding_unsupported_reason ?? null;
 		} catch {
 			configOptions = [];
 			serverCatalog = [];
@@ -125,24 +247,50 @@
 	});
 
 	$effect(() => {
-		if (agentConfig?.runner) {
-			const configuredKind = agentConfig.runner.kind;
-			kind = configuredKind === 'auto'
-				? (agentConfig.backend.includes('claude') ? 'claude' : agentConfig.backend.includes('opencode') ? 'opencode' : 'codex')
-				: configuredKind;
-			containerEngine = agentConfig.runner.container_engine ?? 'none';
-			image = isBuiltInImage(agentConfig.runner.image) ? defaultImage() : agentConfig.runner.image;
-			workspace = agentConfig.runner.workspace ?? '';
-			projectName = agentConfig.runner.project_name ?? '';
-			model = agentConfig.runner.model ?? '';
-			sessionConfig = { ...agentConfig.runner.session_config };
-			selectedMcpServers = [...agentConfig.runner.mcp_servers];
-			environmentText = Object.entries(agentConfig.runner.environment).map(([key, value]) => `${key}=${value}`).join('\n');
-			startupCommandsText = (agentConfig.runner.startup_commands ?? []).join('\n');
-			volumesText = agentConfig.volumes.join('\n');
-			subscriptionAuth = agentConfig.runner.subscription_auth;
-			commandText = agentConfig.runner.command.join('\n');
-		}
+		const id = agentId;
+		let disposed = false;
+		updatingRunnerImage = false;
+		rebuildingEnvironment = false;
+		preservedEnvironments = [];
+		rebuildResult = null;
+		runnerImageUpdate = null;
+		confirmingRebuild = false;
+		runnerReadiness = null;
+		void refreshRunnerReadiness(id);
+		void agents.environment(id).then((result) => {
+			if (!disposed) preservedEnvironments = result.preserved_environments;
+		}).catch(() => {});
+		return () => { disposed = true; readinessRequest++; };
+	});
+
+	let initializedAgentId = '';
+	let initializedConfig: LiveConfig['agents'][0] | null = null;
+	$effect(() => {
+		const config = agentConfig;
+		if (!config?.runner || (config === initializedConfig && agentId === initializedAgentId)) return;
+		initializedConfig = config;
+		initializedAgentId = agentId;
+
+		const configuredKind = config.runner.kind;
+		kind = configuredKind === 'auto'
+			? inferHarnessKindFromBackend(config.backend)
+			: canonicalHarnessKind(configuredKind);
+		containerEngine = config.runner.container_engine ?? 'none';
+		proxyMode = config.runner.proxy ?? 'inherit';
+		savedKind = kind;
+		savedContainerEngine = containerEngine;
+		image = isManagedDefaultImage(config.runner.image) ? defaultImage() : config.runner.image;
+		workspace = config.runner.workspace ?? '';
+		projectName = config.runner.project_name ?? '';
+		model = config.runner.model ?? '';
+		sessionConfig = { ...config.runner.session_config };
+		selectedMcpServers = [...config.runner.mcp_servers];
+		environmentText = Object.entries(config.runner.environment).map(([key, value]) => `${key}=${value}`).join('\n');
+		startupCommandsText = (config.runner.startup_commands ?? []).join('\n');
+		volumesText = config.volumes.join('\n');
+		subscriptionAuth = config.runner.subscription_auth;
+		sshAgentForwarding = config.runner.ssh_agent_forwarding ?? false;
+		commandText = config.runner.command.join('\n');
 	});
 
 	let lastSignal = 0;
@@ -167,7 +315,9 @@
 					startup_commands: startupCommandsText.split('\n').map((line) => line.trim()).filter(Boolean),
 					command: commandText.split('\n').map((line) => line.trim()).filter(Boolean),
 					subscription_auth: subscriptionAuth,
-					container_engine: containerEngine
+					ssh_agent_forwarding: sshAgentForwarding,
+					container_engine: containerEngine,
+					proxy: proxyMode
 				},
 				volumes: volumesText.split('\n').map((line) => line.trim()).filter(Boolean)
 			});
@@ -234,6 +384,7 @@
 				headers: mcpType === 'stdio' ? {} : parseKeyValueLines(mcpHeaders)
 			};
 			await mcpServers.upsert(definition);
+			mcpVerification = Object.fromEntries(Object.entries(mcpVerification).filter(([key]) => key !== definition.name));
 			serverCatalog = (await mcpServers.list()).servers;
 			if (!selectedMcpServers.includes(definition.name)) selectedMcpServers = [...selectedMcpServers, definition.name];
 			resetMcpForm();
@@ -251,6 +402,7 @@
 		try {
 			await mcpServers.delete(name);
 			selectedMcpServers = selectedMcpServers.filter((item) => item !== name);
+			mcpVerification = Object.fromEntries(Object.entries(mcpVerification).filter(([key]) => key !== name));
 			serverCatalog = (await mcpServers.list()).servers;
 			confirmDeleteMcp = null;
 			if (editingMcpName === name) resetMcpForm();
@@ -258,42 +410,81 @@
 			mcpError = String(error);
 		}
 	}
+
+	async function verifyMcpServer(server: McpServerDefinition) {
+		if (verifyingMcp) return;
+		verifyingMcp = server.name;
+		mcpVerification = Object.fromEntries(Object.entries(mcpVerification).filter(([key]) => key !== server.name));
+		try {
+			mcpVerification = {
+				...mcpVerification,
+				[server.name]: await mcpServers.verify(server.name, agentId)
+			};
+		} catch (error) {
+			mcpVerification = {
+				...mcpVerification,
+				[server.name]: {
+					ok: false,
+					status: 'verification_failed',
+					message: error instanceof Error ? error.message : 'Could not verify MCP server',
+					suggestion: 'Check the saved server configuration and try again.'
+				}
+			};
+		} finally {
+			verifyingMcp = null;
+		}
+	}
+
+	function verificationTone(result: McpVerificationResult): string {
+		if (result.ok) return 'border-emerald-500/25 bg-emerald-500/10 text-emerald-600';
+		if (result.status === 'authentication_required' || result.status === 'command_path_incorrect') {
+			return 'border-amber-500/25 bg-amber-500/10 text-amber-600';
+		}
+		return 'border-destructive/25 bg-destructive/5 text-destructive';
+	}
 </script>
 
+{#if showSignIn}
+	<AgentSignIn {agentId} onclose={() => showSignIn = false} onauthenticated={() => void refreshRunnerReadiness(agentId)} />
+{/if}
+
 <div class="mx-auto max-w-3xl space-y-6">
-	<div class="rounded-xl border border-border bg-card p-5">
-		<h2 class="text-sm font-semibold">ACP agent</h2>
+	<div class="ai-card p-5">
+		<h2 class="text-sm font-semibold">ACP harness</h2>
 		<p class="mt-1 text-xs leading-relaxed text-muted-foreground">
-			XpressClaw talks to the agent over the Agent Client Protocol. Each task resumes this project's active conversation by default; the agent keeps ownership of its reasoning, tools, and subagents.
+			XpressClaw talks to this coding harness over the Agent Client Protocol. New tasks branch from this agent's active conversation when the harness supports it, while follow-ups stay with their task; the harness keeps ownership of its reasoning, tools, and subagents.
 		</p>
 
 		<div class="mt-5 grid gap-4 sm:grid-cols-2">
 			<div class={modelOptions.length > 0 ? 'sm:col-span-2' : ''}>
-				<label for="runner-kind" class="mb-1 block text-xs font-medium text-muted-foreground">Agent</label>
+				<label for="runner-kind" class="mb-1 block text-xs font-medium text-muted-foreground">Harness</label>
 				<select id="runner-kind" bind:value={kind} onchange={selectDefaultImage} class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring">
 					{#each agentOptions as agent}
 						<option value={agent.kind}>{agent.name}</option>
 					{/each}
-					<option value="custom">Other ACP agent</option>
+					{#if kind !== 'custom' && !agentOptions.some((agent) => agent.kind === kind)}
+						<option value={kind}>Other ACP harness ({kind})</option>
+					{/if}
+					<option value="custom">Other ACP harness</option>
 				</select>
 			</div>
 			{#if modelOptions.length === 0}<div>
 				<label for="runner-model" class="mb-1 block text-xs font-medium text-muted-foreground">Model</label>
-				<input id="runner-model" list="runner-model-options" bind:value={model} placeholder="Agent default" class="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-sm outline-none focus:ring-1 focus:ring-ring" />
+				<input id="runner-model" list="runner-model-options" bind:value={model} placeholder="Harness default" class="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-sm outline-none focus:ring-1 focus:ring-ring" />
 				<datalist id="runner-model-options">
 					{#each modelOptions as option}
 						<option value={option.value}>{option.name}</option>
 					{/each}
 				</datalist>
 				<p class="mt-1 text-[11px] text-muted-foreground">
-					{modelOptions.length > 0 ? `${modelOptions.length} choices reported by the agent. ` : 'Choices appear after the agent starts its first session. '}
-					Leave blank to use the agent's default.
+					{modelOptions.length > 0 ? `${modelOptions.length} choices reported by the harness. ` : 'Choices appear after the harness starts its first session. '}
+					Leave blank to use the harness default.
 				</p>
 			</div>{/if}
 		</div>
 
 		<div class="mt-4">
-			<label for="runner-workspace" class="mb-1 block text-xs font-medium text-muted-foreground">Project workspace</label>
+			<label for="runner-workspace" class="mb-1 block text-xs font-medium text-muted-foreground">Workspace folder</label>
 			<div class="flex gap-2">
 				<input id="runner-workspace" bind:value={workspace} placeholder="~/projects/my-app" class="min-w-0 flex-1 rounded-md border border-input bg-background px-3 py-2 font-mono text-sm outline-none focus:ring-1 focus:ring-ring" />
 				<button type="button" onclick={() => (showWorkspacePicker = true)} class="rounded-md border border-border px-3 py-2 text-xs hover:bg-accent">Browse…</button>
@@ -306,21 +497,67 @@
 		</div>
 
 		<div class="mt-4">
-			<label for="runner-project-name" class="mb-1 block text-xs font-medium text-muted-foreground">Project name</label>
+			<label for="runner-project-name" class="mb-1 block text-xs font-medium text-muted-foreground">Agent name</label>
 			<input id="runner-project-name" bind:value={projectName} placeholder="Derived from workspace folder" class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring" />
 		</div>
 
 		<div class="mt-4">
-			<label for="runner-image" class="mb-1 block text-xs font-medium text-muted-foreground">Container image</label>
-			<input id="runner-image" bind:value={image} class="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-sm outline-none focus:ring-1 focus:ring-ring" />
-			<p class="mt-1 text-[11px] text-muted-foreground">Published images are pulled on demand. Extend one or provide a custom image whose command starts an ACP server over stdio.</p>
+			<label for="runner-image" class="mb-1 block text-xs font-medium text-muted-foreground">Image for new environments</label>
+			{#if runnerReadiness?.runner_update}
+				<p data-runner-upgrade-details class="mb-3 text-xs text-muted-foreground">
+					Harness update available: current environment {runnerReadiness.runner_update.current_version}; downloaded {runnerReadiness.runner_update.available_version}.
+					The downloaded version takes effect after an environment rebuild.
+				</p>
+			{/if}
+			<div class="flex gap-2">
+				<input id="runner-image" bind:value={image} class="min-w-0 flex-1 rounded-md border border-input bg-background px-3 py-2 font-mono text-sm outline-none focus:ring-1 focus:ring-ring" />
+				{#if canUpdateRunnerImage}
+					<button type="button" onclick={updateRunnerImage} disabled={updatingRunnerImage} class="shrink-0 rounded-md border border-border px-3 py-2 text-xs hover:bg-accent disabled:opacity-50">
+						{updatingRunnerImage ? 'Downloading…' : 'Download harness update'}
+					</button>
+				{/if}
+			</div>
+			<p class="mt-1 text-[11px] text-muted-foreground">The Agent keeps its container, installed tools, and files across turns and image updates. Downloading an image selects it for the next explicit rebuild. Custom images must start an ACP server over stdio.</p>
+			{#if runnerImageUpdate}
+				<div role={runnerImageUpdate.error ? 'alert' : 'status'} class="mt-2 flex items-start justify-between gap-2 rounded-md border px-3 py-2 text-xs {runnerImageUpdate.error ? 'border-destructive/30 bg-destructive/5 text-destructive' : 'border-emerald-500/25 bg-emerald-500/10 text-emerald-600'}">
+					<span>{runnerImageUpdate.message}</span>
+					<button type="button" aria-label="Dismiss harness update message" onclick={() => (runnerImageUpdate = null)} class="shrink-0 opacity-70 hover:opacity-100">×</button>
+				</div>
+			{/if}
+			<div class="mt-4 border-t border-border pt-3">
+				<p class="text-xs text-muted-foreground">Saved settings are applied automatically on the next turn, preserving installed tools and files. Rebuild only to start fresh or apply a downloaded image. Finish active work before rebuilding; queued work can remain.</p>
+				{#if confirmingRebuild}
+					<div role="alert" class="mt-2 rounded-md border border-destructive/30 p-3 text-xs">
+						<p>Rebuilding permanently deletes installed tools and files outside mounted folders. Workspace folders and mounted volumes are retained. Stopped helper containers and the old environment they depend on are preserved separately. Running helpers must be stopped first.</p>
+						<div class="mt-3 flex flex-wrap gap-2">
+							<button type="button" onclick={rebuildEnvironment} disabled={rebuildingEnvironment} class="rounded-md bg-destructive px-3 py-2 text-destructive-foreground disabled:opacity-50">{rebuildingEnvironment ? 'Rebuilding…' : 'Discard environment and rebuild'}</button>
+							<button type="button" onclick={() => confirmingRebuild = false} disabled={rebuildingEnvironment} class="rounded-md border border-border px-3 py-2">Cancel</button>
+						</div>
+					</div>
+				{:else}
+					<button type="button" onclick={() => { confirmingRebuild = true; rebuildResult = null; }} class="mt-2 rounded-md border border-border px-3 py-2 text-xs">Rebuild environment…</button>
+				{/if}
+				{#if rebuildResult}<p role={rebuildResult.error ? 'alert' : 'status'} class="mt-2 text-xs {rebuildResult.error ? 'text-destructive' : 'text-muted-foreground'}">{rebuildResult.message}</p>{/if}
+				{#if preservedEnvironments.length > 0}
+					<details class="mt-3 rounded-md border border-border p-3 text-xs">
+						<summary class="cursor-pointer">Preserved environments ({preservedEnvironments.length})</summary>
+						<p class="mt-2 text-muted-foreground">Stopped helpers keep their files and their original environment. The Agent uses its replacement. These copies continue to use disk space and are kept until explicitly removed.</p>
+						{#each preservedEnvironments as saved (saved.container_id)}
+							<div class="mt-3">
+								<p>{saved.dependents.length ? saved.dependents.join(', ') : 'No remaining helper dependencies'}</p>
+								<p class="mt-1 break-all font-mono text-muted-foreground">{saved.name}</p>
+							</div>
+						{/each}
+					</details>
+				{/if}
+			</div>
 		</div>
 	</div>
 
-	<div class="rounded-xl border border-border bg-card p-5">
+	<div class="ai-card p-5">
 		<h2 class="text-sm font-semibold">Harness capabilities</h2>
 		<p class="mt-1 text-xs leading-relaxed text-muted-foreground">
-			These controls come directly from this ACP agent. They become available after its first turn and are applied before every new task turn.
+			These controls come directly from this ACP harness. They become available after its first turn and are applied before every new task turn.
 		</p>
 		{#if configOptions.length === 0}
 			<div class="mt-4 rounded-md border border-dashed border-border px-3 py-4 text-center text-xs text-muted-foreground">
@@ -355,13 +592,16 @@
 		{/if}
 	</div>
 
-	<div class="rounded-xl border border-border bg-card p-5">
+	<div class="ai-card p-5">
 		<div class="flex items-start justify-between gap-3">
 			<div>
 				<h2 class="text-sm font-semibold">MCP servers</h2>
 				<p class="mt-1 text-xs leading-relaxed text-muted-foreground">Attach only the servers this harness needs. Stdio commands are paths inside its image; HTTP and SSE servers can be remote.</p>
 			</div>
-			<button type="button" onclick={openNewMcp} class="shrink-0 rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent">+ Server</button>
+			<div class="flex shrink-0 flex-wrap justify-end gap-2">
+				<button type="button" onclick={() => openExternal(mcpRegistryUrl)} class="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent">Registry</button>
+				<button type="button" onclick={openNewMcp} class="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent">+ Server</button>
+			</div>
 		</div>
 
 		{#if serverCatalog.length === 0 && !addingMcp}
@@ -369,16 +609,27 @@
 		{:else}
 			<div class="mt-4 space-y-2">
 				{#each serverCatalog as server}
-					<div class="flex items-start gap-3 rounded-md border border-border/70 px-3 py-2.5 hover:bg-accent/30">
-						<input type="checkbox" class="mt-0.5 h-4 w-4 rounded border-input" checked={selectedMcpServers.includes(server.name)} onchange={() => toggleMcp(server.name)} />
-						<span class="min-w-0 flex-1">
-							<span class="block text-sm font-medium">{server.name} <span class="ml-1 text-[10px] font-normal uppercase text-muted-foreground">{server.type}</span></span>
-							<span class="block truncate font-mono text-[11px] text-muted-foreground">{server.command || server.url}</span>
-						</span>
-						<button type="button" onclick={() => editMcpServer(server)} class="text-[11px] text-muted-foreground hover:text-foreground">Edit</button>
-						<button type="button" onclick={() => deleteMcpServer(server.name)} class="text-[11px] {confirmDeleteMcp === server.name ? 'text-destructive' : 'text-muted-foreground hover:text-destructive'}">
-							{confirmDeleteMcp === server.name ? 'Confirm' : 'Delete'}
-						</button>
+					<div class="rounded-md border border-border/70 px-3 py-2.5 hover:bg-accent/30" data-mcp-server={server.name}>
+						<div class="flex items-start gap-3">
+							<input type="checkbox" class="mt-0.5 h-4 w-4 rounded border-input" checked={selectedMcpServers.includes(server.name)} onchange={() => toggleMcp(server.name)} />
+							<span class="min-w-0 flex-1">
+								<span class="block text-sm font-medium">{server.name} <span class="ml-1 text-[10px] font-normal uppercase text-muted-foreground">{server.type}</span></span>
+								<span class="block truncate font-mono text-[11px] text-muted-foreground">{server.command || server.url}</span>
+							</span>
+							<button type="button" onclick={() => verifyMcpServer(server)} disabled={verifyingMcp !== null} class="text-[11px] text-muted-foreground hover:text-foreground disabled:opacity-50">
+								{verifyingMcp === server.name ? 'Verifying…' : 'Verify'}
+							</button>
+							<button type="button" onclick={() => editMcpServer(server)} class="text-[11px] text-muted-foreground hover:text-foreground">Edit</button>
+							<button type="button" onclick={() => deleteMcpServer(server.name)} class="text-[11px] {confirmDeleteMcp === server.name ? 'text-destructive' : 'text-muted-foreground hover:text-destructive'}">
+								{confirmDeleteMcp === server.name ? 'Confirm' : 'Delete'}
+							</button>
+						</div>
+						{#if mcpVerification[server.name]}
+							{@const result = mcpVerification[server.name]}
+							<p aria-live="polite" class="mt-2 rounded-md border px-3 py-2 text-[11px] leading-relaxed {verificationTone(result)}">
+								{result.message}{#if result.suggestion} {result.suggestion}{/if}
+							</p>
+						{/if}
 					</div>
 				{/each}
 			</div>
@@ -404,14 +655,21 @@
 		{/if}
 	</div>
 
-	<div class="rounded-xl border border-border bg-card p-5">
-		<h2 class="text-sm font-semibold">Skills, plugins, hooks, and native configuration</h2>
+	<div class="ai-card p-5">
+		<div class="flex flex-wrap items-start justify-between gap-3">
+			<h2 class="text-sm font-semibold">Skills, plugins, hooks, and native configuration</h2>
+			{#if extensionDocumentationUrl}
+				<button type="button" onclick={() => openExternal(extensionDocumentationUrl)} class="shrink-0 rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent">
+					{hasSkillsGuide ? `${selectedAgent?.name ?? harnessName(kind)} skills guide` : `${selectedAgent?.name ?? harnessName(kind)} docs`}
+				</button>
+			{/if}
+		</div>
 		<p class="mt-1 text-xs leading-relaxed text-muted-foreground">
 			With host login enabled, the harness's normal configuration directory is mounted read-write, so its installed skills, plugins, hooks, custom agents, and settings load normally. Project-local configuration is loaded from the workspace. Add explicit mounts for any other configuration directories.
 		</p>
 		<label for="customization-volumes" class="mt-4 mb-1 block text-xs font-medium text-muted-foreground">Additional mounts</label>
-		<textarea id="customization-volumes" bind:value={volumesText} rows="4" placeholder={'~/my-claude-plugin:/home/node/.claude/plugins/my-plugin:ro\n~/shared-skills:/home/node/.codex/skills:ro'} class="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs outline-none focus:ring-1 focus:ring-ring"></textarea>
-		<p class="mt-1 text-[11px] text-muted-foreground">One <code>host-path:container-path[:ro]</code> mount per line. These are trusted harness inputs and may execute code through hooks or plugins.</p>
+		<textarea id="customization-volumes" bind:value={volumesText} rows="4" placeholder={'~/my-claude-plugin:/home/node/.claude/plugins/my-plugin:ro,z\n~/shared-skills:/home/node/.codex/skills:ro'} class="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs outline-none focus:ring-1 focus:ring-ring"></textarea>
+		<p class="mt-1 text-[11px] text-muted-foreground">One <code>host-path:container-path[:options]</code> mount per line. Options are <code>ro</code>, <code>rw</code>, <code>z</code> (shared SELinux label), or <code>Z</code> (private label), separated by commas. These are trusted harness inputs and may execute code through hooks or plugins.</p>
 
 		<label for="harness-environment" class="mt-4 mb-1 block text-xs font-medium text-muted-foreground">Harness environment</label>
 		<textarea id="harness-environment" bind:value={environmentText} rows="4" placeholder={'CODEX_CONFIG={"features":{"example":true}}\nCLAUDE_CONFIG_DIR=/home/node/.claude'} class="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs outline-none focus:ring-1 focus:ring-ring"></textarea>
@@ -422,7 +680,20 @@
 		<p class="mt-1 text-[11px] text-muted-foreground">One idempotent shell command per line. Commands run in the workspace before every short-lived ACP task.</p>
 	</div>
 
-	<div class="rounded-xl border border-border bg-card p-5">
+	<div class="ai-card space-y-5 p-5">
+		<div class="space-y-2">
+			<label for="agent-proxy" class="block text-sm font-medium">Network proxy</label>
+			<select id="agent-proxy" bind:value={proxyMode} class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm">
+				<option value="inherit">Use instance proxy (default)</option>
+				<option value="direct">Connect directly</option>
+			</select>
+			<p class="text-xs text-muted-foreground">Direct connections skip the instance domain and header rules. Changes apply on the next turn. <a href="/settings/proxy" class="underline">Proxy settings</a></p>
+		</div>
+		<HostSshAccess bind:enabled={sshAgentForwarding}
+			agentForwardingUnsupportedReason={sshAgentForwardingUnsupportedReason} />
+	</div>
+
+	<div class="ai-card p-5">
 		<div class="flex items-start gap-3">
 			<input
 				id="container-engine"
@@ -438,22 +709,28 @@
 				</p>
 				{#if containerEngine === 'host'}
 					<p class="mt-2 rounded-md border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-amber-600">
-						This grants the agent control of host containers, images, volumes, and any paths the engine can mount. Use only with agents and images you trust.
+						This grants the harness control of host containers, images, volumes, and any paths the engine can mount. Use only with harnesses and images you trust.
 					</p>
 				{/if}
 			</div>
 		</div>
 	</div>
 
-	<div class="rounded-xl border border-border bg-card p-5">
-		<div class="flex items-start gap-3">
+	<div class="ai-card p-5">
+		<h2 class="text-sm font-semibold">Provider sign-in</h2>
+		<div class="mt-3 flex items-center gap-3">
+			<button type="button" onclick={() => showSignIn = true} disabled={kind !== savedKind} class="rounded bg-primary px-3 py-1.5 text-sm text-primary-foreground disabled:opacity-50">Sign in</button>
+			<span class="text-xs text-muted-foreground">{kind !== savedKind ? 'Save the harness selection before signing in.' : runnerReadiness?.authentication_status === 'authenticated' ? 'Signed in' : 'Connect this Agent to its provider in XpressClaw.'}</span>
+		</div>
+		{#if kind === 'antigravity'}<AntigravityAuth />{/if}
+		<div class="mt-4 flex items-start gap-3 border-t border-border pt-4">
 			<input id="subscription-auth" type="checkbox" bind:checked={subscriptionAuth} disabled={kind === 'custom'} class="mt-0.5 h-4 w-4 rounded border-input disabled:opacity-50" />
 			<div>
 				<label for="subscription-auth" class="text-sm font-medium">Use host login and harness configuration</label>
 				<p class="mt-1 text-xs leading-relaxed text-muted-foreground">
 					{kind === 'custom'
-						? 'Custom agents manage their own authentication; add any required directories in the Volumes tab.'
-						: "Mount the selected agent's standard configuration directory into each worker. This includes its subscription login plus installed skills, plugins, hooks, custom agents, and user settings. SSH keys still require an explicit mount."}
+						? 'Custom harnesses manage their own authentication; add any required directories in the mounts above.'
+						: "Mount the selected harness's standard configuration directory into each worker. This includes its subscription login plus installed skills, plugins, hooks, custom agents, and user settings. Git SSH authentication is configured separately above."}
 				</p>
 				{#if subscriptionAuth}
 					<p class="mt-2 rounded-md border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-600">
@@ -464,16 +741,16 @@
 		</div>
 	</div>
 
-	<div class="rounded-xl border border-border bg-card p-5">
+	<div class="ai-card p-5">
 		<h2 class="text-sm font-semibold">ACP server command</h2>
-		<p class="mt-1 text-xs text-muted-foreground">{kind === 'custom' ? 'Required for custom agents.' : 'Optional override for the built-in adapter.'} Enter one argument per line. Available placeholder: <code>{'{workspace}'}</code>.</p>
+		<p class="mt-1 text-xs text-muted-foreground">{kind === 'custom' ? 'Required for custom harnesses.' : 'Optional override for the built-in adapter.'} Enter one argument per line. Available placeholder: <code>{'{workspace}'}</code>.</p>
 		<textarea bind:value={commandText} rows="7" placeholder={'my-agent\nacp\n--cwd\n{workspace}'} class="mt-3 w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs outline-none focus:ring-1 focus:ring-ring"></textarea>
 	</div>
 </div>
 
 {#if showWorkspacePicker}
 	<DirectoryPicker
-		title="Choose project workspace"
+		title="Choose workspace folder"
 		initialPath={workspace}
 		onclose={() => (showWorkspacePicker = false)}
 		onselect={(path) => {

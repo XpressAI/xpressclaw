@@ -653,11 +653,8 @@ fn notify_conversation(
         );
     }
 
-    // On completion or failure, send an unprocessed "user" message so the
-    // conversation processor wakes the agent to respond about the result.
-    // Uses sender_type "user" because the processor only checks for
-    // unprocessed user messages (system messages are user messages with
-    // a SYSTEM prefix in this architecture).
+    // On completion or failure, route a system-authored user message through
+    // the durable Conversation queue so participating Agents can respond.
     if status == "completed" || status == "failed" {
         let wake_content = format!(
             "SYSTEM: Background task \"{}\" has {}. Please acknowledge this to the user.",
@@ -781,6 +778,16 @@ async fn poll_once(db: &Arc<Database>, config: &Config) -> crate::error::Result<
             None => continue,
         };
 
+        if let Err(error) =
+            WorkflowEngine::new(db.clone()).attach_default_workflows_to_task(&claimed.task_id)
+        {
+            warn!(
+                task_id = claimed.task_id,
+                error = %error,
+                "default task workflow attachment failed"
+            );
+        }
+
         // Check dependencies before dispatching (ADR-020).
         // If not all dependencies are completed, skip this task for now.
         if !board.is_ready(&claimed.task_id).unwrap_or(true) {
@@ -846,7 +853,7 @@ async fn poll_once(db: &Arc<Database>, config: &Config) -> crate::error::Result<
             }
             DriverResult::Failed(reason) => {
                 let _ = queue.fail(claimed.id, reason);
-                let _ = board.update_status(&claimed.task_id, "cancelled", None);
+                let _ = board.update_status(&claimed.task_id, "blocked", None);
                 warn!(task_id = claimed.task_id, reason, "task execution failed");
                 notify_conversation(db, config, &claimed.task_id, &claimed.agent_id, "failed");
                 // Advance workflow if this task is part of one
@@ -908,13 +915,25 @@ mod tests {
     use crate::tasks::board::CreateTask;
 
     fn setup() -> Arc<Database> {
-        Arc::new(Database::open_memory().unwrap())
+        let db = Arc::new(Database::open_memory().unwrap());
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO agents (id, name, backend, config) VALUES ('atlas', 'Atlas', 'native', '{}')",
+                [],
+            )
+        })
+        .unwrap();
+        db
     }
 
     #[test]
     fn test_current_subtask_finds_in_progress() {
         let subtasks = vec![
             Task {
+                start_after: None,
+                backlog: false,
+                position: 0.0,
+                revision: 0,
                 id: "1".into(),
                 title: "Step 1".into(),
                 status: TaskStatus::Completed,
@@ -924,14 +943,22 @@ mod tests {
                 parent_task_id: None,
                 sop_id: None,
                 conversation_id: None,
+                project_id: None,
                 created_at: String::new(),
                 updated_at: String::new(),
                 completed_at: None,
                 context: None,
+                provenance: "durable".into(),
+                blocks_parent: true,
+                parent_review_required: false,
                 task_type: "normal".into(),
                 hidden: false,
             },
             Task {
+                start_after: None,
+                backlog: false,
+                position: 0.0,
+                revision: 0,
                 id: "2".into(),
                 title: "Step 2".into(),
                 status: TaskStatus::InProgress,
@@ -941,14 +968,22 @@ mod tests {
                 parent_task_id: None,
                 sop_id: None,
                 conversation_id: None,
+                project_id: None,
                 created_at: String::new(),
                 updated_at: String::new(),
                 completed_at: None,
                 context: None,
+                provenance: "durable".into(),
+                blocks_parent: true,
+                parent_review_required: false,
                 task_type: "normal".into(),
                 hidden: false,
             },
             Task {
+                start_after: None,
+                backlog: false,
+                position: 0.0,
+                revision: 0,
                 id: "3".into(),
                 title: "Step 3".into(),
                 status: TaskStatus::Pending,
@@ -958,10 +993,14 @@ mod tests {
                 parent_task_id: None,
                 sop_id: None,
                 conversation_id: None,
+                project_id: None,
                 created_at: String::new(),
                 updated_at: String::new(),
                 completed_at: None,
                 context: None,
+                provenance: "durable".into(),
+                blocks_parent: true,
+                parent_review_required: false,
                 task_type: "normal".into(),
                 hidden: false,
             },
@@ -974,6 +1013,10 @@ mod tests {
     #[test]
     fn test_current_subtask_falls_back_to_pending() {
         let subtasks = vec![Task {
+            start_after: None,
+            backlog: false,
+            position: 0.0,
+            revision: 0,
             id: "1".into(),
             title: "Step 1".into(),
             status: TaskStatus::Pending,
@@ -983,10 +1026,14 @@ mod tests {
             parent_task_id: None,
             sop_id: None,
             conversation_id: None,
+            project_id: None,
             created_at: String::new(),
             updated_at: String::new(),
             completed_at: None,
             context: None,
+            provenance: "durable".into(),
+            blocks_parent: true,
+            parent_review_required: false,
             task_type: "normal".into(),
             hidden: false,
         }];
@@ -998,6 +1045,10 @@ mod tests {
     #[test]
     fn test_current_subtask_none_when_all_done() {
         let subtasks = vec![Task {
+            start_after: None,
+            backlog: false,
+            position: 0.0,
+            revision: 0,
             id: "1".into(),
             title: "Step 1".into(),
             status: TaskStatus::Completed,
@@ -1007,10 +1058,14 @@ mod tests {
             parent_task_id: None,
             sop_id: None,
             conversation_id: None,
+            project_id: None,
             created_at: String::new(),
             updated_at: String::new(),
             completed_at: None,
             context: None,
+            provenance: "durable".into(),
+            blocks_parent: true,
+            parent_review_required: false,
             task_type: "normal".into(),
             hidden: false,
         }];
@@ -1033,6 +1088,8 @@ mod tests {
         // Create a completed task — dispatcher should skip it
         let task = board
             .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "Already done".into(),
                 description: None,
                 agent_id: Some("atlas".into()),

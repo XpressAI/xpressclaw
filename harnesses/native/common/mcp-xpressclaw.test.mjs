@@ -1,7 +1,113 @@
 import assert from 'node:assert/strict';
+import { execFile as execFileCallback, spawn } from 'node:child_process';
+import { once } from 'node:events';
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { createServer } from 'node:http';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { createInterface } from 'node:readline';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 
-import { buildWakeupRequest } from './mcp-xpressclaw.mjs';
+import {
+  briefingMarkdown,
+  buildInstructions,
+  buildProjectMemoryRequest,
+  buildWakeupRequest,
+  memoryResourceTemplates,
+  runManagedGitPush,
+  TOOLS,
+} from './mcp-xpressclaw.mjs';
+
+const execFile = promisify(execFileCallback);
+
+test('native environment tools bind ports, task creation and publication to their Agent', { timeout: 5000 }, async () => {
+  const requests = [];
+  const server = createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    requests.push({ url: request.url, agent: request.headers['x-xpressclaw-agent-id'], body: chunks.length ? JSON.parse(Buffer.concat(chunks).toString()) : null });
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end('{}');
+  });
+  server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  const child = spawn(process.execPath, [fileURLToPath(new URL('./mcp-xpressclaw.mjs', import.meta.url))], {
+    env: { ...process.env, XPRESSCLAW_URL: `http://127.0.0.1:${server.address().port}`, XPRESSCLAW_AGENT_ID: 'atlas', XPRESSCLAW_TASK_ID: 'parent-task' }, stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  const output = createInterface({ input: child.stdout })[Symbol.asyncIterator]();
+  let id = 0;
+  async function call(name, args) {
+    child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: ++id, method: 'tools/call', params: { name, arguments: args } }) + '\n');
+    const response = JSON.parse((await output.next()).value);
+    assert.equal(response.result.isError, false, JSON.stringify(response));
+  }
+  try {
+    child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: ++id, method: 'tools/list' }) + '\n');
+    const names = JSON.parse((await output.next()).value).result.tools.map(tool => tool.name);
+    for (const name of ['create_task', 'forward_port', 'expose_port', 'list_port_forwards', 'remove_port_forward', 'publish_task_files']) assert.ok(names.includes(name));
+    await call('create_task', { title: 'Delegated work', agent_id: 'reviewer' });
+    assert.deepEqual(requests.at(-1), { url: '/api/environments/atlas/tasks', agent: 'atlas', body: { title: 'Delegated work', agent_id: 'reviewer', parent_task_id: 'parent-task' } });
+    await call('list_project_agents', { limit: 25, offset: 25 });
+    assert.equal(requests.at(-1).url, '/api/environments/atlas/agents?limit=25&offset=25');
+    await call('create_task', { title: 'Next quarter', parent_task_id: null, backlog: true, start_after: '2099-01-01T00:00:00Z' });
+    assert.equal(requests.at(-1).body.parent_task_id, null);
+    assert.equal(requests.at(-1).body.backlog, true);
+    const tasks = [
+      { ref: 'research', title: 'Research', agent_id: 'reviewer', backlog: true },
+      { title: 'Implement', depends_on: ['research'], start_after: '2099-02-01T00:00:00Z' },
+    ];
+    await call('create_tasks', { tasks, parent_task_id: null });
+    assert.deepEqual(requests.at(-1), { url: '/api/environments/atlas/tasks/batch', agent: 'atlas', body: { tasks, parent_task_id: null } });
+    await call('create_tasks', { tasks });
+    assert.equal(requests.at(-1).body.parent_task_id, 'parent-task');
+    await call('list_project_tasks', { status: 'scheduled', offset: 100 });
+    assert.equal(requests.at(-1).url, '/api/environments/atlas/tasks?status=scheduled&offset=100');
+    await call('get_project_task', { task_id: 'task-one' });
+    assert.equal(requests.at(-1).url, '/api/environments/atlas/tasks/task-one');
+    await call('review_delegated_task', { task_id: 'task-one', expected_attempt_id: 'worker-attempt', expected_revision: 4, decision: 'revise', guidance: 'Finish the deployment before verification.' });
+    assert.deepEqual(requests.at(-1), {
+      url: '/api/environments/atlas/tasks/task-one/review', agent: 'atlas',
+      body: { expected_attempt_id: 'worker-attempt', expected_revision: 4, decision: 'revise', guidance: 'Finish the deployment before verification.', parent_task_id: 'parent-task' },
+    });
+    await call('update_task_planning', { task_id: 'task-one', expected_revision: 2, action: 'queue' });
+    assert.deepEqual(requests.at(-1).body, { expected_revision: 2, action: 'queue' });
+    assert.equal(requests.at(-1).url, '/api/environments/atlas/tasks/task-one/planning');
+    await call('list_project_workflows', { include_templates: false });
+    assert.equal(requests.at(-1).url, '/api/environments/atlas/workflows?include_templates=false');
+    await call('get_project_workflow', { workflow_id: 'template-one' });
+    assert.equal(requests.at(-1).url, '/api/environments/atlas/workflows/template-one');
+    const schedules = [{ workflow_id: 'template-one', inputs: { worker: 'reviewer' }, cron: '0 9 * * 1', enabled: false }];
+    await call('schedule_workflows', { schedules });
+    assert.deepEqual(requests.at(-1), { url: '/api/environments/atlas/workflows/schedule', agent: 'atlas', body: { schedules } });
+    const workflows = [{ yaml_content: 'name: Draft\nflows: {main: {steps: []}}', enabled: false }];
+    await call('create_workflows', { workflows });
+    assert.deepEqual(requests.at(-1).body, { workflows });
+    await call('update_project_workflow', { workflow_id: 'owned-one', expected_revision: 1, enabled: false });
+    assert.equal(requests.at(-1).url, '/api/environments/atlas/workflows/owned-one');
+    assert.deepEqual(requests.at(-1).body, { expected_revision: 1, enabled: false });
+    await call('expose_port', { container_port: 3000 });
+    assert.deepEqual(requests.at(-1).body, { direction: 'container_to_host', container_port: 3000, host_port: 3000 });
+    await call('forward_port', { direction: 'host_to_container', host_port: 8080, container_port: 8081 });
+    assert.equal(requests.at(-1).body.direction, 'host_to_container');
+    await call('publish_task_files', { files: ['/tmp/report', 'results'], content: 'Files ready' });
+    assert.equal(requests.at(-1).url, '/api/environments/atlas/tasks/parent-task/files');
+    assert.deepEqual(requests.at(-1).body.files, ['/tmp/report', path.resolve('results')]);
+  } finally { child.kill(); await new Promise(resolve => server.close(resolve)); }
+});
+
+test('project planning schemas expose dates, approval holds, independent parents and bounded batches', () => {
+  const tool = (name) => TOOLS.find(tool => tool.name === name).inputSchema;
+  assert.deepEqual(tool('create_task').properties.parent_task_id.type, ['string', 'null']);
+  assert.deepEqual(tool('create_task').properties.start_after.type, ['string', 'null']);
+  assert.equal(tool('create_task').properties.backlog.type, 'boolean');
+  assert.equal(tool('create_tasks').properties.tasks.maxItems, 100);
+  assert.equal(tool('create_tasks').properties.tasks.items.properties.depends_on.type, 'array');
+  assert.equal(tool('schedule_workflows').properties.schedules.maxItems, 100);
+  assert.equal(tool('schedule_workflows').properties.schedules.items.oneOf.length, 2);
+  assert.ok(tool('update_task_planning').required.includes('expected_revision'));
+  assert.ok(tool('update_project_workflow').required.includes('expected_revision'));
+});
 
 test('binds a scheduled wake-up to the task that armed it', () => {
   const request = buildWakeupRequest(
@@ -24,6 +130,41 @@ test('binds a scheduled wake-up to the task that armed it', () => {
     continuation_task_id: 'task-123',
     delay_seconds: 300,
   });
+});
+
+test('binds a scheduled wake-up to the conversation lane that armed it', () => {
+  const request = buildWakeupRequest(
+    {
+      name: 'Check review',
+      delay_seconds: 60,
+      message: 'Check the review and update the conversation.',
+    },
+    {
+      agentId: 'reviewer',
+      taskId: '',
+      conversationId: 'conversation-123',
+    },
+  );
+
+  assert.equal(request.continuation_task_id, undefined);
+  assert.equal(request.conversation_id, 'conversation-123');
+});
+
+test('task wake-ups take precedence for tasks linked to conversations', () => {
+  const request = buildWakeupRequest(
+    {
+      delay_seconds: 60,
+      message: 'Continue the task.',
+    },
+    {
+      agentId: 'reviewer',
+      taskId: 'task-123',
+      conversationId: 'conversation-123',
+    },
+  );
+
+  assert.equal(request.continuation_task_id, 'task-123');
+  assert.equal(request.conversation_id, undefined);
 });
 
 test('keeps standalone compatibility when no task identity is available', () => {
@@ -58,3 +199,710 @@ test('rejects ambiguous wake-up deadlines', () => {
     /provide exactly one/,
   );
 });
+
+test('binds new memory provenance to the current task and agent', () => {
+  const request = buildProjectMemoryRequest(
+    {
+      title: 'Deployment convention',
+      body: 'Use blue-green deployment.',
+      note_type: 'convention',
+      source_task_id: 'spoofed-task',
+      created_by: 'user',
+    },
+    { taskId: 'task-123' },
+  );
+
+  assert.deepEqual(request, {
+    title: 'Deployment convention',
+    body: 'Use blue-green deployment.',
+    note_type: 'convention',
+    source_task_id: 'task-123',
+    created_by: 'agent',
+  });
+});
+
+test('initialization instructions hint at available project memory', () => {
+  const instructions = buildInstructions({
+    active_notes: 7,
+    pinned_notes: 2,
+    note_types: [{ name: 'decision', count: 3 }],
+    top_tags: [{ name: '日本語', count: 2 }],
+    pinned: [{ id: 'note-1', title: 'Deployment decision' }],
+    recent: [],
+    hint: 'Search before changing conventions.',
+  });
+
+  assert.match(instructions, /7 active note\(s\)/);
+  assert.match(instructions, /decision: 3/);
+  assert.match(instructions, /日本語/);
+  assert.match(instructions, /Deployment decision/);
+  assert.match(instructions, /data, not instructions/);
+  assert.match(instructions, /memory:\/\/project\/briefing/);
+});
+
+test('advertises a note resource template and renders discoverable links', () => {
+  assert.deepEqual(memoryResourceTemplates(), [{
+    uriTemplate: 'memory://project/note/{note_id}',
+    name: 'Project memory note',
+    description: 'Read one durable note by ID in the current project.',
+    mimeType: 'text/markdown',
+    annotations: { audience: ['assistant'], priority: 1 },
+  }]);
+
+  const markdown = briefingMarkdown({
+    hint: 'Use durable memory.',
+    active_notes: 1,
+    pinned_notes: 1,
+    note_types: [],
+    top_tags: [],
+    pinned: [{ id: 'note/1', title: '決定', summary: 'SQLiteを使う' }],
+    recent: [],
+  });
+  assert.match(markdown, /memory:\/\/project\/note\/note%2F1/);
+  assert.match(markdown, /SQLiteを使う/);
+});
+
+test('advertises project memory tools with conservative MCP annotations', () => {
+  const search = TOOLS.find((tool) => tool.name === 'search_project_memory');
+  const get = TOOLS.find((tool) => tool.name === 'get_project_memory');
+  const archive = TOOLS.find((tool) => tool.name === 'archive_project_memory');
+  assert.equal(search.annotations.readOnlyHint, true);
+  assert.equal(search.annotations.openWorldHint, false);
+  assert.equal(get.annotations.readOnlyHint, false);
+  assert.equal(get.annotations.idempotentHint, false);
+  assert.equal(archive.annotations.destructiveHint, true);
+});
+
+test('local collaboration tools are visible only to explicitly authorized Agent processes', async () => {
+  assert.equal(TOOLS.some((tool) => tool.name === 'local_forge_create_repository'), false);
+  const child = spawn(
+    process.execPath,
+    [fileURLToPath(new URL('./mcp-xpressclaw.mjs', import.meta.url))],
+    {
+      env: {
+        ...process.env,
+        XPRESSCLAW_URL: 'http://127.0.0.1:1',
+        XPRESSCLAW_AGENT_ID: 'authorized-agent',
+        XPRESSCLAW_LOCAL_COLLABORATION: '1',
+        XPRESSCLAW_COLLABORATION_TOKEN: 'scoped-capability',
+      },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    },
+  );
+  const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
+  const output = lines[Symbol.asyncIterator]();
+  child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' })}\n`);
+  const listed = JSON.parse((await output.next()).value);
+  const names = listed.result.tools.map((tool) => tool.name);
+  assert.ok(names.includes('local_forge_create_repository'));
+  assert.ok(names.includes('local_forge_push_branch'));
+  assert.ok(names.includes('local_build_trigger'));
+  child.stdin.end();
+  if (child.exitCode === null) await once(child, 'exit');
+  lines.close();
+});
+
+test('managed forge pushes disable repository and configured Git hooks', { timeout: 10000 }, async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'xpressclaw-managed-push-'));
+  const checkout = path.join(root, 'checkout');
+  const remote = path.join(root, 'remote.git');
+  const configuredHooks = path.join(root, 'configured-hooks');
+  const repositoryMarker = path.join(root, 'repository-hook-ran');
+  const configuredMarker = path.join(root, 'configured-hook-ran');
+  const token = 'malicious-hook-must-not-see-this-token';
+  const git = (argumentsValue, cwd = checkout) => execFile('git', argumentsValue, { cwd });
+
+  try {
+    await mkdir(checkout);
+    await mkdir(configuredHooks);
+    await git(['init', '-b', 'main']);
+    await git(['config', 'user.name', 'XpressClaw test']);
+    await git(['config', 'user.email', 'test@localhost']);
+    await writeFile(path.join(checkout, 'README.md'), '# fixture\n');
+    await git(['add', 'README.md']);
+    await git(['commit', '-m', 'fixture']);
+    await execFile('git', ['init', '--bare', remote]);
+
+    const repositoryHook = path.join(checkout, '.git', 'hooks', 'pre-push');
+    await writeFile(
+      repositoryHook,
+      `#!/bin/sh\nprintf '%s' "$XPRESSCLAW_GIT_TOKEN"\ntouch ${JSON.stringify(repositoryMarker)}\n`,
+    );
+    await chmod(repositoryHook, 0o700);
+    const configuredHook = path.join(configuredHooks, 'pre-push');
+    await writeFile(
+      configuredHook,
+      `#!/bin/sh\nprintf '%s' "$XPRESSCLAW_GIT_TOKEN" >&2\ntouch ${JSON.stringify(configuredMarker)}\n`,
+    );
+    await chmod(configuredHook, 0o700);
+    const remoteHook = path.join(remote, 'hooks', 'pre-receive');
+    await writeFile(remoteHook, `#!/bin/sh\necho ${JSON.stringify(token)} >&2\n`);
+    await chmod(remoteHook, 0o700);
+
+    const output = await runManagedGitPush({
+      directory: checkout,
+      remote,
+      branch: 'main',
+      username: 'xpressclaw-agent',
+      token,
+    });
+    assert.equal(output.includes(token), false);
+    assert.match(output, /\[REDACTED\]/);
+    await assert.rejects(readFile(repositoryMarker), { code: 'ENOENT' });
+
+    await git(['config', 'core.hooksPath', configuredHooks]);
+    await writeFile(path.join(checkout, 'README.md'), '# configured hook fixture\n');
+    await git(['add', 'README.md']);
+    await git(['commit', '-m', 'exercise configured hook suppression']);
+    const configuredOutput = await runManagedGitPush({
+      directory: checkout,
+      remote,
+      branch: 'main',
+      username: 'xpressclaw-agent',
+      token,
+    });
+    assert.equal(configuredOutput.includes(token), false);
+    assert.match(configuredOutput, /\[REDACTED\]/);
+    await assert.rejects(readFile(configuredMarker), { code: 'ENOENT' });
+
+    await git(['commit', '--amend', '--no-edit']);
+    await runManagedGitPush({
+      directory: checkout,
+      remote,
+      branch: 'main',
+      username: 'xpressclaw-agent',
+      token,
+      forceWithLease: true,
+    });
+
+    await writeFile(remoteHook, `#!/bin/sh\necho ${JSON.stringify(token)} >&2\nexit 1\n`);
+    await writeFile(path.join(checkout, 'README.md'), '# changed fixture\n');
+    await git(['add', 'README.md']);
+    await git(['commit', '-m', 'exercise failed push redaction']);
+    await assert.rejects(
+      runManagedGitPush({
+        directory: checkout,
+        remote,
+        branch: 'main',
+        username: 'xpressclaw-agent',
+        token,
+      }),
+      (error) => {
+        assert.equal(error.message.includes(token), false);
+        assert.match(error.message, /\[REDACTED\]/);
+        return true;
+      },
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('managed forge pushes do not execute configured credential helpers', { timeout: 10000 }, async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'xpressclaw-managed-credentials-'));
+  const checkout = path.join(root, 'checkout');
+  const marker = path.join(root, 'credential-helper-ran');
+  const globalMarker = path.join(root, 'global-credential-helper-ran');
+  const globalConfig = path.join(root, 'malicious-global-gitconfig');
+  const token = 'credential-helper-must-not-see-this-token';
+  const server = createServer((_request, response) => {
+    response.writeHead(401, { 'www-authenticate': 'Basic realm="test"' });
+    response.end('authentication required');
+  });
+
+  try {
+    await mkdir(checkout);
+    await execFile('git', ['init', '-b', 'main'], { cwd: checkout });
+    await execFile('git', ['config', 'user.name', 'XpressClaw test'], { cwd: checkout });
+    await execFile('git', ['config', 'user.email', 'test@localhost'], { cwd: checkout });
+    await execFile(
+      'git',
+      ['config', 'credential.helper', `!touch ${JSON.stringify(marker)}; echo username=stolen; echo password=$XPRESSCLAW_GIT_TOKEN`],
+      { cwd: checkout },
+    );
+    await writeFile(path.join(checkout, 'README.md'), '# fixture\n');
+    await execFile('git', ['add', 'README.md'], { cwd: checkout });
+    await execFile('git', ['commit', '-m', 'fixture'], { cwd: checkout });
+    server.listen(0, '127.0.0.1');
+    await once(server, 'listening');
+    const address = server.address();
+    assert.equal(typeof address, 'object');
+
+    await assert.rejects(
+      runManagedGitPush({
+        directory: checkout,
+        remote: `http://127.0.0.1:${address.port}/repository.git`,
+        branch: 'main',
+        username: 'xpressclaw-agent',
+        token,
+      }),
+      (error) => {
+        assert.equal(error.message.includes(token), false);
+        return true;
+      },
+    );
+    await assert.rejects(readFile(marker), { code: 'ENOENT' });
+
+    await execFile('git', ['config', '--unset-all', 'credential.helper'], { cwd: checkout });
+    await execFile(
+      'git',
+      ['config', '--file', globalConfig, 'credential.helper', `!touch ${JSON.stringify(globalMarker)}; echo username=stolen; echo password=$XPRESSCLAW_GIT_TOKEN`],
+    );
+    const previousGlobalConfig = process.env.GIT_CONFIG_GLOBAL;
+    process.env.GIT_CONFIG_GLOBAL = globalConfig;
+    try {
+      await assert.rejects(runManagedGitPush({
+        directory: checkout,
+        remote: `http://127.0.0.1:${address.port}/repository.git`,
+        branch: 'main',
+        username: 'xpressclaw-agent',
+        token,
+      }));
+    } finally {
+      if (previousGlobalConfig === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+      else process.env.GIT_CONFIG_GLOBAL = previousGlobalConfig;
+    }
+    await assert.rejects(readFile(globalMarker), { code: 'ENOENT' });
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('managed forge pushes ignore repository URL rewrites and inherited proxies', { timeout: 10000 }, async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'xpressclaw-managed-url-rewrite-'));
+  const checkout = path.join(root, 'checkout');
+  let expectedRequests = 0;
+  const attackerAuthorization = [];
+  const expectedServer = createServer((_request, response) => {
+    expectedRequests += 1;
+    response.writeHead(401, { 'www-authenticate': 'Basic realm="expected"' });
+    response.end('authentication required');
+  });
+  const attackerServer = createServer((request, response) => {
+    attackerAuthorization.push(request.headers.authorization ?? '');
+    response.writeHead(401, { 'www-authenticate': 'Basic realm="attacker"' });
+    response.end('authentication required');
+  });
+  const proxyAuthorization = [];
+  const proxyServer = createServer((request, response) => {
+    proxyAuthorization.push(request.headers.authorization ?? '');
+    response.writeHead(401, { 'www-authenticate': 'Basic realm="proxy"' });
+    response.end('authentication required');
+  });
+  const proxyKeys = ['HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'no_proxy'];
+  const previousProxyEnvironment = Object.fromEntries(
+    proxyKeys.map((key) => [key, process.env[key]]),
+  );
+
+  try {
+    await mkdir(checkout);
+    await execFile('git', ['init', '-b', 'main'], { cwd: checkout });
+    await execFile('git', ['config', 'user.name', 'XpressClaw test'], { cwd: checkout });
+    await execFile('git', ['config', 'user.email', 'test@localhost'], { cwd: checkout });
+    await writeFile(path.join(checkout, 'README.md'), '# fixture\n');
+    await execFile('git', ['add', 'README.md'], { cwd: checkout });
+    await execFile('git', ['commit', '-m', 'fixture'], { cwd: checkout });
+
+    expectedServer.listen(0, '127.0.0.1');
+    attackerServer.listen(0, '127.0.0.1');
+    proxyServer.listen(0, '127.0.0.1');
+    await Promise.all([
+      once(expectedServer, 'listening'),
+      once(attackerServer, 'listening'),
+      once(proxyServer, 'listening'),
+    ]);
+    const expectedAddress = expectedServer.address();
+    const attackerAddress = attackerServer.address();
+    const proxyAddress = proxyServer.address();
+    assert.equal(typeof expectedAddress, 'object');
+    assert.equal(typeof attackerAddress, 'object');
+    assert.equal(typeof proxyAddress, 'object');
+    const expectedBase = `http://127.0.0.1:${expectedAddress.port}/`;
+    const attackerBase = `http://127.0.0.1:${attackerAddress.port}/`;
+    const proxyBase = `http://127.0.0.1:${proxyAddress.port}`;
+    await execFile(
+      'git',
+      ['config', `url.${attackerBase}.pushInsteadOf`, expectedBase],
+      { cwd: checkout },
+    );
+    Object.assign(process.env, {
+      HTTP_PROXY: proxyBase,
+      HTTPS_PROXY: proxyBase,
+      NO_PROXY: '',
+      http_proxy: proxyBase,
+      https_proxy: proxyBase,
+      no_proxy: '',
+    });
+
+    const token = 'url-rewrite-must-not-see-this-token';
+    let pushError;
+    await assert.rejects(runManagedGitPush({
+      directory: checkout,
+      remote: `${expectedBase}repository.git`,
+      branch: 'main',
+      username: 'xpressclaw-agent',
+      token,
+    }), (error) => {
+      pushError = error;
+      return true;
+    });
+
+    assert.ok(
+      expectedRequests > 0,
+      `the intended forge endpoint should receive the request: ${pushError?.message}`,
+    );
+    assert.deepEqual(attackerAuthorization, []);
+    assert.deepEqual(proxyAuthorization, []);
+  } finally {
+    for (const [key, value] of Object.entries(previousProxyEnvironment)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await Promise.all([
+      new Promise((resolve) => expectedServer.close(resolve)),
+      new Promise((resolve) => attackerServer.close(resolve)),
+      new Promise((resolve) => proxyServer.close(resolve)),
+    ]);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('serves project memory discovery and writes over the stdio MCP protocol', { timeout: 5000 }, async () => {
+  let createdBody = null;
+  const controlTokens = [];
+  const server = createServer(async (request, response) => {
+    controlTokens.push(request.headers['x-xpressclaw-internal-token']);
+    if (request.url === '/api/memory/project-a/index' && request.method === 'GET') {
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({
+        active_notes: 3,
+        pinned_notes: 1,
+        note_types: [{ name: 'decision', count: 2 }],
+        top_tags: [{ name: 'architecture', count: 2 }],
+        pinned: [],
+        recent: [],
+        hint: 'Review project decisions first.',
+      }));
+      return;
+    }
+    if (request.url === '/api/memory/project-a/notes' && request.method === 'POST') {
+      const chunks = [];
+      for await (const chunk of request) chunks.push(chunk);
+      createdBody = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      response.writeHead(201, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ id: 'note-1', ...createdBody }));
+      return;
+    }
+    response.writeHead(404, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ error: 'not found' }));
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const address = server.address();
+  assert.equal(typeof address, 'object');
+
+  const child = spawn(
+    process.execPath,
+    [fileURLToPath(new URL('./mcp-xpressclaw.mjs', import.meta.url))],
+    {
+      env: {
+        ...process.env,
+        XPRESSCLAW_URL: `http://127.0.0.1:${address.port}`,
+        XPRESSCLAW_CONTROL_TOKEN: 'internal-secret',
+        XPRESSCLAW_AGENT_ID: 'project-a',
+        XPRESSCLAW_TASK_ID: 'task-9',
+      },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    },
+  );
+  const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
+  const output = lines[Symbol.asyncIterator]();
+  let childError = '';
+  child.stderr.on('data', (chunk) => {
+    childError += chunk.toString('utf8');
+  });
+  const requestMcp = async (message) => {
+    child.stdin.write(`${JSON.stringify(message)}\n`);
+    const next = await output.next();
+    assert.equal(next.done, false, childError || 'MCP server closed stdout unexpectedly');
+    return JSON.parse(next.value);
+  };
+
+  try {
+    const initialized = await requestMcp({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'initialize',
+      params: { protocolVersion: '2025-11-25' },
+    });
+    assert.equal(initialized.result.capabilities.resources.listChanged, true);
+    assert.match(initialized.result.instructions, /3 active note\(s\)/);
+
+    const listed = await requestMcp({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
+    assert.ok(listed.result.tools.some((tool) => tool.name === 'create_project_memory'));
+
+    const created = await requestMcp({
+      jsonrpc: '2.0',
+      id: 3,
+      method: 'tools/call',
+      params: {
+        name: 'create_project_memory',
+        arguments: { title: 'ADR', body: 'Use SQLite.', note_type: 'decision' },
+      },
+    });
+    assert.equal(created.result.structuredContent.id, 'note-1');
+    assert.equal(createdBody.source_task_id, 'task-9');
+    assert.equal(createdBody.created_by, 'agent');
+
+    const notification = await output.next();
+    assert.equal(
+      JSON.parse(notification.value).method,
+      'notifications/resources/list_changed',
+    );
+    assert.ok(controlTokens.length > 0);
+    assert.ok(controlTokens.every((token) => token === 'internal-secret'));
+  } finally {
+    child.stdin.end();
+    if (child.exitCode === null) await once(child, 'exit');
+    lines.close();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('repository adoption maps a nested clone to the assigned workspace boundary', { timeout: 5000 }, async () => {
+  const workspace = await mkdtemp(path.join(tmpdir(), 'xpressclaw-adopt-'));
+  const repository = path.join(workspace, 'nested', 'repo');
+  await mkdir(repository, { recursive: true });
+  await execFile('git', ['-C', repository, 'init', '--quiet']);
+  let proposal = null;
+  let agentHeader = null;
+  const server = createServer(async (request, response) => {
+    if (request.url === '/api/workspaces/atlas/repository/propose' && request.method === 'POST') {
+      const chunks = [];
+      for await (const chunk of request) chunks.push(chunk);
+      proposal = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      agentHeader = request.headers['x-xpressclaw-agent-id'];
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ status: 'pending', path: proposal.path }));
+      return;
+    }
+    response.writeHead(404, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ error: 'not found' }));
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const address = server.address();
+  assert.equal(typeof address, 'object');
+  const child = spawn(process.execPath, [fileURLToPath(new URL('./mcp-xpressclaw.mjs', import.meta.url))], {
+    env: {
+      ...process.env,
+      XPRESSCLAW_URL: `http://127.0.0.1:${address.port}`,
+      XPRESSCLAW_CONTROL_TOKEN: 'internal-secret',
+      XPRESSCLAW_AGENT_ID: 'atlas',
+      XPRESSCLAW_WORKSPACE: workspace,
+      XPRESSCLAW_REPOSITORY: workspace,
+    },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
+  const output = lines[Symbol.asyncIterator]();
+  try {
+    child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'adopt_repository', arguments: { path: 'nested/repo' } } })}\n`);
+    const reply = JSON.parse((await output.next()).value);
+    assert.equal(reply.result.structuredContent.status, 'pending');
+    assert.deepEqual(proposal, { path: 'nested/repo' });
+    assert.equal(agentHeader, 'atlas');
+
+    child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'adopt_repository', arguments: { path: '..' } } })}\n`);
+    const rejected = JSON.parse((await output.next()).value);
+    assert.equal(rejected.result.isError, true);
+    assert.match(rejected.result.content[0].text, /inside the Agent's assigned workspace/);
+  } finally {
+    child.stdin.end();
+    if (child.exitCode === null) await once(child, 'exit');
+    lines.close();
+    await new Promise((resolve) => server.close(resolve));
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test('conversation tools publish files, download attachments, and create linked work', { timeout: 5000 }, async () => {
+  const workspace = await mkdtemp(path.join(tmpdir(), 'xpressclaw-conversation-'));
+  await writeFile(path.join(workspace, 'report.md'), '# Report\nUseful evidence.\n');
+  let publishedBody = null;
+  let taskBody = null;
+  const controlTokens = [];
+  const server = createServer(async (request, response) => {
+    controlTokens.push(request.headers['x-xpressclaw-internal-token']);
+    if (request.url === '/api/memory/project-a/index' && request.method === 'GET') {
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ active_notes: 0, pinned_notes: 0, note_types: [], top_tags: [], pinned: [], recent: [], hint: '' }));
+      return;
+    }
+    if (request.url === '/api/conversations/conversation-a/agent-messages' && request.method === 'POST') {
+      const chunks = [];
+      for await (const chunk of request) chunks.push(chunk);
+      publishedBody = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      response.writeHead(201, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ message: { id: 1 }, queued_agents: [] }));
+      return;
+    }
+    if (request.url === '/api/conversations/conversation-a/attachments/file-1' && request.method === 'GET') {
+      response.writeHead(200, { 'content-type': 'text/markdown' });
+      response.end('# Published finding\n');
+      return;
+    }
+    if (request.url === '/api/conversations/conversation-a/tasks' && request.method === 'POST') {
+      const chunks = [];
+      for await (const chunk of request) chunks.push(chunk);
+      taskBody = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      response.writeHead(201, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ id: 'task-10', ...taskBody }));
+      return;
+    }
+    response.writeHead(404, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ error: 'not found' }));
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const address = server.address();
+  assert.equal(typeof address, 'object');
+
+  const child = spawn(
+    process.execPath,
+    [fileURLToPath(new URL('./mcp-xpressclaw.mjs', import.meta.url))],
+    {
+      env: {
+        ...process.env,
+        XPRESSCLAW_URL: `http://127.0.0.1:${address.port}`,
+        XPRESSCLAW_CONTROL_TOKEN: 'internal-secret',
+        XPRESSCLAW_AGENT_ID: 'atlas',
+        XPRESSCLAW_TASK_ID: 'task-9',
+        XPRESSCLAW_PROJECT_ID: 'project-a',
+        XPRESSCLAW_CONVERSATION_ID: 'conversation-a',
+        XPRESSCLAW_WORKSPACE: workspace,
+      },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    },
+  );
+  const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
+  const output = lines[Symbol.asyncIterator]();
+  let childError = '';
+  child.stderr.on('data', (chunk) => {
+    childError += chunk.toString('utf8');
+  });
+  const requestMcp = async (message) => {
+    child.stdin.write(`${JSON.stringify(message)}\n`);
+    const next = await output.next();
+    assert.equal(next.done, false, childError || 'MCP server closed stdout unexpectedly');
+    return JSON.parse(next.value);
+  };
+
+  try {
+    const initialized = await requestMcp({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-11-25' } });
+    assert.match(initialized.result.instructions, /linked to a project conversation/);
+    assert.match(initialized.result.instructions, /normal final response is automatically delivered to this project conversation/);
+    assert.match(initialized.result.instructions, /Reserve send_conversation_message for genuine interim updates or publishing workspace files while you continue working/);
+    assert.match(initialized.result.instructions, /Never use the tool to duplicate your final response/);
+    const listed = await requestMcp({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
+    assert.deepEqual(
+      listed.result.tools
+        .filter((tool) => tool.name.includes('conversation'))
+        .map((tool) => tool.name),
+      ['send_conversation_message', 'download_conversation_attachment', 'create_conversation_task'],
+    );
+    const sendConversationMessage = listed.result.tools.find((tool) => tool.name === 'send_conversation_message');
+    assert.match(sendConversationMessage.description, /genuine interim update or publish container files or folders/);
+    assert.match(sendConversationMessage.description, /normal final response is delivered automatically/);
+    assert.match(sendConversationMessage.description, /never use this tool to duplicate it/);
+
+    await requestMcp({
+      jsonrpc: '2.0',
+      id: 3,
+      method: 'tools/call',
+      params: { name: 'send_conversation_message', arguments: { content: 'Research complete.', files: ['report.md'] } },
+    });
+    assert.equal(publishedBody.agent_id, 'atlas');
+    assert.equal(publishedBody.source_task_id, 'task-9');
+    assert.equal(Buffer.from(publishedBody.attachments[0].data, 'base64').toString('utf8'), '# Report\nUseful evidence.\n');
+
+    const downloaded = await requestMcp({
+      jsonrpc: '2.0',
+      id: 4,
+      method: 'tools/call',
+      params: { name: 'download_conversation_attachment', arguments: { attachment_id: 'file-1', file_name: '../finding.md' } },
+    });
+    const downloadedPath = downloaded.result.structuredContent.path;
+    assert.equal(path.dirname(downloadedPath), path.join(workspace, '.xpressclaw', 'conversations', 'conversation-a'));
+    assert.equal(await readFile(downloadedPath, 'utf8'), '# Published finding\n');
+
+    await requestMcp({
+      jsonrpc: '2.0',
+      id: 5,
+      method: 'tools/call',
+      params: { name: 'create_conversation_task', arguments: { title: 'Continue research', description: 'Check the edge cases.' } },
+    });
+    assert.equal(taskBody.agent_id, 'atlas');
+    assert.equal(taskBody.creator_agent_id, 'atlas');
+    assert.equal(taskBody.project_id, 'project-a');
+    assert.ok(controlTokens.length > 0);
+    assert.ok(controlTokens.every((token) => token === 'internal-secret'));
+  } finally {
+    child.stdin.end();
+    if (child.exitCode === null) await once(child, 'exit');
+    lines.close();
+    await new Promise((resolve) => server.close(resolve));
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+for (const mode of ['legacy-chat', 'task-command']) {
+test(`connected ${mode} tools publish through the platform bridge and cannot schedule local work`, { timeout: 5000 }, async () => {
+  const requests = [];
+  const directory = await mkdtemp(path.join(tmpdir(), 'connect-tools-test-'));
+  const file = path.join(directory, 'result.txt');
+  await writeFile(file, 'result');
+  const server = createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    requests.push({ url: request.url, agent: request.headers['x-xpressclaw-agent-id'], body: JSON.parse(Buffer.concat(chunks).toString()) });
+    response.writeHead(200, { 'content-type': 'application/json' }); response.end('{}');
+  });
+  server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  const child = spawn(process.execPath, [fileURLToPath(new URL('./mcp-xpressclaw.mjs', import.meta.url))], {
+    env: { ...process.env, XPRESSCLAW_WORKSPACE: directory, XPRESSCLAW_URL: `http://127.0.0.1:${server.address().port}`, XPRESSCLAW_AGENT_ID: 'atlas', XPRESSCLAW_CONVERSATION_ID: mode === 'legacy-chat' ? 'linked-turn' : '', XPRESSCLAW_TASK_ID: mode === 'task-command' ? 'local-task' : '', XPRESSCLAW_CONNECT_COMMAND_ID: mode === 'task-command' ? 'execution-id' : '', XPRESSCLAW_CONNECT: '1' }, stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  const output = createInterface({ input: child.stdout })[Symbol.asyncIterator](); let id = 0;
+  async function call(method, params) {
+    child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: ++id, method, params }) + '\n');
+    return JSON.parse((await output.next()).value).result;
+  }
+  try {
+    const names = (await call('tools/list')).tools.map(tool => tool.name);
+    assert.ok(names.includes('publish_task_files'));
+    assert.ok(names.includes('update_task_status'));
+    assert.ok(names.includes('send_conversation_message'));
+    assert.ok(names.includes('create_conversation_task'));
+    await call('tools/call', { name: 'get_task', arguments: {} });
+    assert.equal(requests.pop().body.name, 'get_task');
+    for (const name of ['forward_port', 'expose_port', 'list_port_forwards', 'remove_port_forward']) {
+      assert.ok(!names.includes(name), name);
+      const denied = await call('tools/call', { name, arguments: { direction: 'host_to_container', host_port: 8080, container_port: 8081, id: 'mapping' } });
+      assert.equal(denied.isError, true, name);
+      assert.equal(requests.length, 0);
+    }
+    assert.ok(!names.includes('schedule_wakeup'));
+    const denied = await call('tools/call', { name: 'schedule_wakeup', arguments: { delay_seconds: 10 } });
+    assert.equal(denied.isError, true); assert.equal(requests.length, 0);
+    const sent = await call('tools/call', { name: 'publish_task_files', arguments: { files: [file], content: 'Ready' } });
+    assert.equal(sent.isError, false, JSON.stringify(sent));
+    assert.equal(requests.at(-1).url, mode === 'task-command' ? '/api/settings/connect/commands/execution-id/tools' : '/api/settings/connect/conversations/linked-turn/tools');
+    assert.equal(requests.at(-1).body.name, 'send_message');
+    assert.equal(Buffer.from(requests.at(-1).body.arguments.attachments[0].data, 'base64').toString(), 'result');
+    await call('tools/call', { name: 'update_task_status', arguments: { status: 'Done' } });
+    assert.deepEqual(requests.at(-1).body, { name: 'update_task_status', arguments: { status: 'Done' } });
+  } finally { child.kill(); await new Promise(resolve => server.close(resolve)); await rm(directory, { recursive: true, force: true }); }
+});
+
+}

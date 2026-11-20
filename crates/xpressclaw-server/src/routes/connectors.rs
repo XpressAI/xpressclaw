@@ -207,7 +207,7 @@ async fn create_channel(
                 agent_id: req.agent_id,
             },
         )
-        .map_err(internal_error)?;
+        .map_err(channel_binding_error)?;
     Ok((StatusCode::CREATED, Json(json!(ch))))
 }
 
@@ -228,10 +228,7 @@ async fn update_channel(
     let mgr = ConnectorManager::new(state.db.clone());
     let ch = mgr
         .update_channel(&channel_id, req.agent_id.as_deref())
-        .map_err(|e| match &e {
-            xpressclaw_core::error::Error::ChannelNotFound { .. } => not_found(&e),
-            _ => internal_error(e),
-        })?;
+        .map_err(channel_binding_error)?;
     Ok(Json(json!(ch)))
 }
 
@@ -277,4 +274,19 @@ fn not_found(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
         StatusCode::NOT_FOUND,
         Json(json!({ "error": e.to_string() })),
     )
+}
+
+fn channel_binding_error(
+    error: xpressclaw_core::error::Error,
+) -> (StatusCode, Json<Value>) {
+    match &error {
+        xpressclaw_core::error::Error::AgentNotFound { .. }
+        | xpressclaw_core::error::Error::ChannelNotFound { .. }
+        | xpressclaw_core::error::Error::ProjectNotFound { .. } => not_found(&error),
+        xpressclaw_core::error::Error::Project(_) => (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": error.to_string() })),
+        ),
+        _ => internal_error(error),
+    }
 }

@@ -17,9 +17,9 @@ not yet available. The practical local engine may be rootful Docker, Docker
 Desktop, or rootless Podman.
 
 The expected threat model is trusted agents and trusted runner images. The
-short-lived worker should contain accidental damage to its own root filesystem,
-but the host container engine is not treated as a boundary against a malicious
-worker.
+Agent container contains accidental damage to its own root filesystem, which
+ADR-033 now retains between turns, but the host container engine is not treated
+as a boundary against a malicious worker.
 
 ## Decision
 
@@ -84,3 +84,13 @@ would make every product image larger.
 
 Rejected as the only option because it would leave common repository test and
 release workflows unusable in the current implementation.
+
+### Retained environment dependencies
+
+Agent-created containers may share a retained Agent's network, IPC, or PID
+namespace, or use its volumes. They can outlive a turn and remain dependencies
+even when stopped. ADR-033 preserves the Agent environment across image updates
+and checks these dependencies before explicit removal. Rebuild/delete must report
+the dependent containers, leaving the user to migrate or remove them explicitly.
+Host-engine access remains available; dependency handling must not disable it or
+recursively delete arbitrary host workloads.

@@ -1,0 +1,215 @@
+<script lang="ts">
+	import { onMount } from 'svelte';
+	import '@xterm/xterm/css/xterm.css';
+	import { request, environments } from '$lib/api';
+	import { openExternal } from '$lib/utils';
+
+	let { agentId, initialSession = 'xpressclaw', authenticationMethod, onAuthenticated }: {
+		agentId: string; initialSession?: string; authenticationMethod?: string; onAuthenticated?: () => void;
+	} = $props();
+	let host = $state<HTMLDivElement>();
+	let connected = $state(false);
+	let connecting = $state(true);
+	let error = $state('');
+	let reconnect = $state<() => void>(() => {});
+	let session = $state('xpressclaw');
+	let joinedSession = $state('');
+	let sessions = $state<string[]>([]);
+	let shareMessage = $state('');
+	async function refreshSessions() {
+		try { sessions = (await environments.terminalSessions(agentId)).sessions; }
+		catch (cause) { error = String(cause); }
+	}
+	async function shareSession() {
+		if (!connected || !joinedSession) return;
+		const url = new URL(`/agents/${encodeURIComponent(agentId)}`, window.location.origin);
+		url.searchParams.set('tab', 'files'); url.searchParams.set('terminal', joinedSession);
+		try { await navigator.clipboard.writeText(url.toString()); shareMessage = 'Link copied'; }
+		catch { shareMessage = url.toString(); }
+	}
+
+	onMount(() => {
+		session = initialSession;
+		let disposed = false;
+		let cleanup = () => {};
+		void (async () => {
+			const [{ Terminal }, { FitAddon }, { WebLinksAddon }] = await Promise.all([
+				import('@xterm/xterm'),
+				import('@xterm/addon-fit'),
+				import('@xterm/addon-web-links'),
+			]);
+			if (disposed || !host) return;
+			const terminal = new Terminal({
+				cursorBlink: true,
+				convertEol: false,
+				fontSize: 13,
+				fontFamily: "'JetBrains Mono', 'Cascadia Code', 'SFMono-Regular', Consolas, monospace",
+				scrollback: 10_000,
+				theme: terminalTheme(),
+			});
+			const fitAddon = new FitAddon();
+			terminal.loadAddon(fitAddon);
+			terminal.loadAddon(new WebLinksAddon((_event, uri) => {
+				void openExternal(uri).catch((cause) => {
+					error = `Could not open link: ${String(cause)}`;
+				});
+			}));
+			terminal.open(host);
+			requestAnimationFrame(() => fitAddon.fit());
+
+			let websocket: WebSocket | null = null;
+			let signedIn = false;
+			const encoder = new TextEncoder();
+			const decoder = new TextDecoder();
+
+			function connect() {
+				if (!/^[A-Za-z0-9_-]{1,64}$/.test(session)) { error = 'Use 1–64 letters, digits, underscores or hyphens for the session name.'; connecting = false; return; }
+				const requestedSession = session;
+				websocket?.close();
+				connected = false;
+				connecting = true;
+				signedIn = false;
+				error = '';
+				if (authenticationMethod) terminal.reset();
+				terminal.writeln(authenticationMethod ? '\x1b[90mStarting sign-in…\x1b[0m' : '\x1b[90mConnecting to the retained project environment…\x1b[0m');
+				const url = new URL(authenticationMethod
+					? `/api/sessions/${encodeURIComponent(agentId)}/authentication/terminal`
+					: `/api/workspaces/${encodeURIComponent(agentId)}/terminal`, window.location.href);
+				url.protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+				url.searchParams.set('columns', String(terminal.cols));
+				url.searchParams.set('rows', String(terminal.rows));
+				url.searchParams.set('session', requestedSession);
+				if (authenticationMethod) url.searchParams.set('method_id', authenticationMethod);
+				websocket = new WebSocket(url);
+				const connection = websocket;
+				websocket.binaryType = 'arraybuffer';
+				websocket.onmessage = (event) => {
+					if (websocket !== connection || disposed) return;
+					if (typeof event.data === 'string') {
+						try {
+							const control = JSON.parse(event.data) as { type?: string; message?: string };
+							if (control.type === 'ready') {
+								connected = true;
+								joinedSession = requestedSession;
+								connecting = false;
+								terminal.focus();
+								if (!authenticationMethod) void refreshSessions();
+							} else if (control.type === 'authenticated') {
+								signedIn = true;
+								connected = false;
+								connecting = false;
+								onAuthenticated?.();
+							} else if (control.type === 'error') {
+								error = control.message || 'The terminal failed to start.';
+								connecting = false;
+								terminal.writeln(`\r\n\x1b[31m${error}\x1b[0m`);
+							} else if (control.type === 'exit') {
+								connected = false;
+								connecting = false;
+								terminal.writeln('\r\n\x1b[90mTerminal exited.\x1b[0m');
+							}
+						} catch {
+							terminal.write(event.data);
+						}
+						return;
+					}
+					if (event.data instanceof ArrayBuffer) {
+						terminal.write(decoder.decode(new Uint8Array(event.data), { stream: true }));
+					} else if (event.data instanceof Blob) {
+						void event.data.arrayBuffer().then((buffer) => {
+							terminal.write(decoder.decode(new Uint8Array(buffer), { stream: true }));
+						});
+					}
+				};
+			websocket.onerror = () => {
+				if (websocket !== connection || disposed) return;
+				connected = false;
+				connecting = false;
+				error = 'Could not connect to the retained project environment.';
+				// WebSocket does not expose an HTTP 401 handshake to JavaScript.
+				// Probe a protected endpoint so expired sessions recover through
+				// the normal login redirect instead of looking like a terminal fault.
+				void request(`/api/agents/${encodeURIComponent(agentId)}`).catch(() => undefined);
+			};
+				websocket.onclose = () => {
+					if (websocket !== connection || disposed) return;
+					connected = false;
+					connecting = false;
+					if (authenticationMethod && !signedIn && !error) error = 'Sign-in was interrupted. You can try again.';
+				};
+			}
+
+			const inputSubscription = terminal.onData((data) => {
+				if (websocket?.readyState === WebSocket.OPEN) websocket.send(encoder.encode(data));
+			});
+			const resizeSubscription = terminal.onResize(({ cols, rows }) => {
+				if (websocket?.readyState === WebSocket.OPEN) {
+					websocket.send(JSON.stringify({ type: 'resize', columns: cols, rows }));
+				}
+			});
+			const resizeObserver = new ResizeObserver(() => {
+				try { fitAddon.fit(); } catch {}
+			});
+			resizeObserver.observe(host);
+			const themeObserver = new MutationObserver(() => {
+				terminal.options.theme = terminalTheme();
+			});
+			themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
+			reconnect = connect;
+			connect();
+
+			cleanup = () => {
+				websocket?.close();
+				inputSubscription.dispose();
+				resizeSubscription.dispose();
+				resizeObserver.disconnect();
+				themeObserver.disconnect();
+				terminal.dispose();
+			};
+		})();
+		return () => {
+			disposed = true;
+			cleanup();
+		};
+	});
+
+	function terminalTheme() {
+		const dark = document.documentElement.classList.contains('dark');
+		return dark
+			? {
+				background: '#0d0f18', foreground: '#e4e7ef', cursor: '#7c93ff',
+				selectionBackground: '#33467a', black: '#141722', red: '#f87171', green: '#34d399',
+				yellow: '#fbbf24', blue: '#60a5fa', magenta: '#c084fc', cyan: '#22d3ee', white: '#e5e7eb',
+			}
+			: {
+				background: '#ffffff', foreground: '#1f2937', cursor: '#365bd6',
+				selectionBackground: '#c7d2fe', black: '#111827', red: '#dc2626', green: '#059669',
+				yellow: '#d97706', blue: '#2563eb', magenta: '#9333ea', cyan: '#0891b2', white: '#f3f4f6',
+			};
+	}
+</script>
+
+<div class="flex h-full min-h-[12rem] flex-col bg-background" data-project-terminal>
+	<div class="flex h-8 shrink-0 items-center justify-between border-b border-border px-3 text-[11px] text-muted-foreground">
+		<div class="flex items-center gap-2">
+			<span class="h-1.5 w-1.5 rounded-full {connected ? 'bg-emerald-500' : connecting ? 'animate-pulse bg-amber-500' : 'bg-muted-foreground'}"></span>
+			<span>{authenticationMethod ? (connected ? 'Agent sign-in' : connecting ? 'Connecting…' : 'Sign-in disconnected') : (connected ? 'Container terminal' : connecting ? 'Connecting…' : 'Terminal disconnected')}</span>
+		</div>
+		{#if !authenticationMethod}
+		<form class="flex items-center gap-2" onsubmit={(event) => { event.preventDefault(); shareMessage = ''; reconnect(); }}>
+			<input aria-label="tmux session name" list={`terminal-sessions-${agentId}`} bind:value={session} class="w-28 rounded border border-border bg-background px-2 py-0.5" />
+			<datalist id={`terminal-sessions-${agentId}`}>{#each sessions as name}<option value={name}></option>{/each}</datalist>
+			<button class="rounded border border-border px-2 py-0.5">Join / create</button>
+			<button type="button" disabled={!connected} onclick={shareSession} class="rounded border border-border px-2 py-0.5 disabled:opacity-50">Share</button>
+		</form>
+		{/if}
+		{#if !connected && !connecting}
+			<button type="button" onclick={() => reconnect()} class="rounded border border-border px-2 py-0.5 hover:bg-accent">Reconnect</button>
+		{/if}
+	</div>
+	<div bind:this={host} class="min-h-0 flex-1 p-2"></div>
+	{#if shareMessage}<p class="px-3 text-xs text-muted-foreground">{shareMessage}</p>{/if}
+	{#if error}
+		<div class="shrink-0 border-t border-destructive/30 bg-destructive/5 px-3 py-1.5 text-[11px] text-destructive">{error}</div>
+	{/if}
+</div>

@@ -1,10 +1,14 @@
 use std::sync::Arc;
 
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
+use uuid::Uuid;
 
+use crate::dashboard::finalize_inactive_git_baselines;
 use crate::db::Database;
 use crate::error::{Error, Result};
+use crate::projects::ensure_project_accepts_work;
 use crate::sessions::SessionManager;
 
 /// A queued task item for native attempt dispatch.
@@ -31,17 +35,228 @@ impl TaskQueue {
         Self { db }
     }
 
+    pub(crate) fn ensure_locally_scheduled(
+        conn: &rusqlite::Connection,
+        task_id: &str,
+    ) -> Result<()> {
+        let connected: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM connect_work WHERE kind='task_turn' AND local_id=?1)",
+            [task_id],
+            |r| r.get(0),
+        )?;
+        if connected {
+            return Err(Error::Task(
+                "This task is scheduled by Xpress AI; continue it on the platform".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Enqueue a task for an agent.
     pub fn enqueue(&self, task_id: &str, agent_id: &str) -> Result<QueueItem> {
+        let item = self.db.with_conn(|conn| {
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let item = Self::enqueue_in_transaction(&transaction, task_id, agent_id)?;
+            transaction.commit()?;
+            Ok::<_, Error>(item)
+        })?;
+        debug!(task_id, agent_id, queue_id = item.id, "enqueued task");
+        Ok(item)
+    }
+
+    /// Create a queue item and its initial attempt inside a caller-owned
+    /// transaction. Conversation work uses this so dispatch cannot survive a
+    /// failed linked-message publication.
+    pub(crate) fn enqueue_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        task_id: &str,
+        agent_id: &str,
+    ) -> Result<QueueItem> {
+        Self::ensure_locally_scheduled(transaction, task_id)?;
+        Self::enqueue_authorized_in_transaction(transaction, task_id, agent_id)
+    }
+
+    /// Only Connect admission may bypass local scheduling policy, after
+    /// validating its command, binding, and lease in this same transaction.
+    pub(crate) fn enqueue_platform_task_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        task_id: &str,
+        agent_id: &str,
+    ) -> Result<QueueItem> {
+        Self::enqueue_authorized_in_transaction(transaction, task_id, agent_id)
+    }
+
+    fn enqueue_authorized_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        task_id: &str,
+        agent_id: &str,
+    ) -> Result<QueueItem> {
+        ensure_task_project_accepts_work(transaction, task_id)?;
+        if let Some(item) = transaction.query_row(
+            "SELECT * FROM task_queue WHERE task_id = ?1 AND status = 'queued' ORDER BY id LIMIT 1",
+            [task_id], |row| Ok(row_to_item(row)),
+        ).optional()?.transpose()? {
+            Self::preserve_queued_response(transaction, task_id)?;
+            return Ok(item);
+        }
+        Self::enqueue_new_in_transaction(transaction, task_id, agent_id)
+    }
+
+    /// Insert a distinct response, after the caller has checked admission.
+    fn enqueue_new_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        task_id: &str,
+        agent_id: &str,
+    ) -> Result<QueueItem> {
+        let (title, description, context) = transaction.query_row(
+            "SELECT title, description, context FROM tasks WHERE id = ?1",
+            [task_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )?;
+        let context = context
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
+        let kind = context
+            .as_ref()
+            .and_then(|value| value.get("kind"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("task");
+        let source_type = context
+            .as_ref()
+            .and_then(|value| value.get("origin"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("task");
+        let source_id = context
+            .as_ref()
+            .and_then(|value| value.get("source_id"))
+            .and_then(|value| value.as_str())
+            .unwrap_or(task_id);
+        let prompt = match description {
+            Some(description) if !description.trim().is_empty() => {
+                format!("{title}\n\n{description}")
+            }
+            _ => title,
+        };
+
+        transaction.execute(
+            "INSERT INTO task_queue (task_id, agent_id, status) VALUES (?1, ?2, 'queued')",
+            rusqlite::params![task_id, agent_id],
+        )?;
+        let queue_id = transaction.last_insert_rowid();
+        let attempt_id = Uuid::new_v4().to_string();
+        transaction.execute(
+            "INSERT OR IGNORE INTO logical_sessions (id, agent_id) VALUES (?1, ?1)",
+            [agent_id],
+        )?;
+        transaction.execute(
+            "INSERT INTO work_attempts
+             (id, session_id, task_id, queue_id, kind, runner, status, prompt,
+              response_queued_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'auto', 'queued', ?6, CURRENT_TIMESTAMP)",
+            rusqlite::params![attempt_id, agent_id, task_id, queue_id, kind, prompt],
+        )?;
+        transaction.execute(
+            "UPDATE task_queue SET attempt_id = ?1 WHERE id = ?2",
+            rusqlite::params![attempt_id, queue_id],
+        )?;
+        transaction.execute(
+            "UPDATE tasks SET session_id = ?1, active_attempt_id = ?2,
+                updated_at = CURRENT_TIMESTAMP WHERE id = ?3",
+            rusqlite::params![agent_id, attempt_id, task_id],
+        )?;
+        transaction.execute(
+            "UPDATE logical_sessions SET status = 'queued', updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?1 AND status != 'running'",
+            [agent_id],
+        )?;
+        transaction.execute(
+            "INSERT INTO session_events
+             (session_id, attempt_id, task_id, source_type, source_id,
+              event_type, summary, payload)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'attempt_queued', 'Work queued', ?6)",
+            rusqlite::params![
+                agent_id,
+                attempt_id,
+                task_id,
+                source_type,
+                source_id,
+                serde_json::json!({ "runner": "auto", "kind": kind, "queue_id": queue_id })
+                    .to_string(),
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE logical_sessions
+             SET latest_summary = 'Work queued', updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?1",
+            [agent_id],
+        )?;
+
+        transaction
+            .query_row(
+                "SELECT * FROM task_queue WHERE id = ?1",
+                [queue_id],
+                |row| Ok(row_to_item(row)),
+            )
+            .map_err(Error::from)?
+    }
+
+    /// Ensure a task has exactly one dispatchable queue item. Workflow
+    /// recovery uses this after persisting task ownership but before (or after
+    /// an interrupted) initial dispatch.
+    pub fn ensure_enqueued(&self, task_id: &str, agent_id: &str) -> Result<Option<QueueItem>> {
         let id = self.db.with_conn(|conn| {
-            conn.execute(
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let inactive_workflow: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM workflow_step_executions e
+                 JOIN workflow_instances i ON i.id = e.instance_id
+                 WHERE e.task_id = ?1 AND e.task_id IS NOT i.source_task_id
+                   AND (i.status != 'running' OR e.status != 'running'))",
+                [task_id],
+                |row| row.get(0),
+            )?;
+            if inactive_workflow {
+                transaction.commit()?;
+                return Ok(None);
+            }
+            Self::ensure_locally_scheduled(&transaction, task_id)?;
+            ensure_task_project_accepts_work(&transaction, task_id)?;
+            let active = transaction
+                .query_row(
+                    "SELECT id, attempt_id FROM task_queue
+                     WHERE task_id = ?1 AND status IN ('queued', 'running')
+                     ORDER BY id DESC LIMIT 1",
+                    [task_id],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+                )
+                .optional()?;
+            if let Some((id, attempt_id)) = active {
+                Self::preserve_queued_response(&transaction, task_id)?;
+                transaction.commit()?;
+                return Ok::<_, Error>(attempt_id.is_none().then_some(id));
+            }
+            transaction.execute(
                 "INSERT INTO task_queue (task_id, agent_id, status) VALUES (?1, ?2, 'queued')",
                 rusqlite::params![task_id, agent_id],
             )?;
-            Ok::<_, Error>(conn.last_insert_rowid())
+            let id = transaction.last_insert_rowid();
+            transaction.commit()?;
+            Ok(Some(id))
         })?;
 
-        self.create_attempt_for_item(id, task_id, agent_id)
+        id.map(|id| self.create_attempt_for_item(id, task_id, agent_id))
+            .transpose()
     }
 
     /// Enqueue one continuation turn unless the task already has a queued
@@ -49,7 +264,13 @@ impl TaskQueue {
     /// continuation waits behind it and receives any messages sent meanwhile.
     pub fn enqueue_continuation(&self, task_id: &str, agent_id: &str) -> Result<Option<QueueItem>> {
         let id = self.db.with_conn(|conn| {
-            let changed = conn.execute(
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            Self::ensure_locally_scheduled(&transaction, task_id)?;
+            ensure_task_project_accepts_work(&transaction, task_id)?;
+            let changed = transaction.execute(
                 "INSERT INTO task_queue (task_id, agent_id, status)
                  SELECT ?1, ?2, 'queued'
                  WHERE NOT EXISTS (
@@ -57,11 +278,458 @@ impl TaskQueue {
                  )",
                 rusqlite::params![task_id, agent_id],
             )?;
-            Ok::<_, Error>((changed == 1).then(|| conn.last_insert_rowid()))
+            let id = (changed == 1).then(|| transaction.last_insert_rowid());
+            Self::preserve_queued_response(&transaction, task_id)?;
+            transaction.commit()?;
+            Ok::<_, Error>(id)
         })?;
 
         id.map(|id| self.create_attempt_for_item(id, task_id, agent_id))
             .transpose()
+    }
+
+    /// Enqueue (or coalesce into) the response cycle triggered by a user
+    /// message, retaining an explicit association instead of inferring the
+    /// timer anchor from unrelated task history.
+    pub fn enqueue_continuation_for_message(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+        message_id: i64,
+        message_timestamp: &str,
+    ) -> Result<Option<QueueItem>> {
+        let created = self.db.with_conn(|conn| {
+            // Reserve the writer before looking for a coalescible continuation.
+            // Otherwise the dispatcher can claim that row between the lookup
+            // and trigger update, leaving this message attached to no response.
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let item = Self::enqueue_continuation_for_message_in_transaction(
+                &transaction,
+                task_id,
+                agent_id,
+                message_id,
+                message_timestamp,
+            )?;
+            transaction.commit()?;
+            Ok::<_, Error>(item)
+        })?;
+
+        if let Some(item) = created.as_ref() {
+            debug!(
+                task_id,
+                agent_id,
+                queue_id = item.id,
+                "enqueued task continuation"
+            );
+        }
+        Ok(created)
+    }
+
+    /// Enqueue or coalesce a message-triggered continuation in a caller-owned
+    /// transaction. The message itself may therefore share one commit with a
+    /// workflow step execution.
+    pub(crate) fn enqueue_continuation_for_message_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        task_id: &str,
+        agent_id: &str,
+        message_id: i64,
+        message_timestamp: &str,
+    ) -> Result<Option<QueueItem>> {
+        Self::ensure_locally_scheduled(transaction, task_id)?;
+        ensure_task_project_accepts_work(transaction, task_id)?;
+        let queued_attempt_id = Self::coalescible_queued_attempt(transaction, task_id)?;
+
+        let (created, response_attempt_id) = match queued_attempt_id {
+            Some(Some(attempt_id)) => {
+                Self::associate_response_trigger_in_transaction(
+                    transaction,
+                    &attempt_id,
+                    message_id,
+                    message_timestamp,
+                )?;
+                (None, attempt_id)
+            }
+            Some(None) => {
+                return Err(Error::Task(format!(
+                    "queued continuation for task {task_id} has no work attempt"
+                )));
+            }
+            None => {
+                let item = Self::enqueue_in_transaction(transaction, task_id, agent_id)?;
+                let attempt_id = item.attempt_id.clone().ok_or_else(|| {
+                    Error::Task(format!(
+                        "queued continuation for task {task_id} has no work attempt"
+                    ))
+                })?;
+                Self::associate_response_trigger_in_transaction(
+                    transaction,
+                    &attempt_id,
+                    message_id,
+                    message_timestamp,
+                )?;
+                (Some(item), attempt_id)
+            }
+        };
+        // This response now also owns a reply or scheduled message, even if
+        // a delegation notification originally created it.
+        transaction.execute(
+            "DELETE FROM task_delegation_automatic_responses WHERE response_attempt_id=?1",
+            [&response_attempt_id],
+        )?;
+        Self::adopt_waiting_workflow_continuation_in_transaction(
+            transaction,
+            task_id,
+            &response_attempt_id,
+        )?;
+        // Reopen a terminal or parked task in the same commit that makes its
+        // response dispatchable. The route's earlier task snapshot may have
+        // raced with workflow cancellation or another terminal transition.
+        transaction.execute(
+            "UPDATE tasks
+             SET status = CASE
+                     WHEN status IN ('completed', 'cancelled', 'waiting_for_input', 'blocked')
+                     THEN 'pending' ELSE status END,
+                 completed_at = CASE
+                     WHEN status IN ('completed', 'cancelled', 'waiting_for_input', 'blocked')
+                     THEN NULL ELSE completed_at END,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?1",
+            [task_id],
+        )?;
+        Ok(created)
+    }
+
+    /// A user response to a question asked by a same-task workflow
+    /// continuation remains part of that continuation. Move the durable
+    /// ownership marker from the completed question turn to the newly queued
+    /// answer turn before reopening the task.
+    fn adopt_waiting_workflow_continuation_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        task_id: &str,
+        response_attempt_id: &str,
+    ) -> Result<()> {
+        let waiting = transaction
+            .query_row(
+                "SELECT execution.id, execution.continuation_attempt_id,
+                        COALESCE(attempt.result, attempt.error_message, '')
+                 FROM workflow_step_executions execution
+                 JOIN workflow_instances instance ON instance.id = execution.instance_id
+                 JOIN work_attempts attempt
+                   ON attempt.id = execution.continuation_attempt_id
+                 JOIN tasks task ON task.id = execution.task_id
+                 WHERE execution.task_id = ?1
+                   AND execution.status = 'running'
+                   AND instance.status = 'running'
+                   AND task.status = 'waiting_for_input'
+                   AND attempt.status = 'completed'
+                 ORDER BY execution.started_at ASC, execution.rowid ASC
+                 LIMIT 1",
+                [task_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((execution_id, previous_attempt_id, output)) = waiting else {
+            return Ok(());
+        };
+        if !crate::workers::native::needs_user_input(&output) {
+            return Ok(());
+        }
+        transaction.execute(
+            "UPDATE workflow_step_executions
+             SET continuation_attempt_id = ?1
+             WHERE id = ?2 AND continuation_attempt_id = ?3 AND status = 'running'",
+            rusqlite::params![response_attempt_id, execution_id, previous_attempt_id],
+        )?;
+        Ok(())
+    }
+
+    /// Recovery notifications may share ordinary pending guidance, but must not
+    /// acquire a workflow continuation or an old assignment's queued response.
+    pub(super) fn enqueue_delegation_notification_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        task_id: &str,
+        agent_id: &str,
+        message_id: i64,
+        message_timestamp: &str,
+    ) -> Result<String> {
+        Self::ensure_locally_scheduled(transaction, task_id)?;
+        ensure_task_project_accepts_work(transaction, task_id)?;
+        let queued: Option<String> = transaction
+            .query_row(
+                "SELECT q.attempt_id FROM task_queue q
+             JOIN work_attempts a ON a.id=q.attempt_id
+             WHERE q.task_id=?1 AND q.agent_id=?2 AND a.session_id=?2
+               AND q.status='queued' AND a.status='queued'
+               AND NOT EXISTS (SELECT 1 FROM workflow_step_executions e
+                   WHERE e.continuation_attempt_id=q.attempt_id)
+             ORDER BY q.id DESC LIMIT 1",
+                rusqlite::params![task_id, agent_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let attempt_id = match queued {
+            Some(id) => id,
+            None => {
+                let id = Self::enqueue_new_in_transaction(transaction, task_id, agent_id)?
+                    .attempt_id
+                    .ok_or_else(|| Error::Task("Recovery response has no attempt".into()))?;
+                transaction.execute("INSERT INTO task_delegation_automatic_responses(response_attempt_id) VALUES(?1)", [&id])?;
+                id
+            }
+        };
+        Self::associate_response_trigger_in_transaction(
+            transaction,
+            &attempt_id,
+            message_id,
+            message_timestamp,
+        )?;
+        Ok(attempt_id)
+    }
+
+    /// Ordinary admission adopts any existing automatic response. A later
+    /// child resolution must not discard this independently requested work.
+    fn preserve_queued_response(
+        transaction: &rusqlite::Transaction<'_>,
+        task_id: &str,
+    ) -> Result<()> {
+        transaction.execute("DELETE FROM task_delegation_automatic_responses
+            WHERE response_attempt_id IN (SELECT attempt_id FROM task_queue WHERE task_id=?1 AND status='queued')", [task_id])?;
+        Ok(())
+    }
+
+    /// Find the newest queued response that may absorb another user message.
+    /// A workflow continuation owns its attempt exclusively: otherwise a user
+    /// message could become part of that attempt and be discarded when only
+    /// the workflow run is cancelled.
+    fn coalescible_queued_attempt(
+        transaction: &rusqlite::Transaction<'_>,
+        task_id: &str,
+    ) -> Result<Option<Option<String>>> {
+        transaction
+            .query_row(
+                "SELECT queue.attempt_id
+                 FROM task_queue queue
+                 WHERE queue.task_id = ?1 AND queue.status = 'queued'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM workflow_step_executions execution
+                       WHERE execution.continuation_attempt_id = queue.attempt_id
+                   )
+                 ORDER BY queue.id DESC LIMIT 1",
+                [task_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(Error::from)
+    }
+
+    fn associate_response_trigger_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        attempt_id: &str,
+        message_id: i64,
+        message_timestamp: &str,
+    ) -> Result<()> {
+        let updated = transaction.execute(
+            "UPDATE work_attempts
+             SET response_queued_at = CASE
+                    WHEN COALESCE(trigger_message_id, 0) <= ?1 THEN ?2
+                    ELSE response_queued_at END,
+                 trigger_message_id = MAX(COALESCE(trigger_message_id, 0), ?1)
+             WHERE id = ?3",
+            rusqlite::params![message_id, message_timestamp, attempt_id],
+        )?;
+        if updated != 1 {
+            return Err(Error::Task(format!(
+                "queued continuation attempt {attempt_id} was not found"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Add GitHub review feedback and enqueue a continuation for the task's
+    /// current assignment as one atomic unit.
+    ///
+    /// GitHub review polling performs network I/O before it knows a follow-up
+    /// is necessary. The task may be reassigned or cancelled during that
+    /// await, so callers must not reuse the agent or status from their older
+    /// polling snapshot here. A terminal task returns `None` without adding a
+    /// message or creating work.
+    pub(crate) fn enqueue_review_follow_up_for_current_agent(
+        &self,
+        task_id: &str,
+        message: &str,
+    ) -> Result<Option<(String, Option<QueueItem>)>> {
+        let outcome = self.db.with_conn(|conn| {
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            Self::ensure_locally_scheduled(&transaction, task_id)?;
+            ensure_task_project_accepts_work(&transaction, task_id)?;
+            let (agent_id, title, description, context, status): (
+                Option<String>,
+                String,
+                Option<String>,
+                Option<String>,
+                String,
+            ) = transaction.query_row(
+                "SELECT agent_id, title, description, context, status
+                 FROM tasks WHERE id = ?1",
+                [task_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )?;
+            if matches!(status.as_str(), "completed" | "cancelled") {
+                transaction.commit()?;
+                return Ok::<_, Error>(None);
+            }
+            let agent_id = agent_id
+                .filter(|agent_id| !agent_id.trim().is_empty())
+                .ok_or_else(|| {
+                    Error::Task("cannot queue review feedback for an unassigned task".into())
+                })?;
+            transaction.execute(
+                "INSERT INTO task_messages (task_id, role, content) VALUES (?1, 'user', ?2)",
+                rusqlite::params![task_id, message],
+            )?;
+            let message_id = transaction.last_insert_rowid();
+            let message_timestamp: String = transaction.query_row(
+                "SELECT timestamp FROM task_messages WHERE id = ?1",
+                [message_id],
+                |row| row.get(0),
+            )?;
+            if let Some(attempt_id) = Self::coalescible_queued_attempt(&transaction, task_id)? {
+                let attempt_id = attempt_id.ok_or_else(|| {
+                    Error::Task(format!(
+                        "queued continuation for task {task_id} has no work attempt"
+                    ))
+                })?;
+                Self::associate_response_trigger_in_transaction(
+                    &transaction,
+                    &attempt_id,
+                    message_id,
+                    &message_timestamp,
+                )?;
+                Self::preserve_queued_response(&transaction, task_id)?;
+                transaction.execute(
+                    "UPDATE tasks SET status = 'in_progress', completed_at = NULL,
+                        updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+                    [task_id],
+                )?;
+                transaction.commit()?;
+                return Ok::<_, Error>(Some((agent_id, None)));
+            }
+
+            transaction.execute(
+                "INSERT INTO task_queue (task_id, agent_id, status) VALUES (?1, ?2, 'queued')",
+                rusqlite::params![task_id, agent_id],
+            )?;
+            let queue_id = transaction.last_insert_rowid();
+            let context = context
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
+            let kind = context
+                .as_ref()
+                .and_then(|value| value.get("kind"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("task");
+            let source_type = context
+                .as_ref()
+                .and_then(|value| value.get("origin"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("task");
+            let source_id = context
+                .as_ref()
+                .and_then(|value| value.get("source_id"))
+                .and_then(|value| value.as_str())
+                .unwrap_or(task_id);
+            let prompt = match description {
+                Some(description) if !description.trim().is_empty() => {
+                    format!("{title}\n\n{description}")
+                }
+                _ => title,
+            };
+            let attempt_id = Uuid::new_v4().to_string();
+            transaction.execute(
+                "INSERT OR IGNORE INTO logical_sessions (id, agent_id) VALUES (?1, ?1)",
+                [&agent_id],
+            )?;
+            transaction.execute(
+                "INSERT INTO work_attempts
+                 (id, session_id, task_id, queue_id, kind, runner, status, prompt,
+                  trigger_message_id, response_queued_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'auto', 'queued', ?6, ?7, ?8)",
+                rusqlite::params![
+                    attempt_id,
+                    agent_id,
+                    task_id,
+                    queue_id,
+                    kind,
+                    prompt,
+                    message_id,
+                    message_timestamp
+                ],
+            )?;
+            transaction.execute(
+                "UPDATE task_queue SET attempt_id = ?1 WHERE id = ?2",
+                rusqlite::params![attempt_id, queue_id],
+            )?;
+            transaction.execute(
+                "UPDATE tasks SET session_id = ?1, active_attempt_id = ?2,
+                    status = 'in_progress', completed_at = NULL,
+                    updated_at = CURRENT_TIMESTAMP WHERE id = ?3",
+                rusqlite::params![agent_id, attempt_id, task_id],
+            )?;
+            transaction.execute(
+                "UPDATE logical_sessions SET status = 'queued', updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?1 AND status != 'running'",
+                [&agent_id],
+            )?;
+            transaction.execute(
+                "INSERT INTO session_events
+                 (session_id, attempt_id, task_id, source_type, source_id,
+                  event_type, summary, payload)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'attempt_queued', 'Work queued', ?6)",
+                rusqlite::params![
+                    agent_id,
+                    attempt_id,
+                    task_id,
+                    source_type,
+                    source_id,
+                    serde_json::json!({ "runner": "auto", "kind": kind, "queue_id": queue_id })
+                        .to_string(),
+                ],
+            )?;
+            transaction.execute(
+                "UPDATE logical_sessions
+                 SET latest_summary = 'Work queued', updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?1",
+                [&agent_id],
+            )?;
+            transaction.commit()?;
+            Ok(Some((agent_id, Some(queue_id))))
+        })?;
+
+        let Some((agent_id, queue_id)) = outcome else {
+            return Ok(None);
+        };
+        let item = queue_id.map(|queue_id| self.get(queue_id)).transpose()?;
+        Ok(Some((agent_id, item)))
     }
 
     fn create_attempt_for_item(&self, id: i64, task_id: &str, agent_id: &str) -> Result<QueueItem> {
@@ -137,6 +805,28 @@ impl TaskQueue {
         })
     }
 
+    /// Whether this task still owns queued or in-flight response work. Queue
+    /// rows are included because a running row may deliberately outlive its
+    /// terminal attempt while retaining the dispatch lease on a container.
+    pub fn has_active_response_for_task(&self, task_id: &str) -> Result<bool> {
+        self.db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM task_queue
+                    WHERE task_id = ?1 AND status IN ('queued', 'running')
+                 ) OR EXISTS(
+                    SELECT 1 FROM work_attempts
+                    WHERE task_id = ?1
+                      AND status IN ('queued', 'preparing', 'running',
+                                     'waiting_for_input', 'review')
+                 )",
+                [task_id],
+                |row| row.get(0),
+            )
+            .map_err(Error::from)
+        })
+    }
+
     /// Get a queue item by ID.
     pub fn get(&self, id: i64) -> Result<QueueItem> {
         self.db.with_conn(|conn| {
@@ -146,51 +836,48 @@ impl TaskQueue {
         })?
     }
 
-    /// Claim the next queued item for an agent (atomically set to 'running').
+    /// Claim the next queued item and publish its preparation checkpoint atomically.
+    /// The worker owns started_at because prompt recovery uses it to track which
+    /// commands entered execution.
     pub fn claim(&self, agent_id: &str) -> Result<Option<QueueItem>> {
-        self.db.with_conn(|conn| {
-            // Find the next queued item for this agent
-            let mut stmt = conn.prepare(
-                "SELECT id FROM task_queue WHERE agent_id = ?1 AND status = 'queued' ORDER BY queued_at ASC LIMIT 1",
-            )?;
-
-            let id: Option<i64> = stmt
-                .query_row([agent_id], |row| row.get(0))
-                .ok();
-
-            match id {
-                Some(id) => {
-                    conn.execute(
-                        "UPDATE task_queue SET status = 'running', started_at = CURRENT_TIMESTAMP WHERE id = ?1",
-                        [id],
-                    )?;
-                    // Need to drop conn before calling self.get
-                    Ok(Some(id))
-                }
-                None => Ok(None),
-            }
-        }).and_then(|opt_id| {
-            match opt_id {
-                Some(id) => self.get(id).map(Some),
-                None => Ok(None),
-            }
-        })
+        self.claim_at(Some(agent_id), chrono::Utc::now())
     }
 
     /// Claim the oldest queued item across all logical sessions.
     ///
-    /// Native runners are short-lived workers, so dispatch is no longer tied
-    /// to a long-running per-agent harness process.
+    /// Dispatch is serialized per project even though several retained ACP
+    /// project processes may run concurrently.
     pub fn claim_next(&self) -> Result<Option<QueueItem>> {
+        self.claim_at(None, chrono::Utc::now())
+    }
+
+    pub(crate) fn claim_at(
+        &self,
+        agent_id: Option<&str>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<QueueItem>> {
         self.db
             .with_conn(|conn| {
-                let id: Option<i64> = conn
+                let tx = rusqlite::Transaction::new_unchecked(
+                    conn,
+                    rusqlite::TransactionBehavior::Immediate,
+                )?;
+                super::delegation_notifications::reconcile_in_transaction(&tx)?;
+                let id: Option<i64> = tx
                     .query_row(
-                        "SELECT q.id FROM task_queue q
+                        &format!(
+                            "SELECT q.id FROM task_queue q
                          JOIN tasks t ON t.id = q.task_id
                          JOIN work_attempts candidate ON candidate.id = q.attempt_id
                          WHERE q.status = 'queued'
+                           AND ({eligible})
+                           AND (?2 IS NULL OR q.agent_id = ?2)
                            AND candidate.status = 'queued'
+                           AND (NOT EXISTS (SELECT 1 FROM connect_work w WHERE w.kind='task_turn' AND w.local_id=q.task_id)
+                             OR EXISTS (SELECT 1 FROM connect_commands c JOIN connect_bindings b ON b.id=c.binding_id
+                                JOIN agents bound ON bound.id=b.local_agent_id AND bound.project_id=b.local_project_id
+                                WHERE c.attempt_id=candidate.id AND c.status='accepted' AND c.lease_until > unixepoch(?1)
+                                  AND b.active=1 AND b.generation=c.binding_generation AND b.local_agent_id=q.agent_id AND t.agent_id=q.agent_id AND b.local_project_id=t.project_id))
                            AND NOT EXISTS (
                                SELECT 1 FROM task_dependencies d
                                JOIN tasks dependency ON dependency.id = d.depends_on_id
@@ -204,31 +891,135 @@ impl TaskQueue {
                                      'preparing', 'running', 'waiting_for_input', 'review'
                                  )
                            )
-                         ORDER BY t.priority DESC, q.queued_at ASC LIMIT 1",
-                        [],
+                           AND NOT EXISTS (
+                               SELECT 1 FROM task_queue active_dispatch
+                               JOIN work_attempts active_owner
+                                 ON active_owner.id = active_dispatch.attempt_id
+                               WHERE active_dispatch.agent_id = q.agent_id
+                                 AND active_dispatch.status = 'running'
+                                 AND (
+                                     active_owner.status NOT IN (
+                                         'completed', 'failed', 'cancelled', 'interrupted'
+                                     )
+                                     OR active_owner.container_id IS NOT NULL
+                                 )
+                           )
+                           AND NOT EXISTS (
+                               SELECT 1 FROM task_pull_requests monitored_pr
+                               JOIN tasks monitored_task
+                                 ON monitored_task.id = monitored_pr.task_id
+                               WHERE monitored_pr.agent_id = q.agent_id
+                                 AND monitored_pr.task_id != q.task_id
+                                 AND monitored_pr.status IN ('waiting', 'attention')
+                                 AND monitored_task.status NOT IN ('completed', 'cancelled')
+                           )
+                         ORDER BY t.priority DESC, t.position, q.queued_at, q.id LIMIT 1",
+                            eligible = super::planning::ELIGIBLE.replace("{recovery_grant}", &super::delegation_notifications::recovery_grant_sql())
+                        ),
+                        rusqlite::params![
+                            now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                            agent_id
+                        ],
                         |row| row.get(0),
                     )
-                    .ok();
+                    .optional()?;
                 if let Some(id) = id {
-                    let changed = conn.execute(
+                    let changed = tx.execute(
                         "UPDATE task_queue SET status = 'running', started_at = CURRENT_TIMESTAMP
                          WHERE id = ?1 AND status = 'queued'",
                         [id],
                     )?;
                     if changed == 1 {
+                        // Claim, preparation state, and its first event share
+                        // one commit, before workspace or container I/O begins.
+                        tx.execute(
+                            "UPDATE work_attempts SET status = 'preparing'
+                             WHERE id = (SELECT attempt_id FROM task_queue WHERE id = ?1)",
+                            [id],
+                        )?;
+                        tx.execute(
+                            "UPDATE logical_sessions SET status = 'running',
+                                latest_summary = 'Checking workspace before runner startup',
+                                updated_at = CURRENT_TIMESTAMP
+                             WHERE id = (SELECT session_id FROM work_attempts
+                                WHERE id = (SELECT attempt_id FROM task_queue WHERE id = ?1))",
+                            [id],
+                        )?;
+                        tx.execute(
+                            "INSERT INTO session_events
+                             (session_id, attempt_id, task_id, source_type, source_id,
+                              event_type, summary, payload)
+                             SELECT session_id, id, task_id, 'runner', runner,
+                                 'attempt_preparing', 'Checking workspace before runner startup',
+                                 '{\"status\":\"preparing\",\"phase\":\"workspace\"}'
+                             FROM work_attempts WHERE id = (SELECT attempt_id FROM task_queue WHERE id = ?1)",
+                            [id],
+                        )?;
+                        tx.execute(
+                            "UPDATE tasks SET parent_review_required=1 WHERE id=(SELECT task_id FROM task_queue WHERE id=?1)
+                             AND blocks_parent=1 AND hidden=0 AND provenance!='native_plan'
+                             AND EXISTS (SELECT 1 FROM tasks parent JOIN agents owner ON owner.id=parent.agent_id
+                                WHERE parent.id=tasks.parent_task_id AND parent.project_id=tasks.project_id
+                                  AND owner.project_id=parent.project_id AND parent.status NOT IN ('completed','cancelled')
+                                  AND parent.hidden=0 AND parent.provenance!='native_plan'
+                                  AND NOT EXISTS (SELECT 1 FROM connect_work w WHERE w.kind='task_turn' AND w.local_id=parent.id))
+                             AND NOT EXISTS (SELECT 1 FROM connect_work w WHERE w.kind='task_turn' AND w.local_id=tasks.id)
+                             AND NOT EXISTS (SELECT 1 FROM workflow_step_executions e JOIN workflow_instances i ON i.id=e.instance_id
+                                              WHERE e.task_id=tasks.id AND e.task_id IS NOT i.source_task_id)",
+                            [id],
+                        )?;
+                        tx.commit()?;
                         return Ok(Some(id));
                     }
                 }
+                tx.commit()?;
                 Ok(None)
             })
             .and_then(|id| id.map(|id| self.get(id)).transpose())
     }
 
     /// Requeue work that was in flight when the control plane stopped. Any
-    /// corresponding containers are cleaned up by the server before dispatch
-    /// begins, so the same logical attempt can be safely resumed from queued
-    /// state without leaving a task permanently stuck as in-progress.
+    /// corresponding project containers are stopped by the server before
+    /// dispatch begins, so the same logical attempt can be safely resumed from
+    /// queued state without leaving a task permanently stuck as in-progress.
     pub fn recover_in_progress(&self) -> Result<usize> {
+        let finalized = self.db.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let finalized = tx.execute(
+                "UPDATE task_queue
+                 SET status = CASE
+                     WHEN (SELECT status FROM work_attempts WHERE id = task_queue.attempt_id) = 'completed'
+                         THEN 'completed'
+                     ELSE 'failed'
+                 END,
+                 completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP),
+                 harness_response = COALESCE(
+                     harness_response,
+                     (SELECT COALESCE(result, error_message, status)
+                      FROM work_attempts WHERE id = task_queue.attempt_id)
+                 )
+                 WHERE status = 'running'
+                   AND EXISTS (
+                       SELECT 1 FROM work_attempts terminal
+                       WHERE terminal.id = task_queue.attempt_id
+                         AND terminal.status IN ('completed', 'failed', 'cancelled', 'interrupted')
+                   )",
+                [],
+            )?;
+            tx.execute(
+                "UPDATE work_attempts SET container_id = NULL
+                 WHERE container_id IS NOT NULL
+                   AND status IN ('completed', 'failed', 'cancelled', 'interrupted')",
+                [],
+            )?;
+            finalize_inactive_git_baselines(&tx, None)?;
+            tx.commit()?;
+            Ok::<_, Error>(finalized)
+        })?;
+        if finalized > 0 {
+            debug!(finalized, "recovered terminal queue dispatches");
+        }
+
         let orphaned: Vec<(i64, String, String, String)> = self.db.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT q.id, a.id, a.session_id, q.task_id
@@ -262,7 +1053,8 @@ impl TaskQueue {
                 )?;
                 tx.execute(
                     "UPDATE work_attempts SET status = 'queued', container_id = NULL,
-                        started_at = NULL, completed_at = NULL, error_message = NULL
+                        started_at = NULL, completed_at = NULL, error_message = NULL,
+                        response_queued_at = CURRENT_TIMESTAMP, response_started_at = NULL
                      WHERE id = ?1",
                     [attempt_id],
                 )?;
@@ -277,6 +1069,7 @@ impl TaskQueue {
                     [session_id],
                 )?;
             }
+            finalize_inactive_git_baselines(&tx, None)?;
             tx.commit()?;
             Ok::<_, Error>(())
         })?;
@@ -318,6 +1111,43 @@ impl TaskQueue {
             conn.execute(
                 "UPDATE task_queue SET status = 'failed', completed_at = CURRENT_TIMESTAMP, harness_response = ?1 WHERE id = ?2",
                 rusqlite::params![error, id],
+            )
+        })?;
+
+        self.get(id)
+    }
+
+    /// Finalize a running dispatch whose linked attempt is already terminal
+    /// and no longer owns a container. This is the worker-exit counterpart to
+    /// cancellation cleanup: failed container stops retain the running row as
+    /// a lease, then the row becomes releasable when the worker clears the
+    /// container marker after it actually exits.
+    pub fn finalize_released_terminal_dispatch(&self, id: i64) -> Result<QueueItem> {
+        self.db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE task_queue
+                 SET status = CASE
+                         WHEN (SELECT status FROM work_attempts
+                               WHERE id = task_queue.attempt_id) = 'completed'
+                             THEN 'completed'
+                         ELSE 'failed'
+                     END,
+                     completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP),
+                     harness_response = COALESCE(
+                         harness_response,
+                         (SELECT COALESCE(result, error_message, status)
+                          FROM work_attempts WHERE id = task_queue.attempt_id)
+                     )
+                 WHERE id = ?1 AND status = 'running'
+                   AND EXISTS (
+                       SELECT 1 FROM work_attempts terminal
+                       WHERE terminal.id = task_queue.attempt_id
+                         AND terminal.status IN (
+                             'completed', 'failed', 'cancelled', 'interrupted'
+                         )
+                         AND terminal.container_id IS NULL
+                   )",
+                [id],
             )
         })?;
 
@@ -372,6 +1202,23 @@ impl TaskQueue {
     }
 }
 
+fn ensure_task_project_accepts_work(conn: &rusqlite::Connection, task_id: &str) -> Result<()> {
+    let project_id = conn
+        .query_row(
+            "SELECT project_id FROM tasks WHERE id = ?1",
+            [task_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .ok_or_else(|| Error::TaskNotFound {
+            id: task_id.to_string(),
+        })?;
+    if let Some(project_id) = project_id.as_deref() {
+        ensure_project_accepts_work(conn, project_id)?;
+    }
+    Ok(())
+}
+
 fn row_to_item(row: &rusqlite::Row) -> Result<QueueItem> {
     Ok(QueueItem {
         id: row.get("id")?,
@@ -389,12 +1236,101 @@ fn row_to_item(row: &rusqlite::Row) -> Result<QueueItem> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tasks::board::{CreateTask, TaskBoard};
+    use crate::tasks::board::{CreateTask, TaskBoard, TaskStatus};
 
     fn setup() -> (Arc<Database>, TaskQueue) {
         let db = Arc::new(Database::open_memory().unwrap());
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO agents (id, name, backend, config) VALUES ('atlas', 'Atlas', 'native', '{}')",
+                [],
+            )
+        })
+        .unwrap();
         let queue = TaskQueue::new(db.clone());
         (db, queue)
+    }
+
+    #[test]
+    fn claim_records_preparation_before_any_async_startup() {
+        let (db, queue) = setup();
+        let board = TaskBoard::new(db.clone());
+        let task = board
+            .create(&CreateTask {
+                backlog: false,
+                start_after: None,
+                title: "Cold runner".into(),
+                description: None,
+                agent_id: Some("atlas".into()),
+                parent_task_id: None,
+                sop_id: None,
+                conversation_id: None,
+                priority: None,
+                context: None,
+            })
+            .unwrap();
+        let queued = queue.enqueue(&task.id, "atlas").unwrap();
+        let claimed = queue.claim_next().unwrap().unwrap();
+        let sessions = SessionManager::new(db.clone());
+        let attempt = sessions
+            .get_attempt(queued.attempt_id.as_deref().unwrap())
+            .unwrap();
+        assert_eq!(claimed.status, "running");
+        assert_eq!(attempt.status, "preparing");
+        // Claiming does not mean the worker has started: connected-task
+        // prompt recovery uses this timestamp to exclude unstarted commands.
+        assert!(attempt.started_at.is_none());
+        assert!(attempt.response_started_at.is_none());
+        assert!(attempt.container_id.is_none());
+        assert_eq!(sessions.get("atlas").unwrap().status, "running");
+        let events = sessions.list_events("atlas", None, 100).unwrap();
+        let event = events
+            .iter()
+            .find(|event| event.event_type == "attempt_preparing")
+            .unwrap();
+        assert_eq!(event.attempt_id, queued.attempt_id);
+        assert_eq!(event.summary, "Checking workspace before runner startup");
+        assert!(queue.claim_next().unwrap().is_none());
+    }
+
+    #[test]
+    fn failed_preparation_event_rolls_back_the_queue_claim() {
+        let (db, queue) = setup();
+        let board = TaskBoard::new(db.clone());
+        let task = board
+            .create(&CreateTask {
+                backlog: false,
+                start_after: None,
+                title: "Cold runner".into(),
+                description: None,
+                agent_id: Some("atlas".into()),
+                parent_task_id: None,
+                sop_id: None,
+                conversation_id: None,
+                priority: None,
+                context: None,
+            })
+            .unwrap();
+        let item = queue.enqueue(&task.id, "atlas").unwrap();
+        db.conn().execute_batch("CREATE TRIGGER reject_preparing BEFORE INSERT ON session_events
+            WHEN NEW.event_type = 'attempt_preparing' BEGIN SELECT RAISE(FAIL, 'event unavailable'); END;").unwrap();
+        assert!(queue.claim_next().is_err());
+        let unclaimed = queue.get(item.id).unwrap();
+        assert_eq!(unclaimed.status, "queued");
+        assert!(unclaimed.started_at.is_none());
+        let sessions = SessionManager::new(db.clone());
+        assert_eq!(
+            sessions
+                .get_attempt(item.attempt_id.as_deref().unwrap())
+                .unwrap()
+                .status,
+            "queued"
+        );
+        assert_eq!(sessions.get("atlas").unwrap().status, "queued");
+        db.conn()
+            .execute_batch("DROP TRIGGER reject_preparing")
+            .unwrap();
+        assert_eq!(queue.claim_next().unwrap().unwrap().id, item.id);
     }
 
     #[test]
@@ -405,6 +1341,8 @@ mod tests {
         let board = TaskBoard::new(db);
         let task = board
             .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "Test task".into(),
                 description: None,
                 agent_id: Some("atlas".into()),
@@ -432,11 +1370,47 @@ mod tests {
     }
 
     #[test]
+    fn ensure_enqueued_does_not_duplicate_active_dispatch() {
+        let (db, queue) = setup();
+        let task = TaskBoard::new(db.clone())
+            .create(&CreateTask {
+                backlog: false,
+                start_after: None,
+                title: "Owned workflow task".into(),
+                description: None,
+                agent_id: Some("atlas".into()),
+                parent_task_id: None,
+                sop_id: None,
+                conversation_id: None,
+                priority: None,
+                context: None,
+            })
+            .unwrap();
+
+        let first = queue.ensure_enqueued(&task.id, "atlas").unwrap().unwrap();
+        assert!(queue.ensure_enqueued(&task.id, "atlas").unwrap().is_none());
+        assert_eq!(queue.claim("atlas").unwrap().unwrap().id, first.id);
+        assert!(queue.ensure_enqueued(&task.id, "atlas").unwrap().is_none());
+        let dispatches: i64 = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM task_queue WHERE task_id = ?1",
+                    [&task.id],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(dispatches, 1);
+    }
+
+    #[test]
     fn recovers_interrupted_native_attempts() {
         let (db, queue) = setup();
         let board = TaskBoard::new(db.clone());
         let task = board
             .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "Interrupted task".into(),
                 description: None,
                 agent_id: Some("atlas".into()),
@@ -457,16 +1431,73 @@ mod tests {
         board
             .update_status(&task.id, "in_progress", Some("atlas"))
             .unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO dashboard_git_baselines
+                     (work_kind, work_id, workspace, baseline_json, git_state)
+                 VALUES ('attempt', ?1, '/tmp/recovered-task', '{}', 'available')",
+                [attempt_id],
+            )
+        })
+        .unwrap();
 
         assert_eq!(queue.recover_in_progress().unwrap(), 1);
         assert_eq!(queue.get(queued.id).unwrap().status, "queued");
         assert_eq!(board.get(&task.id).unwrap().status.as_str(), "pending");
-        let overview = SessionManager::new(db).overview("atlas").unwrap();
+        let overview = SessionManager::new(db.clone()).overview("atlas").unwrap();
         assert_eq!(overview.session.status, "queued");
         assert!(overview
             .recent_events
             .iter()
             .any(|event| event.event_type == "attempt_requeued"));
+        assert!(db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT finalized_at FROM dashboard_git_baselines
+                     WHERE work_kind = 'attempt' AND work_id = ?1",
+                    [attempt_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+            })
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn recovery_finalizes_terminal_dispatch_and_releases_container_lease() {
+        let (db, queue) = setup();
+        let task = TaskBoard::new(db.clone())
+            .create(&CreateTask {
+                backlog: false,
+                start_after: None,
+                title: "Finished before restart".into(),
+                description: None,
+                agent_id: Some("atlas".into()),
+                parent_task_id: None,
+                sop_id: None,
+                conversation_id: None,
+                priority: None,
+                context: None,
+            })
+            .unwrap();
+        let queued = queue.enqueue(&task.id, "atlas").unwrap();
+        let claimed = queue.claim_next().unwrap().unwrap();
+        let attempt_id = claimed.attempt_id.as_deref().unwrap();
+        let sessions = SessionManager::new(db);
+        sessions
+            .set_container(attempt_id, "retained-project-container")
+            .unwrap();
+        sessions
+            .transition_attempt(attempt_id, "completed", "Done", Some("result"), None)
+            .unwrap();
+
+        assert_eq!(queue.recover_in_progress().unwrap(), 0);
+        assert_eq!(queue.get(queued.id).unwrap().status, "completed");
+        assert!(sessions
+            .get_attempt(attempt_id)
+            .unwrap()
+            .container_id
+            .is_none());
     }
 
     #[test]
@@ -475,6 +1506,8 @@ mod tests {
         let board = TaskBoard::new(db.clone());
         let first_task = board
             .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "Needs an answer".into(),
                 description: None,
                 agent_id: Some("atlas".into()),
@@ -487,6 +1520,8 @@ mod tests {
             .unwrap();
         let second_task = board
             .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "Queued behind the answer".into(),
                 description: None,
                 agent_id: Some("atlas".into()),
@@ -533,11 +1568,346 @@ mod tests {
     }
 
     #[test]
+    fn running_dispatch_holds_project_lease_until_container_cleanup_finishes() {
+        let (db, queue) = setup();
+        let board = TaskBoard::new(db.clone());
+        let first_task = board
+            .create(&CreateTask {
+                backlog: false,
+                start_after: None,
+                title: "Cancel this turn".into(),
+                description: None,
+                agent_id: Some("atlas".into()),
+                parent_task_id: None,
+                sop_id: None,
+                conversation_id: None,
+                priority: None,
+                context: None,
+            })
+            .unwrap();
+        let second_task = board
+            .create(&CreateTask {
+                backlog: false,
+                start_after: None,
+                title: "Run after cleanup".into(),
+                description: None,
+                agent_id: Some("atlas".into()),
+                parent_task_id: None,
+                sop_id: None,
+                conversation_id: None,
+                priority: None,
+                context: None,
+            })
+            .unwrap();
+        let first = queue.enqueue(&first_task.id, "atlas").unwrap();
+        let claimed = queue.claim_next().unwrap().unwrap();
+        assert_eq!(claimed.id, first.id);
+        let second = queue.enqueue(&second_task.id, "atlas").unwrap();
+
+        let sessions = SessionManager::new(db);
+        sessions
+            .set_container(
+                claimed.attempt_id.as_deref().unwrap(),
+                "retained-project-container",
+            )
+            .unwrap();
+        sessions
+            .transition_attempt(
+                claimed.attempt_id.as_deref().unwrap(),
+                "cancelled",
+                "Cancellation requested",
+                None,
+                None,
+            )
+            .unwrap();
+
+        // The terminal attempt no longer provides the ordinary session lock,
+        // but its running dispatch keeps the shared Agent container leased
+        // until the cancellation path has stopped it.
+        assert!(queue.claim_next().unwrap().is_none());
+        sessions
+            .clear_container(claimed.attempt_id.as_deref().unwrap())
+            .unwrap();
+        assert_eq!(queue.claim_next().unwrap().unwrap().id, second.id);
+    }
+
+    #[test]
+    fn atomic_attempt_cancellation_blocks_review_enqueue_before_cleanup() {
+        use crate::workers::github_review::{GithubReviewGate, GithubReviewManager};
+
+        let (db, queue) = setup();
+        let board = TaskBoard::new(db.clone());
+        let task = board
+            .create(&CreateTask {
+                backlog: false,
+                start_after: None,
+                title: "Cancel while GitHub is polling".into(),
+                description: None,
+                agent_id: Some("atlas".into()),
+                parent_task_id: None,
+                sop_id: None,
+                conversation_id: None,
+                priority: None,
+                context: None,
+            })
+            .unwrap();
+        let reviews = GithubReviewManager::new(db.clone());
+        reviews
+            .register(
+                &task.id,
+                "atlas",
+                "XpressAI/example",
+                "https://github.com/XpressAI/example/pull/7",
+            )
+            .unwrap();
+        queue.enqueue(&task.id, "atlas").unwrap();
+        let claimed = queue.claim_next().unwrap().unwrap();
+        let attempt_id = claimed.attempt_id.as_deref().unwrap();
+        let sessions = SessionManager::new(db.clone());
+        sessions
+            .transition_attempt(attempt_id, "running", "Working", None, None)
+            .unwrap();
+
+        let cancelled = sessions
+            .cancel_task_attempts(&task.id, "Work cancelled by user")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(cancelled.len(), 1);
+        assert_eq!(cancelled[0].id, attempt_id);
+        assert_eq!(cancelled[0].status, "cancelled");
+        assert_eq!(board.get(&task.id).unwrap().status, TaskStatus::Cancelled);
+        assert_eq!(reviews.gate(&task.id).unwrap(), GithubReviewGate::None);
+        assert!(queue
+            .enqueue_review_follow_up_for_current_agent(&task.id, "New review feedback")
+            .unwrap()
+            .is_none());
+        let queued_follow_ups: i64 = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM task_queue WHERE task_id = ?1 AND status = 'queued'",
+                    [&task.id],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(queued_follow_ups, 0);
+    }
+
+    #[test]
+    fn task_cancellation_retires_feedback_enqueued_before_the_transaction() {
+        let (db, queue) = setup();
+        let board = TaskBoard::new(db.clone());
+        let task = board
+            .create(&CreateTask {
+                backlog: false,
+                start_after: None,
+                title: "Cancel after a stale active-attempt read".into(),
+                description: None,
+                agent_id: Some("atlas".into()),
+                parent_task_id: None,
+                sop_id: None,
+                conversation_id: None,
+                priority: None,
+                context: None,
+            })
+            .unwrap();
+        queue.enqueue(&task.id, "atlas").unwrap();
+        let running = queue.claim_next().unwrap().unwrap();
+        let running_attempt = running.attempt_id.as_deref().unwrap();
+        let sessions = SessionManager::new(db.clone());
+        sessions
+            .transition_attempt(running_attempt, "running", "Working", None, None)
+            .unwrap();
+
+        // This is the interleaving from the review: cancellation previously
+        // read the running attempt, then feedback replaced active_attempt_id
+        // with a newly queued continuation before cancellation committed.
+        let (_, queued) = queue
+            .enqueue_review_follow_up_for_current_agent(&task.id, "New review feedback")
+            .unwrap()
+            .unwrap();
+        let queued = queued.unwrap();
+        let queued_attempt = queued.attempt_id.as_deref().unwrap();
+
+        let cancelled = sessions
+            .cancel_task_attempts(&task.id, "Work cancelled by user")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(cancelled.len(), 2);
+        assert_eq!(
+            sessions.get_attempt(running_attempt).unwrap().status,
+            "cancelled"
+        );
+        assert_eq!(
+            sessions.get_attempt(queued_attempt).unwrap().status,
+            "cancelled"
+        );
+        assert_eq!(queue.get(running.id).unwrap().status, "running");
+        assert_eq!(queue.get(queued.id).unwrap().status, "failed");
+        assert_eq!(board.get(&task.id).unwrap().status, TaskStatus::Cancelled);
+        let active_attempt_id: Option<String> = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT active_attempt_id FROM tasks WHERE id = ?1",
+                    [&task.id],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert!(active_attempt_id.is_none());
+        assert!(queue.claim_next().unwrap().is_none());
+    }
+
+    #[test]
+    fn claimed_dispatch_serializes_project_before_container_startup() {
+        let (db, queue) = setup();
+        let board = TaskBoard::new(db);
+        for title in ["First turn", "Second turn"] {
+            let task = board
+                .create(&CreateTask {
+                    backlog: false,
+                    start_after: None,
+                    title: title.into(),
+                    description: None,
+                    agent_id: Some("atlas".into()),
+                    parent_task_id: None,
+                    sop_id: None,
+                    conversation_id: None,
+                    priority: None,
+                    context: None,
+                })
+                .unwrap();
+            queue.enqueue(&task.id, "atlas").unwrap();
+        }
+
+        // The first claim changes the dispatch row before its worker has time
+        // to transition the attempt or attach the shared Agent container.
+        assert!(queue.claim_next().unwrap().is_some());
+        assert!(queue.claim_next().unwrap().is_none());
+    }
+
+    #[test]
+    fn pending_pr_review_reserves_agent_lane_but_allows_same_task_follow_up() {
+        use crate::workers::github_review::GithubReviewManager;
+
+        let (db, queue) = setup();
+        let board = TaskBoard::new(db.clone());
+        let review_task = board
+            .create(&CreateTask {
+                backlog: false,
+                start_after: None,
+                title: "Await PR review".into(),
+                description: None,
+                agent_id: Some("atlas".into()),
+                parent_task_id: None,
+                sop_id: None,
+                conversation_id: None,
+                priority: None,
+                context: None,
+            })
+            .unwrap();
+        let next_task = board
+            .create(&CreateTask {
+                backlog: false,
+                start_after: None,
+                title: "Must wait for review".into(),
+                description: None,
+                agent_id: Some("atlas".into()),
+                parent_task_id: None,
+                sop_id: None,
+                conversation_id: None,
+                priority: None,
+                context: None,
+            })
+            .unwrap();
+        GithubReviewManager::new(db.clone())
+            .register(
+                &review_task.id,
+                "atlas",
+                "XpressAI/example",
+                "https://github.com/XpressAI/example/pull/7",
+            )
+            .unwrap();
+        let waiting = queue.enqueue(&next_task.id, "atlas").unwrap();
+        assert!(queue.claim_next().unwrap().is_none());
+
+        let follow_up = queue
+            .enqueue_continuation(&review_task.id, "atlas")
+            .unwrap()
+            .unwrap();
+        assert_eq!(queue.claim_next().unwrap().unwrap().id, follow_up.id);
+        assert_eq!(queue.get(waiting.id).unwrap().status, "queued");
+    }
+
+    #[test]
+    fn terminal_pull_request_releases_lane_while_task_has_remaining_work() {
+        use crate::workers::github_review::GithubReviewManager;
+
+        let (db, queue) = setup();
+        let board = TaskBoard::new(db.clone());
+        let review_task = board
+            .create(&CreateTask {
+                backlog: false,
+                start_after: None,
+                title: "Await PR review".into(),
+                description: None,
+                agent_id: Some("atlas".into()),
+                parent_task_id: None,
+                sop_id: None,
+                conversation_id: None,
+                priority: None,
+                context: None,
+            })
+            .unwrap();
+        let next_task = board
+            .create(&CreateTask {
+                backlog: false,
+                start_after: None,
+                title: "Run after review".into(),
+                description: None,
+                agent_id: Some("atlas".into()),
+                parent_task_id: None,
+                sop_id: None,
+                conversation_id: None,
+                priority: None,
+                context: None,
+            })
+            .unwrap();
+        GithubReviewManager::new(db.clone())
+            .register(
+                &review_task.id,
+                "atlas",
+                "XpressAI/example",
+                "https://github.com/XpressAI/example/pull/7",
+            )
+            .unwrap();
+        let next = queue.enqueue(&next_task.id, "atlas").unwrap();
+        assert!(queue.claim_next().unwrap().is_none());
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE task_pull_requests SET status = 'approved' WHERE task_id = ?1",
+                [&review_task.id],
+            )?;
+            Ok::<_, crate::error::Error>(())
+        })
+        .unwrap();
+        assert_eq!(
+            board.get(&review_task.id).unwrap().status,
+            TaskStatus::InProgress
+        );
+        assert_eq!(queue.claim_next().unwrap().unwrap().id, next.id);
+    }
+
+    #[test]
     fn recovers_waiting_attempts_after_restart() {
         let (db, queue) = setup();
         let board = TaskBoard::new(db.clone());
         let task = board
             .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "Waiting when the server stopped".into(),
                 description: None,
                 agent_id: Some("atlas".into()),
@@ -584,6 +1954,8 @@ mod tests {
         let board = TaskBoard::new(db);
         let task = board
             .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "Complete test".into(),
                 description: None,
                 agent_id: Some("atlas".into()),
@@ -610,6 +1982,8 @@ mod tests {
         let board = TaskBoard::new(db);
         let t1 = board
             .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "T1".into(),
                 description: None,
                 agent_id: Some("atlas".into()),
@@ -622,6 +1996,8 @@ mod tests {
             .unwrap();
         let t2 = board
             .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "T2".into(),
                 description: None,
                 agent_id: Some("atlas".into()),
@@ -645,9 +2021,11 @@ mod tests {
     #[test]
     fn coalesces_messages_into_one_queued_continuation() {
         let (db, queue) = setup();
-        let board = TaskBoard::new(db);
+        let board = TaskBoard::new(db.clone());
         let task = board
             .create(&CreateTask {
+                backlog: false,
+                start_after: None,
                 title: "Conversation".into(),
                 description: None,
                 agent_id: Some("atlas".into()),
@@ -667,16 +2045,41 @@ mod tests {
         let running = queue.claim("atlas").unwrap().unwrap();
         assert_eq!(running.id, first.id);
 
+        let conversation = crate::tasks::conversation::TaskConversation::new(db.clone());
+        let first_message = conversation
+            .add_message(&task.id, "user", "First follow-up")
+            .unwrap();
         let continuation = queue
-            .enqueue_continuation(&task.id, "atlas")
+            .enqueue_continuation_for_message(
+                &task.id,
+                "atlas",
+                first_message.id,
+                &first_message.timestamp,
+            )
             .unwrap()
             .unwrap();
         assert_ne!(continuation.id, first.id);
         assert!(queue.has_queued_for_task(&task.id).unwrap());
+        let second_message = conversation
+            .add_message(&task.id, "user", "More context")
+            .unwrap();
         assert!(queue
-            .enqueue_continuation(&task.id, "atlas")
+            .enqueue_continuation_for_message(
+                &task.id,
+                "atlas",
+                second_message.id,
+                &second_message.timestamp,
+            )
             .unwrap()
             .is_none());
         assert_eq!(queue.pending_count("atlas").unwrap(), 1);
+        let attempt = SessionManager::new(db)
+            .get_attempt(continuation.attempt_id.as_deref().unwrap())
+            .unwrap();
+        assert_eq!(attempt.trigger_message_id, Some(second_message.id));
+        assert_eq!(
+            attempt.response_queued_at.as_deref(),
+            Some(second_message.timestamp.as_str())
+        );
     }
 }

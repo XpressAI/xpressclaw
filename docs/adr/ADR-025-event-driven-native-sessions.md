@@ -2,11 +2,11 @@
 
 ## Status
 
-Partially superseded by ADR-026
+Partially superseded by ADR-026 and ADR-033
 
 The runtime adapter section is superseded by ADR-026. The project/task UX,
-short-lived attempt isolation, and development-environment decisions remain
-in force.
+task dispatch, and development-environment separation remain in force. ADR-033
+supersedes the disposable-container lifetime with retained project containers.
 
 ## Context
 
@@ -33,31 +33,39 @@ plane; execution contexts belong to workers.
 
 ## Decision
 
-### One project, one active native conversation, many tasks
+### One project, one active native conversation, many task branches
 
 Each configured workspace/runner pair is presented as a project and backed by
 one durable `logical_session`. Messages from a person, task, schedule, or
-workflow become durable tasks and are sent to the project's
-active native Codex, Claude Code, or OpenCode conversation. The project remains
-writable while work is queued or running. Future connector messages must use
-the same path once that runtime is restored.
+workflow become durable tasks. A task inherits the project's active native
+Codex, Claude Code, or OpenCode context as its own conversation branch when
+the runner supports it. The project remains writable while work is queued or
+running. Future connector messages must use the same path once that runtime is
+restored.
 
-The native conversation is resumed across short-lived worker containers. A
-task can explicitly request a fresh conversation. A dependent task instead
-continues the native conversation of its prerequisite when that prerequisite
-used the same project and runner. A follow-up message on an existing task
-always continues that task's conversation. The precedence is therefore:
+The native conversation remains live in the retained project ACP process and is
+resumed from its persisted identifier after unavoidable process restarts. A
+task can explicitly request a fresh conversation.
+A dependent task branches from the native conversation of its prerequisite
+when that prerequisite used the same project and runner. A follow-up message on
+the currently active task resumes its branch. Reopening an older task forks
+from that task's saved branch so new work does not rewrite its earlier context.
+The precedence is therefore:
 
-1. the conversation of a dependency;
-2. an earlier turn on the same task;
+1. an earlier turn on the same task;
+2. the conversation of a dependency;
 3. a requested fresh conversation;
 4. the project's most recent conversation.
+
+If a runner does not support conversation forks, XpressClaw continues the
+selected source conversation as a compatibility fallback and records that
+fallback in the task timeline.
 
 Executable work is represented by a `work_attempt`. An attempt records:
 
 - the task and queue item that caused it;
 - provenance and kind (`interactive`, `scheduled`, `workflow`, or `task`);
-- native runner, native session ID, and ephemeral container ID;
+- native runner, native session ID, and active project-container lease;
 - lifecycle (`queued`, `preparing`, `running`, `waiting_for_input`, `review`,
   `completed`, `failed`, or `cancelled`);
 - structured results, errors, and artifacts.
@@ -69,7 +77,7 @@ is deliberately excluded from the primary artifact view.
 
 ### Native products own the agent loop
 
-The durable task queue is consumed by short-lived native CLI workers. The
+The durable task queue is consumed by project-scoped native ACP processes. The
 initial adapters are:
 
 - Codex via `codex exec --json`;
@@ -193,6 +201,26 @@ remains responsible for permissions and execution and emits the normal ACP
 tool-call activity; XpressClaw does not independently verify the call. A future deterministic control-plane MCP step
 would belong to the workflow runtime rather than the ACP client.
 
+### Delegated work visibility
+
+Durable child Tasks are displayed separately from native harness plan/checklist
+rows. The task activity API includes a read-only snapshot of each delegated
+Task's assigned Agent, current execution state, blocking relationship, timestamps,
+and latest event kind. The UI links to the child's existing task transcript; it
+does not copy that transcript or launch another execution. Incremental activity
+polls refresh this snapshot even when the parent has emitted no new events.
+
+A queued parent explains when required child work is preventing its next turn,
+and confirms that queued guidance is saved. A parent that is actively executing
+or awaiting an answer keeps that more immediate status. Cancelled or failed
+required work remains visible as needing attention, matching the scheduler's
+existing completion gate. Completed child Tasks are retained in a collapsed
+history, while native plan rows remain under Steps.
+
+This view represents XpressClaw's durable delegation model. Harness-owned native
+subagents require separate lifecycle/session integration and are not inferred
+from generic tool output or represented as newly scheduled Tasks here.
+
 ## Consequences
 
 ### Positive
@@ -200,8 +228,8 @@ would belong to the workflow runtime rather than the ACP client.
 - Users can choose the native agent product that best fits each workflow step.
 - The project differentiates on orchestration, isolation, devices, and UX
   instead of maintaining another agent framework.
-- Session history remains coherent even though native execution contexts are
-  disposable.
+- Session history remains coherent in a live project process and across its
+  unavoidable restarts.
 - Schedules, task dependencies, and workflows share one dispatch path and one
   audit model. Future connector sources must enter through that same path.
 - The UI can be designed around intent, progress, evidence, and decisions
@@ -215,8 +243,7 @@ would belong to the workflow runtime rather than the ACP client.
   message can be queued behind current work even though the session UI remains
   responsive.
 - Commands and control changes selected while a native turn is already running
-  apply to the next turn because attempt containers and ACP connections are
-  short-lived.
+  apply to the next turn through the retained ACP connection.
 - Existing conversation and legacy harness code remains temporarily for data
   compatibility, but it is no longer the server's task execution path. It can
   be deleted after configuration and CLI migration are complete.
@@ -239,7 +266,7 @@ Build the runner images you use with:
 ```bash
 docker buildx build --load -f harnesses/native/codex/Dockerfile -t xpressclaw-runner-codex:latest -t localhost/xpressclaw-runner-codex:latest harnesses/native
 docker buildx build --load -f harnesses/native/claude/Dockerfile -t xpressclaw-runner-claude:latest -t localhost/xpressclaw-runner-claude:latest harnesses/native
-docker buildx build --load -f harnesses/native/opencode/Dockerfile -t xpressclaw-runner-opencode:latest -t localhost/xpressclaw-runner-opencode:latest harnesses/native
+scripts/build-runner-images.sh opencode  # binary template, pinned by harnesses/runner-versions.json
 ```
 
 Then sign in on the host with the selected CLI. API-key based LLM router
@@ -255,10 +282,64 @@ boundary: use only runner images you control or have audited.
 ## Related ADRs
 
 - ADR-002: Agent Backend Abstraction (superseded for task execution)
-- ADR-003: Container Isolation (retained, changed to per-attempt containers)
+- ADR-003: Container Isolation (retained, changed to per-project containers)
 - ADR-018: Desired-State Controller (superseded for agent execution)
 - ADR-019: Background Conversations (event durability retained)
 - ADR-020: Task Dependencies (retained)
 - ADR-021: Agent Sessions / Actor Model (superseded)
 - ADR-022: Workflow execution retained; connector runtime deferred
 - ADR-024: Android device capability work (designed to attach as a resource)
+
+### Delegated task and failure visibility
+
+Durable child tasks appear in assigned-Agent, project, search, recent-work, and
+status-count views, with links back to their parent. Only hidden idle work and
+native harness checklist rows are excluded from ordinary task lists; checklist
+rows remain visible as parent steps. A required child that needs attention must
+not make its queued parent appear to be executing.
+
+Unresolved blocked/input tasks have a separate read-only attention snapshot, so
+recent-history limits cannot hide the work responsible for an indicator. This
+includes active parents blocked by a cancelled required child, using the same
+derived activity state as the task view; cancelled optional work and resolved
+parents are not new failures. The global attention panel uses this snapshot and
+can expand beyond its five-row preview. Project
+warnings lead to the affected task or Agent. Delegated progress includes the
+current attempt's failure reason, not an older failure after retry or resolution.
+Session status is derived on reads from current attempts and unresolved tasks;
+cached failure flags from cancelled/completed work do not keep projects red.
+Historical attempts and their errors remain intact.
+
+### Delegation failure propagation
+
+A durable child that fails, is cancelled, or needs input must notify its active
+parent. Before claiming native work, reconcile these states into a transactional
+notification journal, a system message on the parent, and one queued parent
+response. Repeated polls and control-plane restarts must not repeat delivery for
+the same child attempt/state and parent assignment. Coalesce ordinary queued parent
+guidance, but never take over a workflow-owned response. Do not create replacement
+tasks or retry children automatically. User replies, resumes, and scheduled checks may reuse the
+journal for the same unresolved blocker without creating another alert or turn.
+A reassigned parent gets a notification for its new owner.
+
+Only an attempt backed by this journal may run a recovery turn while required
+children remain incomplete. The grant is scoped to its current parent assignment
+and an unresolved child outcome. All other admission constraints still apply,
+including dependencies, scheduling, project deletion, Connect ownership and active
+Agent work. Parent completion still requires the original review/child gates.
+The recovery prompt carries the child identity and error, asks the parent to
+diagnose or seek user input, and does not replay the original task description.
+Completed/cancelled parents are never reopened by this mechanism.
+
+Notification-only responses are recorded separately from ordinary work. If all
+of their child outcomes resolve before execution, dispatch reconciliation and
+parent completion roll-up cancel these unused responses atomically, retaining
+the journal and transcript. A user reply, scheduled message, explicit resume,
+or independent continuation adopts the response and prevents automatic removal.
+Started work, container leases, and workflow-owned responses are never retired
+by this cleanup. Migration 53 leaves older responses with unknown origin intact.
+
+Recovery prompts recheck each child outcome and omit resolved failures. If a
+child resolves after claim or alongside pending user guidance, the parent gets
+current-state guidance instead of the obsolete error or original task brief.
+This does not waive required-child completion gates or retry children.

@@ -4,13 +4,13 @@
 	let { children } = $props();
 </script>
 
-<div class="flex min-h-screen items-center justify-center bg-background p-4">
+<div class="flex min-h-screen items-center justify-center bg-background p-4 pt-[calc(env(safe-area-inset-top)+1rem)] pl-[calc(env(safe-area-inset-left)+1rem)] pr-[calc(env(safe-area-inset-right)+1rem)] pb-[calc(env(safe-area-inset-bottom)+1rem)]">
 	<div class="w-full max-w-2xl">
 		<!-- Header -->
 		<div class="mb-8 text-center">
 			<img src="/icon.png" alt="xpressclaw" class="mx-auto mb-4 h-12 w-12 rounded-xl" />
 			<h1 class="text-2xl font-bold text-foreground">Set up xpressclaw</h1>
-			<p class="mt-1 text-sm text-muted-foreground">Connect an ACP agent to a project and a durable stream of work</p>
+			<p class="mt-1 text-sm text-muted-foreground">Give an Agent a workspace and ACP harness</p>
 		</div>
 
 		{@render children()}

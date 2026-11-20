@@ -22,4 +22,8 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 reqwest = { workspace = true }
+zeroize = { workspace = true }
 urlencoding = "2"
+
+[dev-dependencies]
+tempfile = "3"

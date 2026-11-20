@@ -1,0 +1,253 @@
+<script lang="ts">
+	import { goto } from '$app/navigation';
+	import { onMount } from 'svelte';
+	import { agents, conversations, projects, tasks, type Agent, type Conversation, type Project, type Task } from '$lib/api';
+	import { isTransientRefreshError, subscribeLiveUpdates, usePaneActive } from '$lib/liveUpdates';
+	import { PROJECT_MUTATION_EVENT, publishProjectMutation, type ProjectMutation } from '$lib/projectEvents';
+	import { agentRuntimeSummary, harnessMark, timeAgo } from '$lib/utils';
+	import AgentLoading from '$lib/components/AgentLoading.svelte';
+	import ProjectSettingsDialog from '$lib/components/ProjectSettingsDialog.svelte';
+	import ProjectStorageDialog from '$lib/components/ProjectStorageDialog.svelte';
+
+	let { projectId }: { projectId: string } = $props();
+	const paneActive = usePaneActive();
+	let project = $state<Project | null>(null);
+	let projectConversations = $state<Conversation[]>([]);
+	let agentList = $state<Agent[]>([]);
+	let taskList = $state<Task[]>([]);
+	let attentionTasks = $state<Task[]>([]);
+	let loading = $state(true);
+	let creatingConversation = $state(false);
+	let addingAgent = $state(false);
+	let conversationTitle = $state('');
+	let selectedAgents = $state<string[]>([]);
+	let selectedAgentToMove = $state('');
+	let projectIdCopied = $state(false);
+	let showingProjectSettings = $state(false);
+	let showingStorage = $state(false);
+	let error = $state('');
+	let projectMutationVersion = 0;
+	let loadGeneration = 0;
+	let appliedGeneration = 0;
+
+	let projectAgents = $derived(agentList.filter((agent) => agent.project_id === projectId));
+	let availableAgents = $derived(agentList.filter((agent) => agent.project_id !== projectId));
+
+	onMount(() => {
+		const handleProjectMutation = (event: Event) => {
+			const mutation = (event as CustomEvent<ProjectMutation>).detail;
+			if (mutation?.kind !== 'updated' || mutation.project.id !== projectId) return;
+			projectMutationVersion += 1;
+			if (mutation.authoritative || !project || project.updated_at < mutation.project.updated_at) {
+				project = mutation.project;
+			}
+		};
+		window.addEventListener(PROJECT_MUTATION_EVENT, handleProjectMutation);
+		void load();
+		const unsubscribeLiveUpdates = subscribeLiveUpdates(
+			['projects', 'conversations', 'agents', 'sessions', 'tasks'],
+			() => load(true),
+			{ active: paneActive, fallbackIntervalMs: 5000 }
+		);
+		return () => {
+			unsubscribeLiveUpdates();
+			window.removeEventListener(PROJECT_MUTATION_EVENT, handleProjectMutation);
+		};
+	});
+
+	async function load(rethrowTransient = false) {
+		const gen = ++loadGeneration;
+		const mutationVersionAtStart = projectMutationVersion;
+		try {
+			const [loadedProject, loadedConversations, loadedAgents, loadedTasks, attention] = await Promise.all([
+				projects.get(projectId),
+				conversations.list(projectId),
+				agents.list(),
+				projects.tasks(projectId),
+				tasks.attention(),
+			]);
+			if (gen < appliedGeneration) return;
+			appliedGeneration = gen;
+			if (projectMutationVersion === mutationVersionAtStart) project = loadedProject;
+			projectConversations = loadedConversations;
+			agentList = loadedAgents;
+			taskList = loadedTasks;
+			attentionTasks = (attention.tasks ?? []).filter(task => task.project_id === projectId);
+			error = '';
+			if (loading && selectedAgents.length === 0) selectedAgents = project?.agent_ids.slice() ?? [];
+		} catch (cause) {
+			if (gen >= appliedGeneration) {
+				error = cause instanceof Error ? cause.message : 'Could not load this project.';
+			}
+			if (rethrowTransient && isTransientRefreshError(cause)) throw cause;
+		} finally {
+			if (appliedGeneration > 0 || gen === loadGeneration) loading = false;
+		}
+	}
+
+	function toggleAgent(agentId: string) {
+		selectedAgents = selectedAgents.includes(agentId)
+			? selectedAgents.filter((id) => id !== agentId)
+			: [...selectedAgents, agentId];
+	}
+
+	async function copyProjectId() {
+		if (!project) return;
+		try {
+			await navigator.clipboard.writeText(project.id);
+			projectIdCopied = true;
+		} catch {
+			error = 'Could not copy the Project ID. It remains visible so you can select it.';
+		}
+	}
+
+	async function createConversation() {
+		if (!conversationTitle.trim()) return;
+		error = '';
+		try {
+			const conversation = await conversations.create({
+				project_id: projectId,
+				title: conversationTitle.trim(),
+				participant_ids: selectedAgents,
+			});
+			projectConversations = [conversation, ...projectConversations];
+			conversationTitle = '';
+			creatingConversation = false;
+			if (project) project = { ...project, conversation_count: project.conversation_count + 1 };
+		} catch (cause) {
+			error = cause instanceof Error ? cause.message : 'Could not create the conversation.';
+		}
+	}
+
+	async function moveAgent() {
+		if (!selectedAgentToMove) return;
+		error = '';
+		try {
+			await projects.assignAgent(projectId, selectedAgentToMove);
+			selectedAgentToMove = '';
+			addingAgent = false;
+			await load();
+		} catch (cause) {
+			error = cause instanceof Error ? cause.message : 'Could not add the Agent.';
+		}
+	}
+
+	function projectUpdated(updated: Project) {
+		project = updated;
+		showingProjectSettings = false;
+		error = '';
+		publishProjectMutation({ kind: 'updated', project: updated });
+	}
+
+	async function projectDeleted(deletedProjectId: string) {
+		showingProjectSettings = false;
+		publishProjectMutation({ kind: 'deleted', projectId: deletedProjectId });
+		const remainingProjects = await projects.list().catch(() => []);
+		const nextProject = remainingProjects.find((candidate) => candidate.id !== deletedProjectId);
+		await goto(nextProject ? `/projects/${encodeURIComponent(nextProject.id)}` : '/projects', {
+			replaceState: true,
+		});
+	}
+
+	function agentState(agent: Agent): string {
+		const attention = attentionTasks.filter(task => task.agent_id === agent.id);
+		if (attention.some(task => (task.activity_status ?? task.status) === 'blocked')) return 'blocked';
+		if (attention.some(task => (task.activity_status ?? task.status) === 'waiting_for_input')) return 'waiting_for_input';
+		return agent.status;
+	}
+
+	function taskDot(status: string): string {
+		if (['failed', 'blocked', 'error'].includes(status)) return 'bg-red-500';
+		if (status === 'in_progress' || status === 'running') return 'bg-blue-500 animate-pulse';
+		if (['waiting_for_input', 'waiting_for_subtasks', 'waiting_for_dependencies'].includes(status)) return 'bg-orange-500';
+		if (status === 'pending' || status === 'queued') return 'bg-amber-400';
+		return 'bg-emerald-500';
+	}
+</script>
+
+<div class="workspace-scroll-y h-full">
+	{#if loading}
+		<div class="flex h-full items-center justify-center"><AgentLoading label="Loading project" phase="loading" /></div>
+	{:else if project}
+		<div class="mx-auto max-w-6xl space-y-8 p-4 sm:p-6">
+			{#if project.deletion_started_at}
+				<div role="alert" class="rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-700 dark:text-amber-300">Deletion was interrupted after this Project stopped accepting new work. Open Project settings and confirm deletion again to finish cleanup.</div>
+			{/if}
+			<header class="flex flex-wrap items-start justify-between gap-4">
+				<div class="flex min-w-0 items-center gap-4">
+					<span class="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-primary/10 text-xl font-semibold text-primary">{project.icon || project.name.slice(0, 1).toUpperCase()}</span>
+					<div class="min-w-0"><p class="text-xs text-muted-foreground"><a href="/projects" class="hover:text-foreground">Projects</a> /</p><h1 class="truncate text-2xl font-bold">{project.name}</h1><p class="mt-1 text-sm text-muted-foreground">{project.description || 'A shared context for conversations, Agents, tasks, and memory.'}</p><div class="mt-2 flex min-w-0 items-center gap-2 text-[11px] text-muted-foreground"><span class="shrink-0 font-medium">Project ID</span><code data-project-id class="min-w-0 select-all truncate rounded bg-muted px-1.5 py-0.5 font-mono">{project.id}</code><button type="button" aria-label="Copy project ID" onclick={() => void copyProjectId()} class="shrink-0 font-medium text-primary hover:underline">{projectIdCopied ? 'Copied' : 'Copy ID'}</button></div></div>
+				</div>
+				<div class="flex shrink-0 items-center gap-2">
+					<button type="button" onclick={() => (showingStorage = true)} class="rounded-lg border border-border px-3 py-2 text-sm font-medium text-muted-foreground hover:bg-accent hover:text-foreground">Clean up</button>
+					<button type="button" onclick={() => (showingProjectSettings = true)} class="rounded-lg border border-border px-3 py-2 text-sm font-medium text-muted-foreground hover:bg-accent hover:text-foreground">Project settings</button>
+					<button type="button" onclick={() => (creatingConversation = !creatingConversation)} class="rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground">+ Conversation</button>
+				</div>
+			</header>
+
+			{#if error}<div class="rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</div>{/if}
+
+			{#if attentionTasks.length > 0 || projectAgents.some(agent => ['blocked', 'failed', 'error', 'waiting_for_input'].includes(agent.status))}
+                <section aria-label="Project needs attention" class="rounded-xl border border-orange-500/40 bg-orange-500/5 p-4 space-y-3">
+                    <h2 class="font-semibold">Needs attention</h2>
+                    {#each attentionTasks as task (task.id)}
+                        <div class="min-w-0">
+                            <a href="/tasks/{task.id}" class="text-sm font-medium text-primary underline">{task.title}</a>
+                            <p class="text-xs text-muted-foreground">{(task.activity_status ?? task.status) === 'waiting_for_input' ? 'Needs input' : 'Blocked'} · {projectAgents.find(agent => agent.id === task.agent_id)?.title || task.agent_id || 'Unassigned'}</p>
+                            {#if task.parent_task_id}<a href="/tasks/{task.parent_task_id}" class="text-xs text-muted-foreground underline">Parent: {task.parent_title || 'Open parent task'}</a>{/if}
+                            {#if task.error_message}<p class="mt-1 whitespace-pre-wrap break-words text-xs text-destructive">{task.error_message}</p>{/if}
+                        </div>
+                    {/each}
+                    {#each projectAgents.filter(agent => ['blocked', 'failed', 'error', 'waiting_for_input'].includes(agent.status) && !attentionTasks.some(task => task.agent_id === agent.id)) as agent}
+                        <a href="/agents/{encodeURIComponent(agent.id)}" class="block text-sm text-primary underline">{agent.title || agent.name} — open work needing attention</a>
+                    {/each}
+                </section>
+            {/if}
+
+            {#if creatingConversation}
+				<form onsubmit={(event) => { event.preventDefault(); void createConversation(); }} class="ai-card space-y-4 p-4">
+					<div><label for="conversation-title" class="text-xs font-medium">Conversation name</label><input id="conversation-title" bind:value={conversationTitle} placeholder="What are we working through?" class="mt-1 w-full rounded-lg border border-input bg-background px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring" /></div>
+					<div><p class="mb-2 text-xs font-medium">Agents in this conversation</p><div class="flex flex-wrap gap-2">{#each projectAgents as agent (agent.id)}<button type="button" onclick={() => toggleAgent(agent.id)} class="flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs {selectedAgents.includes(agent.id) ? 'border-primary bg-primary/10 text-primary' : 'border-border text-muted-foreground'}"><span class="flex h-5 w-5 items-center justify-center rounded-full bg-muted text-[9px]">{harnessMark(agent.backend)}</span>{agent.title || agent.name}</button>{/each}</div></div>
+					<div class="flex justify-end gap-2"><button type="button" onclick={() => (creatingConversation = false)} class="rounded-lg border border-border px-3 py-2 text-sm">Cancel</button><button disabled={!conversationTitle.trim()} class="rounded-lg bg-primary px-4 py-2 text-sm text-primary-foreground disabled:opacity-40">Create conversation</button></div>
+				</form>
+			{/if}
+
+			<section>
+				<div class="mb-3 flex items-end justify-between"><div><h2 class="font-semibold">Conversations</h2><p class="text-xs text-muted-foreground">Talk with several Agents and turn decisions into durable work.</p></div><span class="text-xs text-muted-foreground">{projectConversations.length}</span></div>
+				{#if projectConversations.length === 0}
+					<button type="button" onclick={() => (creatingConversation = true)} class="w-full rounded-xl border border-dashed border-border p-8 text-center text-sm text-muted-foreground hover:border-primary/40 hover:text-foreground">Start the first conversation</button>
+				{:else}
+					<div class="grid gap-3 md:grid-cols-2">{#each projectConversations as conversation (conversation.id)}<a href="/conversations/{encodeURIComponent(conversation.id)}" data-project-conversation={conversation.id} class="ai-card p-4 transition hover:bg-[hsl(var(--hover))]"><div class="flex items-start gap-3"><span class="text-lg">{conversation.icon || '#'}</span><div class="min-w-0 flex-1"><h3 class="truncate text-sm font-medium">{conversation.title || 'Untitled conversation'}</h3><p class="mt-1 text-xs text-muted-foreground">{conversation.participants.filter((participant) => participant.participant_type === 'agent').length} Agents · {timeAgo(conversation.last_message_at || conversation.created_at)}</p></div><span class="text-muted-foreground">→</span></div></a>{/each}</div>
+				{/if}
+			</section>
+
+			<div class="grid gap-8 lg:grid-cols-[minmax(0,1fr)_minmax(18rem,0.65fr)]">
+				<section>
+					<div class="mb-3 flex items-center justify-between"><div><h2 class="font-semibold">Recent tasks</h2><p class="text-xs text-muted-foreground">Work created here or from a conversation.</p></div><a href={`/tasks?view=list&project=${encodeURIComponent(projectId)}&status=all&sort=newest`} class="text-xs text-primary hover:underline">All tasks</a></div>
+					<div class="ai-card overflow-hidden">{#if taskList.length === 0}<p class="p-5 text-sm text-muted-foreground">No tasks in this project yet.</p>{:else}{#each taskList.slice(0, 8) as task (task.id)}<a href="/tasks/{task.id}" class="flex items-center gap-3 border-b border-border/70 px-4 py-3 last:border-0 hover:bg-[hsl(var(--hover))]"><span class="h-2 w-2 shrink-0 rounded-full {taskDot(task.activity_status ?? task.status)}"></span><span class="min-w-0 flex-1"><span class="block truncate text-sm">{task.title}</span><span class="text-[11px] text-muted-foreground">{(task.activity_status ?? task.status).replaceAll('_', ' ')} · {timeAgo(task.updated_at)}</span></span><span class="text-muted-foreground">→</span></a>{/each}{/if}</div>
+				</section>
+
+				<section>
+					<div class="mb-3 flex items-center justify-between"><div><h2 class="font-semibold">Agents</h2><p class="text-xs text-muted-foreground">Durable harnesses and workspaces available here.</p></div><button type="button" onclick={() => (addingAgent = !addingAgent)} class="text-xs text-primary">+ Add</button></div>
+					{#if addingAgent}<div class="mb-3 space-y-2 rounded-lg border border-border bg-card p-2"><div class="flex gap-2"><select bind:value={selectedAgentToMove} class="min-w-0 flex-1 rounded-md border border-input bg-background px-2 py-1.5 text-xs"><option value="">Choose an existing Agent…</option>{#each availableAgents as agent}<option value={agent.id}>{agent.title || agent.name}</option>{/each}</select><button type="button" onclick={() => void moveAgent()} disabled={!selectedAgentToMove} class="rounded-md bg-primary px-3 text-xs text-primary-foreground disabled:opacity-40">Move here</button></div><a href="/setup?mode=add-session&amp;project_id={encodeURIComponent(projectId)}" class="block rounded-md border border-dashed border-border px-3 py-2 text-center text-xs text-muted-foreground hover:border-primary/40 hover:text-foreground">Create a new Agent in this Project</a></div>{/if}
+					<div class="space-y-2">{#each projectAgents as agent (agent.id)}<a href="/agents/{encodeURIComponent(agent.id)}" class="flex items-center gap-3 rounded-xl border border-border bg-card p-3 hover:border-primary/40"><span class="flex h-9 w-9 items-center justify-center rounded-xl bg-muted text-xs font-semibold">{harnessMark(agent.backend)}</span><span class="min-w-0 flex-1"><span class="block truncate text-sm font-medium">{agent.title || agent.name}</span><span class="block truncate text-[11px] text-muted-foreground">{agentRuntimeSummary(agent)}{#if ['blocked', 'error', 'failed'].includes(agentState(agent))} · Needs attention{:else if agentState(agent) === 'waiting_for_input'} · Needs input{/if}</span></span><span class="h-2 w-2 rounded-full {taskDot(agentState(agent))}"></span></a>{/each}{#if projectAgents.length === 0}<a href="/setup?mode=add-session&amp;project_id={encodeURIComponent(projectId)}" class="block rounded-xl border border-dashed border-border p-5 text-center text-sm text-muted-foreground">Create an Agent in this Project</a>{/if}</div>
+				</section>
+			</div>
+		</div>
+	{:else}
+		<div class="p-6 text-sm text-destructive">{error || 'Project not found.'}</div>
+	{/if}
+</div>
+
+{#if project && showingProjectSettings}
+	<ProjectSettingsDialog
+		{project}
+		onclose={() => (showingProjectSettings = false)}
+		onupdated={projectUpdated}
+		ondeleted={projectDeleted}
+	/>
+{/if}
+
+{#if project && showingStorage}
+	<ProjectStorageDialog {projectId} projectName={project.name} onclose={() => showingStorage = false} />
+{/if}

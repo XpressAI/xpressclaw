@@ -42,19 +42,51 @@ agent advertises the model selector and its valid values; Xpressclaw does not
 maintain provider-specific model lists or translate the preference into a CLI
 flag. An invalid value fails with the choices reported by that agent.
 
+### Task model controls
+
+The task picker reads one backend-resolved ACP snapshot independent of recent
+activity history. Observed schemas are not preferences: the composer does not
+copy displayed defaults into messages. Explicit picker edits are task preferences
+scoped to Agent/runner, persisted separately from message delivery. Idle connected
+edits apply without a prompt; busy/disconnected edits remain visibly pending until
+acknowledged by the appropriate session. Dispatch freezes preferences before
+asynchronous preparation. A model change refreshes dependent controls and clears
+previously explicit model-dependent preferences. Users can clear task preferences
+without reconstructing an adapter's original defaults.
+
+See [the picker contract](../acp-picker-reset.md) for context/revision checks,
+application boundaries, compatibility, and bounded review scope. This does not
+initialize a brand-new ACP session or change queue/continuation/crash-repair rules.
+
 ### Session lifecycle
 
-Each work attempt starts a short-lived, attached container. Xpressclaw performs
-the ACP handshake, then creates a session for fresh work or continues a stored
-ACP session. It prefers `session/resume` when the agent advertises that
-capability and otherwise uses `session/load`. The returned ACP session ID is
-stored on the attempt and selected using the precedence from ADR-025:
-dependency, earlier turn on the same task, explicit fresh conversation, then
-the project's latest conversation.
+> **Updated by ADR-033:** Each project now retains its initialized ACP process
+> and connection as well as its container across ordinary turns.
 
-The container remains disposable. Session durability belongs to the agent's
-mounted data directory and the ACP session identifier. Custom images that need
-durable state must declare an explicit volume.
+The first work attempt starts and initializes an attached ACP process in the
+project's container. Later attempts are serialized through that connection.
+Xpressclaw creates a session for fresh work, continues an already-live task
+session, or uses `session/fork` to branch an older task, dependency, or the
+project's active context. Forking is capability-gated because it is an unstable
+ACP extension. If unavailable or rejected, XpressClaw continues the selected
+source with `session/resume` when advertised and `session/load` otherwise. The
+forked session is also activated with `session/resume` or `session/load` before
+applying controls or prompting: a successful fork can return a detached session.
+Agents without either activation method retain the legacy live-fork behavior.
+The returned fork ID is stored on the attempt before activation so interrupted
+setup can recover the same branch. ACP session IDs are selected using the
+precedence from ADR-025: earlier turn on the same task, dependency, explicit
+fresh conversation, then the project's latest conversation.
+
+Attempts created before task branches were introduced can share one mutable
+ACP session ID, so their exact historical context cannot be reconstructed.
+Reopening one still forks the shared session's current tip to isolate future
+turns on that task.
+
+Session durability still belongs to the agent's data and persisted ACP session
+identifier. The long-lived process is an optimization and continuity feature;
+after a crash, hard cancellation, reconfiguration, or control-plane restart,
+Xpressclaw starts a new process and resumes the durable session.
 
 ### Events and tasks
 
@@ -76,6 +108,26 @@ response directly back to that in-flight ACP request. If an agent only asks in
 ordinary response text, the task still waits and a later chat reply resumes the
 same ACP session as a new turn.
 
+### Transient Claude credential refresh conflicts
+
+Claude can reject `session/prompt` because another Claude Code process is
+refreshing the shared OAuth token or exited while holding the refresh lock.
+For this specific error, the ACP client retries at most three times, waiting
+one minute between requests. Retries reuse the same prompt, native session,
+and task attempt or conversation turn; they do not create new work or rerun
+session setup. Intermediate failures stay in server diagnostics rather than
+appearing as failed work or chat errors. Claude's matching synthetic error
+message is buffered until the prompt response confirms the matching error,
+then withheld from the visible transcript during recovery. Successful replies
+that quote the error, and replies preceding unrelated failures, retain their
+text and message order.
+
+Automatic replay is permitted only before genuine assistant output, thought,
+tool, plan, permission, or elicitation activity. Metadata and echoed user input
+do not prevent recovery. Cancellation and process shutdown interrupt the wait.
+After the retry limit, or for unrelated authentication/provider errors, the
+normal terminal error is surfaced so the user can intervene.
+
 ### Scoped control-plane wake-ups
 
 Built-in runner images include a narrow Xpressclaw MCP server that can arm,
@@ -84,8 +136,8 @@ attaches it at ACP session creation or resume with the project identity and
 local control-plane address fixed by the client. It does not expose arbitrary
 task mutation or cross-project scheduling.
 
-The scheduler persists the deadline independently of the disposable attempt
-container. When due, it creates ordinary scheduled work, which follows the
+The scheduler persists the deadline independently of any active ACP process.
+When due, it creates ordinary scheduled work, which follows the
 same ACP session-selection precedence described above. This supplies the
 future callback that an in-turn sleep, host timer, or persistent goal runner
 cannot provide on its own while keeping model-loop ownership in the native
@@ -97,7 +149,15 @@ The initial client chooses an affirmative permission option when an ACP agent
 requests approval. This preserves the previous autonomous-worker behavior and
 is limited by the attempt container, workspace mounts, network policy, and
 resource limits. Permission requests and the selected option are recorded.
-A configurable interactive/autonomous permission policy is future work.
+
+The built-in Codex runner also defaults its ACP adapter to
+`agent-full-access`. Codex's normal workspace sandbox would otherwise create a
+second, product-specific restriction inside the retained Agent container and
+make common development tools fail despite already being isolated from the
+host. This does not grant host access: the outer container, its mounts, network,
+limits, and the separately opt-in host container-engine socket remain the
+security boundary. An explicit `INITIAL_AGENT_MODE` runner environment value or
+an ACP mode selected by the user overrides the default.
 
 ### Compatibility
 
@@ -121,9 +181,8 @@ templates.
 ### Negative
 
 - Products without native ACP support require an adapter.
-- The control plane must keep a bidirectional container attachment open for a
-  turn instead of consuming one-way logs after process exit. Structured
-  questions extend that lifetime until the user answers or cancels.
+- The control plane must supervise a bidirectional container attachment for the
+  project's lifetime instead of consuming one-way logs after process exit.
 - Session continuation depends on the server implementing `session/resume` or
   `session/load` and retaining the referenced session state.
 - Automatically approving permissions is suitable only for trusted images and

@@ -2,14 +2,14 @@
 	import type { Snippet } from 'svelte';
 
 	let {
-		label = '', overVar = '', asVar = 'item',
+		parallel = false, label = '', overVar = '', asVar = 'item',
 		expanded = false, compact = false,
 		onupdate = (_: Record<string, unknown>) => {},
 		ontoggle = () => {},
 		onremove = () => {},
 		children
 	}: {
-		label?: string; overVar?: string; asVar?: string;
+		parallel?: boolean; label?: string; overVar?: string; asVar?: string;
 		expanded?: boolean; compact?: boolean;
 		onupdate?: (updates: Record<string, unknown>) => void;
 		ontoggle?: () => void;
@@ -21,22 +21,22 @@
 <div class="group rounded-lg bg-amber-950/10 loop-animated-border">
 	<!-- Header -->
 	<div class="flex items-center gap-2 px-3 py-2">
-		<span class="text-[10px] font-bold tracking-wider text-red-400">LOOP</span>
-		<span class="text-sm font-medium text-foreground flex-1 truncate">{label || 'For each'}</span>
-		{#if overVar}
+		<span class="text-[10px] font-bold tracking-wider text-red-400">{parallel ? 'PARALLEL' : 'LOOP'}</span>
+		<span class="text-sm font-medium text-foreground flex-1 truncate">{label || (parallel ? 'Parallel branches' : 'For each')}</span>
+		{#if !parallel && overVar}
 			<span class="text-[10px] text-muted-foreground font-mono">{overVar} as {asVar}</span>
 		{/if}
 		{#if !compact}
-			<button onclick={ontoggle} aria-label={expanded ? 'Collapse loop' : 'Expand loop'} class="text-muted-foreground hover:text-foreground">
+			<button onclick={ontoggle} aria-label={expanded ? (parallel ? 'Collapse parallel' : 'Collapse loop') : (parallel ? 'Expand parallel' : 'Expand loop')} class="text-muted-foreground hover:text-foreground">
 				<svg class="h-3.5 w-3.5 transition-transform {expanded ? 'rotate-180' : ''}" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M19.5 8.25l-7.5 7.5-7.5-7.5" /></svg>
 			</button>
-			<button onclick={onremove} aria-label="Remove loop" class="text-muted-foreground/30 hover:text-destructive opacity-0 group-hover:opacity-100 transition-opacity">
+			<button onclick={onremove} aria-label={parallel ? 'Remove parallel' : 'Remove loop'} class="text-muted-foreground/30 hover:text-destructive opacity-0 group-hover:opacity-100 transition-opacity">
 				<svg class="h-3.5 w-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
 			</button>
 		{/if}
 	</div>
 
-	{#if expanded && !compact}
+	{#if expanded && !compact && !parallel}
 		<div class="border-t border-dashed border-amber-600/30 px-3 py-2 space-y-2">
 			<div class="grid grid-cols-2 gap-2">
 				<div>
@@ -55,6 +55,7 @@
 		</div>
 	{/if}
 
+	{#if parallel && !compact}<p class="px-3 pb-2 text-xs text-muted-foreground">Branches run independently. The next step waits for every branch.</p>{/if}
 	<!-- Nested content (child blocks) -->
 	{#if !compact}
 		<div class="px-4 py-2">

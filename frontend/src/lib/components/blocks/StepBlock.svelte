@@ -8,6 +8,7 @@
 		outputs = {},
 		expanded = false, compact = false,
 		agentList = [],
+		agentRoles = [],
 		capabilities = { commands: [], configOptions: [], mcpServers: [] },
 		onupdate = (_: Record<string, unknown>) => {},
 		ontoggle = () => {},
@@ -20,6 +21,7 @@
 		outputs?: Record<string, { type?: string; description?: string }>;
 		expanded?: boolean; compact?: boolean;
 		agentList?: Agent[];
+		agentRoles?: { name: string; description?: string }[];
 		capabilities?: { commands: AcpCommand[]; configOptions: AcpConfigOption[]; mcpServers: string[] };
 		onupdate?: (updates: Record<string, unknown>) => void;
 		ontoggle?: () => void;
@@ -87,7 +89,14 @@
 					<select value={agent} onchange={(e) => onupdate({ agent: e.currentTarget.value })}
 						class="mt-1 w-full rounded border border-input bg-background px-2 py-1.5 text-xs">
 						<option value="">Select agent...</option>
-						{#each agentList as a}<option value={a.name}>{a.title || a.name}</option>{/each}
+						{#if agentRoles.length > 0}
+							<optgroup label="Run-time roles">
+								{#each agentRoles as role}<option value="@{role.name}">@{role.name}{role.description ? ` — ${role.description}` : ''}</option>{/each}
+							</optgroup>
+						{/if}
+						<optgroup label="Fixed agents">
+							{#each agentList as a}<option value={a.name}>{a.title || a.name}</option>{/each}
+						</optgroup>
 					</select>
 					</label>
 				</div>

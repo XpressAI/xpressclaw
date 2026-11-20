@@ -4,18 +4,167 @@
 // an agent arm a durable future turn without exposing XpressClaw's broader
 // local API or allowing work to be scheduled for another project.
 
+import { createHash } from 'node:crypto';
 import { createInterface } from 'node:readline';
+import { execFile as execFileCallback } from 'node:child_process';
+import { mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { promisify } from 'node:util';
 
 const BASE_URL = (process.env.XPRESSCLAW_URL ?? '').replace(/\/$/, '');
+const CONTROL_TOKEN = process.env.XPRESSCLAW_CONTROL_TOKEN ?? '';
 const AGENT_ID = process.env.XPRESSCLAW_AGENT_ID ?? process.env.AGENT_ID ?? '';
 const TASK_ID = process.env.XPRESSCLAW_TASK_ID ?? '';
+const CONVERSATION_ID = process.env.XPRESSCLAW_CONVERSATION_ID ?? '';
+const CONNECTED = process.env.XPRESSCLAW_CONNECT === '1';
+const CONNECT_COMMAND_ID = process.env.XPRESSCLAW_CONNECT_COMMAND_ID;
+const CONNECTED_TOOLS = new Set(['send_conversation_message', 'publish_task_files', 'download_conversation_attachment', 'create_conversation_task', 'list_platform_attachments', 'get_task', 'update_task_step', 'update_task_status']);
+const PROJECT_ID = process.env.XPRESSCLAW_PROJECT_ID ?? '';
+const REPOSITORY_ROOT = process.env.XPRESSCLAW_REPOSITORY ?? '';
+const LOCAL_COLLABORATION = process.env.XPRESSCLAW_LOCAL_COLLABORATION === '1';
+const COLLABORATION_TOKEN = process.env.XPRESSCLAW_COLLABORATION_TOKEN ?? '';
+const execFile = promisify(execFileCallback);
 
-const INSTRUCTIONS = `Use schedule_wakeup whenever work must pause and resume later.
+const INSTRUCTIONS = CONNECTED ? `This turn belongs to Xpress AI. Your final response is returned to its chat or task automatically. Use send_conversation_message for interim updates and files (8 MiB per file, 20 MiB per turn), and list_platform_attachments and download_conversation_attachment for platform chat uploads. Use create_conversation_task to create independent follow-up work assigned to you in the same platform project. Local wake-ups and delegation are unavailable for connected turns; leave a clear final status when waiting. The platform owns task scheduling and cancellation. When executing an assigned task, perform the work in that task; never create a replacement task for the same assignment. For an assigned task, call get_task to read its checklist, update_task_step for completed or skipped steps (zero-based step_num), then update_task_status with Done, Failed, Waiting, or Doing before your final reply. The requested status takes effect with the final reply, subject to the platform completion gates. Workspace paths are not download links; publish files before your final response.` : `Container paths such as /tmp are not user download links. Use publish_task_files for task deliverables, or send_conversation_message with files for conversation deliverables. Both support files and folder archives. Users can browse the container and download larger folders from Files → Container. Use forward_port for a host-local LLM and expose_port for a container server. For shared interactive logins, run tmux new-session -s NAME; the user can join NAME from the Files terminal.\n\nFor project management, discover teammates with list_project_agents and use their exact IDs. create_tasks can commit up to 100 tasks with ref-based dependencies, start_after and Backlog placement. For independent long-term work set parent_task_id to null so this planning turn can finish. When asked only for a plan, keep tasks in Backlog and workflows disabled until execution is authorized. Inspect progress with list_project_tasks and get_project_task; change future work with update_task_planning. Worker results wake their parent for review. Use review_delegated_task to accept fulfilled assignments, revise the same child with guidance, or wait on a blocker. Required children prevent completion, while explicit coordination wake-ups and replies can still run. Discover workflow templates with list_project_workflows and get_project_workflow, then schedule independent project-owned copies with schedule_workflows, or author definitions with create_workflows. update_project_workflow can pause, enable or reschedule the Project’s copies.\n\nUse schedule_wakeup whenever work must pause and resume later.
 
-The wake-up is stored by XpressClaw, survives control-plane restarts, and starts exactly one future turn in this project's existing ACP conversation. After it is armed, end the current turn instead of sleeping, polling, or claiming that an OS timer can initiate a model turn.`;
+The wake-up is stored by XpressClaw, survives control-plane restarts, and starts exactly one future turn in this project's existing ACP conversation. After it is armed, end the current turn instead of sleeping, polling, or claiming that an OS timer can initiate a model turn.
 
-const TOOLS = [
+XpressClaw also provides durable, project-scoped memory. Read memory://project/briefing or call get_project_memory_index near the start of work that depends on project conventions or prior decisions. Search before making a project-wide choice. Store only durable, reusable knowledge as an atomic note; do not use memory as a task log. Typed links are explicit claims, while vector similarity is only a retrieval aid.${CONVERSATION_ID ? '\n\nThis turn is linked to a project conversation. Your normal final response is automatically delivered to this project conversation; use it for your one final reply. Reserve send_conversation_message for genuine interim updates or publishing workspace files while you continue working. Never use the tool to duplicate your final response. Use download_conversation_attachment to inspect files people or other Agents published, and create_conversation_task when substantial work should continue independently.' : ''}`;
+
+const taskProperties = {
+  title: { type: 'string', minLength: 1 }, description: { type: 'string' },
+  agent_id: { type: 'string', description: 'Exact ID from list_project_agents; omitted means the calling Agent.' },
+  priority: { type: 'integer', minimum: -1000, maximum: 1000 },
+  start_after: { type: ['string', 'null'], description: 'Earliest start as an RFC 3339 timestamp including timezone. Omit for immediate eligibility.' },
+  backlog: { type: 'boolean', description: 'True parks work for approval. It cannot run until moved to the queue, even after start_after.' },
+  new_session: { type: 'boolean' },
+  depends_on: { type: 'array', items: { type: 'string' }, description: 'Task IDs in this Project, or refs in this batch, that must complete first.' },
+};
+const parentTaskProperty = {
+  type: ['string', 'null'],
+  description: 'Omit to make blocking children of the current task. Use null for independent long-term work that should not block this planning turn.',
+};
+const pageProperties = {
+  limit: { type: 'integer', minimum: 1, maximum: 200 }, offset: { type: 'integer', minimum: 0 },
+};
+
+export const TOOLS = [
+  {
+    name: 'list_project_agents',
+    description: 'Discover Agents in your current Project, including exact IDs, display titles, harnesses and status. Use these IDs for assignments instead of guessing names.',
+    inputSchema: { type: 'object', properties: pageProperties, additionalProperties: false },
+  },
+  {
+    name: 'list_project_tasks',
+    description: 'Inspect and paginate durable work in the current Project, with scheduling state, dependencies and revisions. Use status=all for completed work too.',
+    inputSchema: { type: 'object', properties: { ...pageProperties, agent_id: { type: 'string' }, status: { type: 'string', enum: ['active','all','attention','backlog','queue','scheduled','working','input','blocked','review','done'] }, search: { type: 'string', maxLength: 200 } }, additionalProperties: false },
+  },
+  {
+    name: 'get_project_task',
+    description: 'Read a Project task, its current planning revision and its latest 20 messages, including worker results.',
+    inputSchema: { type: 'object', properties: { task_id: { type: 'string', minLength: 1 } }, required: ['task_id'], additionalProperties: false },
+  },
+  {
+    name: 'create_task',
+    description: 'Create durable Project work assigned to an Agent, optionally in Backlog, with an earliest start and dependencies. Eligible work is queued; Backlog is held for approval. Omit parent_task_id for a blocking child, or set it to null for independent future work.',
+    inputSchema: { type: 'object', properties: { ...taskProperties, parent_task_id: parentTaskProperty }, required: ['title'], additionalProperties: false },
+  },
+  {
+    name: 'create_tasks',
+    description: 'Atomically create 1–100 Project tasks with assignments, future starts, Backlog and dependencies. Give tasks unique refs to reference prerequisites within the batch. Invalid batches create nothing. Larger plans can use multiple batches and returned task IDs.',
+    inputSchema: { type: 'object', properties: {
+      tasks: { type: 'array', minItems: 1, maxItems: 100, items: { type: 'object', properties: { ...taskProperties, ref: { type: 'string', minLength: 1 } }, required: ['title'], additionalProperties: false } },
+      parent_task_id: parentTaskProperty,
+    }, required: ['tasks'], additionalProperties: false },
+  },
+  {
+    name: 'review_delegated_task',
+    description: 'Review a result from a child of this task. A finished worker response is a handoff, not automatic completion. Inspect the result and accept only fulfilled assignments; revise continues the same child with guidance; wait records an unresolved blocker without starting more work. Use the attempt ID from the notification or get_project_task. Only the parent Agent can decide.',
+    inputSchema: { type: 'object', properties: {
+      task_id: { type: 'string', minLength: 1 }, expected_attempt_id: { type: 'string' },
+      expected_revision: { type: 'integer', description: 'Current task revision from get_project_task.' },
+      decision: { type: 'string', enum: ['accept', 'revise', 'wait'] },
+      guidance: { type: 'string', maxLength: 20000, description: 'Concrete corrections or the unresolved blocker; required for revise and wait.' },
+    }, required: ['task_id', 'expected_attempt_id', 'expected_revision', 'decision'], additionalProperties: false },
+  },
+  {
+    name: 'update_task_planning',
+    description: 'Schedule, park, release, reassign or reprioritize a Project task. Read its revision first. queue releases Backlog but preserves its date and dependencies; schedule with activate=true also releases Backlog. Running work cannot be changed with this tool.',
+    inputSchema: { type: 'object', properties: {
+      task_id: { type: 'string', minLength: 1 }, expected_revision: { type: 'integer' },
+      action: { type: 'string', enum: ['schedule','backlog','queue','assign','priority'] },
+      start_after: taskProperties.start_after, activate: { type: 'boolean' },
+      agent_id: taskProperties.agent_id, priority: taskProperties.priority,
+    }, required: ['task_id','expected_revision','action'], additionalProperties: false },
+  },
+  {
+    name: 'list_project_workflows',
+    description: 'Discover shared workflow templates and workflows owned by this Project. Includes IDs, input schemas, schedules, execution counts and errors. Set include_templates=false to inspect only this Project’s work.',
+    inputSchema: { type: 'object', properties: { ...pageProperties, include_templates: { type: 'boolean' } }, additionalProperties: false },
+  },
+  {
+    name: 'get_project_workflow',
+    description: 'Read a shared template or this Project’s workflow, including its YAML and current revision.',
+    inputSchema: { type: 'object', properties: { workflow_id: { type: 'string' } }, required: ['workflow_id'], additionalProperties: false },
+  },
+  {
+    name: 'create_workflows',
+    description: 'Atomically create 1–100 workflows owned by this Project from validated YAML. Workflows may include schedule.run_at (RFC 3339) or schedule.cron (server-local time), and schedule.inputs. All assigned Agents must belong to this Project. Use enabled=false to hold a proposal for approval. Workflows appear in Automations.',
+    inputSchema: { type: 'object', properties: {
+      workflows: { type: 'array', minItems: 1, maxItems: 100, items: {
+        type: 'object', properties: { yaml_content: { type: 'string', minLength: 1 }, enabled: { type: 'boolean' } },
+        required: ['yaml_content'], additionalProperties: false,
+      } },
+    }, required: ['workflows'], additionalProperties: false },
+  },
+  {
+    name: 'schedule_workflows',
+    description: 'Atomically schedule 1–100 independent copies of existing workflows in this Project. Each entry supplies its own inputs and exactly one of run_at or cron. Templates remain unchanged. One-time copies disable after firing; recurring copies keep running. Use enabled=false for approval.',
+    inputSchema: { type: 'object', properties: {
+      schedules: { type: 'array', minItems: 1, maxItems: 100, items: {
+        type: 'object', properties: {
+          workflow_id: { type: 'string' }, name: { type: 'string' },
+          inputs: { type: 'object', additionalProperties: true },
+          run_at: { type: 'string', description: 'RFC 3339 date and time including timezone.' },
+          cron: { type: 'string', description: 'Cron expression in the server’s local timezone.' },
+          enabled: { type: 'boolean' },
+        }, required: ['workflow_id'], oneOf: [{ required: ['run_at'], not: { required: ['cron'] } }, { required: ['cron'], not: { required: ['run_at'] } }], additionalProperties: false,
+      } },
+    }, required: ['schedules'], additionalProperties: false },
+  },
+  {
+    name: 'update_project_workflow',
+    description: 'Pause or enable a Project-owned workflow, or replace its YAML to change its schedule, inputs or steps. Read its revision first. This cannot edit shared templates or interrupt an already-started run.',
+    inputSchema: { type: 'object', properties: {
+      workflow_id: { type: 'string' }, expected_revision: { type: 'integer' },
+      enabled: { type: 'boolean' }, yaml_content: { type: 'string' },
+    }, required: ['workflow_id','expected_revision'], additionalProperties: false },
+  },
+  {
+    name: 'forward_port',
+    description: 'Forward TCP between this container and the machine running XpressClaw. host_to_container makes host 127.0.0.1:host_port available at container 127.0.0.1:container_port (for example a local LLM). container_to_host exposes a container server on host loopback. Mappings persist across environment restarts. Another Agent can reach an exposed server by forwarding its host port into their own container.',
+    inputSchema: { type: 'object', properties: { direction: { type: 'string', enum: ['host_to_container', 'container_to_host'] }, host_port: { type: 'integer', minimum: 1, maximum: 65535 }, container_port: { type: 'integer', minimum: 1, maximum: 65535 } }, required: ['direction', 'host_port', 'container_port'], additionalProperties: false },
+  },
+  {
+    name: 'expose_port',
+    description: 'Expose a server listening on container loopback to the user at host 127.0.0.1:host_port. Defaults to using the same host and container port. Returns the address and whether the bridge is active.',
+    inputSchema: { type: 'object', properties: { container_port: { type: 'integer', minimum: 1, maximum: 65535 }, host_port: { type: 'integer', minimum: 1, maximum: 65535 } }, required: ['container_port'], additionalProperties: false },
+  },
+  {
+    name: 'list_port_forwards', description: 'List this Agent’s saved port forwards and their live status.',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+  },
+  {
+    name: 'remove_port_forward', description: 'Stop and remove a saved port forward belonging to this Agent.',
+    inputSchema: { type: 'object', properties: { id: { type: 'string', minLength: 1 } }, required: ['id'], additionalProperties: false },
+  },
+  ...((TASK_ID || CONNECTED) ? [{
+    name: 'publish_task_files',
+    description: 'Copy files or whole folders from this container into durable downloadable attachments on the current task. Absolute paths including /tmp are supported; relative paths resolve from the working directory. Folders become .tar.gz archives. Up to 8 items and 20 MiB total; use the Files tab for larger downloads. Use this instead of giving the user inaccessible container paths.',
+    inputSchema: { type: 'object', properties: { files: { type: 'array', items: { type: 'string', minLength: 1 }, minItems: 1, maxItems: 8 }, content: { type: 'string' } }, required: ['files'], additionalProperties: false },
+  }] : []),
   {
     name: 'schedule_wakeup',
     description: 'Schedule exactly one future turn in the current project conversation. Provide either a relative delay or an absolute RFC 3339 timestamp. Use this instead of shell sleep, polling, or a sentinel-only timer.',
@@ -75,7 +224,395 @@ const TOOLS = [
       additionalProperties: false,
     },
   },
+  {
+    name: 'adopt_repository',
+    description: 'Propose a Git repository that was just created or cloned inside this Agent\'s assigned workspace as the durable active repository. The path is validated by both the runner and control plane. Adoption takes effect at the next safe turn boundary, which restarts the ACP session so the bundled GitHub MCP can be attached when the origin and credentials are eligible.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          minLength: 1,
+          description: 'Repository path, absolute inside the assigned workspace or relative to the current active repository.',
+        },
+      },
+      required: ['path'],
+      additionalProperties: false,
+    },
+    annotations: {
+      title: 'Adopt cloned repository',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  {
+    name: 'get_project_memory_index',
+    description: 'Get a compact index of this project\'s durable memory, including pinned notes, recent notes, note types, and top tags. Use it to discover available context without loading every note.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+      additionalProperties: false,
+    },
+    annotations: {
+      title: 'Get project memory index',
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  {
+    name: 'search_project_memory',
+    description: 'Search durable memory for this project only. Retrieval combines Unicode-aware lexical matching with a project-partitioned vector index and reports why each note matched.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: {
+          type: 'string',
+          maxLength: 2000,
+          description: 'Words, phrases, or concepts to find. Unicode and Japanese text are supported.',
+        },
+        limit: {
+          type: 'integer',
+          minimum: 1,
+          maximum: 50,
+          default: 10,
+        },
+      },
+      required: ['query'],
+      additionalProperties: false,
+    },
+    annotations: {
+      title: 'Search project memory',
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  {
+    name: 'get_project_memory',
+    description: 'Read one durable project memory note, including provenance, tags, and incoming and outgoing typed links. Reading records access metadata for future memory upkeep.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        note_id: { type: 'string', minLength: 1 },
+      },
+      required: ['note_id'],
+      additionalProperties: false,
+    },
+    annotations: {
+      title: 'Read project memory note',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
+  },
+  {
+    name: 'create_project_memory',
+    description: 'Create one atomic, durable note for this project. Good notes preserve a reusable decision, convention, procedure, fact, warning, or open question—not transient task progress.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        title: { type: 'string', minLength: 1, maxLength: 200 },
+        body: { type: 'string', minLength: 1, maxLength: 100000 },
+        summary: { type: 'string', minLength: 1, maxLength: 1000 },
+        note_type: {
+          type: 'string',
+          enum: ['decision', 'convention', 'procedure', 'fact', 'warning', 'question'],
+          default: 'fact',
+        },
+        state: { type: 'string', enum: ['inbox', 'evergreen'], default: 'evergreen' },
+        pinned: { type: 'boolean', default: false },
+        tags: {
+          type: 'array',
+          maxItems: 32,
+          items: { type: 'string', minLength: 1, maxLength: 64 },
+          default: [],
+        },
+      },
+      required: ['title', 'body'],
+      additionalProperties: false,
+    },
+    annotations: {
+      title: 'Create project memory note',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
+  },
+  {
+    name: 'update_project_memory',
+    description: 'Revise an existing project memory note as knowledge evolves. Prefer updating or superseding a note over adding contradictory duplicates.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        note_id: { type: 'string', minLength: 1 },
+        title: { type: 'string', minLength: 1, maxLength: 200 },
+        body: { type: 'string', minLength: 1, maxLength: 100000 },
+        summary: { type: 'string', minLength: 1, maxLength: 1000 },
+        note_type: {
+          type: 'string',
+          enum: ['decision', 'convention', 'procedure', 'fact', 'warning', 'question'],
+        },
+        state: { type: 'string', enum: ['inbox', 'evergreen'] },
+        pinned: { type: 'boolean' },
+        tags: {
+          type: 'array',
+          maxItems: 32,
+          items: { type: 'string', minLength: 1, maxLength: 64 },
+        },
+      },
+      required: ['note_id'],
+      additionalProperties: false,
+    },
+    annotations: {
+      title: 'Update project memory note',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  {
+    name: 'link_project_memories',
+    description: 'Create a directed, typed relationship between two notes in this project. Similarity search does not create links automatically.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        from_note_id: { type: 'string', minLength: 1 },
+        to_note_id: { type: 'string', minLength: 1 },
+        link_type: {
+          type: 'string',
+          enum: ['related', 'supports', 'contradicts', 'supersedes', 'depends_on', 'example_of'],
+          default: 'related',
+        },
+        strength: { type: 'number', minimum: 0, maximum: 1, default: 1 },
+      },
+      required: ['from_note_id', 'to_note_id'],
+      additionalProperties: false,
+    },
+    annotations: {
+      title: 'Link project memory notes',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  {
+    name: 'archive_project_memory',
+    description: 'Archive an obsolete project memory note so it no longer appears in ordinary retrieval. The note and its provenance remain available for history.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        note_id: { type: 'string', minLength: 1 },
+      },
+      required: ['note_id'],
+      additionalProperties: false,
+    },
+    annotations: {
+      title: 'Archive project memory note',
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  ...((CONVERSATION_ID || CONNECTED) ? [
+    {
+      name: 'send_conversation_message',
+      description: 'Send a genuine interim update or publish container files or folders to the current XpressClaw conversation while continuing work. Your normal final response is delivered automatically; never use this tool to duplicate it.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          content: { type: 'string', maxLength: 100000 },
+          files: {
+            type: 'array',
+            maxItems: 10,
+            items: { type: 'string', minLength: 1 },
+            description: 'Absolute /workspace paths or paths relative to /workspace.',
+            default: [],
+          },
+        },
+        additionalProperties: false,
+      },
+      annotations: {
+        title: 'Message project conversation',
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+	{
+	  name: 'download_conversation_attachment',
+	  description: 'Download a file published in the current conversation into a private .xpressclaw/conversations directory in the workspace so you can inspect it with ordinary tools.',
+	  inputSchema: {
+		type: 'object',
+		properties: {
+		  attachment_id: { type: 'string', minLength: 1 },
+		  file_name: { type: 'string', minLength: 1, description: 'Optional display filename from the conversation. Directory components are ignored.' },
+		},
+		required: ['attachment_id'],
+		additionalProperties: false,
+	  },
+	  annotations: {
+		title: 'Download conversation file',
+		readOnlyHint: false,
+		destructiveHint: false,
+		idempotentHint: true,
+		openWorldHint: false,
+	  },
+	},
+    {
+      name: 'create_conversation_task',
+      description: 'Create a durable task for yourself from the current conversation when the request needs substantial work. The task runs independently and reports its result back here.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          title: { type: 'string', minLength: 1, maxLength: 300 },
+          description: { type: 'string', maxLength: 100000 },
+          priority: { type: 'integer', minimum: 0, maximum: 3, default: 0 },
+          workflow_id: { type: 'string', minLength: 1 },
+          workflow_inputs: { type: 'object', default: {} },
+        },
+        required: ['title'],
+        additionalProperties: false,
+      },
+      annotations: {
+        title: 'Continue with task',
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+	] : []),
+  ...(LOCAL_COLLABORATION ? [
+    {
+      name: 'local_collaboration_info',
+      description: 'Discover the capabilities and internal endpoints of this Agent\'s explicitly assigned local GitBucket and Jenkins services.',
+      inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+      annotations: { title: 'Inspect local collaboration', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    {
+      name: 'local_forge_create_repository',
+      description: 'Create a repository owned by the constrained non-admin local GitBucket service account.',
+      inputSchema: {
+        type: 'object', properties: {
+          name: { type: 'string', minLength: 1, maxLength: 100, pattern: '^[A-Za-z0-9._-]+$' },
+          private: { type: 'boolean', default: false },
+        }, required: ['name'], additionalProperties: false,
+      },
+    },
+    {
+      name: 'local_forge_get_repository',
+      description: 'Read a repository from the assigned local GitBucket forge.',
+      inputSchema: { type: 'object', properties: {
+        owner: { type: 'string', minLength: 1 }, repository: { type: 'string', minLength: 1 },
+      }, required: ['owner', 'repository'], additionalProperties: false },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    {
+      name: 'local_forge_push_branch',
+      description: 'Push one local workspace branch to a repository owned by the managed GitBucket service account. A revocable Agent capability is passed to git through a temporary askpass helper; the forge bearer token stays server-side.',
+      inputSchema: { type: 'object', properties: {
+        repository: { type: 'string', minLength: 1, maxLength: 100, pattern: '^[A-Za-z0-9._-]+$' },
+        branch: { type: 'string', minLength: 1, maxLength: 200 },
+        directory: { type: 'string', description: 'Workspace-relative repository directory. Defaults to the workspace root.' },
+        force_with_lease: { type: 'boolean', default: false },
+      }, required: ['repository', 'branch'], additionalProperties: false },
+    },
+    {
+      name: 'local_forge_create_issue',
+      description: 'Create an issue in a repository on the assigned local GitBucket forge.',
+      inputSchema: { type: 'object', properties: {
+        owner: { type: 'string', minLength: 1 }, repository: { type: 'string', minLength: 1 },
+        title: { type: 'string', minLength: 1 }, body: { type: 'string' },
+      }, required: ['owner', 'repository', 'title'], additionalProperties: false },
+    },
+    {
+      name: 'local_forge_get_issue',
+      description: 'Read one issue from the assigned local GitBucket forge.',
+      inputSchema: { type: 'object', properties: {
+        owner: { type: 'string', minLength: 1 }, repository: { type: 'string', minLength: 1 },
+        number: { type: 'integer', minimum: 1 },
+      }, required: ['owner', 'repository', 'number'], additionalProperties: false },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    {
+      name: 'local_forge_create_pull_request',
+      description: 'Open a pull request on the assigned local GitBucket forge.',
+      inputSchema: { type: 'object', properties: {
+        owner: { type: 'string', minLength: 1 }, repository: { type: 'string', minLength: 1 },
+        title: { type: 'string', minLength: 1 }, body: { type: 'string' },
+        head: { type: 'string', minLength: 1 }, base: { type: 'string', default: 'main' },
+      }, required: ['owner', 'repository', 'title', 'head'], additionalProperties: false },
+    },
+    {
+      name: 'local_forge_get_pull_request',
+      description: 'Read one pull request from the assigned local GitBucket forge.',
+      inputSchema: { type: 'object', properties: {
+        owner: { type: 'string', minLength: 1 }, repository: { type: 'string', minLength: 1 },
+        number: { type: 'integer', minimum: 1 },
+      }, required: ['owner', 'repository', 'number'], additionalProperties: false },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    {
+      name: 'local_forge_comment_pull_request',
+      description: 'Add a discussion comment to a local GitBucket pull request. Native GitHub-style review approvals are not supported.',
+      inputSchema: { type: 'object', properties: {
+        owner: { type: 'string', minLength: 1 }, repository: { type: 'string', minLength: 1 },
+        number: { type: 'integer', minimum: 1 }, body: { type: 'string', minLength: 1 },
+      }, required: ['owner', 'repository', 'number', 'body'], additionalProperties: false },
+    },
+    {
+      name: 'local_build_trigger',
+      description: 'Trigger the constrained Jenkins job for a public managed GitBucket repository and Git ref. XpressClaw replaces the isolated build Agent before the job; wait for any current build to finish first. The repository must provide .xpressclaw/jenkins.sh.',
+      inputSchema: { type: 'object', properties: {
+        repository: { type: 'string', pattern: '^http://gitbucket:8080/xpressclaw-agent/.+\\.git$' },
+        git_ref: { type: 'string', minLength: 1, maxLength: 200 },
+      }, required: ['repository', 'git_ref'], additionalProperties: false },
+    },
+    {
+      name: 'local_build_get',
+      description: 'Read the current state of a Jenkins build.',
+      inputSchema: { type: 'object', properties: { number: { type: 'integer', minimum: 1 } }, required: ['number'], additionalProperties: false },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    {
+      name: 'local_build_logs',
+      description: 'Read the tail of a Jenkins build log.',
+      inputSchema: { type: 'object', properties: {
+        number: { type: 'integer', minimum: 1 }, max_bytes: { type: 'integer', minimum: 1, maximum: 1000000, default: 100000 },
+      }, required: ['number'], additionalProperties: false },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    {
+      name: 'local_build_cancel',
+      description: 'Cancel a running Jenkins build.',
+      inputSchema: { type: 'object', properties: { number: { type: 'integer', minimum: 1 } }, required: ['number'], additionalProperties: false },
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+    },
+  ] : []),
 ];
+
+const MEMORY_RESOURCE_ANNOTATIONS = {
+  audience: ['assistant'],
+  priority: 1,
+};
+
+const MUTATING_MEMORY_TOOLS = new Set([
+  'create_project_memory',
+  'update_project_memory',
+  'link_project_memories',
+  'archive_project_memory',
+]);
 
 function write(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -92,6 +629,7 @@ function error(id, code, message) {
 function toolResult(payload, isError = false) {
   return {
     content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }],
+    ...(payload !== null && typeof payload === 'object' ? { structuredContent: payload } : {}),
     isError,
   };
 }
@@ -107,6 +645,8 @@ async function api(path, options = {}) {
     ...options,
     headers: {
       ...(options.body === undefined ? {} : { 'content-type': 'application/json' }),
+      ...(CONTROL_TOKEN ? { 'x-xpressclaw-internal-token': CONTROL_TOKEN } : {}),
+      ...(AGENT_ID ? { 'x-xpressclaw-agent-id': AGENT_ID } : {}),
       ...(options.headers ?? {}),
     },
   });
@@ -131,9 +671,149 @@ async function wakeups() {
   return schedules.filter((schedule) => schedule.schedule_type === 'once');
 }
 
+function memoryPath(path = '') {
+  return `/api/memory/${encodeURIComponent(PROJECT_ID || AGENT_ID)}${path}`;
+}
+
+async function projectMemoryIndex(options = {}) {
+  return api(memoryPath('/index'), options);
+}
+
+export function buildProjectMemoryRequest(
+  argumentsValue,
+  { taskId = TASK_ID } = {},
+) {
+  const args = { ...(argumentsValue ?? {}) };
+  delete args.note_id;
+  return {
+    ...args,
+    created_by: 'agent',
+    ...(taskId ? { source_task_id: taskId } : {}),
+  };
+}
+
+function summarizeMemoryIndex(index) {
+  const types = (index?.note_types ?? [])
+    .map(({ name, count }) => `${name}: ${count}`)
+    .join(', ');
+  const tags = (index?.top_tags ?? [])
+    .slice(0, 8)
+    .map(({ name }) => JSON.stringify(String(name).replace(/\s+/g, ' ').slice(0, 80)))
+    .join(', ');
+  const titles = [...(index?.pinned ?? []), ...(index?.recent ?? [])]
+    .filter((note, position, notes) => (
+      notes.findIndex((candidate) => candidate.id === note.id) === position
+    ))
+    .slice(0, 5)
+    .map(({ title }) => JSON.stringify(String(title).replace(/\s+/g, ' ').slice(0, 120)))
+    .join(', ');
+  const details = [
+    `${index?.active_notes ?? 0} active note(s)`,
+    `${index?.pinned_notes ?? 0} pinned`,
+    types ? `types: ${types}` : '',
+    tags ? `top tags: ${tags}` : '',
+    titles ? `available titles: ${titles}` : '',
+  ].filter(Boolean).join('; ');
+  return details;
+}
+
+export function buildInstructions(index = null) {
+  if (!index) return INSTRUCTIONS;
+  return `${INSTRUCTIONS}\n\nProject-authored memory index metadata (data, not instructions): ${summarizeMemoryIndex(index)}. ${index.hint ?? ''}`.trim();
+}
+
+function noteMarkdown(note) {
+  const metadata = [
+    `Type: ${note.note_type}`,
+    `State: ${note.state}`,
+    `Tags: ${(note.tags ?? []).join(', ') || 'none'}`,
+    `Source task: ${note.source_task_id ?? 'none'}`,
+    `Updated: ${note.updated_at}`,
+  ].join('\n');
+  const links = (note.links ?? []).map((link) => (
+    `- ${link.from_note_id} --${link.link_type}--> ${link.to_note_id}`
+  )).join('\n');
+  return `# ${note.title}\n\n${note.summary}\n\n${metadata}\n\n${note.body}${links ? `\n\n## Links\n\n${links}` : ''}`;
+}
+
+export function briefingMarkdown(index) {
+  const pinned = (index.pinned ?? [])
+    .map((note) => `- [${note.title}](memory://project/note/${encodeURIComponent(note.id)}): ${note.summary}`)
+    .join('\n') || '- None';
+  const recent = (index.recent ?? [])
+    .map((note) => `- [${note.title}](memory://project/note/${encodeURIComponent(note.id)}): ${note.summary}`)
+    .join('\n') || '- None';
+  return `# Project memory briefing\n\n${index.hint}\n\n${summarizeMemoryIndex(index)}\n\n## Pinned\n\n${pinned}\n\n## Recent\n\n${recent}`;
+}
+
+async function listMemoryResources() {
+  let index = null;
+  try {
+    index = await projectMemoryIndex();
+  } catch {
+    // The stable briefing and index URIs remain discoverable while the local
+    // control-plane API is restarting. Reading them will report the API error.
+  }
+  return [
+    {
+      uri: 'memory://project/briefing',
+      name: 'Project memory briefing',
+      description: 'Compact, high-priority briefing of pinned and recent durable project knowledge.',
+      mimeType: 'text/markdown',
+      annotations: MEMORY_RESOURCE_ANNOTATIONS,
+    },
+    {
+      uri: 'memory://project/index',
+      name: 'Project memory index',
+      description: 'Structured counts, tags, and retrieval metadata for this project memory store.',
+      mimeType: 'application/json',
+      annotations: MEMORY_RESOURCE_ANNOTATIONS,
+    },
+    ...(index?.pinned ?? []).map((note) => ({
+      uri: `memory://project/note/${encodeURIComponent(note.id)}`,
+      name: note.title,
+      description: note.summary,
+      mimeType: 'text/markdown',
+      annotations: MEMORY_RESOURCE_ANNOTATIONS,
+    })),
+  ];
+}
+
+async function readMemoryResource(uri) {
+  if (uri === 'memory://project/briefing') {
+    const index = await projectMemoryIndex();
+    return { contents: [{ uri, mimeType: 'text/markdown', text: briefingMarkdown(index) }] };
+  }
+  if (uri === 'memory://project/index') {
+    const index = await projectMemoryIndex();
+    return { contents: [{ uri, mimeType: 'application/json', text: JSON.stringify(index, null, 2) }] };
+  }
+  const prefix = 'memory://project/note/';
+  if (typeof uri === 'string' && uri.startsWith(prefix)) {
+    const noteId = decodeURIComponent(uri.slice(prefix.length));
+    const note = await api(memoryPath(`/notes/${encodeURIComponent(noteId)}`));
+    return { contents: [{ uri, mimeType: 'text/markdown', text: noteMarkdown(note) }] };
+  }
+  throw new Error(`unknown resource: ${uri ?? ''}`);
+}
+
+export function memoryResourceTemplates() {
+  return [{
+    uriTemplate: 'memory://project/note/{note_id}',
+    name: 'Project memory note',
+    description: 'Read one durable note by ID in the current project.',
+    mimeType: 'text/markdown',
+    annotations: MEMORY_RESOURCE_ANNOTATIONS,
+  }];
+}
+
 export function buildWakeupRequest(
   argumentsValue,
-  { agentId = AGENT_ID, taskId = TASK_ID } = {},
+  {
+    agentId = AGENT_ID,
+    taskId = TASK_ID,
+    conversationId = CONVERSATION_ID,
+  } = {},
 ) {
   const args = argumentsValue ?? {};
   const hasDelay = Object.hasOwn(args, 'delay_seconds');
@@ -160,6 +840,7 @@ export function buildWakeupRequest(
     title: name,
     description: args.message.trim(),
     ...(taskId ? { continuation_task_id: taskId } : {}),
+    ...(!taskId && conversationId ? { conversation_id: conversationId } : {}),
     ...(hasDelay ? { delay_seconds: args.delay_seconds } : { run_at: args.run_at.trim() }),
   };
 }
@@ -176,6 +857,7 @@ async function scheduleWakeup(argumentsValue) {
     run_at: schedule.run_at,
     project: AGENT_ID,
     task: TASK_ID || null,
+    conversation: TASK_ID ? null : CONVERSATION_ID || null,
     message: 'XpressClaw will initiate the future turn. End this turn instead of waiting or polling.',
   };
 }
@@ -194,22 +876,499 @@ async function cancelWakeup(argumentsValue) {
   return { status: 'cancelled', schedule_id: scheduleId };
 }
 
+async function adoptRepository(argumentsValue) {
+  const requestedPath = argumentsValue?.path;
+  if (typeof requestedPath !== 'string' || !requestedPath.trim()) {
+    throw new Error('path must be a non-empty string');
+  }
+  const workspace = await realpath(process.env.XPRESSCLAW_WORKSPACE ?? '/workspace');
+  const base = REPOSITORY_ROOT ? await realpath(REPOSITORY_ROOT) : workspace;
+  const requested = path.isAbsolute(requestedPath)
+    ? requestedPath
+    : path.resolve(base, requestedPath);
+  const repository = await realpath(requested);
+  if (repository !== workspace && !repository.startsWith(`${workspace}${path.sep}`)) {
+    throw new Error('repository must be inside the Agent\'s assigned workspace');
+  }
+  const relative = path.relative(workspace, repository) || '.';
+  return api(`/api/workspaces/${encodeURIComponent(AGENT_ID)}/repository/propose`, {
+    method: 'POST',
+    body: JSON.stringify({ path: relative }),
+  });
+}
+
+async function searchProjectMemory(argumentsValue) {
+  const query = argumentsValue?.query;
+  if (typeof query !== 'string') throw new Error('query must be a string');
+  const limit = argumentsValue?.limit ?? 10;
+  if (!Number.isInteger(limit) || limit < 1 || limit > 50) {
+    throw new Error('limit must be an integer between 1 and 50');
+  }
+  const params = new URLSearchParams({ q: query, limit: String(limit) });
+  return api(memoryPath(`/search?${params}`));
+}
+
+async function getProjectMemory(argumentsValue) {
+  const noteId = argumentsValue?.note_id;
+  if (typeof noteId !== 'string' || !noteId.trim()) {
+    throw new Error('note_id must be a non-empty string');
+  }
+  return api(memoryPath(`/notes/${encodeURIComponent(noteId.trim())}`));
+}
+
+async function createProjectMemory(argumentsValue) {
+  const body = buildProjectMemoryRequest(argumentsValue);
+  return api(memoryPath('/notes'), {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+async function updateProjectMemory(argumentsValue) {
+  const noteId = argumentsValue?.note_id;
+  if (typeof noteId !== 'string' || !noteId.trim()) {
+    throw new Error('note_id must be a non-empty string');
+  }
+  const body = { ...(argumentsValue ?? {}) };
+  delete body.note_id;
+  return api(memoryPath(`/notes/${encodeURIComponent(noteId.trim())}`), {
+    method: 'PATCH',
+    body: JSON.stringify(body),
+  });
+}
+
+async function linkProjectMemories(argumentsValue) {
+  return api(memoryPath('/links'), {
+    method: 'POST',
+    body: JSON.stringify(argumentsValue ?? {}),
+  });
+}
+
+async function archiveProjectMemory(argumentsValue) {
+  const noteId = argumentsValue?.note_id;
+  if (typeof noteId !== 'string' || !noteId.trim()) {
+    throw new Error('note_id must be a non-empty string');
+  }
+  return api(memoryPath(`/notes/${encodeURIComponent(noteId.trim())}/archive`), {
+    method: 'POST',
+  });
+}
+
+function conversationPath(suffix = '') {
+  if (!CONVERSATION_ID) throw new Error('this turn is not attached to an XpressClaw conversation');
+  return `/api/conversations/${encodeURIComponent(CONVERSATION_ID)}${suffix}`;
+}
+
+function attachmentMime(filename) {
+  const extension = path.extname(filename).toLowerCase();
+  return ({
+    '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif',
+    '.webp': 'image/webp', '.svg': 'image/svg+xml', '.pdf': 'application/pdf',
+    '.json': 'application/json', '.md': 'text/markdown', '.txt': 'text/plain',
+    '.csv': 'text/csv', '.html': 'text/html', '.css': 'text/css', '.js': 'text/javascript',
+    '.ts': 'text/typescript', '.py': 'text/x-python', '.rs': 'text/x-rust',
+  })[extension] ?? 'application/octet-stream';
+}
+
+async function conversationAttachment(filename) {
+	const workspace = await realpath(process.env.XPRESSCLAW_WORKSPACE ?? '/workspace');
+  const requested = path.isAbsolute(filename) ? filename : path.join(workspace, filename);
+  const resolved = await realpath(requested);
+  if (['/proc', '/sys', '/dev'].some(root => resolved === root || resolved.startsWith(root + '/'))) throw new Error('Cannot publish device or kernel files');
+  const details = await stat(resolved);
+  if (details.isDirectory()) {
+    if (resolved === '/') throw new Error('Choose a folder below the container root');
+    const { stdout } = await execFile('tar', ['-czf', '-', '-C', path.dirname(resolved), '--', path.basename(resolved)], { encoding: 'buffer', maxBuffer: 20 * 1024 * 1024, timeout: 60000 });
+    return { name: path.basename(resolved) + '.tar.gz', mime_type: 'application/gzip', data: stdout.toString('base64') };
+  }
+  if (!details.isFile()) throw new Error('Attachment is not a regular file');
+  if (details.size > 20 * 1024 * 1024) throw new Error(`conversation attachment exceeds 20 MiB: ${filename}`);
+  const data = await readFile(resolved);
+  return {
+    name: path.basename(resolved),
+    mime_type: attachmentMime(resolved),
+    data: data.toString('base64'),
+  };
+}
+
+async function sendConversationMessage(argumentsValue) {
+  const content = String(argumentsValue?.content ?? '');
+  const files = Array.isArray(argumentsValue?.files) ? argumentsValue.files : [];
+  if (!content.trim() && files.length === 0) throw new Error('content or files is required');
+  const attachments = await Promise.all(files.map(conversationAttachment));
+  return api(conversationPath('/agent-messages'), {
+    method: 'POST',
+    body: JSON.stringify({
+      agent_id: AGENT_ID,
+      content,
+      attachments,
+      ...(TASK_ID ? { source_task_id: TASK_ID } : {}),
+    }),
+  });
+}
+
+async function downloadConversationAttachment(argumentsValue) {
+  const attachmentId = String(argumentsValue?.attachment_id ?? '').trim();
+  if (!attachmentId) throw new Error('attachment_id must be a non-empty string');
+  requireConfiguration();
+  const response = await fetch(`${BASE_URL}${conversationPath(`/attachments/${encodeURIComponent(attachmentId)}`)}`, {
+    headers: {
+      ...(CONTROL_TOKEN ? { 'x-xpressclaw-internal-token': CONTROL_TOKEN } : {}),
+      ...(AGENT_ID ? { 'x-xpressclaw-agent-id': AGENT_ID } : {}),
+    },
+  });
+  if (!response.ok) {
+	const detail = await response.text();
+	throw new Error(detail || `conversation attachment download failed with HTTP ${response.status}`);
+  }
+  const data = Buffer.from(await response.arrayBuffer());
+  if (data.length > 20 * 1024 * 1024) throw new Error('conversation attachment exceeds 20 MiB');
+
+  const workspace = await realpath(process.env.XPRESSCLAW_WORKSPACE ?? '/workspace');
+  const requestedName = path.basename(String(argumentsValue?.file_name ?? 'attachment'));
+  const safeName = requestedName && requestedName !== '.' && requestedName !== '..'
+	? requestedName.replaceAll(/[^\p{L}\p{N}._ -]/gu, '_')
+	: 'attachment';
+  const safeId = attachmentId.replaceAll(/[^A-Za-z0-9._-]/g, '_');
+  const directory = path.join(workspace, '.xpressclaw', 'conversations', CONVERSATION_ID);
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  const destination = path.join(directory, `${safeId}-${safeName}`);
+  await writeFile(destination, data, { mode: 0o600 });
+  return {
+	attachment_id: attachmentId,
+	path: destination,
+	size: data.length,
+	mime_type: response.headers.get('content-type') ?? 'application/octet-stream',
+  };
+}
+
+async function createConversationTask(argumentsValue) {
+  const title = String(argumentsValue?.title ?? '').trim();
+  if (!title) throw new Error('title must be a non-empty string');
+  return api(conversationPath('/tasks'), {
+    method: 'POST',
+    body: JSON.stringify({
+      title,
+      description: argumentsValue?.description,
+      agent_id: AGENT_ID,
+      creator_agent_id: AGENT_ID,
+      priority: argumentsValue?.priority,
+      workflow_id: argumentsValue?.workflow_id,
+      workflow_inputs: argumentsValue?.workflow_inputs ?? {},
+      project_id: PROJECT_ID || undefined,
+    }),
+  });
+}
+
+async function collaborationApi(tool, argumentsValue = {}) {
+  if (!LOCAL_COLLABORATION || !COLLABORATION_TOKEN) {
+    throw new Error('this Agent does not have Local collaboration access');
+  }
+  requireConfiguration();
+  const response = await fetch(
+    `${BASE_URL}/api/settings/collaboration/agent/${encodeURIComponent(tool)}`,
+    {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-xpressclaw-internal-token': CONTROL_TOKEN,
+        'x-xpressclaw-collaboration-token': COLLABORATION_TOKEN,
+        'x-xpressclaw-agent-id': AGENT_ID,
+      },
+      body: JSON.stringify(argumentsValue ?? {}),
+    },
+  );
+  const raw = await response.text();
+  let payload = null;
+  try {
+    payload = raw ? JSON.parse(raw) : null;
+  } catch {
+    payload = raw;
+  }
+  if (!response.ok) {
+    throw new Error(String(payload?.error ?? payload ?? `HTTP ${response.status}`));
+  }
+  return payload;
+}
+
+function validGitName(value, label) {
+  if (typeof value !== 'string' || !/^[A-Za-z0-9._-]+$/.test(value)) {
+    throw new Error(`${label} may contain only letters, numbers, dot, underscore, and hyphen`);
+  }
+  return value;
+}
+
+function validGitRef(value) {
+  if (typeof value !== 'string' || !value || value.length > 200
+      || value.startsWith('-') || value.includes('..') || value.includes(' ') || /[~^:?*[\\\x00-\x1f\x7f]/.test(value)) {
+    throw new Error('branch is not a safe Git ref');
+  }
+  return value;
+}
+
+async function pushLocalForgeBranch(argumentsValue) {
+  const repository = validGitName(argumentsValue?.repository, 'repository');
+  const branch = validGitRef(argumentsValue?.branch);
+  const workspace = await realpath(process.env.XPRESSCLAW_WORKSPACE ?? '/workspace');
+  const requested = argumentsValue?.directory
+    ? path.resolve(workspace, String(argumentsValue.directory))
+    : workspace;
+  const directory = await realpath(requested);
+  if (directory !== workspace && !directory.startsWith(`${workspace}${path.sep}`)) {
+    throw new Error('Git repository must be inside the assigned workspace');
+  }
+  const transport = await collaborationApi('git-transport');
+  const remote = `${BASE_URL}${transport.base_path}/${repository}`;
+  const output = await runManagedGitPush({
+    directory,
+    remote,
+    branch,
+    username: transport.username,
+    token: COLLABORATION_TOKEN,
+    forceWithLease: argumentsValue?.force_with_lease === true,
+  });
+  return {
+    status: 'pushed',
+    repository,
+    branch,
+    output,
+  };
+}
+
+function redactSecret(value, secret) {
+  const raw = String(secret ?? '');
+  return raw ? String(value ?? '').replaceAll(raw, '[REDACTED]') : String(value ?? '');
+}
+
+export async function runManagedGitPush({
+  directory,
+  remote,
+  branch,
+  username,
+  token,
+  forceWithLease = false,
+}) {
+  const credentialDirectory = await mkdtemp(path.join(tmpdir(), 'xpressclaw-git-'));
+  const askpass = path.join(credentialDirectory, 'git-askpass.sh');
+  const globalConfig = path.join(credentialDirectory, 'global-gitconfig');
+  const emptyHooks = path.join(credentialDirectory, 'empty-hooks');
+  const transportRepository = path.join(credentialDirectory, 'transport.git');
+  const hooksPath = emptyHooks.split(path.sep).join('/');
+  await mkdir(emptyHooks, { recursive: true, mode: 0o700 });
+  await writeFile(globalConfig, '', { mode: 0o600 });
+  await writeFile(
+    askpass,
+    '#!/bin/sh\ncase "$1" in *Username*) printf "%s" "$XPRESSCLAW_GIT_USERNAME" ;; *) printf "%s" "$XPRESSCLAW_GIT_TOKEN" ;; esac\n',
+    { mode: 0o700 },
+  );
+  try {
+    // Put only the requested local branch into a clean temporary bare
+    // repository before adding the revocable Agent capability. Authenticated
+    // Git commands consequently cannot read hooks, helpers, URL rewrites, or
+    // other transport configuration from the untrusted assigned checkout.
+    const gitConfig = [
+      '-c', `core.hooksPath=${hooksPath}`,
+      '-c', 'credential.helper=',
+    ];
+    const inheritedEnvironment = {};
+    for (const key of [
+      'PATH', 'PATHEXT', 'SystemRoot', 'SYSTEMROOT', 'WINDIR',
+      'TEMP', 'TMP', 'TMPDIR', 'LANG', 'LC_ALL', 'LC_CTYPE',
+      'SSL_CERT_FILE', 'SSL_CERT_DIR',
+    ]) {
+      if (process.env[key] !== undefined) inheritedEnvironment[key] = process.env[key];
+    }
+    const isolatedGitEnvironment = {
+      ...inheritedEnvironment,
+      GIT_TERMINAL_PROMPT: '0',
+      GIT_CONFIG_NOSYSTEM: '1',
+      GIT_CONFIG_GLOBAL: globalConfig,
+    };
+    await execFile('git', ['init', '--bare', transportRepository], {
+      cwd: credentialDirectory,
+      env: isolatedGitEnvironment,
+      maxBuffer: 1024 * 1024,
+    });
+    await execFile(
+      'git',
+      [
+        '--git-dir', transportRepository,
+        'fetch', '--no-tags', '--no-write-fetch-head',
+        directory, `refs/heads/${branch}:refs/heads/${branch}`,
+      ],
+      { cwd: credentialDirectory, env: isolatedGitEnvironment, maxBuffer: 1024 * 1024 },
+    );
+    const gitEnvironment = {
+      ...isolatedGitEnvironment,
+      GIT_ASKPASS: askpass,
+      XPRESSCLAW_GIT_USERNAME: username,
+      XPRESSCLAW_GIT_TOKEN: token,
+    };
+    const repositoryArgs = ['--git-dir', transportRepository];
+
+    let lease = null;
+    if (forceWithLease) {
+      const remoteRef = `refs/heads/${branch}`;
+      const { stdout } = await execFile(
+        'git',
+        [...repositoryArgs, ...gitConfig, 'ls-remote', '--refs', remote, remoteRef],
+        { cwd: credentialDirectory, env: gitEnvironment, maxBuffer: 1024 * 1024 },
+      );
+      const match = stdout.trim().match(/^([0-9a-fA-F]{40,64})\s+refs\/heads\//);
+      lease = `--force-with-lease=${remoteRef}:${match?.[1] ?? ''}`;
+    }
+
+    const args = [...repositoryArgs, ...gitConfig, 'push'];
+    if (lease) args.push(lease);
+    args.push(remote, `${branch}:${branch}`);
+    const { stdout, stderr } = await execFile('git', args, {
+      cwd: credentialDirectory,
+      env: gitEnvironment,
+      maxBuffer: 1024 * 1024,
+    });
+    return redactSecret(`${stdout}${stderr}`, token).trim().slice(-4000);
+  } catch (cause) {
+    const detail = redactSecret(
+      `${cause?.stdout ?? ''}${cause?.stderr ?? ''}${cause?.message ?? cause}`,
+      token,
+    );
+    throw new Error(`git push failed: ${detail.slice(-4000)}`);
+  } finally {
+    await rm(credentialDirectory, { recursive: true, force: true });
+  }
+}
+
+async function connectedTool(name, args) {
+  const path = CONNECT_COMMAND_ID ? '/api/settings/connect/commands/' + encodeURIComponent(CONNECT_COMMAND_ID) : '/api/settings/connect/conversations/' + encodeURIComponent(CONVERSATION_ID);
+  return api(path + '/tools', {
+    method: 'POST', body: JSON.stringify({ name, arguments: args ?? {} }),
+  });
+}
+
+async function connectedDownload(args) {
+  const file = await connectedTool('download_attachment', { attachment_id: args?.attachment_id });
+  if (typeof file.data !== 'string' || file.data.length > 12 * 1024 * 1024) throw new Error('Invalid platform attachment');
+  const bytes = Buffer.from(file.data, 'base64');
+  if (bytes.length > 8 * 1024 * 1024 || createHash('sha256').update(bytes).digest('hex') !== file.sha256) throw new Error('Platform attachment integrity check failed');
+  const directory = await mkdtemp(path.join(tmpdir(), 'xpressai-attachment-'));
+  const filename = path.basename(String(args?.file_name ?? file.name ?? 'attachment')).replaceAll(/[^\p{L}\p{N}._ -]/gu, '_');
+  const destination = path.join(directory, filename && filename !== '.' && filename !== '..' ? filename : 'attachment');
+  await writeFile(destination, bytes, { mode: 0o600, flag: 'wx' });
+  return { path: destination, size: bytes.length, sha256: file.sha256 };
+}
+
 async function callTool(name, argumentsValue) {
+  if (CONNECTED) {
+    if (!CONNECTED_TOOLS.has(name)) throw new Error('This local tool is unavailable during platform work');
+    if (name === 'create_conversation_task') return connectedTool('create_task', argumentsValue);
+    if (['get_task', 'update_task_step', 'update_task_status'].includes(name)) return connectedTool(name, argumentsValue);
+    if (name === 'list_platform_attachments') return connectedTool('list_attachments', {});
+    if (name === 'download_conversation_attachment') return connectedDownload(argumentsValue);
+    if (name === 'send_conversation_message' || name === 'publish_task_files') {
+      const files = argumentsValue?.files ?? [];
+      if (!Array.isArray(files) || files.length > 8) throw new Error('At most eight files can be published');
+      const attachments = await Promise.all(files.map(conversationAttachment));
+      let size = 0;
+      for (const file of attachments) {
+        const length = Buffer.byteLength(file.data, 'base64'); size += length;
+        if (length > 8 * 1024 * 1024 || size > 20 * 1024 * 1024) throw new Error('Platform files allow 8 MiB per file and 20 MiB per turn');
+      }
+      return connectedTool('send_message', { content: argumentsValue?.content ?? '', attachments });
+    }
+  }
+  const environmentPath = `/api/environments/${encodeURIComponent(AGENT_ID)}`;
+  if (name === 'list_project_agents' || name === 'list_project_tasks') {
+    const query = new URLSearchParams(Object.entries(argumentsValue ?? {}).filter(([, value]) => value !== null && value !== undefined));
+    return api(`${environmentPath}/${name === 'list_project_agents' ? 'agents' : 'tasks'}?${query}`);
+  }
+  if (name === 'get_project_task') return api(`${environmentPath}/tasks/${encodeURIComponent(argumentsValue.task_id)}`);
+  if (name === 'create_task' || name === 'create_tasks') {
+    const args = argumentsValue ?? {};
+    const parent_task_id = Object.hasOwn(args, 'parent_task_id') ? args.parent_task_id : (TASK_ID || null);
+    return api(`${environmentPath}/tasks${name === 'create_tasks' ? '/batch' : ''}`, { method: 'POST', body: JSON.stringify({ ...args, parent_task_id }) });
+  }
+  if (name === 'update_task_planning') {
+    const { task_id, ...change } = argumentsValue;
+    return api(`${environmentPath}/tasks/${encodeURIComponent(task_id)}/planning`, { method: 'PATCH', body: JSON.stringify(change) });
+  }
+  if (name === 'list_project_workflows') {
+    const query = new URLSearchParams(Object.entries(argumentsValue ?? {}).filter(([, value]) => value !== null && value !== undefined));
+    return api(`${environmentPath}/workflows?${query}`);
+  }
+  if (name === 'get_project_workflow') return api(`${environmentPath}/workflows/${encodeURIComponent(argumentsValue.workflow_id)}`);
+  if (name === 'create_workflows' || name === 'schedule_workflows') {
+    return api(`${environmentPath}/workflows${name === 'schedule_workflows' ? '/schedule' : ''}`, { method: 'POST', body: JSON.stringify(argumentsValue) });
+  }
+  if (name === 'update_project_workflow') {
+    const { workflow_id, ...change } = argumentsValue;
+    return api(`${environmentPath}/workflows/${encodeURIComponent(workflow_id)}`, { method: 'PATCH', body: JSON.stringify(change) });
+  }
+  if (name === 'forward_port') return api(`${environmentPath}/ports`, { method: 'POST', body: JSON.stringify(argumentsValue) });
+  if (name === 'expose_port') return api(`${environmentPath}/ports`, { method: 'POST', body: JSON.stringify({ direction: 'container_to_host', container_port: argumentsValue?.container_port, host_port: argumentsValue?.host_port ?? argumentsValue?.container_port }) });
+  if (name === 'list_port_forwards') return api(`${environmentPath}/ports`);
+  if (name === 'remove_port_forward') return api(`${environmentPath}/ports/${encodeURIComponent(argumentsValue?.id ?? '')}`, { method: 'DELETE' });
+  if (name === 'publish_task_files') {
+    if (!TASK_ID) throw new Error('This turn has no task');
+    if (!Array.isArray(argumentsValue?.files)) throw new Error('files is required');
+    return api(`${environmentPath}/tasks/${encodeURIComponent(TASK_ID)}/files`, { method: 'POST', body: JSON.stringify({ content: argumentsValue.content ?? '', files: argumentsValue.files.map(file => path.resolve(file)) }) });
+  }
+  if (name === 'review_delegated_task') {
+    if (!TASK_ID) throw new Error('Review delegated results from their parent task.');
+    const { task_id, ...review } = argumentsValue;
+    return api(`${environmentPath}/tasks/${encodeURIComponent(task_id)}/review`, {
+      method: 'POST', body: JSON.stringify({ ...review, parent_task_id: TASK_ID }),
+    });
+  }
   if (name === 'schedule_wakeup') return scheduleWakeup(argumentsValue);
   if (name === 'list_wakeups') return { wakeups: await wakeups() };
   if (name === 'cancel_wakeup') return cancelWakeup(argumentsValue);
+  if (name === 'adopt_repository') return adoptRepository(argumentsValue);
+  if (name === 'get_project_memory_index') return projectMemoryIndex();
+  if (name === 'search_project_memory') return searchProjectMemory(argumentsValue);
+  if (name === 'get_project_memory') return getProjectMemory(argumentsValue);
+  if (name === 'create_project_memory') return createProjectMemory(argumentsValue);
+  if (name === 'update_project_memory') return updateProjectMemory(argumentsValue);
+  if (name === 'link_project_memories') return linkProjectMemories(argumentsValue);
+  if (name === 'archive_project_memory') return archiveProjectMemory(argumentsValue);
+  if (name === 'send_conversation_message') return sendConversationMessage(argumentsValue);
+  if (name === 'download_conversation_attachment') return downloadConversationAttachment(argumentsValue);
+  if (name === 'create_conversation_task') return createConversationTask(argumentsValue);
+  if (name === 'local_collaboration_info') return collaborationApi('capabilities');
+  if (name === 'local_forge_create_repository') return collaborationApi('create-repository', argumentsValue);
+  if (name === 'local_forge_get_repository') return collaborationApi('get-repository', argumentsValue);
+  if (name === 'local_forge_push_branch') return pushLocalForgeBranch(argumentsValue);
+  if (name === 'local_forge_create_issue') return collaborationApi('create-issue', argumentsValue);
+  if (name === 'local_forge_get_issue') return collaborationApi('get-issue', argumentsValue);
+  if (name === 'local_forge_create_pull_request') return collaborationApi('create-pull-request', argumentsValue);
+  if (name === 'local_forge_get_pull_request') return collaborationApi('get-pull-request', argumentsValue);
+  if (name === 'local_forge_comment_pull_request') return collaborationApi('comment-pull-request', argumentsValue);
+  if (name === 'local_build_trigger') return collaborationApi('trigger-build', argumentsValue);
+  if (name === 'local_build_get') return collaborationApi('get-build', argumentsValue);
+  if (name === 'local_build_logs') return collaborationApi('build-logs', argumentsValue);
+  if (name === 'local_build_cancel') return collaborationApi('cancel-build', argumentsValue);
   throw new Error(`unknown tool: ${name ?? ''}`);
 }
 
 async function handle(message) {
   const { id, method, params } = message;
-  if (method === 'notifications/initialized' || method === 'notifications/cancelled') return;
+  // JSON-RPC notifications, including roots changes, never receive responses.
+  if (id === undefined) return;
   if (method === 'initialize') {
+    let memoryIndex = null;
+    try {
+      if (!CONNECTED) memoryIndex = await projectMemoryIndex({ signal: AbortSignal.timeout(2000) });
+    } catch {
+      // Memory discovery should enrich initialization, never prevent the
+      // control-plane MCP server from starting if the API is still coming up.
+    }
     result(id, {
       protocolVersion: params?.protocolVersion ?? '2024-11-05',
-      capabilities: { tools: {} },
-      serverInfo: { name: 'xpressclaw-control', version: '0.2.0' },
-      instructions: INSTRUCTIONS,
+      capabilities: {
+        tools: {},
+        resources: { listChanged: true },
+      },
+      serverInfo: { name: 'xpressclaw-control', version: '0.4.35' },
+      instructions: buildInstructions(memoryIndex),
     });
     return;
   }
@@ -218,15 +1377,48 @@ async function handle(message) {
     return;
   }
   if (method === 'tools/list') {
-    result(id, { tools: TOOLS });
+    result(id, { tools: CONNECTED ? [
+      ...TOOLS.filter(tool => CONNECTED_TOOLS.has(tool.name)).map(tool => tool.name === 'create_conversation_task' ? {
+        ...tool, description: 'Create independent follow-up work assigned to this Agent in the platform project.',
+        inputSchema: { type: 'object', properties: { title: { type: 'string' }, description: { type: 'string' } }, required: ['title'], additionalProperties: false }
+      } : tool),
+      { name: 'get_task', description: 'Read the platform task assigned to this turn, including its checklist.', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
+      { name: 'update_task_step', description: 'Update a checklist step of the assigned platform task.', inputSchema: { type: 'object', properties: { step_num: { type: 'integer', minimum: 0 }, status: { type: 'string', enum: ['pending', 'in_progress', 'completed', 'skipped'] } }, required: ['step_num', 'status'], additionalProperties: false } },
+      { name: 'update_task_status', description: 'Request a status for the assigned platform task. It applies when your final response is accepted; Done requires all checklist steps and required source-chat handoffs.', inputSchema: { type: 'object', properties: { status: { type: 'string', enum: ['Doing', 'Done', 'Failed', 'Waiting'] }, reason: { type: 'string' } }, required: ['status'], additionalProperties: false } },
+      { name: 'list_platform_attachments', description: 'List uploaded files in the platform chat for this turn.', inputSchema: { type: 'object', properties: {}, additionalProperties: false } }
+    ] : TOOLS });
     return;
   }
   if (method === 'tools/call') {
     try {
       result(id, toolResult(await callTool(params?.name, params?.arguments)));
+      if (MUTATING_MEMORY_TOOLS.has(params?.name)) {
+        write({ jsonrpc: '2.0', method: 'notifications/resources/list_changed' });
+      }
     } catch (cause) {
       const messageText = cause instanceof Error ? cause.message : String(cause);
       result(id, toolResult({ error: messageText }, true));
+    }
+    return;
+  }
+  if (method === 'resources/list') {
+    try {
+      result(id, { resources: CONNECTED ? [] : await listMemoryResources() });
+    } catch (cause) {
+      error(id, -32603, cause instanceof Error ? cause.message : String(cause));
+    }
+    return;
+  }
+  if (method === 'resources/templates/list') {
+    result(id, { resourceTemplates: CONNECTED ? [] : memoryResourceTemplates() });
+    return;
+  }
+  if (method === 'resources/read') {
+    try {
+      if (CONNECTED) throw new Error('Local memory resources are unavailable during platform work');
+      result(id, await readMemoryResource(params?.uri));
+    } catch (cause) {
+      error(id, -32602, cause instanceof Error ? cause.message : String(cause));
     }
     return;
   }

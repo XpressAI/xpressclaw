@@ -1,0 +1,255 @@
+name: __WORKFLOW_NAME__
+description: Exercise browser flows, capture evidence, classify regressions, and optionally make one safe fix and retest pass.
+version: 1
+
+inputs:
+  target_url:
+    type: string
+    description: URL of the application or page to test.
+    required: true
+  test_scope:
+    type: string
+    description: User flows, viewports, and expected behavior to cover.
+    required: true
+  access_notes:
+    type: string
+    description: Non-secret setup or account guidance for the browser-capable Agent.
+    default: Use only access and test data already configured for this Agent.
+  allow_fix:
+    type: boolean
+    description: Allow one narrow local fix followed by a retest; publishing remains forbidden.
+    default: false
+  tester:
+    type: agent
+    description: Browser-capable Agent context that tests and optionally fixes the UI.
+    required: true
+    primary: true
+
+flows:
+  main:
+    color: "#ec4899"
+    steps:
+      - id: exercise_flows
+        type: step
+        label: Execute browser flows
+        agent: "@tester"
+        new_session: true
+        prompt: |
+          Use your browser capabilities to test this target:
+
+          URL: @target_url
+          Scope: @test_scope
+          Access notes: @access_notes
+
+          Exercise the requested flows at relevant viewports. Capture concrete
+          evidence such as screenshots, URLs, visible states, console or network
+          errors, and exact reproduction steps. Do not submit destructive forms,
+          make purchases, alter production data, or change accounts unless the
+          test scope explicitly authorizes that exact action. Return status as
+          exactly "passed", "findings", or "blocked".
+        outputs:
+          status:
+            type: string
+            description: passed, findings, or blocked.
+          evidence:
+            type: array
+            description: Concrete screenshots, URLs, logs, and observed states.
+          findings:
+            type: array
+            description: Candidate regressions with reproduction steps.
+          summary:
+            type: string
+            description: Tested coverage and result.
+
+      - id: classify_findings
+        type: step
+        label: Classify evidence and findings
+        agent: "@tester"
+        prompt: |
+          Classify this browser-test result:
+
+          Status: @exercise_flows.status
+          Evidence: @exercise_flows.evidence
+          Findings: @exercise_flows.findings
+
+          Separate confirmed regressions from expected behavior, environment
+          failures, accessibility concerns, and inconclusive observations. For each
+          confirmed finding, assign severity, confidence, affected flow, and exact
+          reproduction steps. Return status as exactly "passed", "actionable", or
+          "blocked".
+        outputs:
+          status:
+            type: string
+            description: passed, actionable, or blocked.
+          findings:
+            type: array
+            description: Classified, reproducible findings.
+          summary:
+            type: string
+            description: Classification rationale.
+
+      - id: finding_route
+        type: when
+        label: Findings need action?
+        switch: "@classify_findings.status"
+        arms:
+          - match: passed
+            goto: flow report_original
+          - match: actionable
+            continue: true
+          - match: blocked
+            goto: flow blocked
+          - match: default
+            goto: flow blocked
+
+      - id: fix_gate
+        type: when
+        label: Apply one safe fix?
+        switch: "@allow_fix"
+        arms:
+          - match: "true"
+            continue: true
+          - match: "false"
+            goto: flow report_original
+
+      - id: apply_fix
+        type: step
+        label: Apply one narrow local fix
+        agent: "@tester"
+        prompt: |
+          Apply one narrow, reversible local fix for the highest-confidence
+          regression in this classified report:
+
+          @classify_findings.findings
+
+          Reinspect the repository first, preserve unrelated changes, and run
+          focused checks. Do not commit, push, open or update a pull request,
+          deploy, publish, or change external data. If a safe fix cannot be made in
+          the current workspace, make no changes and report the blocker.
+        outputs:
+          outcome:
+            type: string
+            description: fixed or blocked.
+          summary:
+            type: string
+            description: Local changes and focused verification.
+          changed_files:
+            type: array
+            description: Files changed during the optional fix.
+
+      - id: fix_result
+        type: when
+        label: Local fix available?
+        switch: "@apply_fix.outcome"
+        arms:
+          - match: fixed
+            continue: true
+          - match: blocked
+            goto: flow blocked
+          - match: default
+            goto: flow blocked
+
+      - id: retest_fix
+        type: step
+        label: Retest the affected flows
+        agent: "@tester"
+        prompt: |
+          Retest the exact affected flows at @target_url after this local fix:
+
+          @apply_fix.summary
+
+          Original findings: @classify_findings.findings
+          Test scope: @test_scope
+
+          Capture fresh evidence and compare it with the original result. Return
+          status as exactly "passed", "findings", or "blocked". Do not perform any
+          additional fixes in this run.
+        outputs:
+          status:
+            type: string
+            description: passed, findings, or blocked.
+          evidence:
+            type: array
+            description: Fresh post-fix evidence.
+          summary:
+            type: string
+            description: Retest result and remaining regressions.
+
+      - id: retest_route
+        type: when
+        label: Retest result
+        switch: "@retest_fix.status"
+        arms:
+          - match: passed
+            goto: flow report_retest
+          - match: findings
+            goto: flow report_retest
+          - match: blocked
+            goto: flow blocked
+          - match: default
+            goto: flow blocked
+
+  report_original:
+    color: "#22c55e"
+    steps:
+      - id: report_original_result
+        type: step
+        label: Produce reproducible report
+        agent: "@tester"
+        prompt: |
+          Produce a concise reproducible UI regression report for @target_url.
+
+          Scope: @test_scope
+          Evidence: @exercise_flows.evidence
+          Classification: @classify_findings.findings
+
+          Include environment and viewport, exact steps, expected versus actual
+          behavior, severity and confidence, evidence references, and a clear pass,
+          fail, or blocked conclusion. No fix was published.
+        outputs:
+          report:
+            type: string
+            description: Reproducible evidence-based regression report.
+
+  report_retest:
+    color: "#22c55e"
+    steps:
+      - id: report_retest_result
+        type: step
+        label: Report fix and retest
+        agent: "@tester"
+        prompt: |
+          Produce a reproducible UI regression and retest report for @target_url.
+
+          Original findings: @classify_findings.findings
+          Local fix: @apply_fix.summary
+          Changed files: @apply_fix.changed_files
+          Retest evidence: @retest_fix.evidence
+          Retest result: @retest_fix.summary
+
+          Clearly distinguish verified fixes, remaining findings, and anything
+          blocked. State that the changes are local and were not published.
+        outputs:
+          report:
+            type: string
+            description: Original findings, local fix, evidence, and retest result.
+
+  blocked:
+    color: "#ef4444"
+    steps:
+      - id: report_test_blocker
+        type: step
+        label: Report test blocker
+        agent: "@tester"
+        prompt: |
+          The UI regression run could not complete safely.
+
+          Browser result: @exercise_flows.summary
+          Classification: @classify_findings.summary
+
+          Report the exact access, environment, test data, browser capability, or
+          repository prerequisite needed to reproduce and continue.
+        outputs:
+          report:
+            type: string
+            description: Actionable test blocker and collected evidence.

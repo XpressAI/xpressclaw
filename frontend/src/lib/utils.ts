@@ -1,12 +1,16 @@
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
+import { invoke, isTauri } from '@tauri-apps/api/core';
+import { serverTimestampMs } from './serverTime';
 
 export function cn(...inputs: ClassValue[]) {
 	return twMerge(clsx(inputs));
 }
 
 export function timeAgo(dateStr: string): string {
-	const date = new Date(dateStr + 'Z');
+	const parsed = serverTimestampMs(dateStr);
+	if (parsed === null) return '';
+	const date = new Date(parsed);
 	const now = new Date();
 	const seconds = Math.floor((now.getTime() - date.getTime()) / 1000);
 
@@ -22,26 +26,124 @@ export function formatCost(usd: number): string {
 	return `$${usd.toFixed(2)}`;
 }
 
-/** Open a URL in the system browser via the server, with browser fallback. */
+/** Open a URL in the user's browser, never on the machine hosting the API. */
 export async function openExternal(url: string): Promise<void> {
-	try {
-		await fetch('/api/open-url', {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ url })
-		});
-	} catch {
-		window.open(url, '_blank');
+	const target = new URL(url);
+	if (target.protocol !== 'http:' && target.protocol !== 'https:') {
+		throw new Error('Only HTTP and HTTPS links can be opened');
 	}
+
+	if (isTauri()) {
+		await invoke('open_external_url', { url: target.href });
+		return;
+	}
+
+	window.open(target.href, '_blank', 'noopener,noreferrer');
 }
 
-/** Compact product mark for an ACP-backed project. */
+/** Compact product mark for an ACP-backed agent. */
 export function harnessMark(backend: string): string {
-	const normalized = backend.toLowerCase();
+	const normalized = canonicalHarnessKind(backend);
+	if (normalized === 'antigravity') return 'AG';
 	if (normalized.includes('claude')) return 'A';
 	if (normalized.includes('opencode')) return 'O';
 	if (normalized.includes('codex')) return 'C';
+	if (normalized === 'deepseek-harness') return 'DS';
+	if (normalized.includes('copilot')) return 'GH';
+	if (normalized.includes('cursor')) return 'CU';
+	if (normalized.includes('cline')) return 'CL';
+	if (normalized.includes('glm')) return 'G';
+	if (normalized.includes('grok')) return 'X';
+	if (normalized.includes('junie')) return 'J';
+	if (normalized.includes('kilo')) return 'KI';
+	if (normalized.includes('kimi')) return 'K';
+	if (normalized.includes('mistral')) return 'M';
+	if (normalized.includes('qwen')) return 'Q';
+	if (normalized === 'pi' || normalized.includes('pi-acp')) return 'π';
+	if (normalized.includes('custom')) return '+';
 	return 'R';
+}
+
+/** Normalize exact supported aliases to a stable built-in harness kind. */
+export function canonicalHarnessKind(backend: string): string {
+	const normalized = backend.trim().toLowerCase();
+	if (normalized === 'agy') return 'antigravity';
+	if (['deepseek', 'dsh', 'dsh-acp', 'deepseek-harness-acp', '@openma/deepseek-harness-acp'].includes(normalized)) return 'deepseek-harness';
+	if (normalized === 'copilot') return 'github-copilot';
+	if (normalized === 'pi-acp') return 'pi';
+	return normalized;
+}
+
+/** Infer a built-in kind from a legacy backend label, where fuzzy matching is intentional. */
+export function inferHarnessKindFromBackend(backend: string): string {
+	const normalized = canonicalHarnessKind(backend);
+	if (normalized.includes('deepseek-harness')) return 'deepseek-harness';
+	if (normalized.includes('claude')) return 'claude';
+	if (normalized.includes('opencode')) return 'opencode';
+	if (normalized.includes('codex')) return 'codex';
+	if (normalized.includes('copilot')) return 'github-copilot';
+	return normalized;
+}
+
+/** User-facing product name for an ACP harness identifier. */
+export function harnessName(backend: string): string {
+	const normalized = canonicalHarnessKind(backend);
+	const names: Record<string, string> = {
+		antigravity: 'Google Antigravity',
+		claude: 'Claude Agent',
+		'claude-code': 'Claude Agent',
+		'claude-sdk': 'Claude Agent',
+		codex: 'Codex',
+		'deepseek-harness': 'DeepSeek Harness',
+		'github-copilot': 'GitHub Copilot',
+		junie: 'Junie',
+		kimi: 'Kimi CLI',
+		opencode: 'OpenCode',
+		pi: 'pi ACP',
+		qwen: 'Qwen Code',
+		cursor: 'Cursor',
+		cline: 'Cline',
+		glm: 'GLM Agent',
+		grok: 'Grok Build',
+		kilo: 'Kilo Code',
+		'mistral-vibe': 'Mistral Vibe',
+		custom: 'Custom ACP',
+	};
+	if (names[normalized]) return names[normalized];
+	return normalized
+		.split(/[-_\s]+/)
+		.filter(Boolean)
+		.map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+		.join(' ') || 'ACP harness';
+}
+
+/** Compact folder label for an agent workspace. */
+export function workspaceFolder(workspace: string | null | undefined): string {
+	const normalized = workspace?.trim().replace(/[\\/]+$/, '') ?? '';
+	if (!normalized) return 'No folder yet';
+	return normalized.split(/[\\/]/).filter(Boolean).pop() ?? normalized;
+}
+
+interface AgentRuntimeSummaryInput {
+	backend: string;
+	config?: {
+		runner?: {
+			kind?: string | null;
+			workspace?: string | null;
+		};
+	};
+}
+
+/** Harness and folder metadata shown beneath an Agent name. */
+export function agentRuntimeSummary(agent: AgentRuntimeSummaryInput): string {
+	const runner = agent.config?.runner;
+	return `${harnessName(runner?.kind || agent.backend)} · ${workspaceFolder(runner?.workspace)}`;
+}
+
+/** Expanded runtime metadata for hover text. */
+export function agentRuntimeTitle(agent: AgentRuntimeSummaryInput): string {
+	const runner = agent.config?.runner;
+	return `${harnessName(runner?.kind || agent.backend)} · ${runner?.workspace?.trim() || 'No workspace folder yet'}`;
 }
 
 /** Get cached user profile (loaded from server, cached in memory). */

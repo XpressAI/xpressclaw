@@ -9,7 +9,7 @@ exclude = ["external/ready-agent-cog"]
 resolver = "2"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.4.35"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Xpress AI <hello@xpress.ai>"]
@@ -23,20 +23,30 @@ tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["ws", "multipart"] }
 axum-extra = { version = "0.10", features = ["typed-header"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
+tower-http = { version = "0.6", features = ["cors", "fs", "trace", "compression-gzip", "compression-br"] }
 
 # HTTP client
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
+serde_urlencoded = "0.7"
 
 # Database
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled", "functions", "hooks"] }
 sqlite-vec = "0.1"
 zerocopy = { version = "0.8", features = ["derive"] }
+unicode-casefold = "0.2"
+unicode-normalization = "0.1"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+sha2 = "0.10"
+base64 = "0.22"
+zip = { version = "4", default-features = false }
+ring = "0.17"
+argon2 = { version = "0.5.3", features = ["std", "zeroize"] }
+zeroize = "1"
+subtle = "2"
 
 # CLI
 clap = { version = "4", features = ["derive"] }
@@ -75,10 +85,15 @@ async-trait = "0.1"
 
 # Futures utilities
 futures-util = "0.3"
-tokio-util = { version = "0.7", features = ["compat"] }
+tokio-util = { version = "0.7", features = ["compat", "io", "codec"] }
 
 # Agent Client Protocol
-agent-client-protocol = { version = "1.2.0", features = ["unstable_elicitation"] }
+agent-client-protocol = { version = "1.2.0", features = [
+    "unstable_auth_methods",
+    "unstable_elicitation",
+    "unstable_session_fork",
+    "unstable_end_turn_token_usage",
+] }
 
 open = "5"
 

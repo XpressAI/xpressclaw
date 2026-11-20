@@ -1,0 +1,13 @@
+#!/bin/sh
+set -eu
+
+config="${XPRESSCLAW_PI_MCP_CONFIG:-/run/xpressclaw/pi-mcp/config.json}"
+if [ ! -r "$config" ]; then
+  echo "pi MCP configuration is not readable: $config" >&2
+  exit 1
+fi
+
+exec /usr/local/bin/pi \
+  --extension /usr/local/lib/node_modules/pi-mcp-adapter/index.ts \
+  --mcp-config "$config" \
+  "$@"

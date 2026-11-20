@@ -1,6 +1,32 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+runner_list=$(node scripts/runner-versions.mjs list)
+all_runners=()
+while IFS= read -r runner; do
+  all_runners+=("$runner")
+done <<<"$runner_list"
+
+if [[ $# -gt 0 ]]; then
+  runners=("$@")
+  for runner in "${runners[@]}"; do
+    supported=false
+    for known_runner in "${all_runners[@]}"; do
+      if [[ "$runner" == "$known_runner" ]]; then
+        supported=true
+        break
+      fi
+    done
+    if [[ "$supported" == false ]]; then
+      echo "Unknown runner: $runner" >&2
+      echo "Supported runners: ${all_runners[*]}" >&2
+      exit 2
+    fi
+  done
+else
+  runners=("${all_runners[@]}")
+fi
+
 runtime="${CONTAINER_RUNTIME:-}"
 if [[ -z "$runtime" ]]; then
   if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
@@ -28,86 +54,17 @@ fi
 
 echo "Building runner images with ${build_command[*]}"
 
-runners=(
-  codex claude github-copilot junie kimi opencode pi qwen
-  cline cursor glm grok kilo mistral-vibe
-)
-
 for runner in "${runners[@]}"; do
-  dockerfile="$runner"
+  dockerfile=$(node scripts/runner-versions.mjs dockerfile "$runner")
   build_args=()
-  case "$runner" in
-    github-copilot)
-      dockerfile=npm
-      build_args=(--build-arg AGENT_KIND=github-copilot --build-arg AGENT_PACKAGE=@github/copilot@1.0.71 --build-arg AGENT_BINARY=copilot)
-      ;;
-    cline)
-      dockerfile=npm
-      build_args=(--build-arg AGENT_KIND=cline --build-arg AGENT_PACKAGE=cline@3.0.38 --build-arg AGENT_BINARY=cline)
-      ;;
-    glm)
-      dockerfile=npm
-      build_args=(--build-arg AGENT_KIND=glm --build-arg AGENT_PACKAGE=glm-acp-agent@1.1.4 --build-arg AGENT_BINARY=glm-acp-agent)
-      ;;
-    grok)
-      dockerfile=npm
-      build_args=(--build-arg AGENT_KIND=grok --build-arg AGENT_PACKAGE=@xai-official/grok@0.2.97 --build-arg AGENT_BINARY=grok)
-      ;;
-    kilo)
-      dockerfile=npm
-      build_args=(--build-arg AGENT_KIND=kilo --build-arg AGENT_PACKAGE=@kilocode/cli@7.3.54 --build-arg AGENT_BINARY=kilo)
-      ;;
-    pi)
-      dockerfile=npm
-      build_args=(--build-arg AGENT_KIND=pi --build-arg AGENT_PACKAGE=pi-acp@0.0.31 --build-arg AGENT_BINARY=pi-acp)
-      ;;
-    qwen)
-      dockerfile=npm
-      build_args=(--build-arg AGENT_KIND=qwen --build-arg AGENT_PACKAGE=@qwen-code/qwen-code@0.19.10 --build-arg AGENT_BINARY=qwen)
-      ;;
-    cursor)
-      dockerfile=binary
-      build_args=(
-        --build-arg AGENT_KIND=cursor
-        --build-arg AGENT_BINARY=cursor-agent
-        --build-arg AGENT_PATH=dist-package/cursor-agent
-        --build-arg AGENT_ARCHIVE_AMD64=https://downloads.cursor.com/lab/2026.07.20-8cc9c0b/linux/x64/agent-cli-package.tar.gz
-        --build-arg AGENT_ARCHIVE_ARM64=https://downloads.cursor.com/lab/2026.07.20-8cc9c0b/linux/arm64/agent-cli-package.tar.gz
-      )
-      ;;
-    junie)
-      dockerfile=binary
-      build_args=(
-        --build-arg AGENT_KIND=junie
-        --build-arg AGENT_BINARY=junie
-        --build-arg AGENT_PATH=junie-app/bin/junie
-        --build-arg AGENT_ARCHIVE_AMD64=https://github.com/JetBrains/junie/releases/download/1966.57/junie-release-1966.57-linux-amd64.zip
-        --build-arg AGENT_ARCHIVE_ARM64=https://github.com/JetBrains/junie/releases/download/1966.57/junie-release-1966.57-linux-aarch64.zip
-      )
-      ;;
-    kimi)
-      dockerfile=binary
-      build_args=(
-        --build-arg AGENT_KIND=kimi
-        --build-arg AGENT_BINARY=kimi
-        --build-arg AGENT_PATH=kimi
-        --build-arg AGENT_ARCHIVE_AMD64=https://github.com/MoonshotAI/kimi-cli/releases/download/1.49.0/kimi-1.49.0-x86_64-unknown-linux-gnu.tar.gz
-        --build-arg AGENT_ARCHIVE_ARM64=https://github.com/MoonshotAI/kimi-cli/releases/download/1.49.0/kimi-1.49.0-aarch64-unknown-linux-gnu.tar.gz
-        --build-arg AGENT_SHA256_AMD64=6ce0b83f583c45a64cc9f51ffe7e1a8e03ee79acda69945fcf8c23341b9d892f
-        --build-arg AGENT_SHA256_ARM64=5ac54cabce16ede27b9d2069b9b88edee25528646e7bb5befa9980a1ca71febb
-      )
-      ;;
-    mistral-vibe)
-      dockerfile=binary
-      build_args=(
-        --build-arg AGENT_KIND=mistral-vibe
-        --build-arg AGENT_BINARY=vibe-acp
-        --build-arg AGENT_PATH=vibe-acp
-        --build-arg AGENT_ARCHIVE_AMD64=https://github.com/mistralai/mistral-vibe/releases/download/v2.17.1/vibe-acp-linux-x86_64-2.17.1.zip
-        --build-arg AGENT_ARCHIVE_ARM64=https://github.com/mistralai/mistral-vibe/releases/download/v2.17.1/vibe-acp-linux-aarch64-2.17.1.zip
-      )
-      ;;
-  esac
+  resolved_build_args_output=$(node scripts/runner-versions.mjs build-args "$runner")
+  resolved_build_args=()
+  while IFS= read -r build_arg; do
+    resolved_build_args+=("$build_arg")
+  done <<<"$resolved_build_args_output"
+  for build_arg in "${resolved_build_args[@]}"; do
+    build_args+=(--build-arg "$build_arg")
+  done
   "${build_command[@]}" \
     --file "harnesses/native/${dockerfile}/Dockerfile" \
     --target runner \
