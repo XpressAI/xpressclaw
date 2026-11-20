@@ -21,7 +21,8 @@ XpressClaw publishes one product-specific image for each supported ACP agent:
 | `kilo` | Kilo Code |
 | `mistral-vibe` | Mistral Vibe |
 
-`codex`, `claude`, and `opencode` retain dedicated Dockerfiles. The `npm` and
+`codex` and `claude` retain dedicated Dockerfiles. OpenCode ships only
+platform binaries from 2.0 onward, so it uses the `binary` template. The `npm` and
 `binary` Dockerfiles are parameterized templates; CI supplies the exact
 package or platform archive recorded in
 [`harnesses/runner-versions.json`](../runner-versions.json). Run
