@@ -1037,12 +1037,13 @@ mod tests {
             run(&docker, "const fs=require('fs');fs.writeFileSync('/tmp/installed-tool','keep');fs.writeFileSync('/persist/session','native-session');").await;
             let before = docker.inspect_optional(&name).await.unwrap().unwrap();
             volumes.push(before.mounts.as_ref().unwrap().iter().find(|mount| mount.destination.as_deref()==Some("/persist")).unwrap().name.clone().unwrap());
-            let changed = ContainerSpec { environment: vec!["VALUE=new".into()], ..spec.clone() };
+            let changed = ContainerSpec { init: Some(true), environment: vec!["VALUE=new".into()], ..spec.clone() };
             assert!(docker.project_configuration_needs_recovery("agent", &changed).await.unwrap());
             docker.recover_project_configuration("agent", &changed).await.unwrap();
             let after = docker.inspect_optional(&name).await.unwrap().unwrap();
             snapshots.push(after.image.clone().unwrap());
             assert_ne!(after.id.as_deref(), Some(original.info.container_id.as_str()));
+            assert_eq!(after.host_config.as_ref().and_then(|host| host.init), Some(true));
             assert!(docker.inspect_optional(&backup).await.unwrap().is_some());
             let values = run(&docker, "const fs=require('fs');console.log(JSON.stringify([fs.readFileSync('/tmp/installed-tool','utf8'),fs.readFileSync('/persist/session','utf8'),process.env.VALUE,process.env.OLD_TOKEN||'']));").await;
             assert_eq!(values.trim(), r#"["keep","native-session","new",""]"#);

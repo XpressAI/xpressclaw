@@ -63,6 +63,10 @@ pub struct ContainerSpec {
     /// runtimes use container root because it maps back to the invoking user.
     #[serde(default)]
     pub run_as_host_user: bool,
+    /// Run a container init process before the harness. Omit the unset value
+    /// so existing specifications retain their fingerprints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub init: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,6 +169,7 @@ impl Default for ContainerSpec {
             cmd: None,
             working_dir: None,
             run_as_host_user: false,
+            init: None,
         }
     }
 }
@@ -644,6 +649,7 @@ impl DockerManager {
             .as_deref()
             .is_some_and(|network| network.starts_with("container:"));
         let host_config = HostConfig {
+            init: spec.init,
             memory: spec.memory_limit,
             nano_cpus: spec.cpu_limit,
             group_add: socket_mount_groups(spec),
@@ -2143,6 +2149,7 @@ pub(crate) mod tests {
             environment: vec!["TOKEN=secret".into()],
             ..Default::default()
         };
+        assert!(serde_json::to_value(&spec).unwrap().get("init").is_none());
         let container = retained_fixture(&spec);
         let mut changed = spec.clone();
         changed.image = "new-image:latest".into();
@@ -2158,6 +2165,10 @@ pub(crate) mod tests {
         assert!(error.contains("preserved"));
         assert!(!error.contains("secret"));
         for changed in [
+            ContainerSpec {
+                init: Some(true),
+                ..spec.clone()
+            },
             ContainerSpec {
                 cmd: Some(vec!["other-harness".into()]),
                 ..spec.clone()

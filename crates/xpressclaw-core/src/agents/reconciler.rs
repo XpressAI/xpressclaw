@@ -571,6 +571,7 @@ async fn reconcile_apps(
             cmd: Some(vec!["sh".to_string(), "-c".to_string(), cmd]),
             working_dir: Some(format!("/workspace/apps/{app_id}")),
             run_as_host_user: false,
+            init: None,
         };
 
         // Record attempt time + bump restart count

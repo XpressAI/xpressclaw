@@ -3730,6 +3730,9 @@ fn build_spec(
             cfg!(target_os = "macos"),
             docker.is_rootless(),
         ),
+        // Antigravity's per-session worker treats a parent at PID 1 as dead.
+        // An init process keeps its ACP front alive in the worker's parent check.
+        init: (kind == "antigravity").then_some(true),
     })
 }
 
@@ -7544,6 +7547,46 @@ flows:
             acp_command_for(&config, "deepseek-harness", "/workspace").unwrap(),
             vec!["dsh-acp"]
         );
+    }
+
+    #[tokio::test]
+    async fn antigravity_launch_settings_recover_legacy_pid_one_environments() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = RuntimeRepository {
+            bootstrap_root: root.path().into(),
+            active_root: root.path().into(),
+            active: false,
+            git_dir: None,
+            git_common_dir: None,
+            container_bootstrap: "/workspace".into(),
+            container_root: "/workspace".into(),
+        };
+        let (docker, _, server) =
+            crate::docker::manager::tests::mock_retained_image(json!({})).await;
+        for kind in ["antigravity", "agy", "codex"] {
+            let mut agent = AgentConfig::default();
+            agent.runner.kind = kind.into();
+            agent.runner.subscription_auth = false;
+            agent.runner.ssh_agent_forwarding = false;
+            agent.runner.startup_commands = vec!["true".into()];
+            let kind = resolve_runner_kind(&agent).unwrap();
+            let spec = build_spec(
+                &Config::default(),
+                &agent,
+                &kind,
+                &docker,
+                &repository,
+                None,
+            )
+            .unwrap();
+            let mut legacy = spec.clone();
+            legacy.init = None;
+            let changed = retained_process_fingerprint(&spec).unwrap()
+                != retained_process_fingerprint(&legacy).unwrap();
+            assert_eq!(changed, kind == "antigravity");
+            assert_eq!(spec.init, (kind == "antigravity").then_some(true));
+        }
+        server.abort();
     }
 
     #[test]

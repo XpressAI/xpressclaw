@@ -130,6 +130,7 @@ pub fn build_container_spec_with_mcp(
         cmd: None,
         working_dir: None,
         run_as_host_user: false,
+        init: None,
     }
 }
 
