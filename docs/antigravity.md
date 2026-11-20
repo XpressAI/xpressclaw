@@ -65,6 +65,12 @@ CLI. Task and Conversation sessions use the common ACP lifecycle, including
 permissions, tool updates, cancellation, and load/resume. Model availability
 comes from the selected account or provider.
 
+XpressClaw launches Antigravity behind the container engine's init process.
+Its per-session workers otherwise mistake the ACP front running as PID 1 for
+a terminated parent and fail to start conversations. Existing environments
+adopt this setting through automatic recovery, retaining installed tools,
+login state, and mounted files.
+
 The GitHub and coordination servers use ACP's stdio MCP transport. Selected
 HTTP MCP servers use the CLI's per-session worker mode, which Google requires
 for client-configured HTTP servers. The pinned CLI advertises stdio and HTTP;

@@ -1995,6 +1995,7 @@ exit 4
         ]),
         working_dir: None,
         run_as_host_user: false,
+        init: None,
     };
 
     if let Err(error) = docker.launch(&workload_id, &spec).await {
