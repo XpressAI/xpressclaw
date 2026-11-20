@@ -21,6 +21,7 @@ use xpressclaw_core::config::{
     ContainerEngineAccess, McpServerConfig, NativeRunnerConfig,
 };
 use xpressclaw_core::docker::manager::ContainerSpec;
+use xpressclaw_core::external_tools::path_for_external_tool;
 use xpressclaw_core::llm::anthropic::AnthropicProvider;
 use xpressclaw_core::llm::local::detect_ollama;
 use xpressclaw_core::llm::openai::OpenAiProvider;
@@ -421,13 +422,15 @@ async fn list_directories(
     let current = requested.canonicalize().map_err(|error| {
         bad_request(format!(
             "Cannot open directory {}: {error}",
-            requested.display()
+            path_for_external_tool(&requested).display()
         ))
     })?;
+    // Keep the canonical path for filesystem access; normalize API fields only.
+    let display_path = path_for_external_tool(&current);
     if !current.is_dir() {
         return Err(bad_request(format!(
             "{} is not a directory",
-            current.display()
+            display_path.display()
         )));
     }
 
@@ -445,21 +448,21 @@ async fn list_directories(
             }
             Some((
                 entry.file_name().to_string_lossy().into_owned(),
-                path.display().to_string(),
+                path_for_external_tool(&path).display().to_string(),
             ))
         })
         .collect::<Vec<_>>();
     directories.sort_by_key(|(name, _)| name.to_lowercase());
-    let root = current
+    let root = display_path
         .ancestors()
         .last()
-        .unwrap_or(current.as_path())
+        .unwrap_or(display_path.as_path())
         .display()
         .to_string();
     Ok(Json(json!({
-        "path": current.display().to_string(),
-        "parent": current.parent().map(|path| path.display().to_string()),
-        "home": home.map(|path| path.display().to_string()),
+        "path": display_path.display().to_string(),
+        "parent": display_path.parent().map(|path| path.display().to_string()),
+        "home": home.map(|path| path_for_external_tool(&path).display().to_string()),
         "roots": [root],
         "directories": directories.into_iter().map(|(name, path)| json!({
             "name": name,
@@ -483,13 +486,15 @@ async fn project_environment(
     let workspace = requested.canonicalize().map_err(|error| {
         bad_request(format!(
             "Cannot inspect workspace {}: {error}",
-            requested.display()
+            path_for_external_tool(&requested).display()
         ))
     })?;
+    // Probes below join onto the verbatim path; only the response is stripped.
+    let display_workspace = path_for_external_tool(&workspace);
     if !workspace.is_dir() {
         return Err(bad_request(format!(
             "{} is not a directory",
-            workspace.display()
+            display_workspace.display()
         )));
     }
 
@@ -621,7 +626,7 @@ async fn project_environment(
     let git_uses_ssh = git_repository && repository_uses_ssh_remote(&workspace);
 
     Ok(Json(json!({
-        "workspace": workspace.display().to_string(),
+        "workspace": display_workspace.display().to_string(),
         "detected_files": detected_files,
         "suggestions": suggestions,
         "git_repository": git_repository,
@@ -632,7 +637,7 @@ async fn project_environment(
 fn repository_uses_ssh_remote(workspace: &FsPath) -> bool {
     std::process::Command::new("git")
         .arg("-C")
-        .arg(workspace)
+        .arg(path_for_external_tool(workspace))
         .args(["config", "--get-regexp", r"^remote\..*\.(url|pushurl)$"])
         .output()
         .ok()
@@ -2651,6 +2656,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn setup_paths_round_trip_long_directories_without_verbatim_prefixes() {
+        let root = tempfile::tempdir().unwrap();
+        let mut workspace = root.path().canonicalize().unwrap();
+        while workspace.as_os_str().len() <= 280 {
+            workspace.push("nested project folder");
+        }
+        std::fs::create_dir_all(workspace.join("child folder")).unwrap();
+        std::fs::write(workspace.join("compose.yaml"), "services: {}\n").unwrap();
+
+        let listing = list_directories(Query(DirectoryQuery {
+            path: Some(workspace.display().to_string()),
+        }))
+        .await
+        .unwrap()
+        .0;
+        let path = listing["path"].as_str().unwrap();
+        assert!(!path.starts_with(r"\\?\"));
+        assert_eq!(FsPath::new(path).canonicalize().unwrap(), workspace);
+        for value in [&listing["parent"], &listing["home"], &listing["roots"][0]] {
+            if let Some(path) = value.as_str() {
+                assert!(!path.starts_with(r"\\?\"), "{path}");
+            }
+        }
+        assert_eq!(listing["directories"].as_array().unwrap().len(), 1);
+        let child = listing["directories"][0]["path"].as_str().unwrap();
+        assert!(!child.starts_with(r"\\?\"));
+        let child_listing = list_directories(Query(DirectoryQuery {
+            path: Some(child.into()),
+        }))
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(child_listing["parent"], listing["path"]);
+
+        let environment = project_environment(Query(ProjectEnvironmentQuery { path: path.into() }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(environment["workspace"], listing["path"]);
+        assert_eq!(environment["detected_files"], json!(["compose.yaml"]));
+        assert_eq!(
+            environment["suggestions"][0]["command"],
+            "docker compose up -d"
+        );
+
+        let file = workspace.join("compose.yaml").display().to_string();
+        let directory_error = list_directories(Query(DirectoryQuery {
+            path: Some(file.clone()),
+        }))
+        .await
+        .unwrap_err();
+        let environment_error = project_environment(Query(ProjectEnvironmentQuery { path: file }))
+            .await
+            .unwrap_err();
+        for (status, Json(body)) in [directory_error, environment_error] {
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            let message = body["error"].as_str().unwrap();
+            assert!(message.ends_with("is not a directory"));
+            assert!(!message.contains(r"\\?\"));
+        }
+    }
+
+    #[tokio::test]
     async fn environment_inspection_suggests_opt_in_commands() {
         let workspace = std::env::temp_dir().join(format!(
             "xpressclaw-environment-test-{}",
@@ -2684,6 +2752,7 @@ mod tests {
         .await
         .unwrap()
         .0;
+        assert!(!response["workspace"].as_str().unwrap().starts_with(r"\\?\"));
         let suggestions = response["suggestions"].as_array().unwrap();
         assert!(suggestions
             .iter()

@@ -1,12 +1,12 @@
 use std::path::{Path, PathBuf};
 
-/// Return a path that can safely be passed to a native external tool.
+/// Return a path for native external tools and user-facing API fields.
 ///
 /// Windows `canonicalize()` returns verbatim paths such as `\\?\C:\...` and
 /// `\\?\UNC\server\share\...`. Those paths are useful for filesystem
 /// containment checks, but tools including Git and Docker Desktop do not
 /// consistently accept them as command-line arguments.
-pub(crate) fn path_for_external_tool(path: &Path) -> PathBuf {
+pub fn path_for_external_tool(path: &Path) -> PathBuf {
     // Recognized verbatim prefixes are unambiguous, so perform the conversion
     // on every host. This lets Linux and macOS exercise both the conversion
     // and its external-tool call sites without requiring a Windows runner.

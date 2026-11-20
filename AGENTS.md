@@ -6,6 +6,11 @@
 - Do not run `cargo fmt --all`. Cargo follows the local `ready-agent-cog` path dependency despite the workspace exclusion and will modify the `external/ready-agent-cog` submodule.
 - Treat everything under `external/` as third-party code unless a task explicitly targets it.
 
+## Windows paths
+
+- Keep canonical paths for filesystem access and containment checks, including Windows extended-length paths.
+- Use `xpressclaw_core::external_tools::path_for_external_tool` for native-tool arguments and paths displayed in API responses or user-facing errors. It converts both verbatim drive and UNC paths; do not duplicate that conversion.
+
 ## Build storage
 
 - Create task worktrees under `.worktrees/`, never under `target/`. Source checkouts must not live in a directory that `cargo clean` can delete.
