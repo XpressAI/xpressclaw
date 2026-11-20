@@ -949,7 +949,7 @@ export interface TaskListOptions {
 export type PlanningAction = { action: 'schedule'; start_after: string | null; activate?: boolean } | { action: 'backlog' | 'queue' } | { action: 'assign'; agent_id: string } | { action: 'priority'; priority: number } | { action: 'reorder'; before_id?: string; after_id?: string };
 export const tasks = {
 	attention: (agentId?: string) => request<{ tasks: Task[] }>(`/api/tasks/attention${agentId ? `?agent_id=${encodeURIComponent(agentId)}` : ''}`),
-    planning: (options: { project_id?: string; agent_id?: string; status?: string; search?: string; limit?: number; offset?: number }) => {
+    planning: (options: { project_id?: string; agent_id?: string; status?: string; search?: string; limit?: number; offset?: number; sort?: 'planning' | 'newest' }) => {
         const query = new URLSearchParams();
         for (const [key, value] of Object.entries(options)) if (value !== undefined && value !== '') query.set(key, String(value));
         return request<{ tasks: Task[]; total: number; counts: Record<string, number> }>(`/api/tasks/planning?${query}`);

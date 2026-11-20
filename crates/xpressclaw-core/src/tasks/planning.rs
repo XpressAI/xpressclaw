@@ -169,6 +169,15 @@ pub struct PlanningFilter {
     pub search: Option<String>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
+    #[serde(default)]
+    pub sort: PlanningSort,
+}
+#[derive(Default, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanningSort {
+    #[default]
+    Planning,
+    Newest,
 }
 #[derive(Serialize)]
 pub struct PlanningPage {
@@ -238,37 +247,71 @@ impl TaskPlanner {
             }
             let mut predicate = " FROM planned tasks WHERE 1=1".to_string();
             let mut values: Vec<Box<dyn rusqlite::types::ToSql>> = vec![];
-            for (column, value) in [("project_id", &filter.project_id), ("agent_id", &filter.agent_id)] {
+            for (column, value) in [
+                ("project_id", &filter.project_id),
+                ("agent_id", &filter.agent_id),
+            ] {
                 if let Some(value) = value.as_ref().filter(|s| !s.is_empty()) {
-                    predicate.push_str(&format!(" AND {column} = ?")); values.push(Box::new(value.clone()));
+                    predicate.push_str(&format!(" AND {column} = ?"));
+                    values.push(Box::new(value.clone()));
                 }
             }
             append_task_search(&mut predicate, &mut values, filter.search.as_deref());
-            let refs: Vec<&dyn rusqlite::types::ToSql> = values.iter().map(|v| v.as_ref()).collect();
+            let refs: Vec<&dyn rusqlite::types::ToSql> =
+                values.iter().map(|v| v.as_ref()).collect();
             let mut counts = BTreeMap::new();
-            for row in conn.prepare(&format!("{snapshot} SELECT lane, COUNT(*) {predicate} GROUP BY lane"))?
-                .query_map(refs.as_slice(), |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))? {
-                let (lane, count) = row?; counts.insert(lane, count);
+            for row in conn
+                .prepare(&format!(
+                    "{snapshot} SELECT lane, COUNT(*) {predicate} GROUP BY lane"
+                ))?
+                .query_map(refs.as_slice(), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })?
+            {
+                let (lane, count) = row?;
+                counts.insert(lane, count);
             }
             let selected = filter.status.as_deref().unwrap_or("active");
             match selected {
-                "all" => {},
+                "all" => {}
                 "active" => predicate.push_str(" AND lane != 'done'"),
                 "attention" => predicate.push_str(" AND lane IN ('input','blocked','review')"),
-                lane => { predicate.push_str(" AND lane = ?"); values.push(Box::new(lane.to_string())); }
+                lane => {
+                    predicate.push_str(" AND lane = ?");
+                    values.push(Box::new(lane.to_string()));
+                }
             }
-            let total = counts.iter().filter(|(lane, _)| match selected {
-                "all" => true, "active" => lane.as_str() != "done", "attention" => ["input","blocked","review"].contains(&lane.as_str()), selected => lane.as_str() == selected,
-            }).map(|(_, count)| count).sum();
+            let total = counts
+                .iter()
+                .filter(|(lane, _)| match selected {
+                    "all" => true,
+                    "active" => lane.as_str() != "done",
+                    "attention" => ["input", "blocked", "review"].contains(&lane.as_str()),
+                    selected => lane.as_str() == selected,
+                })
+                .map(|(_, count)| count)
+                .sum();
             values.push(Box::new(filter.limit.unwrap_or(100).clamp(1, 200)));
             values.push(Box::new(filter.offset.unwrap_or(0).max(0)));
-            let refs: Vec<&dyn rusqlite::types::ToSql> = values.iter().map(|v| v.as_ref()).collect();
-            let sql = format!("{snapshot} SELECT tasks.* {predicate} ORDER BY priority DESC, position, id LIMIT ? OFFSET ?");
+            let refs: Vec<&dyn rusqlite::types::ToSql> =
+                values.iter().map(|v| v.as_ref()).collect();
+            let order = match filter.sort {
+                PlanningSort::Planning => "priority DESC, position, id",
+                PlanningSort::Newest => "julianday(created_at) DESC, id DESC",
+            };
+            let sql =
+                format!("{snapshot} SELECT tasks.* {predicate} ORDER BY {order} LIMIT ? OFFSET ?");
             let mut statement = conn.prepare(&sql)?;
             let mut rows = statement.query(refs.as_slice())?;
             let mut tasks = vec![];
-            while let Some(row) = rows.next()? { tasks.push(planning_row(row)?); }
-            Ok(PlanningPage { tasks, total, counts })
+            while let Some(row) = rows.next()? {
+                tasks.push(planning_row(row)?);
+            }
+            Ok(PlanningPage {
+                tasks,
+                total,
+                counts,
+            })
         })
     }
 

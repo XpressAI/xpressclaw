@@ -11,12 +11,14 @@
     onreorder,
     selected = false,
     showDescription = false,
+    draggable = true,
   }: {
     task: Task;
     project: string;
     agent: string;
     selected?: boolean;
     showDescription?: boolean;
+    draggable?: boolean;
     onactions: (task: Task) => void;
     ondrag: (event: DragEvent, task: Task) => void;
     ondrop?: (event: DragEvent, task: Task) => void;
@@ -29,7 +31,7 @@
 <article
   data-planning-card={task.id}
   class:selected
-  draggable={editable}
+  draggable={editable && draggable}
   aria-label={`${task.title}, ${taskLabel(task)}. Use Actions for planning controls.`}
   ondragstart={(event) => ondrag(event, task)}
   ondragover={(event) => {
@@ -46,7 +48,7 @@
         if (
           event.altKey &&
           ["ArrowUp", "ArrowDown"].includes(event.key) &&
-          editable
+          editable && onreorder
         ) {
           event.preventDefault();
           onreorder?.(task, event.key === "ArrowUp" ? -1 : 1);

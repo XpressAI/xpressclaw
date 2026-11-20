@@ -338,7 +338,7 @@
 					<h2 class="text-sm font-semibold">Work</h2>
 					<p class="mt-0.5 text-xs text-muted-foreground">Open a task to see its conversation and every technical step.</p>
 				</div>
-				<a href="/tasks" class="text-xs text-muted-foreground hover:text-foreground">All tasks</a>
+				<a href={`/tasks?view=list&agent=${encodeURIComponent(agentId)}&status=all&sort=newest`} class="text-xs text-muted-foreground hover:text-foreground">All tasks</a>
 			</div>
 			{#if recentWorkTasks.length === 0}
 				<div class="px-4 py-12 text-center text-sm text-muted-foreground">{attentionTasks.length > 0 ? 'No other work for this agent.' : 'No work yet. Send the first task above.'}</div>
