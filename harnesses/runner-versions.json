@@ -4,7 +4,7 @@
   "runners": {
     "codex": {
       "auto_update": true,
-      "version": "2.7.0",
+      "version": "2.8.0",
       "acp_command": [
         "codex-acp"
       ],
@@ -18,12 +18,12 @@
         }
       ],
       "build_args": {
-        "CODEX_ACP_VERSION": "2.7.0"
+        "CODEX_ACP_VERSION": "2.8.0"
       }
     },
     "claude": {
       "auto_update": true,
-      "version": "0.108.1",
+      "version": "0.109.0",
       "acp_command": [
         "claude-agent-acp"
       ],
@@ -37,12 +37,12 @@
         }
       ],
       "build_args": {
-        "CLAUDE_ACP_VERSION": "0.108.1"
+        "CLAUDE_ACP_VERSION": "0.109.0"
       }
     },
     "antigravity": {
       "auto_update": true,
-      "version": "1.5.12",
+      "version": "1.5.13",
       "acp_command": [
         "agy",
         "acp",
@@ -64,10 +64,10 @@
         "AGENT_KIND": "antigravity",
         "AGENT_BINARY": "agy",
         "AGENT_PATH": "antigravity",
-        "AGENT_ARCHIVE_AMD64": "https://github.com/google-antigravity/antigravity-cli/releases/download/1.5.12/agy_cli_linux_x64.tar.gz",
-        "AGENT_ARCHIVE_ARM64": "https://github.com/google-antigravity/antigravity-cli/releases/download/1.5.12/agy_cli_linux_arm64.tar.gz",
-        "AGENT_SHA256_AMD64": "0f0cb851cdc9fbedd50432570aa6ae9c4c398b9ea3f1e23e7776f707643c5b3e",
-        "AGENT_SHA256_ARM64": "594046de1b91561f7fe16476365e3843038ecca56f5f59af45cf9d3091e43bd4"
+        "AGENT_ARCHIVE_AMD64": "https://github.com/google-antigravity/antigravity-cli/releases/download/1.5.13/agy_cli_linux_x64.tar.gz",
+        "AGENT_ARCHIVE_ARM64": "https://github.com/google-antigravity/antigravity-cli/releases/download/1.5.13/agy_cli_linux_arm64.tar.gz",
+        "AGENT_SHA256_AMD64": "7fa9cc6df0d09562693d637c406a86c1b0f52ab3364714b1fd2d79cc6060d4b2",
+        "AGENT_SHA256_ARM64": "36596ad8038531fd75f0e97b5ba8967a30f2fd67f8d9c61959d2e4761d7b215f"
       }
     },
     "deepseek-harness": {
@@ -121,7 +121,7 @@
     },
     "junie": {
       "auto_update": true,
-      "version": "4100.8.0",
+      "version": "4100.10.0",
       "acp_command": [
         "junie",
         "--acp=true"
@@ -138,8 +138,8 @@
         "AGENT_KIND": "junie",
         "AGENT_BINARY": "junie",
         "AGENT_PATH": "junie-app/bin/junie",
-        "AGENT_ARCHIVE_AMD64": "https://github.com/JetBrains/junie-acp-release/releases/download/4100.8/junie-release-4100.8-linux-amd64.zip",
-        "AGENT_ARCHIVE_ARM64": "https://github.com/JetBrains/junie-acp-release/releases/download/4100.8/junie-release-4100.8-linux-aarch64.zip",
+        "AGENT_ARCHIVE_AMD64": "https://github.com/JetBrains/junie-acp-release/releases/download/4100.10/junie-release-4100.10-linux-amd64.zip",
+        "AGENT_ARCHIVE_ARM64": "https://github.com/JetBrains/junie-acp-release/releases/download/4100.10/junie-release-4100.10-linux-aarch64.zip",
         "AGENT_SHA256_AMD64": "",
         "AGENT_SHA256_ARM64": ""
       }
@@ -280,7 +280,7 @@
     },
     "cursor": {
       "auto_update": true,
-      "version": "2026.11.17",
+      "version": "2026.11.19",
       "acp_command": [
         "cursor-agent",
         "acp"
@@ -297,8 +297,8 @@
         "AGENT_KIND": "cursor",
         "AGENT_BINARY": "cursor-agent",
         "AGENT_PATH": "dist-package/cursor-agent",
-        "AGENT_ARCHIVE_AMD64": "https://downloads.cursor.com/lab/2026.11.17-f532c45/linux/x64/agent-cli-package.tar.gz",
-        "AGENT_ARCHIVE_ARM64": "https://downloads.cursor.com/lab/2026.11.17-f532c45/linux/arm64/agent-cli-package.tar.gz",
+        "AGENT_ARCHIVE_AMD64": "https://downloads.cursor.com/lab/2026.11.19-f005e9d/linux/x64/agent-cli-package.tar.gz",
+        "AGENT_ARCHIVE_ARM64": "https://downloads.cursor.com/lab/2026.11.19-f005e9d/linux/arm64/agent-cli-package.tar.gz",
         "AGENT_SHA256_AMD64": "",
         "AGENT_SHA256_ARM64": ""
       }
@@ -326,7 +326,7 @@
     },
     "grok": {
       "auto_update": true,
-      "version": "1.0.90",
+      "version": "1.0.92",
       "acp_command": [
         "grok",
         "agent",
@@ -343,7 +343,7 @@
       ],
       "build_args": {
         "AGENT_KIND": "grok",
-        "AGENT_PACKAGE": "@xai-official/grok@1.0.90",
+        "AGENT_PACKAGE": "@xai-official/grok@1.0.92",
         "AGENT_BINARY": "grok"
       }
     },
