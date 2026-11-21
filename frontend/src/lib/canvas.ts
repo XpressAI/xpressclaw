@@ -179,6 +179,13 @@ export function isHtmlFilePath(path: string | null | undefined): boolean {
 	return HTML_EXTENSIONS.has(clean.slice(dot + 1).toLowerCase());
 }
 
+const TASK_ATTACHMENT_PATH_RE = /^\/api\/tasks\/[^/]+\/messages\/[^/]+\/attachments\/[^/]+$/;
+const CONVERSATION_ATTACHMENT_PATH_RE = /^\/api\/conversations\/[^/]+\/attachments\/[^/]+$/;
+
+function isAttachmentEndpointPathname(pathname: string): boolean {
+	return TASK_ATTACHMENT_PATH_RE.test(pathname) || CONVERSATION_ATTACHMENT_PATH_RE.test(pathname);
+}
+
 export function isAllowedHtmlPreviewEndpoint(rawUrl: string, currentOrigin: string): boolean {
 	let parsed: URL;
 	try {
@@ -187,7 +194,7 @@ export function isAllowedHtmlPreviewEndpoint(rawUrl: string, currentOrigin: stri
 		return false;
 	}
 	if (currentOrigin && parsed.origin !== currentOrigin) return false;
-	if (/^\/api\/(?:tasks|conversations)\/[^/]+\/messages\/[^/]+\/attachments\/[^/]+$/.test(parsed.pathname)) {
+	if (isAttachmentEndpointPathname(parsed.pathname)) {
 		return true;
 	}
 	if (/^\/api\/environments\/[^/]+\/download$/.test(parsed.pathname)) {
@@ -195,6 +202,28 @@ export function isAllowedHtmlPreviewEndpoint(rawUrl: string, currentOrigin: stri
 		return Boolean(filePath && isHtmlFilePath(filePath));
 	}
 	return false;
+}
+
+export function extractActiveWorkspaceRoots(status: {
+	root?: string | null;
+	container_root?: string | null;
+	repository?: {
+		active?: { root?: string | null } | null;
+	} | null;
+}): string[] {
+	// Only include roots representing the active workspace (never repository.bootstrap_root):
+	// workspace file APIs resolve relative paths against active_root(), so including an outer
+	// bootstrap root when a nested repository is active would map sibling files to the wrong path.
+	const seen = new Set<string>();
+	const roots: string[] = [];
+	for (const candidate of [status.root, status.container_root, status.repository?.active?.root]) {
+		if (typeof candidate !== 'string') continue;
+		const trimmed = candidate.trim();
+		if (!trimmed || seen.has(trimmed)) continue;
+		seen.add(trimmed);
+		roots.push(trimmed);
+	}
+	return roots;
 }
 
 export interface CanvasLinkPreviewTarget {
@@ -264,6 +293,8 @@ export function classifyCanvasLink(
 		text?: string | null;
 		hasImageChild?: boolean;
 		imageAlt?: string | null;
+		attachmentName?: string | null;
+		attachmentMimeType?: string | null;
 	},
 	currentOrigin: string,
 ): CanvasLinkPreviewTarget | null {
@@ -348,14 +379,16 @@ export function classifyCanvasLink(
 			};
 		}
 
-		// 3. Task / conversation message attachments
-		if (/^\/api\/(?:tasks|conversations)\/[^/]+\/messages\/[^/]+\/attachments\/[^/]+$/.test(parsed.pathname)) {
-			const fileName = (downloadAttr && downloadAttr.trim())
+		// 3. Task / conversation attachments
+		if (isAttachmentEndpointPathname(parsed.pathname)) {
+			const fileName = (input.attachmentName && input.attachmentName.trim())
+				|| (downloadAttr && downloadAttr.trim())
 				|| (input.imageAlt && input.imageAlt.trim())
 				|| trimmedText
 				|| null;
+			const mime = input.attachmentMimeType?.trim().toLowerCase() || '';
 			const href = `${parsed.pathname}${parsed.search}`;
-			if (input.hasImageChild || isImageFilePath(fileName)) {
+			if (input.hasImageChild || mime.startsWith('image/') || isImageFilePath(fileName)) {
 				return {
 					href,
 					label: fileName || 'Attached image',
@@ -367,7 +400,7 @@ export function classifyCanvasLink(
 					downloadAttr,
 				};
 			}
-			if (isHtmlFilePath(fileName)) {
+			if (mime === 'text/html' || mime.startsWith('text/html;') || isHtmlFilePath(fileName)) {
 				return {
 					href,
 					label: fileName || 'HTML attachment',

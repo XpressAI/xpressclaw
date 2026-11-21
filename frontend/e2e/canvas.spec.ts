@@ -7,6 +7,7 @@ import {
 	computeProjectZones,
 	createCanvasNode,
 	deriveCanvasEdges,
+	extractActiveWorkspaceRoots,
 	isAllowedHtmlPreviewEndpoint,
 	isHtmlFilePath,
 	isImageFilePath,
@@ -768,6 +769,113 @@ test.describe('Spatial Canvas workspace', () => {
 		expect(contextEdges).toBeGreaterThanOrEqual(6);
 	});
 
+	test('previews Conversation attachments and excludes bootstrap_root when a nested repository is active', async ({ page }) => {
+		await mockCanvasApi(page);
+		await page.route('**/api/workspaces/agent-codex', (route) =>
+			route.fulfill({
+				json: {
+					agent_id: 'agent-codex',
+					root: '/srv/agent/repo',
+					container_root: '/workspace/repo',
+					repository: {
+						state: 'attached',
+						message: '',
+						bootstrap_root: '/srv/agent',
+						active: { relative_path: 'repo', root: '/srv/agent/repo', github_repository: null },
+						candidates: [],
+						discovery_truncated: false,
+					},
+					container_exists: true,
+					container_running: true,
+					terminal_available: true,
+				},
+			}),
+		);
+		await page.route('**/api/conversations/conv-alpha/messages**', (route) =>
+			route.fulfill({
+				json: [
+					{
+						id: 201,
+						conversation_id: 'conv-alpha',
+						sender_type: 'agent',
+						sender_id: 'agent-codex',
+						sender_name: 'Codex Builder',
+						content: [
+							'Files:',
+							'- [outside.txt](file:///srv/agent/outside.txt)',
+							'- [main.ts](file:///srv/agent/repo/main.ts)',
+						].join('\n'),
+						created_at: now,
+						attachments: [
+							{ id: 'conv-att-html', name: 'summary.html', mime_type: 'text/html', size: 72 },
+							{ id: 'conv-att-img', name: 'diagram.png', mime_type: 'image/png', size: png1x1.length },
+						],
+					},
+				],
+			}),
+		);
+		await page.route('**/api/conversations/conv-alpha/attachments/conv-att-html', (route) =>
+			route.fulfill({
+				status: 200,
+				contentType: 'text/html; charset=utf-8',
+				body: '<!doctype html><html><body><h1 id="conv-report-heading">Conversation HTML Report</h1></body></html>',
+			}),
+		);
+		await page.route('**/api/conversations/conv-alpha/attachments/conv-att-img', (route) =>
+			route.fulfill({
+				status: 200,
+				contentType: 'image/png',
+				body: png1x1,
+			}),
+		);
+
+		await page.setViewportSize({ width: 1440, height: 900 });
+		await page.goto('/canvas');
+		const alphaCard = page.locator('[data-canvas-project-card="proj-alpha"]');
+		await expect(alphaCard).toBeVisible();
+		await alphaCard.getByRole('button', { name: /Release Sync/ }).click();
+
+		const convWindow = page.locator('[data-canvas-node-kind="conversation"]').first();
+		await expect(convWindow).toBeVisible();
+		const popover = page.locator('[data-canvas-link-popover]');
+
+		// 1. Conversation HTML attachment (/api/conversations/{id}/attachments/{att_id}) -> Preview in Canvas App.
+		await convWindow.getByRole('link', { name: /summary\.html/ }).click();
+		await expect(popover).toBeVisible();
+		await expect(popover).toContainText('summary.html');
+		await popover.getByRole('menuitem', { name: 'Preview in Canvas App' }).click();
+		const convAppCard = page.locator('[data-canvas-app-card]').first();
+		await expect(convAppCard).toBeVisible();
+		await expect(convAppCard.frameLocator('[data-canvas-app-frame]').locator('#conv-report-heading')).toHaveText('Conversation HTML Report');
+
+		// 2. Conversation image attachment -> Preview in Canvas Image Viewer.
+		await page.locator('[data-canvas-fit]').click();
+		await convWindow.getByRole('link', { name: /diagram\.png/ }).click();
+		await expect(popover).toBeVisible();
+		await expect(popover).toContainText('diagram.png');
+		await popover.getByRole('menuitem', { name: 'Preview in Canvas Image Viewer' }).click();
+		const convImageCard = page.locator('[data-canvas-image-card]').first();
+		await expect(convImageCard).toBeVisible();
+		await expect(convImageCard.locator('img')).toHaveAttribute('src', '/api/conversations/conv-alpha/attachments/conv-att-img');
+
+		// 3. File in bootstrap_root outside the nested active repository must NOT open in Canvas Editor.
+		await page.locator('[data-canvas-fit]').click();
+		await convWindow.getByRole('link', { name: 'outside.txt' }).click();
+		await expect(popover).toBeVisible();
+		await popover.getByRole('menuitem', { name: 'Open in Canvas Editor' }).click();
+		await expect(popover.getByRole('status')).toContainText('outside the agent workspace');
+		await expect(page.locator('[data-canvas-editor-card]')).toHaveCount(0);
+		await page.keyboard.press('Escape');
+
+		// 4. File inside the nested active repository resolves cleanly to main.ts in Canvas Editor.
+		await convWindow.getByRole('link', { name: 'main.ts' }).click();
+		await expect(popover).toBeVisible();
+		await popover.getByRole('menuitem', { name: 'Open in Canvas Editor' }).click();
+		const editorCard = page.locator('[data-canvas-editor-card]').first();
+		await expect(editorCard).toBeVisible();
+		await expect(editorCard.getByLabel('Workspace file path')).toHaveValue('main.ts');
+	});
+
 	test('canvas model enforces safe app URLs, non-overlapping placement, delegation edges, and layout persistence', () => {
 		const origin = 'http://127.0.0.1:8935';
 		const localApp = classifyAppUrl('http://127.0.0.1:3000/dashboard', origin);
@@ -826,6 +934,21 @@ test.describe('Spatial Canvas workspace', () => {
 		expect(resolveWorkspaceRelativePath('/tmp/outside.html', ['/workspace'])).toBeNull();
 		expect(resolveWorkspaceRelativePath('/workspace/../etc/passwd', ['/workspace'])).toBeNull();
 
+		// Nested repository active roots exclude bootstrap_root so sibling files outside the active repo never alias into it.
+		const nestedRoots = extractActiveWorkspaceRoots({
+			root: '/srv/agent/repo',
+			container_root: '/workspace/repo',
+			repository: {
+				active: { root: '/srv/agent/repo' },
+				bootstrap_root: '/srv/agent',
+			} as { active: { root: string }; bootstrap_root: string },
+		});
+		expect(nestedRoots).toEqual(['/srv/agent/repo', '/workspace/repo']);
+		expect(resolveWorkspaceRelativePath('/srv/agent/notes.txt', nestedRoots)).toBeNull();
+		expect(resolveWorkspaceRelativePath('/workspace/notes.txt', nestedRoots)).toBeNull();
+		expect(resolveWorkspaceRelativePath('/srv/agent/repo/notes.txt', nestedRoots)).toBe('notes.txt');
+		expect(resolveWorkspaceRelativePath('/workspace/repo/notes.txt', nestedRoots)).toBe('notes.txt');
+
 		expect(classifyCanvasLink({ href: '/tasks/task-1' }, origin)).toBeNull();
 		expect(classifyCanvasLink({ href: '/projects/proj-alpha' }, origin)).toBeNull();
 		expect(classifyCanvasLink({ href: '/api/environments/agent-1/download?path=%2Fworkspace%2Farchive.zip' }, origin)).toBeNull();
@@ -846,10 +969,34 @@ test.describe('Spatial Canvas workspace', () => {
 		expect(attHtml?.category).toBe('html');
 		expect(attHtml?.isAttachment).toBe(true);
 
+		const convAttImg = classifyCanvasLink({
+			href: '/api/conversations/conv-alpha/attachments/c-img',
+			text: 'shot.png 68 B',
+			hasImageChild: true,
+			imageAlt: 'shot.png',
+			attachmentName: 'shot.png',
+			attachmentMimeType: 'image/png',
+		}, origin);
+		expect(convAttImg?.category).toBe('image');
+		expect(convAttImg?.label).toBe('shot.png');
+		expect(convAttImg?.isAttachment).toBe(true);
+
+		const convAttHtml = classifyCanvasLink({
+			href: '/api/conversations/conv-alpha/attachments/c-html',
+			text: 'report.html 64 B',
+			attachmentName: 'report.html',
+			attachmentMimeType: 'text/html',
+		}, origin);
+		expect(convAttHtml?.category).toBe('html');
+		expect(convAttHtml?.label).toBe('report.html');
+		expect(convAttHtml?.isAttachment).toBe(true);
+
 		const extWeb = classifyCanvasLink({ href: 'http://127.0.0.1:3000/app', text: 'App' }, origin);
 		expect(extWeb?.category).toBe('web');
 
 		expect(isAllowedHtmlPreviewEndpoint('/api/tasks/t1/messages/1/attachments/a2', origin)).toBe(true);
+		expect(isAllowedHtmlPreviewEndpoint('/api/conversations/conv-alpha/attachments/c-html', origin)).toBe(true);
+		expect(isAllowedHtmlPreviewEndpoint('/api/conversations/conv-alpha/messages/1/attachments/c-html', origin)).toBe(false);
 		expect(isAllowedHtmlPreviewEndpoint('/api/environments/agent-1/download?path=%2Ftmp%2Findex.html', origin)).toBe(true);
 		expect(isAllowedHtmlPreviewEndpoint('/api/environments/agent-1/download?path=%2Ftmp%2Fsecret.env', origin)).toBe(false);
 		expect(isAllowedHtmlPreviewEndpoint('/api/auth/bootstrap', origin)).toBe(false);

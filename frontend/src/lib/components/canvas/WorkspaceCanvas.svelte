@@ -34,6 +34,7 @@
 		computeProjectZones,
 		createCanvasNode,
 		deriveCanvasEdges,
+		extractActiveWorkspaceRoots,
 		inferTaskProjectId,
 		isImageFilePath,
 		nodeVisualHeight,
@@ -492,12 +493,7 @@
 		if (inflight) return inflight;
 		const req = workspaces.status(agentId)
 			.then((status) => {
-				const roots = [
-					status.root,
-					status.container_root,
-					status.repository?.active?.root,
-					status.repository?.bootstrap_root,
-				].filter((value): value is string => typeof value === 'string' && value.trim().length > 0);
+				const roots = extractActiveWorkspaceRoots(status);
 				workspaceRootsCache.set(agentId, roots);
 				return roots;
 			})
@@ -534,6 +530,8 @@
 				text: link.textContent,
 				hasImageChild: Boolean(img),
 				imageAlt: img?.getAttribute('alt') ?? null,
+				attachmentName: link.getAttribute('data-attachment-name'),
+				attachmentMimeType: link.getAttribute('data-attachment-mime'),
 			},
 			window.location.origin,
 		);
