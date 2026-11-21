@@ -1,0 +1,6 @@
+branch: fix/worktree-changed-files (PR #297 review round 4)
+codex P2 x2 on 24148aab:
+  1. refreshGit(task = gitTask) — calling refreshGit(undefined) uses the default, so clearing the scope was impossible. Now loadGit(task) sets scope explicitly; refreshGit() reloads gitTask.
+  2. The new await in applyRoute precedes openFile's sequence allocation, so a slow scoped status load could reopen an obsolete path. applyRoute now returns if route !== requestedRoute after the await.
+test: extended 'a reused Files tab refreshes Git status...' with an unscoped link (expects '2 changed' and task_id null) and a gated task-scoped status (mock option taskGitStatusGate) followed by a newer README.md link. Verified: without either fix it fails at the scope-reset step; with only the scope fix (no guard) it fails at the README assertion; with both it passes.
+validation: npm run check 0 errors; related chromium e2e pass.
