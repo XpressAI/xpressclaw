@@ -24,6 +24,7 @@
 	import AiMessage from '$lib/components/AiMessage.svelte';
 	import ImageAttachmentPreviews from '$lib/components/ImageAttachmentPreviews.svelte';
 	import { clearComposerDraft, loadComposerDraft, saveComposerDraft } from '$lib/composerDrafts';
+	import { dismissTaskAttemptError, subscribeTaskErrorDismissal } from '$lib/taskErrorDismissals';
 	import { appendImageFiles, imageDataUrl, MAX_IMAGE_ATTACHMENTS, pastedImageFiles, shouldHandleImagePaste } from '$lib/imageAttachments';
 	import { coalesceAgentMessageFragments } from '$lib/agentMessageFragments';
 	import { WORKSPACE_OPEN_SPLIT_EVENT, type WorkspaceOpenSplitDetail } from '$lib/workspace';
@@ -162,7 +163,7 @@
 	let allTasks = $state<Task[]>([]);
 	let workspaceGit = $state<WorkspaceGitStatus | null>(null);
 	let error = $state<string | null>(null);
-	let dismissedAttemptErrorKey = $state<string | null>(null);
+	let dismissedAttemptId = $state<string | null>(null);
 	let retryingLoad = $state(false);
 	let loading = $state(true);
 	let editing = $state(false);
@@ -347,7 +348,7 @@
 	let activeAttempt = $derived(runningAttempt ?? queuedAttempt);
 	let usageAttempt = $derived(activeAttempt ?? attempts[0] ?? null);
 	let contextUsage = $derived(contextUsageFor(usageAttempt, activityEvents));
-	let latestResultAttempt = $derived(attempts.find(attempt => attempt.result));
+	let latestResultAttempt = $derived(attempts[0]?.result ? attempts[0] : undefined);
 	let latestAttemptResult = $derived(latestResultAttempt?.result ?? null);
 	let latestResult = $derived(
 		latestAttemptResult && !messages.some(message =>
@@ -356,21 +357,20 @@
 			? latestAttemptResult
 			: null
 	);
-	let latestErrorAttempt = $derived(attempts.find(attempt => attempt.error_message) ?? null);
-	let authenticationRequired = $derived(Boolean(latestErrorAttempt && latestErrorAttempt.id === attempts[0]?.id && (
+	let latestErrorAttempt = $derived(
+		attempts[0]?.status === 'failed' && !['completed', 'cancelled'].includes(task?.status ?? '')
+			? attempts[0] : null
+	);
+	let authenticationRequired = $derived(Boolean(latestErrorAttempt && (
 		activityEvents.some(event => event.attempt_id === latestErrorAttempt.id && event.event_type === 'authentication_required')
 		|| latestErrorAttempt.error_message?.startsWith('backend error: ACP turn failed: Authentication required')
 	)));
-	let latestErrorKey = $derived(
-		latestErrorAttempt?.error_message
-			? `${latestErrorAttempt.id}:${latestErrorAttempt.error_message}`
-			: null
-	);
 	let latestError = $derived(
-		latestErrorKey && latestErrorKey !== dismissedAttemptErrorKey
+		latestErrorAttempt && latestErrorAttempt.id !== dismissedAttemptId
 			? latestErrorAttempt?.error_message ?? null
 			: null
 	);
+	$effect(() => subscribeTaskErrorDismissal(taskId, (attemptId) => dismissedAttemptId = attemptId));
 	let platformManaged = $derived(task?.provenance === 'xpress_ai_connect');
 	let blockingDelegates = $derived(delegatedWork.filter(item => item.blocks_parent));
 	let failedDelegates = $derived(blockingDelegates.filter(item => ['blocked', 'failed', 'cancelled', 'interrupted', 'waiting_for_input'].includes(item.activity_status)));
@@ -1201,7 +1201,7 @@
 	}
 
 	function dismissAttemptError() {
-		dismissedAttemptErrorKey = latestErrorKey;
+		if (latestErrorAttempt) dismissTaskAttemptError(taskId, latestErrorAttempt.id);
 		requestAnimationFrame(() => messagesEl?.focus({ preventScroll: true }));
 	}
 

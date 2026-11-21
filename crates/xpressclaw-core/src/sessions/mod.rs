@@ -577,7 +577,7 @@ impl SessionManager {
                         created_at, started_at, completed_at, context_used, context_size,
                         trigger_message_id, response_queued_at, response_started_at
                  FROM work_attempts WHERE task_id = ?1
-                 ORDER BY created_at DESC LIMIT ?2",
+                 ORDER BY created_at DESC, rowid DESC LIMIT ?2",
             )?;
             let attempts = attempt_stmt
                 .query_map(rusqlite::params![task_id, attempt_limit], row_to_attempt)?
@@ -1762,6 +1762,43 @@ mod tests {
             .unwrap();
         assert_eq!(incremental.events.len(), 1);
         assert_eq!(incremental.events[0].summary, "Ran tests");
+    }
+
+    #[test]
+    fn task_activity_orders_same_second_attempts_newest_first() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        insert_agent(&db, "builder");
+        db.conn().execute_batch("INSERT INTO tasks(id,title) VALUES('task','Retry task');
+            INSERT INTO task_queue(id,task_id,agent_id,status) VALUES(1,'task','builder','failed'),(2,'task','builder','queued');").unwrap();
+        let manager = SessionManager::new(db.clone());
+        let failed = manager
+            .create_attempt(
+                "builder", "task", 1, "codex", "task", "task", None, "Original",
+            )
+            .unwrap();
+        manager
+            .transition_attempt(
+                &failed.id,
+                "failed",
+                "Sign in required",
+                None,
+                Some("Authentication required"),
+            )
+            .unwrap();
+        let retried = manager
+            .create_attempt("builder", "task", 2, "codex", "task", "task", None, "Retry")
+            .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE work_attempts SET created_at='2026-11-21 00:00:00' WHERE task_id='task'",
+                [],
+            )
+            .unwrap();
+        for after in [None, Some(0)] {
+            let activity = manager.task_activity("task", after, None, 100, 1).unwrap();
+            assert_eq!(activity.attempts.len(), 1);
+            assert_eq!(activity.attempts[0].id, retried.id);
+        }
     }
 
     #[test]

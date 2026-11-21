@@ -6169,6 +6169,138 @@ mod tests {
     }
 
     #[test]
+    fn authentication_retry_replays_message_guidance_and_attachments_once() {
+        use crate::tasks::attachments::DecodedImageAttachment;
+        use crate::tasks::board::CreateTask;
+
+        let db = Arc::new(Database::open_memory().unwrap());
+        add_test_agent(&db, "atlas");
+        let sessions = SessionManager::new(db.clone());
+        let board = TaskBoard::new(db.clone());
+        let task = board
+            .create(&CreateTask {
+                title: "An older task title".into(),
+                agent_id: Some("atlas".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let conversation = TaskConversation::new(db.clone());
+        let queue = TaskQueue::new(db.clone());
+        conversation
+            .add_user_message_with_attachments_and_enqueue(
+                &task.id,
+                Some("atlas"),
+                "Already handled",
+                &[],
+            )
+            .unwrap();
+        let prior = queue.claim("atlas").unwrap().unwrap();
+        sessions
+            .transition_attempt(
+                prior.attempt_id.as_deref().unwrap(),
+                "preparing",
+                "Preparing",
+                None,
+                None,
+            )
+            .unwrap();
+        sessions
+            .transition_attempt(
+                prior.attempt_id.as_deref().unwrap(),
+                "completed",
+                "Done",
+                None,
+                None,
+            )
+            .unwrap();
+        queue.complete(prior.id, "Done").unwrap();
+
+        conversation
+            .add_user_message_with_attachments_and_enqueue(
+                &task.id,
+                Some("atlas"),
+                "Inspect this screenshot",
+                &[DecodedImageAttachment {
+                    name: "screen.png".into(),
+                    mime_type: "image/png".into(),
+                    data: b"original image".to_vec(),
+                }],
+            )
+            .unwrap();
+        let (guidance, coalesced) = conversation
+            .add_user_message_with_attachments_and_enqueue(
+                &task.id,
+                Some("atlas"),
+                "Focus on the login error",
+                &[],
+            )
+            .unwrap();
+        assert!(coalesced.is_none());
+        let mut failed = queue.claim("atlas").unwrap().unwrap();
+        let expected = build_prompt(&db, &failed, failed.attempt_id.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            expected.content,
+            "Inspect this screenshot\n\nFocus on the login error"
+        );
+        for _ in 0..2 {
+            let failed_id = failed.attempt_id.as_deref().unwrap();
+            sessions
+                .transition_attempt(failed_id, "preparing", "Preparing", None, None)
+                .unwrap();
+            assert!(sessions
+                .get_attempt(failed_id)
+                .unwrap()
+                .started_at
+                .is_some());
+            sessions
+                .transition_attempt(
+                    failed_id,
+                    "failed",
+                    "Sign in required",
+                    None,
+                    Some("backend error: ACP turn failed: Authentication required"),
+                )
+                .unwrap();
+            queue.fail(failed.id, "Authentication required").unwrap();
+            board.update_status(&task.id, "in_progress", None).unwrap();
+            let retried = queue.ensure_enqueued(&task.id, "atlas").unwrap().unwrap();
+            assert!(queue.ensure_enqueued(&task.id, "atlas").unwrap().is_none());
+            failed = queue.claim("atlas").unwrap().unwrap();
+            assert_eq!(failed.id, retried.id);
+            let retry_id = failed.attempt_id.as_deref().unwrap();
+            let prompt = build_prompt(&db, &failed, retry_id).unwrap();
+            assert_eq!(prompt.content, expected.content);
+            assert_eq!(prompt.attachments.len(), 1);
+            assert_eq!(prompt.attachments[0].data, b"original image");
+            assert_eq!(
+                sessions.get_attempt(retry_id).unwrap().trigger_message_id,
+                Some(guidance.id)
+            );
+        }
+        let retry_id = failed.attempt_id.as_deref().unwrap();
+        sessions
+            .transition_attempt(retry_id, "preparing", "Preparing", None, None)
+            .unwrap();
+        sessions
+            .transition_attempt(retry_id, "completed", "Done", None, None)
+            .unwrap();
+        queue.complete(failed.id, "Done").unwrap();
+        conversation
+            .add_user_message_with_attachments_and_enqueue(
+                &task.id,
+                Some("atlas"),
+                "A new request after recovery",
+                &[],
+            )
+            .unwrap();
+        let next = queue.claim("atlas").unwrap().unwrap();
+        let next_prompt = build_prompt(&db, &next, next.attempt_id.as_deref().unwrap()).unwrap();
+        assert_eq!(next_prompt.content, "A new request after recovery");
+        assert!(next_prompt.attachments.is_empty());
+        assert_eq!(conversation.get_messages(&task.id).unwrap().len(), 4);
+    }
+
+    #[test]
     fn task_prompts_stop_at_owned_trigger_and_break_prior_attempt_ties() {
         use crate::tasks::board::CreateTask;
 

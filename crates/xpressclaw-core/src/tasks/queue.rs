@@ -211,9 +211,10 @@ impl TaskQueue {
 
     /// Ensure a task has exactly one dispatchable queue item. Workflow
     /// recovery uses this after persisting task ownership but before (or after
-    /// an interrupted) initial dispatch.
+    /// an interrupted) initial dispatch. A retry retains the failed attempt's
+    /// message boundary so its guidance and attachments are replayed.
     pub fn ensure_enqueued(&self, task_id: &str, agent_id: &str) -> Result<Option<QueueItem>> {
-        let id = self.db.with_conn(|conn| {
+        let item = self.db.with_conn(|conn| {
             let transaction = rusqlite::Transaction::new_unchecked(
                 conn,
                 rusqlite::TransactionBehavior::Immediate,
@@ -234,29 +235,50 @@ impl TaskQueue {
             ensure_task_project_accepts_work(&transaction, task_id)?;
             let active = transaction
                 .query_row(
-                    "SELECT id, attempt_id FROM task_queue
+                    "SELECT * FROM task_queue
                      WHERE task_id = ?1 AND status IN ('queued', 'running')
                      ORDER BY id DESC LIMIT 1",
                     [task_id],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+                    |row| Ok(row_to_item(row)),
                 )
-                .optional()?;
-            if let Some((id, attempt_id)) = active {
+                .optional()?
+                .transpose()?;
+            if let Some(item) = active {
                 Self::preserve_queued_response(&transaction, task_id)?;
                 transaction.commit()?;
-                return Ok::<_, Error>(attempt_id.is_none().then_some(id));
+                return Ok::<_, Error>(item.attempt_id.is_none().then_some(item));
             }
-            transaction.execute(
-                "INSERT INTO task_queue (task_id, agent_id, status) VALUES (?1, ?2, 'queued')",
-                rusqlite::params![task_id, agent_id],
-            )?;
-            let id = transaction.last_insert_rowid();
+            let previous_trigger_message_id: Option<i64> = transaction
+                .query_row(
+                    "SELECT CASE WHEN status = 'failed' THEN trigger_message_id END
+                     FROM work_attempts WHERE task_id = ?1
+                     ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                    [task_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
+            // Publish the attempt and its input boundary together, before
+            // the dispatcher can claim the retry.
+            let item = Self::enqueue_in_transaction(&transaction, task_id, agent_id)?;
+            if let Some(message_id) = previous_trigger_message_id {
+                transaction.execute(
+                    "UPDATE work_attempts SET trigger_message_id = ?1 WHERE id = ?2",
+                    rusqlite::params![message_id, item.attempt_id.as_deref()],
+                )?;
+            }
             transaction.commit()?;
-            Ok(Some(id))
+            Ok(Some(item))
         })?;
 
-        id.map(|id| self.create_attempt_for_item(id, task_id, agent_id))
-            .transpose()
+        item.map(|item| {
+            if item.attempt_id.is_none() {
+                self.create_attempt_for_item(item.id, task_id, agent_id)
+            } else {
+                Ok(item)
+            }
+        })
+        .transpose()
     }
 
     /// Enqueue one continuation turn unless the task already has a queued
