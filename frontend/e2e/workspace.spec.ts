@@ -4556,6 +4556,34 @@ test('task changed files use normal navigation when the workspace is too narrow 
 	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 });
 
+test('a reused Files tab refreshes Git status for a newly linked task', async ({ page }) => {
+	const gitStatusTaskIds: (string | null)[] = [];
+	await page.setViewportSize({ width: 2200, height: 1000 });
+	await mockApi(page, { taskWorktreeFiles: true, gitStatusTaskIds });
+	await page.goto(`/tasks/${taskId}`);
+	for (let paneCount = 2; paneCount <= 4; paneCount += 1) {
+		await page.getByRole('button', { name: 'Split active tab right' }).last().click();
+		await expect(page.locator('[data-workspace-pane]')).toHaveCount(paneCount);
+	}
+
+	// At the pane limit, file links navigate in place instead of splitting.
+	const panes = page.locator('[data-workspace-pane]');
+	const filesPane = panes.first();
+	const details = page.getByRole('dialog', { name: 'Task details', exact: true });
+	await filesPane.getByRole('button', { name: 'Show task details' }).click();
+	await details.getByRole('link', { name: 'src/main.ts' }).focus();
+	await page.keyboard.press('Enter');
+	await expect(filesPane.getByText('feature/workspace-browser · 2 changed')).toBeVisible();
+
+	// A link from another pane reuses that mounted Files tab with a task scope.
+	await panes.last().getByRole('button', { name: 'Show task details' }).click();
+	await details.getByRole('link', { name: '.worktrees/jump-arrows/src/JumpArrows.svelte' }).focus();
+	await page.keyboard.press('Enter');
+	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&task=${taskId}&path=.worktrees%2Fjump-arrows%2Fsrc%2FJumpArrows.svelte&tree=collapsed`);
+	await expect(panes).toHaveCount(4);
+	await expect(filesPane.getByText('feature/workspace-browser · 3 changed')).toBeVisible();
+});
+
 test('task changed-file modified clicks retain normal link behavior', async ({ page }) => {
 	await mockApi(page);
 	await page.goto(`/tasks/${taskId}`);

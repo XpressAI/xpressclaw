@@ -10,6 +10,8 @@
 	let { agentId, route = '' }: { agentId: string; route?: string } = $props();
 	let status = $state<WorkspaceStatus | null>(null);
 	let git = $state<WorkspaceGitStatus | null>(null);
+	// Task whose worktrees the Git snapshot includes (from the route's `task`).
+	let gitTask: string | undefined;
 	let directories = $state<Record<string, WorkspaceEntry[]>>({});
 	let expanded = $state<string[]>(['']);
 	let selectedPath = $state('');
@@ -75,6 +77,9 @@
 		const requested = routeState(requestedRoute);
 		if (requested.terminal) showTerminal = true;
 		showTree = requested.showTree;
+		// A reused tab can receive a link scoped to another task; its worktree
+		// changes must be listed before opening (deleted files need them).
+		if (requested.task !== gitTask) await refreshGit(requested.task);
 		if (requested.path === selectedPath) {
 			fileOpenSequence += 1;
 			loadingFile = false;
@@ -113,7 +118,7 @@
 			const [workspaceStatus, rootDirectory, gitStatus] = await Promise.all([
 				workspaces.status(agentId),
 				workspaces.tree(agentId),
-				workspaces.gitStatus(agentId, undefined, routeState(route).task).catch(() => null),
+				workspaces.gitStatus(agentId, undefined, (gitTask = routeState(route).task)).catch(() => null),
 			]);
 			status = workspaceStatus;
 			directories = { '': rootDirectory.entries };
@@ -224,8 +229,10 @@
 		}
 	}
 
-	async function refreshGit() {
-		git = await workspaces.gitStatus(agentId, undefined, routeState(route).task).catch(() => git);
+	async function refreshGit(task = gitTask) {
+		gitTask = task;
+		const next = await workspaces.gitStatus(agentId, undefined, task).catch(() => git);
+		if (gitTask === task) git = next;
 	}
 
 	async function toggleTree() {
