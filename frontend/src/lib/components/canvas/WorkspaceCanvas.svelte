@@ -96,6 +96,7 @@
 	let addSearch = $state('');
 	let activeProjectFilter = $state<string | null>(null);
 	let seenDelegatedTaskIds = new Set<string>();
+	const dirtyEditorIds = new Set<string>();
 
 	let agentById = $derived(new Map(agents.map((agent) => [agent.id, agent])));
 	let projectById = $derived(new Map(projects.map((project) => [project.id, project])));
@@ -451,9 +452,34 @@
 		if (shouldPersist) persist();
 	}
 
+	function setEditorDirty(id: string, dirty: boolean) {
+		if (dirty) dirtyEditorIds.add(id);
+		else dirtyEditorIds.delete(id);
+	}
+
 	function closeNode(id: string) {
+		if (dirtyEditorIds.has(id)) {
+			const target = nodeById.get(id);
+			const label = target?.filePath || target?.title || 'this editor';
+			if (!window.confirm(`Discard unsaved changes in ${label}?`)) return;
+		}
+		dirtyEditorIds.delete(id);
 		nodes = nodes.filter((node) => node.id !== id).map((node) => node.parentId === id ? { ...node, parentId: null } : node);
 		if (focusedNodeId === id) focusedNodeId = nodes.at(-1)?.id ?? null;
+		persist();
+	}
+
+	function clearCanvas() {
+		const dirtyNodes = nodes.filter((node) => node.kind === 'editor' && dirtyEditorIds.has(node.id));
+		if (dirtyNodes.length > 0) {
+			const message = dirtyNodes.length === 1
+				? `Discard unsaved changes in ${dirtyNodes[0].filePath || dirtyNodes[0].title || '1 editor'} and clear the canvas?`
+				: `Discard unsaved changes in ${dirtyNodes.length} editors and clear the canvas?`;
+			if (!window.confirm(message)) return;
+		}
+		dirtyEditorIds.clear();
+		nodes = [];
+		focusedNodeId = null;
 		persist();
 	}
 
@@ -537,9 +563,23 @@
 		);
 	}
 
-	function spawnAgentNode(agent: Agent, parentNodeId: string | null = null) {
+	function spawnAgentNode(agent: Agent, parentNodeId: string | null = null, route?: string) {
 		addMenuOpen = false;
 		const resolvedParentId = parentNodeId ?? (agent.project_id ? nodes.find((node) => node.kind === 'project' && node.projectId === agent.project_id)?.id ?? null : null);
+		const targetRoute = route || `/agents/${encodeURIComponent(agent.id)}`;
+		const existing = nodes.find((node) => node.kind === 'agent' && node.agentId === agent.id);
+		if (existing) {
+			const patch: Partial<CanvasNode> = {};
+			if (existing.collapsed) patch.collapsed = false;
+			if (route && existing.route !== targetRoute) patch.route = targetRoute;
+			if (Object.keys(patch).length > 0) updateNode(existing.id, patch);
+			if (focusedNodeId === existing.id && route) {
+				bringToFront(existing.id);
+			} else {
+				centerOnNode(existing);
+			}
+			return;
+		}
 		addOrFocusNode(
 			(node) => node.kind === 'agent' && node.agentId === agent.id,
 			{
@@ -549,7 +589,7 @@
 				projectId: agent.project_id,
 				parentId: resolvedParentId,
 				edgeLabel: 'agent',
-				route: `/agents/${encodeURIComponent(agent.id)}`,
+				route: targetRoute,
 			},
 		);
 	}
@@ -749,7 +789,7 @@
 			}
 			const agent = agentById.get(desc.resourceId);
 			if (agent) {
-				spawnAgentNode(agent, parentId);
+				spawnAgentNode(agent, parentId, route);
 				return true;
 			}
 		}
@@ -1060,7 +1100,7 @@
 			{#if nodes.length > 0}
 				<button
 					type="button"
-					onclick={() => { nodes = []; focusedNodeId = null; persist(); }}
+					onclick={clearCanvas}
 					class="rounded-lg p-1.5 text-muted-foreground hover:bg-destructive/15 hover:text-destructive"
 					title="Clear canvas"
 					aria-label="Clear canvas"
@@ -1191,6 +1231,7 @@
 							initialPath={node.filePath}
 							{agents}
 							onUpdateNode={(patch) => updateNode(node.id, patch)}
+							onDirtyChange={(dirty) => setEditorDirty(node.id, dirty)}
 							onOpenImage={(agentId, filePath, parentId) => spawnToolNode('image', agentId, parentId, { filePath, imageSource: 'workspace' })}
 							onOpenHtmlApp={(agentId, filePath, parentId) => spawnToolNode('app', agentId, parentId, { appSource: 'workspace-html', appFilePath: filePath })}
 						/>

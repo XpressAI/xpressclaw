@@ -11,6 +11,7 @@
 		initialPath: string | null;
 		agents: Agent[];
 		onUpdateNode: (patch: { agentId?: string | null; filePath?: string | null; title?: string }) => void;
+		onDirtyChange?: (dirty: boolean) => void;
 		onOpenImage: (agentId: string, filePath: string, parentNodeId: string) => void;
 		onOpenHtmlApp: (agentId: string, filePath: string, parentNodeId: string) => void;
 	}
@@ -21,6 +22,7 @@
 		initialPath,
 		agents,
 		onUpdateNode,
+		onDirtyChange,
 		onOpenImage,
 		onOpenHtmlApp,
 	}: Props = $props();
@@ -48,6 +50,11 @@
 	let dirty = $derived(Boolean(selectedFile && editorValue !== selectedFile.content));
 	let changeByPath = $derived(new Map((git?.files ?? []).map((change) => [change.path, change])));
 	let visibleEntries = $derived(flattenEntries());
+
+	$effect(() => {
+		onDirtyChange?.(dirty);
+		return () => onDirtyChange?.(false);
+	});
 
 	onMount(() => {
 		activeAgentId = agentId || agents[0]?.id || '';

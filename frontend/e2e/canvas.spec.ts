@@ -582,6 +582,35 @@ test.describe('Spatial Canvas workspace', () => {
 		// Stale codex response must NOT populate the editor now scoped to agent-claude.
 		await expect(thirdEditor.getByLabel('Workspace file path')).toHaveValue('');
 		await expect(thirdEditor.locator('[data-monaco-editor]')).toHaveCount(0);
+
+		// Confirm before discarding unsaved editor buffers on Clear canvas and Close window.
+		page.once('dialog', (dialog) => dialog.dismiss());
+		await page.getByRole('button', { name: 'Clear canvas' }).click();
+		await expect(firstEditor).toBeVisible();
+		await expect(firstEditor.locator('[data-monaco-editor] .view-lines')).toContainText('unsaved-edit');
+
+		const firstEditorWindow = page.locator('[data-canvas-node-kind="editor"]').nth(0);
+		page.once('dialog', (dialog) => dialog.dismiss());
+		await firstEditorWindow.getByRole('button', { name: /^Close / }).click();
+		await expect(firstEditor).toBeVisible();
+		await expect(firstEditor.locator('[data-monaco-editor] .view-lines')).toContainText('unsaved-edit');
+
+		page.once('dialog', (dialog) => dialog.accept());
+		await firstEditorWindow.getByRole('button', { name: /^Close / }).click();
+		await expect(page.locator('[data-canvas-editor-card]')).toHaveCount(2);
+
+		// Opening an Agent window and switching its section tab updates the Agent window route instead of staying on Session.
+		await page.locator('[data-canvas-fit]').click();
+		await alphaCard.locator('button[title="Open Agent window on canvas"]', { hasText: 'Codex Builder' }).click();
+		const agentWindow = page.locator('[data-canvas-node-kind="agent"]').first();
+		await expect(agentWindow).toBeVisible();
+		const filesTab = agentWindow.getByRole('tab', { name: 'Files' });
+		await expect(filesTab).toBeVisible();
+		await filesTab.click();
+		await expect(filesTab).toHaveAttribute('aria-selected', 'true');
+		const environmentTab = agentWindow.getByRole('tab', { name: 'Environment' });
+		await environmentTab.click();
+		await expect(environmentTab).toHaveAttribute('aria-selected', 'true');
 	});
 
 	test('canvas model enforces safe app URLs, non-overlapping placement, delegation edges, and layout persistence', () => {
