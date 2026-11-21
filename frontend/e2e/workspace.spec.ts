@@ -8159,40 +8159,46 @@ test('stalled Git refresh times out and a later refresh recovers', async ({ page
     }
 });
 
-test('Agent sign-in opens from an authentication failure and retries only after success', async ({ page }) => {
-	const taskStatusRequests: string[] = [];
-	const postedMessages: Record<string, unknown>[] = [];
-	await mockApi(page, { taskStatus: 'blocked', attemptError: 'backend error: ACP turn failed: Authentication required', taskStatusRequests, postedMessages });
-	await page.route('**/api/sessions/**/authentication', route => route.fulfill({ json: {
-		kind: 'antigravity', status: 'required', methods: [{ id: 'terminal-login', name: 'Google account', description: null, kind: 'terminal', api_key: false }],
-	} }));
-	let input = '';
-	await page.routeWebSocket('**/api/sessions/**/authentication/terminal?**', websocket => {
-		expect(new URL(websocket.url()).searchParams.get('method_id')).toBe('terminal-login');
-		websocket.send(JSON.stringify({ type: 'ready' }));
-		websocket.send(Buffer.from('Enter the sign-in code:\r\n'));
-		websocket.onMessage(message => {
-			if (typeof message !== 'string') {
-				input += message.toString();
-				if (input.includes('1234\r')) websocket.send(JSON.stringify({ type: 'authenticated' }));
-			}
+for (const retryFrom of ['dialog', 'task'] as const) {
+	test(`Agent sign-in retries from the ${retryFrom} only after success`, async ({ page }) => {
+		const taskStatusRequests: string[] = [];
+		const postedMessages: Record<string, unknown>[] = [];
+		await mockApi(page, { taskStatus: 'blocked', attemptError: 'backend error: ACP turn failed: Authentication required', taskStatusRequests, postedMessages });
+		await page.route('**/api/sessions/**/authentication', route => route.fulfill({ json: {
+			kind: 'antigravity', status: 'required', methods: [{ id: 'terminal-login', name: 'Google account', description: null, kind: 'terminal', api_key: false }],
+		} }));
+		let input = '';
+		await page.routeWebSocket('**/api/sessions/**/authentication/terminal?**', websocket => {
+			expect(new URL(websocket.url()).searchParams.get('method_id')).toBe('terminal-login');
+			websocket.send(JSON.stringify({ type: 'ready' }));
+			websocket.send(Buffer.from('Enter the sign-in code:\r\n'));
+			websocket.onMessage(message => {
+				if (typeof message !== 'string') {
+					input += message.toString();
+					if (input.includes('1234\r')) websocket.send(JSON.stringify({ type: 'authenticated' }));
+				}
+			});
 		});
+		await page.goto(`/tasks/${taskId}`);
+		await page.locator('[data-attempt-error]').getByRole('button', { name: 'Sign in', exact: true }).click();
+		const dialog = page.getByRole('dialog', { name: 'Sign in to Agent' });
+		await expect(dialog.getByText('Enter the sign-in code:')).toBeVisible();
+		await expect(dialog.getByLabel('tmux session name')).toHaveCount(0);
+		await expect(dialog.getByRole('button', { name: 'Retry task', exact: true })).toHaveCount(0);
+		await page.screenshot({ path: test.info().outputPath('agent-sign-in-terminal.png') });
+		await page.keyboard.type('1234');
+		await page.keyboard.press('Enter');
+		await expect(dialog.getByText('Signed in successfully.')).toBeVisible();
+		expect(taskStatusRequests).toEqual([]);
+		expect(postedMessages).toEqual([]);
+		if (retryFrom === 'task') await dialog.getByRole('button', { name: 'Done', exact: true }).click();
+		const retryContainer = retryFrom === 'dialog' ? dialog : page.locator('[data-attempt-error]');
+		await retryContainer.getByRole('button', { name: 'Retry task', exact: true }).click();
+		await expect.poll(() => taskStatusRequests).toEqual(['in_progress']);
+		await expect(dialog).not.toBeVisible();
+		expect(postedMessages).toEqual([]);
 	});
-	await page.goto(`/tasks/${taskId}`);
-	await page.locator('[data-attempt-error]').getByRole('button', { name: 'Sign in', exact: true }).click();
-	const dialog = page.getByRole('dialog', { name: 'Sign in to Agent' });
-	await expect(dialog.getByText('Enter the sign-in code:')).toBeVisible();
-	await expect(dialog.getByLabel('tmux session name')).toHaveCount(0);
-	await page.screenshot({ path: test.info().outputPath('agent-sign-in-terminal.png') });
-	await page.keyboard.type('1234');
-	await page.keyboard.press('Enter');
-	await expect(dialog.getByText('Signed in successfully.')).toBeVisible();
-	expect(taskStatusRequests).toEqual([]);
-	expect(postedMessages).toEqual([]);
-	await dialog.getByRole('button', { name: 'Retry task', exact: true }).click();
-	await expect.poll(() => taskStatusRequests).toEqual(['in_progress']);
-	await expect(dialog).not.toBeVisible();
-});
+}
 
 test('Agent sign-in supports provider URLs and forms without writing them to task chat', async ({ page }) => {
 	const opened = await mockDesktopExternalLinks(page);

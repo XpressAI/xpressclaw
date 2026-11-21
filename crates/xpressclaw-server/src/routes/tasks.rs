@@ -755,7 +755,7 @@ async fn update_task_status(
                 .map(|access| (access.owner.as_str(), access.repo.as_str())),
         )
     };
-    let task = updated.map_err(|e| match &e {
+    let mut task = updated.map_err(|e| match &e {
         xpressclaw_core::error::Error::TaskNotFound { .. }
         | xpressclaw_core::error::Error::AgentNotFound { .. } => (
             StatusCode::NOT_FOUND,
@@ -767,6 +767,16 @@ async fn update_task_status(
         ),
         _ => internal_error(e),
     })?;
+    // Starting or retrying must create dispatchable work. Reuse an existing
+    // queued/running attempt so repeated requests cannot create extra turns.
+    if req.status == "in_progress" && !task.backlog {
+        if let Some(agent_id) = task.agent_id.as_deref().filter(|id| !id.is_empty()) {
+            TaskQueue::new(state.db.clone())
+                .ensure_enqueued(&id, agent_id)
+                .map_err(task_write_error)?;
+            task = board.get(&id).map_err(internal_error)?;
+        }
+    }
     Ok(Json(json!(task)))
 }
 
@@ -2277,7 +2287,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_task_status() {
-        let app = test_app();
+        let (app, db) = test_app_with_db();
 
         // Create
         let resp = app
@@ -2315,6 +2325,126 @@ mod tests {
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["status"], "in_progress");
         assert_eq!(body["agent_id"], "atlas");
+        let queued = TaskQueue::new(db.clone()).claim("atlas").unwrap().unwrap();
+        assert_eq!(queued.task_id, task_id);
+        assert_eq!(
+            body["revision"],
+            TaskBoard::new(db).get(&task_id).unwrap().revision
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_after_authentication_failure_queues_one_attempt_without_a_message() {
+        // A previous retry could already have changed the task's status
+        // without creating work. Retrying that task must also recover it.
+        for status in ["blocked", "in_progress"] {
+            let (app, db) = test_app_with_db();
+            let board = TaskBoard::new(db.clone());
+            let task = board
+                .create(&CreateTask {
+                    title: "Get familiar with this project".into(),
+                    agent_id: Some("atlas".into()),
+                    ..Default::default()
+                })
+                .unwrap();
+            let conversation = TaskConversation::new(db.clone());
+            let original_message = conversation
+                .add_message(&task.id, "user", &task.title)
+                .unwrap();
+            let queue = TaskQueue::new(db.clone());
+            let failed = queue.enqueue(&task.id, "atlas").unwrap();
+            let sessions = SessionManager::new(db.clone());
+            let error = "backend error: ACP turn failed: Authentication required";
+            sessions
+                .transition_attempt(
+                    failed.attempt_id.as_deref().unwrap(),
+                    "failed",
+                    "Work attempt failed",
+                    None,
+                    Some(error),
+                )
+                .unwrap();
+            queue.fail(failed.id, error).unwrap();
+            board.update_status(&task.id, status, None).unwrap();
+
+            let mut retry_attempt_id = None;
+            for expected_status in ["queued", "queued", "preparing"] {
+                if expected_status == "preparing" {
+                    let claimed = queue.claim("atlas").unwrap().unwrap();
+                    assert_eq!(claimed.attempt_id, retry_attempt_id);
+                }
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("PATCH")
+                            .uri(format!("/tasks/{}/status", task.id))
+                            .header("content-type", "application/json")
+                            .body(Body::from(json!({"status": "in_progress"}).to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = body_json(response.into_body()).await;
+                assert_eq!(body["status"], "in_progress");
+                let dispatches = queue.list(Some("atlas"), None, 10).unwrap();
+                assert_eq!(dispatches.len(), 2);
+                let retry = dispatches.iter().find(|item| item.id != failed.id).unwrap();
+                let active_id = retry.attempt_id.as_deref().unwrap();
+                assert_ne!(Some(active_id), failed.attempt_id.as_deref());
+                let attempt = sessions.get_attempt(active_id).unwrap();
+                assert_eq!(attempt.status, expected_status);
+                assert_eq!(attempt.prompt, task.title);
+                if let Some(previous) = &retry_attempt_id {
+                    assert_eq!(active_id, previous);
+                }
+                retry_attempt_id = Some(active_id.to_string());
+            }
+
+            let messages = conversation.get_messages(&task.id).unwrap();
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].id, original_message.id);
+            assert_eq!(queue.get(failed.id).unwrap().status, "failed");
+            assert_eq!(
+                sessions
+                    .get_attempt(failed.attempt_id.as_deref().unwrap())
+                    .unwrap()
+                    .error_message
+                    .as_deref(),
+                Some(error)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn starting_backlog_or_unassigned_tasks_does_not_queue_work() {
+        for (backlog, agent_id) in [(true, Some("atlas")), (false, None), (false, Some(""))] {
+            let (app, db) = test_app_with_db();
+            let task = TaskBoard::new(db.clone())
+                .create(&CreateTask {
+                    title: "Not ready to dispatch".into(),
+                    agent_id: agent_id.filter(|id| !id.is_empty()).map(str::to_string),
+                    backlog,
+                    ..Default::default()
+                })
+                .unwrap();
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("PATCH")
+                        .uri(format!("/tasks/{}/status", task.id))
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({"status": "in_progress", "agent_id": agent_id}).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(TaskQueue::new(db).list(None, None, 10).unwrap().is_empty());
+        }
     }
 
     #[tokio::test]
