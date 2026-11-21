@@ -494,6 +494,20 @@ test.describe('Spatial Canvas workspace', () => {
 		await page.locator('[data-canvas-tidy]').click();
 		const contextEdges = await page.locator('[data-canvas-edge-kind="context"]').count();
 		expect(contextEdges).toBeGreaterThanOrEqual(4);
+
+		// Space+drag over a canvas window pans the canvas instead of being swallowed by the window.
+		const worldLayer = page.locator('[data-canvas-pan-surface]');
+		const beforeTransform = await worldLayer.getAttribute('style');
+		const appBox = await appCard.boundingBox();
+		expect(appBox).not.toBeNull();
+		await page.keyboard.down('Space');
+		await page.mouse.move(appBox!.x + appBox!.width / 2, appBox!.y + appBox!.height / 2);
+		await page.mouse.down();
+		await page.mouse.move(appBox!.x + appBox!.width / 2 + 80, appBox!.y + appBox!.height / 2 + 50, { steps: 4 });
+		await page.mouse.up();
+		await page.keyboard.up('Space');
+		const afterTransform = await worldLayer.getAttribute('style');
+		expect(afterTransform).not.toEqual(beforeTransform);
 	});
 
 	test('preserves unsaved editor buffers across Tabs switches, supports duplicate file paths across editors, and discards stale agent loads', async ({ page }) => {

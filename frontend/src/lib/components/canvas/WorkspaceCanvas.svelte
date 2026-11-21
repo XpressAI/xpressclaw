@@ -202,9 +202,11 @@
 		}
 
 		const handleKeyDown = (event: KeyboardEvent) => {
+			if (!visible) return;
 			const target = event.target as HTMLElement | null;
 			const typing = Boolean(target?.closest('input, textarea, select, [contenteditable="true"], .monaco-editor, .xterm'));
 			if (event.code === 'Space' && !typing) {
+				event.preventDefault();
 				spacePressed = true;
 			}
 			if (event.key === 'Escape' && addMenuOpen) {
@@ -378,12 +380,10 @@
 		zoomBy(1 / camera.zoom);
 	}
 
-	function handleBackgroundPointerDown(event: PointerEvent) {
-		addMenuOpen = false;
-		const isMiddle = event.button === 1;
-		const isLeftOnBackground = event.button === 0 && (spacePressed || event.target === event.currentTarget || (event.target as HTMLElement)?.hasAttribute('data-canvas-pan-surface'));
-		if (!isMiddle && !isLeftOnBackground) return;
+	function startPan(event: PointerEvent) {
 		event.preventDefault();
+		event.stopPropagation();
+		addMenuOpen = false;
 		panning = true;
 		const startX = event.clientX;
 		const startY = event.clientY;
@@ -407,6 +407,22 @@
 		window.addEventListener('pointermove', move);
 		window.addEventListener('pointerup', up);
 		window.addEventListener('pointercancel', up);
+	}
+
+	function handleCapturePointerDown(event: PointerEvent) {
+		const target = event.target as HTMLElement | null;
+		if (target?.closest('[data-canvas-hud]')) return;
+		if (event.button === 1 || (event.button === 0 && spacePressed)) {
+			startPan(event);
+		}
+	}
+
+	function handleBackgroundPointerDown(event: PointerEvent) {
+		addMenuOpen = false;
+		const isMiddle = event.button === 1;
+		const isLeftOnBackground = event.button === 0 && (spacePressed || event.target === event.currentTarget || (event.target as HTMLElement)?.hasAttribute('data-canvas-pan-surface'));
+		if (!isMiddle && !isLeftOnBackground) return;
+		startPan(event);
 	}
 
 	function handleWheel(event: WheelEvent) {
@@ -845,6 +861,7 @@
 	data-canvas-zoom={camera.zoom}
 	role="region"
 	aria-label="Spatial workspace canvas"
+	onpointerdowncapture={handleCapturePointerDown}
 	onpointerdown={handleBackgroundPointerDown}
 	onwheel={handleWheel}
 	class="relative flex h-full w-full flex-1 select-none overflow-hidden bg-[hsl(var(--canvas))] {panning || spacePressed ? 'cursor-grabbing' : 'cursor-grab'}"

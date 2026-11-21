@@ -252,7 +252,21 @@
 		directories = {};
 		expanded = [''];
 		error = '';
-		onUpdateNode({ agentId: nextId || null });
+		const agentBoundPreview = sourceMode === 'workspace-html' || sourceMode === 'port';
+		if (htmlBlobUrl) {
+			URL.revokeObjectURL(htmlBlobUrl);
+			htmlBlobUrl = '';
+		}
+		selectedHtmlPath = '';
+		if (agentBoundPreview) {
+			activeUrl = '';
+			urlInput = '';
+			showLauncher = true;
+		}
+		onUpdateNode({
+			agentId: nextId || null,
+			...(agentBoundPreview ? { appFilePath: null, appUrl: null, appSource: null } : {}),
+		});
 		if (nextId) {
 			void loadPorts(nextId);
 			void loadWorkspaceHtmlTree(nextId);

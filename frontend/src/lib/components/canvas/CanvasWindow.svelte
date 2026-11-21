@@ -110,7 +110,7 @@
 	}
 
 	function startDrag(event: PointerEvent) {
-		if (event.button !== 0) return;
+		if (event.button !== 0 || canvasInteracting) return;
 		const target = event.target as HTMLElement | null;
 		if (target?.closest('button, a, input, select')) return;
 		event.preventDefault();
@@ -189,6 +189,7 @@
 	style="left:{node.x}px;top:{node.y}px;width:{node.width}px;height:{node.collapsed ? CANVAS_COLLAPSED_HEIGHT : node.height}px;z-index:{node.zIndex};"
 	class="canvas-window absolute flex flex-col overflow-hidden rounded-xl border bg-card transition-shadow {focused ? 'border-primary/60 shadow-[0_12px_36px_rgb(0_0_0/18%)] ring-1 ring-primary/35 dark:shadow-[0_14px_42px_rgb(0_0_0/48%)]' : 'border-border/90 shadow-[var(--shadow-overlay)] hover:border-border'}"
 	onpointerdown={(event) => {
+		if (event.button === 1 || canvasInteracting) return;
 		event.stopPropagation();
 		onFocus();
 	}}
