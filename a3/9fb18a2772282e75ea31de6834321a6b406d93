@@ -1,0 +1,6 @@
+branch: fix/worktree-changed-files (PR #297 review round 6)
+codex P2: unscoped tab starts loading task B, then gets another unscoped link: requested.task === loadedGitTask skipped the block, gitTask stayed B, B's response passed the scope check and replaced the unscoped list; Refresh kept requesting B.
+fix: same-scope branch supersedes a pending other-scope load (gitTask = route scope, gitGeneration++, gitLoad = null). Proactively also: loadGit applies only when its generation is the latest (fixes out-of-order same-scope reloads, e.g. Refresh during a load), and a failed request (catch -> null) no longer marks the scope loaded with the old snapshot.
+test: reused-tab e2e now asserts '2 changed' after the gated task-B status is released post-README, then clicks Refresh and expects task_id null. Fails without the fix at that assertion; passes with it.
+note: three consecutive Codex rounds found FilesTab scope races; state is now gitTask (intended scope), loadedGitTask (snapshot scope), gitLoad (latest in-flight), gitGeneration (latest wins).
+validation: npm run check 0 errors; 26 chromium e2e matching 'File' pass except the 2 known environmental file-download failures.
