@@ -2,19 +2,21 @@
 	import { onDestroy, onMount } from 'svelte';
 	import { Code2, ExternalLink, FileCode2, Folder, FolderOpen, Globe, Plus, RefreshCw, Radio } from '@lucide/svelte';
 	import { environments, workspaces, type Agent, type PortForward, type WorkspaceEntry } from '$lib/api';
-	import { classifyAppUrl, isHtmlFilePath } from '$lib/canvas';
+	import { classifyAppUrl, isAllowedHtmlPreviewEndpoint, isHtmlFilePath } from '$lib/canvas';
 	import { openExternal } from '$lib/utils';
+
+	const MAX_FETCHED_HTML_BYTES = 4 * 1024 * 1024;
 
 	interface Props {
 		nodeId: string;
 		agentId: string | null;
-		initialSource: 'port' | 'workspace-html' | 'url' | null;
+		initialSource: 'port' | 'workspace-html' | 'html-url' | 'url' | null;
 		initialUrl: string | null;
 		initialFilePath: string | null;
 		agents: Agent[];
 		onUpdateNode: (patch: {
 			agentId?: string | null;
-			appSource?: 'port' | 'workspace-html' | 'url' | null;
+			appSource?: 'port' | 'workspace-html' | 'html-url' | 'url' | null;
 			appUrl?: string | null;
 			appFilePath?: string | null;
 			title?: string;
@@ -34,7 +36,7 @@
 	}: Props = $props();
 
 	let activeAgentId = $state('');
-	let sourceMode = $state<'port' | 'workspace-html' | 'url'>('port');
+	let sourceMode = $state<'port' | 'workspace-html' | 'html-url' | 'url'>('port');
 	let showLauncher = $state(true);
 	let ports = $state<PortForward[]>([]);
 	let loadingPorts = $state(false);
@@ -46,6 +48,7 @@
 	let expanded = $state<string[]>(['']);
 	let loadingFiles = $state(false);
 	let selectedHtmlPath = $state('');
+	let fetchedHtmlUrl = $state('');
 	let htmlBlobUrl = $state('');
 
 	let urlInput = $state('');
@@ -63,7 +66,11 @@
 	onMount(() => {
 		activeAgentId = agentId || agents[0]?.id || '';
 		sourceMode = initialSource ?? (initialFilePath ? 'workspace-html' : initialUrl ? 'url' : 'port');
-		if (initialUrl) {
+		if (sourceMode === 'html-url' && initialUrl) {
+			fetchedHtmlUrl = initialUrl;
+			showLauncher = false;
+			void loadHtmlFromUrl(initialUrl);
+		} else if (initialUrl) {
 			urlInput = initialUrl;
 			activeUrl = initialUrl;
 			showLauncher = false;
@@ -131,6 +138,7 @@
 			htmlBlobUrl = '';
 		}
 		selectedHtmlPath = '';
+		fetchedHtmlUrl = '';
 		const url = `http://127.0.0.1:${port.host_port}/`;
 		sourceMode = 'port';
 		urlInput = url;
@@ -206,6 +214,7 @@
 			htmlBlobUrl = URL.createObjectURL(new Blob([file.content], { type: 'text/html;charset=utf-8' }));
 			sourceMode = 'workspace-html';
 			selectedHtmlPath = file.path;
+			fetchedHtmlUrl = '';
 			activeUrl = '';
 			showLauncher = false;
 			onUpdateNode({
@@ -217,6 +226,41 @@
 			});
 		} catch (cause) {
 			if (req === agentSequence && previewReq === previewSequence && activeAgentId === targetAgentId) {
+				error = cause instanceof Error ? cause.message : String(cause);
+			}
+		}
+	}
+
+	async function loadHtmlFromUrl(targetUrl: string) {
+		const previewReq = ++previewSequence;
+		error = '';
+		if (!isAllowedHtmlPreviewEndpoint(targetUrl, window.location.origin)) {
+			error = 'This endpoint cannot be previewed as an HTML app.';
+			return;
+		}
+		try {
+			const response = await fetch(targetUrl, { credentials: 'same-origin' });
+			if (disposed || previewReq !== previewSequence) return;
+			if (!response.ok) {
+				error = `Failed to load HTML preview (${response.status}).`;
+				return;
+			}
+			const bytes = new Uint8Array(await response.arrayBuffer());
+			if (disposed || previewReq !== previewSequence) return;
+			if (bytes.byteLength > MAX_FETCHED_HTML_BYTES) {
+				error = 'HTML file is too large to preview inline (4 MiB limit).';
+				return;
+			}
+			const html = new TextDecoder('utf-8').decode(bytes);
+			if (htmlBlobUrl) URL.revokeObjectURL(htmlBlobUrl);
+			htmlBlobUrl = URL.createObjectURL(new Blob([html], { type: 'text/html;charset=utf-8' }));
+			sourceMode = 'html-url';
+			fetchedHtmlUrl = targetUrl;
+			selectedHtmlPath = '';
+			activeUrl = '';
+			showLauncher = false;
+		} catch (cause) {
+			if (!disposed && previewReq === previewSequence) {
 				error = cause instanceof Error ? cause.message : String(cause);
 			}
 		}
@@ -234,6 +278,7 @@
 			htmlBlobUrl = '';
 		}
 		selectedHtmlPath = '';
+		fetchedHtmlUrl = '';
 		error = '';
 		sourceMode = 'url';
 		activeUrl = check.normalizedUrl;
@@ -251,6 +296,8 @@
 	function refreshPreview() {
 		if (sourceMode === 'workspace-html' && activeAgentId && selectedHtmlPath) {
 			void loadWorkspaceHtml(activeAgentId, selectedHtmlPath);
+		} else if (sourceMode === 'html-url' && fetchedHtmlUrl) {
+			void loadHtmlFromUrl(fetchedHtmlUrl);
 		} else {
 			reloadNonce += 1;
 		}
@@ -258,7 +305,6 @@
 
 	function handleAgentChange(nextId: string) {
 		agentSequence += 1;
-		previewSequence += 1;
 		loadingPorts = false;
 		loadingFiles = false;
 		addingPort = false;
@@ -267,13 +313,17 @@
 		directories = {};
 		expanded = [''];
 		error = '';
-		const agentBoundPreview = sourceMode === 'workspace-html' || sourceMode === 'port';
-		if (htmlBlobUrl) {
-			URL.revokeObjectURL(htmlBlobUrl);
-			htmlBlobUrl = '';
-		}
-		selectedHtmlPath = '';
+		const agentBoundPreview = sourceMode === 'workspace-html'
+			|| sourceMode === 'port'
+			|| (sourceMode === 'html-url' && fetchedHtmlUrl.startsWith('/api/environments/'));
 		if (agentBoundPreview) {
+			previewSequence += 1;
+			if (htmlBlobUrl) {
+				URL.revokeObjectURL(htmlBlobUrl);
+				htmlBlobUrl = '';
+			}
+			selectedHtmlPath = '';
+			fetchedHtmlUrl = '';
 			activeUrl = '';
 			urlInput = '';
 			showLauncher = true;
@@ -438,10 +488,10 @@
 		{/if}
 
 		<div class="relative flex min-h-0 min-w-0 flex-1 flex-col bg-card">
-			{#if sourceMode === 'workspace-html' && htmlBlobUrl}
-				{#key `${selectedHtmlPath}:${reloadNonce}`}
+			{#if (sourceMode === 'workspace-html' || sourceMode === 'html-url') && htmlBlobUrl}
+				{#key `${selectedHtmlPath || fetchedHtmlUrl}:${reloadNonce}`}
 					<iframe
-						title={selectedHtmlPath || 'Workspace HTML app'}
+						title={selectedHtmlPath || fetchedHtmlUrl || 'HTML app preview'}
 						src={htmlBlobUrl}
 						sandbox="allow-scripts allow-forms"
 						referrerpolicy="no-referrer"

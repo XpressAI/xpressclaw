@@ -34,7 +34,7 @@ export interface CanvasNode {
 	imageUrl: string | null;
 	imageSource: 'workspace' | 'url' | null;
 	appUrl: string | null;
-	appSource: 'port' | 'workspace-html' | 'url' | null;
+	appSource: 'port' | 'workspace-html' | 'html-url' | 'url' | null;
 	appFilePath: string | null;
 	route: string | null;
 }
@@ -117,6 +117,32 @@ const IMAGE_EXTENSIONS = new Set([
 
 const HTML_EXTENSIONS = new Set(['html', 'htm']);
 
+const NON_TEXT_FILE_EXTENSIONS = new Set([
+	'zip', 'tar', 'gz', 'tgz', 'bz2', 'xz', '7z', 'rar',
+	'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx',
+	'exe', 'dll', 'so', 'dylib', 'dmg', 'pkg', 'deb', 'rpm', 'msi', 'appimage',
+	'bin', 'wasm', 'o', 'a', 'class', 'jar', 'pyc',
+	'mp3', 'wav', 'ogg', 'flac', 'aac', 'm4a',
+	'mp4', 'mov', 'avi', 'mkv', 'webm',
+	'ttf', 'otf', 'woff', 'woff2', 'eot',
+	'sqlite', 'db',
+]);
+
+const INTERNAL_SPA_ROOTS = new Set([
+	'agents',
+	'automations',
+	'canvas',
+	'conversations',
+	'dashboard',
+	'login',
+	'projects',
+	'schedules',
+	'settings',
+	'setup',
+	'tasks',
+	'workflows',
+]);
+
 let canvasIdCounter = 0;
 
 export function createCanvasNodeId(kind: CanvasNodeKind): string {
@@ -151,6 +177,244 @@ export function isHtmlFilePath(path: string | null | undefined): boolean {
 	const dot = clean.lastIndexOf('.');
 	if (dot < 0) return false;
 	return HTML_EXTENSIONS.has(clean.slice(dot + 1).toLowerCase());
+}
+
+export function isAllowedHtmlPreviewEndpoint(rawUrl: string, currentOrigin: string): boolean {
+	let parsed: URL;
+	try {
+		parsed = new URL(rawUrl, currentOrigin || 'http://xpressclaw.local');
+	} catch {
+		return false;
+	}
+	if (currentOrigin && parsed.origin !== currentOrigin) return false;
+	if (/^\/api\/(?:tasks|conversations)\/[^/]+\/messages\/[^/]+\/attachments\/[^/]+$/.test(parsed.pathname)) {
+		return true;
+	}
+	if (/^\/api\/environments\/[^/]+\/download$/.test(parsed.pathname)) {
+		const filePath = parsed.searchParams.get('path');
+		return Boolean(filePath && isHtmlFilePath(filePath));
+	}
+	return false;
+}
+
+export interface CanvasLinkPreviewTarget {
+	href: string;
+	label: string;
+	category: 'image' | 'html' | 'file' | 'web';
+	downloadAgentId: string | null;
+	downloadPath: string | null;
+	isAttachment: boolean;
+	fileName: string | null;
+	downloadAttr: string | null;
+}
+
+function pathExtension(path: string | null | undefined): string {
+	if (!path) return '';
+	const clean = path.split('?')[0].split('#')[0];
+	const base = clean.slice(clean.lastIndexOf('/') + 1);
+	const dot = base.lastIndexOf('.');
+	return dot > 0 ? base.slice(dot + 1).toLowerCase() : '';
+}
+
+function pathBasename(path: string | null | undefined): string | null {
+	if (!path) return null;
+	const clean = path.replaceAll('\\', '/').replace(/\/+$/, '');
+	const base = clean.slice(clean.lastIndexOf('/') + 1).trim();
+	return base || null;
+}
+
+export function resolveWorkspaceRelativePath(
+	rawPath: string | null | undefined,
+	roots: readonly (string | null | undefined)[],
+): string | null {
+	if (!rawPath) return null;
+	const normalized = rawPath.replaceAll('\\', '/').trim();
+	if (!normalized || normalized.endsWith('/')) return null;
+
+	const validateRelative = (candidate: string): string | null => {
+		const trimmed = candidate.replace(/^\/+/, '').replace(/\/+$/, '');
+		if (!trimmed) return null;
+		const segments = trimmed.split('/');
+		if (segments.some((seg) => !seg || seg === '.' || seg === '..')) return null;
+		return segments.join('/');
+	};
+
+	if (!normalized.startsWith('/')) {
+		return validateRelative(normalized);
+	}
+
+	const normalizedRoots = roots
+		.filter((root): root is string => typeof root === 'string' && root.trim().length > 0)
+		.map((root) => root.replaceAll('\\', '/').replace(/\/+$/, ''))
+		.filter((root) => root.startsWith('/') && root.length > 1)
+		.sort((a, b) => b.length - a.length);
+
+	for (const root of normalizedRoots) {
+		if (normalized.startsWith(`${root}/`)) {
+			return validateRelative(normalized.slice(root.length + 1));
+		}
+	}
+	return null;
+}
+
+export function classifyCanvasLink(
+	input: {
+		href: string;
+		downloadAttr?: string | null;
+		text?: string | null;
+		hasImageChild?: boolean;
+		imageAlt?: string | null;
+	},
+	currentOrigin: string,
+): CanvasLinkPreviewTarget | null {
+	const rawHref = input.href.trim();
+	if (!rawHref || rawHref.startsWith('#')) return null;
+
+	let parsed: URL;
+	try {
+		parsed = new URL(rawHref, currentOrigin || 'http://xpressclaw.local');
+	} catch {
+		return null;
+	}
+	if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+
+	const sameOrigin = Boolean(currentOrigin) && parsed.origin === currentOrigin;
+	const downloadAttr = input.downloadAttr ?? null;
+	const trimmedText = input.text?.trim() || '';
+
+	if (sameOrigin) {
+		// 1. Agent environment file download links (/api/environments/{agentId}/download?path=...)
+		const envMatch = parsed.pathname.match(/^\/api\/environments\/([^/]+)\/download$/);
+		if (envMatch) {
+			const downloadAgentId = decodeURIComponent(envMatch[1]);
+			const downloadPath = parsed.searchParams.get('path');
+			if (!downloadPath || downloadPath.endsWith('/')) return null;
+			const fileName = (downloadAttr && downloadAttr.trim()) || pathBasename(downloadPath) || trimmedText || null;
+			const nameForExt = fileName || downloadPath;
+			const href = `${parsed.pathname}${parsed.search}`;
+			if (isImageFilePath(nameForExt)) {
+				return {
+					href,
+					label: fileName || 'Image file',
+					category: 'image',
+					downloadAgentId,
+					downloadPath,
+					isAttachment: false,
+					fileName,
+					downloadAttr,
+				};
+			}
+			if (isHtmlFilePath(nameForExt)) {
+				return {
+					href,
+					label: fileName || 'HTML file',
+					category: 'html',
+					downloadAgentId,
+					downloadPath,
+					isAttachment: false,
+					fileName,
+					downloadAttr,
+				};
+			}
+			const ext = pathExtension(nameForExt);
+			if (ext && NON_TEXT_FILE_EXTENSIONS.has(ext)) return null;
+			return {
+				href,
+				label: fileName || downloadPath,
+				category: 'file',
+				downloadAgentId,
+				downloadPath,
+				isAttachment: false,
+				fileName,
+				downloadAttr,
+			};
+		}
+
+		// 2. Workspace raw image links (/api/workspaces/{agentId}/raw?path=...)
+		const rawMatch = parsed.pathname.match(/^\/api\/workspaces\/([^/]+)\/raw$/);
+		if (rawMatch) {
+			const agentId = decodeURIComponent(rawMatch[1]);
+			const filePath = parsed.searchParams.get('path');
+			const fileName = pathBasename(filePath) || trimmedText || 'Image';
+			return {
+				href: `${parsed.pathname}${parsed.search}`,
+				label: fileName,
+				category: 'image',
+				downloadAgentId: agentId,
+				downloadPath: filePath,
+				isAttachment: false,
+				fileName,
+				downloadAttr,
+			};
+		}
+
+		// 3. Task / conversation message attachments
+		if (/^\/api\/(?:tasks|conversations)\/[^/]+\/messages\/[^/]+\/attachments\/[^/]+$/.test(parsed.pathname)) {
+			const fileName = (downloadAttr && downloadAttr.trim())
+				|| (input.imageAlt && input.imageAlt.trim())
+				|| trimmedText
+				|| null;
+			const href = `${parsed.pathname}${parsed.search}`;
+			if (input.hasImageChild || isImageFilePath(fileName)) {
+				return {
+					href,
+					label: fileName || 'Attached image',
+					category: 'image',
+					downloadAgentId: null,
+					downloadPath: null,
+					isAttachment: true,
+					fileName,
+					downloadAttr,
+				};
+			}
+			if (isHtmlFilePath(fileName)) {
+				return {
+					href,
+					label: fileName || 'HTML attachment',
+					category: 'html',
+					downloadAgentId: null,
+					downloadPath: null,
+					isAttachment: true,
+					fileName,
+					downloadAttr,
+				};
+			}
+			return null;
+		}
+
+		// Ignore all other same-origin API routes and internal XpressClaw SPA routes.
+		const firstSeg = parsed.pathname.split('/')[1] ?? '';
+		if (parsed.pathname === '/' || firstSeg === 'api' || firstSeg === '_app' || INTERNAL_SPA_ROOTS.has(firstSeg)) {
+			return null;
+		}
+	}
+
+	// 4. External HTTP(S) links (and non-API, non-SPA same-origin preview URLs)
+	const check = classifyAppUrl(parsed.toString(), currentOrigin);
+	if (!check.valid) return null;
+	const fileName = pathBasename(parsed.pathname);
+	if (isImageFilePath(parsed.pathname)) {
+		return {
+			href: check.normalizedUrl,
+			label: fileName || parsed.host,
+			category: 'image',
+			downloadAgentId: null,
+			downloadPath: null,
+			isAttachment: false,
+			fileName,
+			downloadAttr,
+		};
+	}
+	return {
+		href: check.normalizedUrl,
+		label: trimmedText || parsed.host,
+		category: 'web',
+		downloadAgentId: null,
+		downloadPath: null,
+		isAttachment: false,
+		fileName,
+		downloadAttr,
+	};
 }
 
 export interface ClassifiedAppUrl {
@@ -814,7 +1078,7 @@ export function normalizePersistedCanvasState(raw: unknown): CanvasState | null 
 			imageUrl: typeof node.imageUrl === 'string' ? node.imageUrl : null,
 			imageSource: node.imageSource === 'workspace' || node.imageSource === 'url' ? node.imageSource : null,
 			appUrl: typeof node.appUrl === 'string' ? node.appUrl : null,
-			appSource: node.appSource === 'port' || node.appSource === 'workspace-html' || node.appSource === 'url'
+			appSource: node.appSource === 'port' || node.appSource === 'workspace-html' || node.appSource === 'html-url' || node.appSource === 'url'
 				? node.appSource
 				: null,
 			appFilePath: typeof node.appFilePath === 'string' ? node.appFilePath : null,

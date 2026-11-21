@@ -3,6 +3,8 @@
 	import {
 		Bot,
 		Code2,
+		Download,
+		ExternalLink,
 		FolderKanban,
 		GitBranch,
 		Globe,
@@ -19,12 +21,14 @@
 		SquareTerminal,
 		Trash2,
 	} from '@lucide/svelte';
-	import type { Agent, Conversation, Project, Task } from '$lib/api';
+	import { workspaces, type Agent, type Conversation, type Project, type Task } from '$lib/api';
 	import { notifyLiveUpdatesVisibilityChanged } from '$lib/liveUpdates';
+	import { openExternal } from '$lib/utils';
 	import {
 		bezierEdgePath,
 		CANVAS_GRID_SIZE,
 		clampZoom,
+		classifyCanvasLink,
 		computeCenterOnNodeCamera,
 		computeFitCamera,
 		computeProjectZones,
@@ -34,10 +38,12 @@
 		isImageFilePath,
 		nodeVisualHeight,
 		normalizePersistedCanvasState,
+		resolveWorkspaceRelativePath,
 		seedCanvasNodes,
 		snapCoordinate,
 		tidyCanvasLayout,
 		type CanvasCamera,
+		type CanvasLinkPreviewTarget,
 		type CanvasNode,
 		type CanvasNodeKind,
 		type CanvasState,
@@ -74,7 +80,11 @@
 	}: Props = $props();
 
 	$effect(() => {
-		if (visible) notifyLiveUpdatesVisibilityChanged();
+		if (visible) {
+			notifyLiveUpdatesVisibilityChanged();
+		} else {
+			linkPopover = null;
+		}
 	});
 
 	let viewportEl = $state<HTMLDivElement>();
@@ -97,6 +107,23 @@
 	let activeProjectFilter = $state<string | null>(null);
 	let seenDelegatedTaskIds = new Set<string>();
 	const dirtyEditorIds = new Set<string>();
+
+	interface LinkPopoverState {
+		id: number;
+		x: number;
+		y: number;
+		sourceNodeId: string;
+		agentId: string | null;
+		target: CanvasLinkPreviewTarget;
+		resolvingWorkspace: boolean;
+		workspaceRelativePath: string | null;
+		notice: string | null;
+	}
+
+	let linkPopover = $state<LinkPopoverState | null>(null);
+	let linkPopoverSequence = 0;
+	const workspaceRootsCache = new Map<string, string[]>();
+	const workspaceRootsPending = new Map<string, Promise<string[]>>();
 
 	let agentById = $derived(new Map(agents.map((agent) => [agent.id, agent])));
 	let projectById = $derived(new Map(projects.map((project) => [project.id, project])));
@@ -210,8 +237,9 @@
 				event.preventDefault();
 				spacePressed = true;
 			}
-			if (event.key === 'Escape' && addMenuOpen) {
-				addMenuOpen = false;
+			if (event.key === 'Escape') {
+				if (linkPopover) linkPopover = null;
+				if (addMenuOpen) addMenuOpen = false;
 			}
 		};
 		const handleKeyUp = (event: KeyboardEvent) => {
@@ -219,11 +247,14 @@
 		};
 		window.addEventListener('keydown', handleKeyDown);
 		window.addEventListener('keyup', handleKeyUp);
+		const el = viewportEl;
+		el?.addEventListener('click', handleCanvasClick);
 
 		return () => {
 			observer.disconnect();
 			window.removeEventListener('keydown', handleKeyDown);
 			window.removeEventListener('keyup', handleKeyUp);
+			el?.removeEventListener('click', handleCanvasClick);
 		};
 	});
 
@@ -385,6 +416,7 @@
 		event.preventDefault();
 		event.stopPropagation();
 		addMenuOpen = false;
+		linkPopover = null;
 		panning = true;
 		const startX = event.clientX;
 		const startY = event.clientY;
@@ -412,6 +444,9 @@
 
 	function handleCapturePointerDown(event: PointerEvent) {
 		const target = event.target as HTMLElement | null;
+		if (linkPopover && !target?.closest('[data-canvas-link-popover]')) {
+			linkPopover = null;
+		}
 		if (target?.closest('[data-canvas-hud]')) return;
 		if (event.button === 1 || (event.button === 0 && spacePressed)) {
 			startPan(event);
@@ -420,6 +455,7 @@
 
 	function handleBackgroundPointerDown(event: PointerEvent) {
 		addMenuOpen = false;
+		linkPopover = null;
 		const isMiddle = event.button === 1;
 		const isLeftOnBackground = event.button === 0 && (spacePressed || event.target === event.currentTarget || (event.target as HTMLElement)?.hasAttribute('data-canvas-pan-surface'));
 		if (!isMiddle && !isLeftOnBackground) return;
@@ -430,6 +466,7 @@
 		// Zoom on Ctrl/Cmd+wheel (and trackpad pinch) anywhere over the canvas.
 		if (event.ctrlKey || event.metaKey) {
 			event.preventDefault();
+			linkPopover = null;
 			const factor = event.deltaY < 0 ? 1.1 : 1 / 1.1;
 			zoomBy(factor, event.clientX, event.clientY);
 			return;
@@ -439,12 +476,224 @@
 		const target = event.target as HTMLElement | null;
 		if (target?.closest('[data-canvas-node], [data-canvas-hud]')) return;
 		event.preventDefault();
+		linkPopover = null;
 		camera = {
 			...camera,
 			x: Math.round(camera.x - event.deltaX),
 			y: Math.round(camera.y - event.deltaY),
 		};
 		persist();
+	}
+
+	async function loadWorkspaceRoots(agentId: string): Promise<string[]> {
+		const cached = workspaceRootsCache.get(agentId);
+		if (cached) return cached;
+		const inflight = workspaceRootsPending.get(agentId);
+		if (inflight) return inflight;
+		const req = workspaces.status(agentId)
+			.then((status) => {
+				const roots = [
+					status.root,
+					status.container_root,
+					status.repository?.active?.root,
+					status.repository?.bootstrap_root,
+				].filter((value): value is string => typeof value === 'string' && value.trim().length > 0);
+				workspaceRootsCache.set(agentId, roots);
+				return roots;
+			})
+			.catch(() => [])
+			.finally(() => {
+				workspaceRootsPending.delete(agentId);
+			});
+		workspaceRootsPending.set(agentId, req);
+		return req;
+	}
+
+	function handleCanvasClick(event: MouseEvent) {
+		if (event.defaultPrevented || event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) {
+			return;
+		}
+		const targetEl = event.target as HTMLElement | null;
+		if (!targetEl || targetEl.closest('[data-canvas-hud], [data-canvas-link-popover]')) return;
+		const link = targetEl.closest<HTMLAnchorElement>('a[href]');
+		if (!link || link.hasAttribute('data-canvas-no-preview')) return;
+		if (link.closest('header')) return;
+		const nodeEl = link.closest<HTMLElement>('[data-canvas-node]');
+		const sourceNodeId = nodeEl?.getAttribute('data-canvas-node');
+		if (!sourceNodeId) return;
+		const sourceNode = nodeById.get(sourceNodeId);
+		if (!sourceNode || !['task', 'conversation', 'agent', 'project', 'new-work'].includes(sourceNode.kind)) {
+			return;
+		}
+
+		const img = link.querySelector('img');
+		const classified = classifyCanvasLink(
+			{
+				href: link.getAttribute('href') || link.href,
+				downloadAttr: link.getAttribute('download'),
+				text: link.textContent,
+				hasImageChild: Boolean(img),
+				imageAlt: img?.getAttribute('alt') ?? null,
+			},
+			window.location.origin,
+		);
+		if (!classified) return;
+
+		event.preventDefault();
+		event.stopPropagation();
+
+		const rect = viewportEl?.getBoundingClientRect();
+		const relX = rect ? event.clientX - rect.left : event.clientX;
+		const relY = rect ? event.clientY - rect.top : event.clientY;
+		const popoverId = ++linkPopoverSequence;
+		const agentId = classified.downloadAgentId ?? sourceNode.agentId ?? null;
+
+		let workspaceRelativePath: string | null = null;
+		let resolvingWorkspace = false;
+		if (classified.downloadAgentId && classified.downloadPath) {
+			if (classified.href.startsWith('/api/workspaces/')) {
+				workspaceRelativePath = resolveWorkspaceRelativePath(classified.downloadPath, []);
+			} else {
+				const cachedRoots = workspaceRootsCache.get(classified.downloadAgentId);
+				if (cachedRoots) {
+					workspaceRelativePath = resolveWorkspaceRelativePath(classified.downloadPath, cachedRoots);
+				} else {
+					resolvingWorkspace = true;
+				}
+			}
+		}
+
+		linkPopover = {
+			id: popoverId,
+			x: Math.max(12, Math.min(viewportWidth - 276, Math.round(relX + 8))),
+			y: Math.max(64, Math.min(viewportHeight - 210, Math.round(relY + 8))),
+			sourceNodeId,
+			agentId,
+			target: classified,
+			resolvingWorkspace,
+			workspaceRelativePath,
+			notice: null,
+		};
+
+		if (resolvingWorkspace && classified.downloadAgentId && classified.downloadPath) {
+			const targetAgentId = classified.downloadAgentId;
+			const targetPath = classified.downloadPath;
+			void loadWorkspaceRoots(targetAgentId).then((roots) => {
+				if (linkPopover?.id !== popoverId) return;
+				linkPopover = {
+					...linkPopover,
+					resolvingWorkspace: false,
+					workspaceRelativePath: resolveWorkspaceRelativePath(targetPath, roots),
+				};
+			});
+		}
+	}
+
+	async function resolvePopoverWorkspacePath(state: LinkPopoverState): Promise<string | null> {
+		if (state.workspaceRelativePath) return state.workspaceRelativePath;
+		if (!state.target.downloadAgentId || !state.target.downloadPath) return null;
+		if (state.target.href.startsWith('/api/workspaces/')) {
+			return resolveWorkspaceRelativePath(state.target.downloadPath, []);
+		}
+		const roots = await loadWorkspaceRoots(state.target.downloadAgentId);
+		return resolveWorkspaceRelativePath(state.target.downloadPath, roots);
+	}
+
+	async function previewPopoverAsImage() {
+		const state = linkPopover;
+		if (!state) return;
+		const popoverId = state.id;
+		const relPath = await resolvePopoverWorkspacePath(state);
+		if (linkPopover?.id !== popoverId) return;
+		linkPopover = null;
+		if (relPath && state.agentId) {
+			spawnToolNode('image', state.agentId, state.sourceNodeId, {
+				filePath: relPath,
+				imageSource: 'workspace',
+				title: state.target.label,
+			});
+		} else {
+			spawnToolNode('image', state.agentId, state.sourceNodeId, {
+				imageUrl: state.target.href,
+				imageSource: 'url',
+				title: state.target.label,
+			});
+		}
+	}
+
+	async function previewPopoverAsApp() {
+		const state = linkPopover;
+		if (!state) return;
+		const popoverId = state.id;
+		if (state.target.category === 'html') {
+			const relPath = await resolvePopoverWorkspacePath(state);
+			if (linkPopover?.id !== popoverId) return;
+			linkPopover = null;
+			if (relPath && state.agentId) {
+				spawnToolNode('app', state.agentId, state.sourceNodeId, {
+					appSource: 'workspace-html',
+					appFilePath: relPath,
+					title: `App · ${state.target.label}`,
+				});
+			} else {
+				spawnToolNode('app', state.agentId, state.sourceNodeId, {
+					appSource: 'html-url',
+					appUrl: state.target.href,
+					title: `App · ${state.target.label}`,
+				});
+			}
+			return;
+		}
+		linkPopover = null;
+		spawnToolNode('app', state.agentId, state.sourceNodeId, {
+			appSource: 'url',
+			appUrl: state.target.href,
+			title: `App · ${state.target.label}`,
+		});
+	}
+
+	async function previewPopoverInEditor() {
+		const state = linkPopover;
+		if (!state) return;
+		const popoverId = state.id;
+		const relPath = await resolvePopoverWorkspacePath(state);
+		if (linkPopover?.id !== popoverId) return;
+		if (relPath && state.agentId) {
+			linkPopover = null;
+			spawnToolNode('editor', state.agentId, state.sourceNodeId, {
+				filePath: relPath,
+				title: state.target.label,
+			});
+			return;
+		}
+		linkPopover = {
+			...state,
+			resolvingWorkspace: false,
+			notice: 'This file is outside the agent workspace; download it instead.',
+		};
+	}
+
+	function openPopoverNormally() {
+		const state = linkPopover;
+		if (!state) return;
+		linkPopover = null;
+		const { target } = state;
+		if (target.href.startsWith('http://') || target.href.startsWith('https://')) {
+			void openExternal(target.href);
+			return;
+		}
+		const anchor = document.createElement('a');
+		anchor.href = target.href;
+		anchor.setAttribute('data-canvas-no-preview', 'true');
+		if (target.downloadAttr !== null || target.downloadPath !== null) {
+			anchor.download = target.downloadAttr || target.fileName || '';
+		} else {
+			anchor.target = '_blank';
+			anchor.rel = 'noopener noreferrer';
+		}
+		document.body.appendChild(anchor);
+		anchor.click();
+		anchor.remove();
 	}
 
 	function updateNode(id: string, patch: Partial<CanvasNode>, shouldPersist = true) {
@@ -604,7 +853,7 @@
 			imageUrl?: string | null;
 			imageSource?: 'workspace' | 'url' | null;
 			appUrl?: string | null;
-			appSource?: 'port' | 'workspace-html' | 'url' | null;
+			appSource?: 'port' | 'workspace-html' | 'html-url' | 'url' | null;
 			appFilePath?: string | null;
 			title?: string;
 		},
@@ -625,20 +874,27 @@
 						: (options?.appFilePath ? `App · ${options.appFilePath.split('/').pop()}` : `App${agent ? ` · ${agent.title || agent.name}` : ''}`)
 		);
 
-		// Deduplicate editor/image/html-app for the exact same agent+filePath if already open.
+		// Deduplicate editor/image/app windows targeting the exact same file or URL if already open.
+		const focusExisting = (existing: CanvasNode | undefined): boolean => {
+			if (!existing) return false;
+			if (existing.collapsed) updateNode(existing.id, { collapsed: false });
+			centerOnNode(existing);
+			return true;
+		};
 		if (kind === 'editor' && resolvedAgentId && options?.filePath) {
-			const existing = nodes.find((node) => node.kind === 'editor' && node.agentId === resolvedAgentId && node.filePath === options.filePath);
-			if (existing) {
-				centerOnNode(existing);
-				return;
-			}
+			if (focusExisting(nodes.find((node) => node.kind === 'editor' && node.agentId === resolvedAgentId && node.filePath === options.filePath))) return;
 		}
 		if (kind === 'image' && resolvedAgentId && options?.filePath) {
-			const existing = nodes.find((node) => node.kind === 'image' && node.agentId === resolvedAgentId && node.filePath === options.filePath);
-			if (existing) {
-				centerOnNode(existing);
-				return;
-			}
+			if (focusExisting(nodes.find((node) => node.kind === 'image' && node.agentId === resolvedAgentId && node.filePath === options.filePath))) return;
+		}
+		if (kind === 'image' && options?.imageUrl) {
+			if (focusExisting(nodes.find((node) => node.kind === 'image' && node.imageUrl === options.imageUrl))) return;
+		}
+		if (kind === 'app' && resolvedAgentId && options?.appFilePath) {
+			if (focusExisting(nodes.find((node) => node.kind === 'app' && node.agentId === resolvedAgentId && node.appFilePath === options.appFilePath))) return;
+		}
+		if (kind === 'app' && options?.appUrl) {
+			if (focusExisting(nodes.find((node) => node.kind === 'app' && node.appUrl === options.appUrl))) return;
 		}
 
 		const created = createCanvasNode(
@@ -1291,6 +1547,117 @@
 					Add Window…
 				</button>
 			</div>
+		</div>
+	{/if}
+
+	<!-- Contextual Link Preview Popover -->
+	{#if linkPopover}
+		{@const lp = linkPopover}
+		{@const isExternal = lp.target.href.startsWith('http://') || lp.target.href.startsWith('https://')}
+		{@const isDownload = !isExternal && (lp.target.downloadAttr !== null || lp.target.downloadPath !== null)}
+		<div
+			data-canvas-link-popover
+			data-canvas-hud
+			role="menu"
+			tabindex="-1"
+			aria-label="Link preview actions"
+			style="left:{lp.x}px;top:{lp.y}px;"
+			onpointerdown={(event) => event.stopPropagation()}
+			class="pointer-events-auto absolute z-40 w-64 rounded-xl border border-border bg-card/98 p-1.5 shadow-2xl backdrop-blur"
+		>
+			<div class="border-b border-border/70 px-2 py-1">
+				<div class="truncate text-xs font-medium text-foreground" title={lp.target.label}>{lp.target.label}</div>
+				<div class="truncate font-mono text-[10px] text-muted-foreground" title={lp.workspaceRelativePath || lp.target.downloadPath || lp.target.href}>
+					{lp.workspaceRelativePath || lp.target.downloadPath || lp.target.href}
+				</div>
+			</div>
+
+			<div class="mt-1 space-y-0.5">
+				{#if lp.target.category === 'image'}
+					<button
+						type="button"
+						role="menuitem"
+						onclick={() => void previewPopoverAsImage()}
+						class="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-xs font-medium text-foreground hover:bg-accent"
+					>
+						<ImageIcon class="h-3.5 w-3.5 shrink-0 text-violet-500" />
+						<span>Preview in Canvas Image Viewer</span>
+					</button>
+					{#if isExternal}
+						<button
+							type="button"
+							role="menuitem"
+							onclick={() => void previewPopoverAsApp()}
+							class="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-xs text-foreground hover:bg-accent"
+						>
+							<Globe class="h-3.5 w-3.5 shrink-0 text-amber-500" />
+							<span>Preview in Canvas App</span>
+						</button>
+					{/if}
+				{:else if lp.target.category === 'html'}
+					<button
+						type="button"
+						role="menuitem"
+						onclick={() => void previewPopoverAsApp()}
+						class="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-xs font-medium text-foreground hover:bg-accent"
+					>
+						<Globe class="h-3.5 w-3.5 shrink-0 text-amber-500" />
+						<span>Preview in Canvas App</span>
+					</button>
+					{#if lp.target.downloadAgentId && lp.target.downloadPath && (lp.resolvingWorkspace || lp.workspaceRelativePath)}
+						<button
+							type="button"
+							role="menuitem"
+							onclick={() => void previewPopoverInEditor()}
+							class="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-xs text-foreground hover:bg-accent"
+						>
+							<Code2 class="h-3.5 w-3.5 shrink-0 text-sky-500" />
+							<span>Open in Canvas Editor</span>
+						</button>
+					{/if}
+				{:else if lp.target.category === 'file'}
+					<button
+						type="button"
+						role="menuitem"
+						onclick={() => void previewPopoverInEditor()}
+						class="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-xs font-medium text-foreground hover:bg-accent"
+					>
+						<Code2 class="h-3.5 w-3.5 shrink-0 text-sky-500" />
+						<span>Open in Canvas Editor</span>
+					</button>
+				{:else if lp.target.category === 'web'}
+					<button
+						type="button"
+						role="menuitem"
+						onclick={() => void previewPopoverAsApp()}
+						class="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-xs font-medium text-foreground hover:bg-accent"
+					>
+						<Globe class="h-3.5 w-3.5 shrink-0 text-amber-500" />
+						<span>Preview in Canvas App</span>
+					</button>
+				{/if}
+
+				<button
+					type="button"
+					role="menuitem"
+					onclick={openPopoverNormally}
+					class="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-xs text-muted-foreground hover:bg-accent hover:text-foreground"
+				>
+					{#if isDownload}
+						<Download class="h-3.5 w-3.5 shrink-0" />
+						<span>Download file</span>
+					{:else}
+						<ExternalLink class="h-3.5 w-3.5 shrink-0" />
+						<span>{isExternal ? 'Open in Browser' : 'Open in New Tab'}</span>
+					{/if}
+				</button>
+			</div>
+
+			{#if lp.notice}
+				<p role="status" class="mt-1.5 rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-[10px] text-amber-600 dark:text-amber-400">
+					{lp.notice}
+				</p>
+			{/if}
 		</div>
 	{/if}
 

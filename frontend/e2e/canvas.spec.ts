@@ -2,13 +2,16 @@ import { expect, test, type Page } from '@playwright/test';
 import {
 	bezierEdgePath,
 	classifyAppUrl,
+	classifyCanvasLink,
 	computeFitCamera,
 	computeProjectZones,
 	createCanvasNode,
 	deriveCanvasEdges,
+	isAllowedHtmlPreviewEndpoint,
 	isHtmlFilePath,
 	isImageFilePath,
 	normalizePersistedCanvasState,
+	resolveWorkspaceRelativePath,
 	seedCanvasNodes,
 	tidyCanvasLayout,
 	type CanvasNode,
@@ -631,6 +634,140 @@ test.describe('Spatial Canvas workspace', () => {
 		await expect(environmentTab).toHaveAttribute('aria-selected', 'true');
 	});
 
+	test('previews file links, HTML/image attachments, and web URLs in Canvas directly from inside Task windows', async ({ page }) => {
+		await mockCanvasApi(page);
+		await page.route('**/api/workspaces/agent-codex', (route) =>
+			route.fulfill({
+				json: {
+					agent_id: 'agent-codex',
+					root: '/workspace',
+					container_root: '/workspace',
+					repository: {
+						state: 'attached',
+						message: '',
+						bootstrap_root: '/workspace',
+						active: { relative_path: '', root: '/workspace', github_repository: null },
+						candidates: [],
+						discovery_truncated: false,
+					},
+					container_exists: true,
+					container_running: true,
+					terminal_available: true,
+				},
+			}),
+		);
+		await page.route('**/api/tasks/task-parent/messages', (route) =>
+			route.fulfill({
+				json: [
+					{
+						id: 101,
+						task_id: 'task-parent',
+						agent_id: 'agent-codex',
+						role: 'assistant',
+						content: [
+							'Here are the outputs:',
+							'- [demo.html](file:///workspace/demo.html)',
+							'- [preview.png](file:///workspace/preview.png)',
+							'- [main.ts](file:///workspace/main.ts)',
+							'- [Local App](http://127.0.0.1:4173/demo)',
+						].join('\n'),
+						timestamp: now,
+						attachments: [
+							{ id: 'att-html', name: 'report.html', mime_type: 'text/html', size: 64 },
+							{ id: 'att-img', name: 'shot.png', mime_type: 'image/png', size: png1x1.length },
+						],
+					},
+				],
+			}),
+		);
+		await page.route('**/api/tasks/task-parent/messages/101/attachments/att-html', (route) =>
+			route.fulfill({
+				status: 200,
+				contentType: 'text/html; charset=utf-8',
+				body: '<!doctype html><html><body><h1 id="attached-report">Attached HTML Report</h1></body></html>',
+			}),
+		);
+		await page.route('**/api/tasks/task-parent/messages/101/attachments/att-img', (route) =>
+			route.fulfill({
+				status: 200,
+				contentType: 'image/png',
+				body: png1x1,
+			}),
+		);
+
+		await page.setViewportSize({ width: 1440, height: 900 });
+		await page.goto('/canvas');
+		const parentTaskWindow = page.locator('[data-canvas-node-kind="task"]', { hasText: 'Implement Spatial Canvas' }).first();
+		await expect(parentTaskWindow).toBeVisible();
+		await expect(parentTaskWindow.getByRole('link', { name: 'demo.html' })).toBeVisible();
+
+		// 1. Workspace HTML file:// link -> Preview in Canvas App (resolved as workspace-html with Edit button).
+		await parentTaskWindow.getByRole('link', { name: 'demo.html' }).click();
+		const popover = page.locator('[data-canvas-link-popover]');
+		await expect(popover).toBeVisible();
+		await expect(popover).toContainText('demo.html');
+		await popover.getByRole('menuitem', { name: 'Preview in Canvas App' }).click();
+		await expect(popover).toHaveCount(0);
+		const demoAppCard = page.locator('[data-canvas-app-card]').first();
+		await expect(demoAppCard).toBeVisible();
+		await expect(demoAppCard.getByRole('button', { name: 'Edit' })).toBeVisible();
+		await expect(demoAppCard.frameLocator('[data-canvas-app-frame]').locator('#demo-app-heading')).toHaveText('Canvas Demo App');
+
+		// 2. Workspace image file:// link -> Preview in Canvas Image Viewer.
+		await page.locator('[data-canvas-fit]').click();
+		await parentTaskWindow.getByRole('link', { name: 'preview.png' }).click();
+		await expect(popover).toBeVisible();
+		await popover.getByRole('menuitem', { name: 'Preview in Canvas Image Viewer' }).click();
+		const workspaceImageCard = page.locator('[data-canvas-image-card]').first();
+		await expect(workspaceImageCard).toBeVisible();
+		await expect(workspaceImageCard.locator('img')).toHaveAttribute('src', /\/api\/workspaces\/agent-codex\/raw\?path=preview\.png/);
+
+		// 3. Workspace code file:// link -> Open in Canvas Editor.
+		await page.locator('[data-canvas-fit]').click();
+		await parentTaskWindow.getByRole('link', { name: 'main.ts' }).click();
+		await expect(popover).toBeVisible();
+		await popover.getByRole('menuitem', { name: 'Open in Canvas Editor' }).click();
+		const editorCard = page.locator('[data-canvas-editor-card]').first();
+		await expect(editorCard).toBeVisible();
+		await expect(editorCard.locator('[data-monaco-editor] .view-lines')).toContainText('hello canvas');
+
+		// 4. HTML attachment -> Preview in Canvas App via sandboxed Blob iframe.
+		await page.locator('[data-canvas-fit]').click();
+		await parentTaskWindow.getByRole('link', { name: /Download report\.html/ }).click();
+		await expect(popover).toBeVisible();
+		await popover.getByRole('menuitem', { name: 'Preview in Canvas App' }).click();
+		const attachedAppCard = page.locator('[data-canvas-app-card]').nth(1);
+		await expect(attachedAppCard).toBeVisible();
+		await expect(attachedAppCard.frameLocator('[data-canvas-app-frame]').locator('#attached-report')).toHaveText('Attached HTML Report');
+
+		// 5. Image attachment -> Preview in Canvas Image Viewer.
+		await page.locator('[data-canvas-fit]').click();
+		await parentTaskWindow.getByRole('link', { name: 'Open shot.png' }).click();
+		await expect(popover).toBeVisible();
+		await popover.getByRole('menuitem', { name: 'Preview in Canvas Image Viewer' }).click();
+		const attachedImageCard = page.locator('[data-canvas-image-card]').nth(1);
+		await expect(attachedImageCard).toBeVisible();
+		await expect(attachedImageCard.locator('img')).toHaveAttribute('src', '/api/tasks/task-parent/messages/101/attachments/att-img');
+
+		// 6. External web URL -> Preview in Canvas App & Escape dismissal.
+		await page.locator('[data-canvas-fit]').click();
+		await parentTaskWindow.getByRole('link', { name: 'Local App' }).click();
+		await expect(popover).toBeVisible();
+		await page.keyboard.press('Escape');
+		await expect(popover).toHaveCount(0);
+
+		await parentTaskWindow.getByRole('link', { name: 'Local App' }).click();
+		await expect(popover).toBeVisible();
+		await popover.getByRole('menuitem', { name: 'Preview in Canvas App' }).click();
+		const webAppCard = page.locator('[data-canvas-app-card]').nth(2);
+		await expect(webAppCard).toBeVisible();
+		await expect(webAppCard.locator('[data-canvas-app-frame]')).toHaveAttribute('src', 'http://127.0.0.1:4173/demo');
+
+		// All preview windows spawned from the Task window are tethered via context edges.
+		const contextEdges = await page.locator('[data-canvas-edge-kind="context"]').count();
+		expect(contextEdges).toBeGreaterThanOrEqual(6);
+	});
+
 	test('canvas model enforces safe app URLs, non-overlapping placement, delegation edges, and layout persistence', () => {
 		const origin = 'http://127.0.0.1:8935';
 		const localApp = classifyAppUrl('http://127.0.0.1:3000/dashboard', origin);
@@ -683,5 +820,38 @@ test.describe('Spatial Canvas workspace', () => {
 		expect(restored?.nodes.length).toBe(laidOut.length);
 		expect(restored?.camera.zoom).toBe(1.6);
 		expect(restored?.snapToGrid).toBe(false);
+
+		// Link classification & workspace path mapping helpers
+		expect(resolveWorkspaceRelativePath('/workspace/temp/demo.html', ['/workspace'])).toBe('temp/demo.html');
+		expect(resolveWorkspaceRelativePath('/tmp/outside.html', ['/workspace'])).toBeNull();
+		expect(resolveWorkspaceRelativePath('/workspace/../etc/passwd', ['/workspace'])).toBeNull();
+
+		expect(classifyCanvasLink({ href: '/tasks/task-1' }, origin)).toBeNull();
+		expect(classifyCanvasLink({ href: '/projects/proj-alpha' }, origin)).toBeNull();
+		expect(classifyCanvasLink({ href: '/api/environments/agent-1/download?path=%2Fworkspace%2Farchive.zip' }, origin)).toBeNull();
+
+		const envHtml = classifyCanvasLink({ href: '/api/environments/agent-1/download?path=%2Fworkspace%2Fdemo.html', downloadAttr: '' }, origin);
+		expect(envHtml?.category).toBe('html');
+		expect(envHtml?.downloadAgentId).toBe('agent-1');
+		expect(envHtml?.downloadPath).toBe('/workspace/demo.html');
+
+		const envCode = classifyCanvasLink({ href: '/api/environments/agent-1/download?path=%2Fworkspace%2Fsrc%2Fmain.ts', downloadAttr: '' }, origin);
+		expect(envCode?.category).toBe('file');
+
+		const attImg = classifyCanvasLink({ href: '/api/tasks/t1/messages/1/attachments/a1', hasImageChild: true, imageAlt: 'shot.png' }, origin);
+		expect(attImg?.category).toBe('image');
+		expect(attImg?.isAttachment).toBe(true);
+
+		const attHtml = classifyCanvasLink({ href: '/api/tasks/t1/messages/1/attachments/a2', downloadAttr: 'report.html' }, origin);
+		expect(attHtml?.category).toBe('html');
+		expect(attHtml?.isAttachment).toBe(true);
+
+		const extWeb = classifyCanvasLink({ href: 'http://127.0.0.1:3000/app', text: 'App' }, origin);
+		expect(extWeb?.category).toBe('web');
+
+		expect(isAllowedHtmlPreviewEndpoint('/api/tasks/t1/messages/1/attachments/a2', origin)).toBe(true);
+		expect(isAllowedHtmlPreviewEndpoint('/api/environments/agent-1/download?path=%2Ftmp%2Findex.html', origin)).toBe(true);
+		expect(isAllowedHtmlPreviewEndpoint('/api/environments/agent-1/download?path=%2Ftmp%2Fsecret.env', origin)).toBe(false);
+		expect(isAllowedHtmlPreviewEndpoint('/api/auth/bootstrap', origin)).toBe(false);
 	});
 });
