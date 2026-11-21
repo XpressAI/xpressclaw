@@ -605,7 +605,25 @@ test.describe('Spatial Canvas workspace', () => {
 		const agentWindow = page.locator('[data-canvas-node-kind="agent"]').first();
 		await expect(agentWindow).toBeVisible();
 		const filesTab = agentWindow.getByRole('tab', { name: 'Files' });
+		const workTab = agentWindow.getByRole('tab', { name: 'Work' });
 		await expect(filesTab).toBeVisible();
+		await filesTab.click();
+		await expect(filesTab).toHaveAttribute('aria-selected', 'true');
+		// Navigating back to the bare agent route via link (e.g. sidebar link) resets to Work,
+		// and clicking Files again still works without getting stuck on a stale URL/lastSyncedPath.
+		await page.evaluate(() => {
+			const link = document.createElement('a');
+			link.href = '/agents/agent-codex';
+			link.style.position = 'fixed';
+			link.style.top = '0';
+			link.style.left = '0';
+			link.style.zIndex = '99999';
+			link.textContent = 'Test agent link';
+			document.body.appendChild(link);
+			link.click();
+			link.remove();
+		});
+		await expect(workTab).toHaveAttribute('aria-selected', 'true');
 		await filesTab.click();
 		await expect(filesTab).toHaveAttribute('aria-selected', 'true');
 		const environmentTab = agentWindow.getByRole('tab', { name: 'Environment' });

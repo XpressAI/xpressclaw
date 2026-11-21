@@ -231,20 +231,27 @@
 	];
 
 	beforeNavigate((navigation) => {
-		if (!workspaceReady || navigation.type !== 'link' || navigation.willUnload || !navigation.to?.url) return;
+		if (!workspaceReady || navigation.willUnload || !navigation.to?.url) return;
 		const route = routeFromUrl(navigation.to.url);
+		if (workspaceMode === 'canvas' && (navigation.type === 'link' || navigation.type === 'goto')) {
+			if (route === '/canvas') {
+				lastSyncedPath = route;
+				return;
+			}
+			if (workspacePath(route)) {
+				if (canvasRef?.openRoute(route)) {
+					navigation.cancel();
+					closeMobileMenu();
+					return;
+				}
+				setWorkspaceMode('tabs');
+			}
+		}
+		if (navigation.type !== 'link') return;
 		if (route === '/canvas') {
 			setWorkspaceMode('canvas');
 			lastSyncedPath = route;
 			return;
-		}
-		if (workspaceMode === 'canvas' && workspacePath(route)) {
-			if (canvasRef?.openRoute(route)) {
-				navigation.cancel();
-				closeMobileMenu();
-				return;
-			}
-			setWorkspaceMode('tabs');
 		}
 		if (!workspacePath(route) || route === lastSyncedPath) return;
 		lastSyncedPath = route;
@@ -1270,7 +1277,7 @@
 			return { ...pane, tabs: [fallback], activeTabId: fallback.id };
 		});
 		persistWorkspace();
-		if (focusedProjectWasDeleted) {
+		if (focusedProjectWasDeleted && workspaceMode === 'tabs') {
 			const nextPane = panes.find((pane) => pane.id === focusedPaneId) ?? panes[0];
 			const nextTab = activeTabFor(nextPane);
 			if (currentRoute() !== nextTab.path) {
