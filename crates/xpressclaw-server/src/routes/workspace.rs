@@ -885,9 +885,10 @@ async fn git_status(
                 }
             };
             // The primary checkout reports a nested worktree as one untracked
-            // directory; its own status replaces that entry.
+            // directory, or file by file when a runner-only `.git` pointer hides
+            // it from host Git; the worktree's own status replaces all of them.
             let prefix = format!("{relative}/");
-            files.retain(|change| change.path != relative && change.path != prefix);
+            files.retain(|change| change.path != relative && !change.path.starts_with(&prefix));
             files.extend(changes.into_iter().map(|change| GitChange {
                 path: format!("{prefix}{}", change.path),
                 original_path: change.original_path.map(|path| format!("{prefix}{path}")),
@@ -1876,6 +1877,45 @@ mod tests {
         .await;
         assert_eq!(diff["path"], ".worktrees/feature/app.txt");
         assert!(diff["diff"].as_str().unwrap().contains("+two"), "{diff}");
+    }
+
+    #[tokio::test]
+    async fn task_git_status_replaces_unignored_worktree_entries() {
+        let (app, db, workspace) = worktree_app();
+        // Without the ignore rule, host Git cannot follow the runner-only
+        // `.git` pointer and lists every worktree file as untracked.
+        let root = workspace.path().canonicalize().unwrap();
+        std::fs::write(root.join(".gitignore"), "/.xpressclaw/\n").unwrap();
+        let task_id = task_with_worktree_edits(&db);
+
+        let status = response_json(
+            app.oneshot(
+                Request::get(format!(
+                    "/workspaces/workspace-agent/git/status?task_id={task_id}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            changed_paths(&status),
+            vec![
+                ".gitignore",
+                ".worktrees/feature/added.txt",
+                ".worktrees/feature/app.txt",
+            ],
+            "{status}"
+        );
+        let app_change = status["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|change| change["path"] == ".worktrees/feature/app.txt")
+            .unwrap();
+        assert_eq!(app_change["status"], " M");
     }
 
     #[tokio::test]

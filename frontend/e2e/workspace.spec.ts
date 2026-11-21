@@ -1103,7 +1103,8 @@ async function mockApi(
 				options.workspaceReadRequests?.push(filePath);
 				const readDelayMs = options.workspaceReadDelaysMs?.[filePath] ?? 0;
 				if (readDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, readDelayMs));
-				if (options.includeDeletedWorkspaceFile && filePath === 'src/removed.ts') {
+				if ((options.includeDeletedWorkspaceFile && filePath === 'src/removed.ts')
+					|| (options.taskWorktreeFiles && filePath === '.worktrees/jump-arrows/src/Old.svelte')) {
 					await route.fulfill({ status: 404, contentType: 'application/json', body: JSON.stringify({ error: 'workspace path was not found' }) });
 					return;
 				}
@@ -1126,7 +1127,10 @@ async function mockApi(
 				worktrees: taskWorktree ? [{ path: '.worktrees/jump-arrows', branch: 'fix/jump-arrows' }] : [],
 				files: [
 					...(taskWorktree
-						? [{ path: '.worktrees/jump-arrows/src/JumpArrows.svelte', original_path: null, status: ' M', index_status: ' ', worktree_status: 'M' }]
+						? [
+						{ path: '.worktrees/jump-arrows/src/JumpArrows.svelte', original_path: null, status: ' M', index_status: ' ', worktree_status: 'M' },
+						{ path: '.worktrees/jump-arrows/src/Old.svelte', original_path: null, status: ' D', index_status: ' ', worktree_status: 'D' },
+					]
 						: []),
 					{ path: 'src/main.ts', original_path: null, status: ' M', index_status: ' ', worktree_status: 'M' },
 					{ path: 'README.md', original_path: null, status: '??', index_status: '?', worktree_status: '?' },
@@ -1143,7 +1147,9 @@ async function mockApi(
 					? 'diff --git a/src/main.ts b/src/main.ts\n--- a/src/main.ts\n+++ b/src/main.ts\n@@ -1 +1 @@\n-export const greeting = "hi";\n+export const greeting = "hello";\n'
 					: filePath === 'src/removed.ts'
 						? 'diff --git a/src/removed.ts b/src/removed.ts\ndeleted file mode 100644\n--- a/src/removed.ts\n+++ /dev/null\n@@ -1 +0,0 @@\n-export const removed = true;\n'
-						: '',
+						: filePath === '.worktrees/jump-arrows/src/Old.svelte'
+							? 'diff --git a/src/Old.svelte b/src/Old.svelte\ndeleted file mode 100644\n--- a/src/Old.svelte\n+++ /dev/null\n@@ -1 +0,0 @@\n-<p>old</p>\n'
+							: '',
 				truncated: false,
 			};
 		} else if (path === '/api/tasks/planning') {
@@ -4585,7 +4591,7 @@ test('a reused Files tab refreshes Git status for a newly linked task', async ({
 	await page.keyboard.press('Enter');
 	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&task=${taskId}&path=.worktrees%2Fjump-arrows%2Fsrc%2FJumpArrows.svelte&tree=collapsed`);
 	await expect(panes).toHaveCount(4);
-	await expect(filesPane.getByText('feature/workspace-browser · 3 changed')).toBeVisible();
+	await expect(filesPane.getByText('feature/workspace-browser · 4 changed')).toBeVisible();
 
 	// An unscoped link clears the task scope again.
 	const openFromLastPane = async (name: string) => {
@@ -4608,6 +4614,16 @@ test('a reused Files tab refreshes Git status for a newly linked task', async ({
 	await page.waitForTimeout(500);
 	await expect(filesPane.locator('span[title="README.md"]')).toBeVisible();
 	await expect(page).toHaveURL(/path=README\.md/);
+
+	// A second link for the scope still loading waits for that snapshot, so
+	// a deleted worktree file is recognised instead of rejected.
+	taskGitStatusGate.gate = new Promise<void>((resolve) => { releaseStatus = resolve; });
+	await openFromLastPane('.worktrees/jump-arrows/src/JumpArrows.svelte');
+	await expect.poll(() => gitStatusTaskIds.at(-1)).toBe(taskId);
+	await openFromLastPane('.worktrees/jump-arrows/src/Old.svelte');
+	releaseStatus();
+	await expect(filesPane.locator('span[title=".worktrees/jump-arrows/src/Old.svelte"]')).toBeVisible();
+	await expect(page).toHaveURL(/path=\.worktrees%2Fjump-arrows%2Fsrc%2FOld\.svelte/);
 });
 
 test('task changed-file modified clicks retain normal link behavior', async ({ page }) => {

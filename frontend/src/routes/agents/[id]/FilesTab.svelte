@@ -10,8 +10,11 @@
 	let { agentId, route = '' }: { agentId: string; route?: string } = $props();
 	let status = $state<WorkspaceStatus | null>(null);
 	let git = $state<WorkspaceGitStatus | null>(null);
-	// Task whose worktrees the Git snapshot includes (from the route's `task`).
+	// Task scope (the route's `task`) of the latest status request, of the
+	// snapshot in `git`, and the request still loading, if any.
 	let gitTask: string | undefined;
+	let loadedGitTask: string | undefined;
+	let gitLoad: Promise<void> | null = null;
 	let directories = $state<Record<string, WorkspaceEntry[]>>({});
 	let expanded = $state<string[]>(['']);
 	let selectedPath = $state('');
@@ -79,8 +82,9 @@
 		showTree = requested.showTree;
 		// A reused tab can receive a link scoped to another task; its worktree
 		// changes must be listed before opening (deleted files need them).
-		if (requested.task !== gitTask) {
-			await loadGit(requested.task);
+		if (requested.task !== loadedGitTask) {
+			// Another link for the scope already loading waits for that request.
+			await (requested.task === gitTask && gitLoad ? gitLoad : loadGit(requested.task));
 			// A newer navigation may have started while status loaded.
 			if (route !== requestedRoute) return;
 		}
@@ -127,6 +131,7 @@
 			status = workspaceStatus;
 			directories = { '': rootDirectory.entries };
 			git = gitStatus;
+			loadedGitTask = gitTask;
 			const initialPath = routeState(route).path;
 			if (initialPath) await openFile(initialPath, true, false);
 		} catch (cause) {
@@ -241,8 +246,18 @@
 	/** Load status for `task`, or the unscoped workspace when it is undefined. */
 	async function loadGit(task: string | undefined) {
 		gitTask = task;
-		const next = await workspaces.gitStatus(agentId, undefined, task).catch(() => git);
-		if (gitTask === task) git = next;
+		const load = (async () => {
+			const next = await workspaces.gitStatus(agentId, undefined, task).catch(() => git);
+			if (gitTask !== task) return;
+			git = next;
+			loadedGitTask = task;
+		})();
+		gitLoad = load;
+		try {
+			await load;
+		} finally {
+			if (gitLoad === load) gitLoad = null;
+		}
 	}
 
 	async function toggleTree() {
