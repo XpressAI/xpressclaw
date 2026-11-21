@@ -1648,9 +1648,9 @@ test('activity stays chronological, compact, expandable, and pageable', async ({
 	await expect(page.getByText('Reasoning effort', { exact: true })).toBeVisible();
 });
 
-test('attempt errors can be dismissed', async ({ page }) => {
+test('attempt errors stay dismissed across task switches and reloads', async ({ page }) => {
 	const rawError = '<img src=x onerror="window.__rawHtmlExecuted = true"> ACP process stopped during the turn';
-	await mockApi(page, { attemptError: rawError });
+	await mockApi(page, { taskStatus: 'blocked', taskTitle: 'Dismissed error task', attemptError: rawError });
 	await page.goto(`/tasks/${taskId}`);
 
 	const notification = page.locator('[data-attempt-error]');
@@ -1662,6 +1662,94 @@ test('attempt errors can be dismissed', async ({ page }) => {
 	await dismiss.press('Enter');
 	await expect(notification).toHaveCount(0);
 	await expect(page.locator('[data-task-transcript-scroll]')).toBeFocused();
+	await page.getByRole('link', { name: 'Open agent', exact: true }).click();
+	await expect(page).toHaveURL(`/agents/${agentId}`);
+	await page.locator('[data-workspace-pane] [data-workspace-tab-title="Dismissed error task"]').click();
+	await expect(page.getByRole('heading', { name: 'Dismissed error task' })).toBeVisible();
+	await expect(notification).toHaveCount(0);
+	await page.reload();
+	await expect(page.getByRole('heading', { name: 'Dismissed error task' })).toBeVisible();
+	await expect(notification).toHaveCount(0);
+});
+
+test('attempt errors clear when a newer attempt starts and new failures remain visible', async ({ page }) => {
+	const error = 'backend error: ACP turn failed: Authentication required';
+	const attempts = [attempt('failed', 128_000, error)];
+	await mockApi(page, { taskStatus: 'in_progress', taskAttempts: attempts });
+	await page.goto(`/tasks/${taskId}`);
+	const notification = page.locator('[data-attempt-error]');
+	await expect(notification).toContainText(error);
+	await notification.getByRole('button', { name: 'Dismiss attempt error' }).click();
+	await expect(notification).toHaveCount(0);
+	for (const status of ['queued', 'preparing', 'running', 'waiting_for_input', 'completed']) {
+		attempts.unshift(attempt(status, 128_000, null, status === 'completed' ? 'Recovered successfully.' : null, {
+			id: `recovered-${status}`, created_at: timestamp(attempts.length * 60),
+		}));
+		await page.reload();
+		await expect(page.getByRole('heading', { name: 'Browser-tested workspace' })).toBeVisible();
+		await expect(notification).toHaveCount(0);
+	}
+	// A new failure with the same message must still be shown, even with an
+	// older successful result and a dismissal for the first failed attempt.
+	attempts.unshift(attempt('failed', 128_000, error, null, { id: 'new-failure', created_at: timestamp(600) }));
+	await page.reload();
+	await expect(notification).toContainText(error);
+	await notification.getByRole('button', { name: 'Dismiss attempt error' }).click();
+	await page.reload();
+	await expect(page.getByRole('heading', { name: 'Browser-tested workspace' })).toBeVisible();
+	await expect(notification).toHaveCount(0);
+});
+
+test('attempt errors from older turns stay out of the banner without manual dismissal', async ({ page }) => {
+	const error = 'backend error: ACP turn failed: Authentication required';
+	const attempts = [
+		attempt('completed', 128_000, null, 'First answer', { id: 'recovered-attempt', created_at: timestamp(62) }),
+		attempt('failed', 128_000, error),
+	];
+	await mockApi(page, { taskStatus: 'waiting_for_input', taskAttempts: attempts });
+	await page.goto(`/tasks/${taskId}`);
+	await expect(page.getByText('First answer', { exact: true })).toBeVisible();
+	await expect(page.locator('[data-attempt-error]')).toHaveCount(0);
+	await page.reload();
+	await expect(page.getByText('First answer', { exact: true })).toBeVisible();
+	await expect(page.locator('[data-attempt-error]')).toHaveCount(0);
+});
+
+test('attempt errors dismissed in one window disappear in another', async ({ page, context }) => {
+	const otherPage = await context.newPage();
+	try {
+		for (const tab of [page, otherPage]) {
+			await mockApi(tab, { taskStatus: 'blocked', attemptError: 'Authentication required' });
+			await tab.goto(`/tasks/${taskId}`);
+			await expect(tab.locator('[data-attempt-error]')).toBeVisible();
+		}
+		await page.getByRole('button', { name: 'Dismiss attempt error' }).click();
+		await expect(otherPage.locator('[data-attempt-error]')).toHaveCount(0);
+		await otherPage.reload();
+		await expect(otherPage.getByRole('heading', { name: 'Browser-tested workspace' })).toBeVisible();
+		await expect(otherPage.locator('[data-attempt-error]')).toHaveCount(0);
+	} finally {
+		await otherPage.close();
+	}
+});
+
+test('attempt errors remain dismissed during navigation when storage fills up', async ({ page }) => {
+	const attempts = [attempt('failed', 128_000, 'First failure')];
+	await mockApi(page, { taskStatus: 'blocked', taskTitle: 'Dismissed error task', taskAttempts: attempts });
+	await page.goto(`/tasks/${taskId}`);
+	await page.getByRole('button', { name: 'Dismiss attempt error' }).click();
+	attempts.unshift(attempt('failed', 128_000, 'Second failure', null, { id: 'second-failure' }));
+	await page.reload();
+	await expect(page.locator('[data-attempt-error]')).toContainText('Second failure');
+	await page.evaluate(() => {
+		Storage.prototype.setItem = () => { throw new DOMException('Storage full', 'QuotaExceededError'); };
+	});
+	await page.getByRole('button', { name: 'Dismiss attempt error' }).click();
+	await page.getByRole('link', { name: 'Open agent', exact: true }).click();
+	await expect(page).toHaveURL(`/agents/${agentId}`);
+	await page.locator('[data-workspace-pane] [data-workspace-tab-title="Dismissed error task"]').click();
+	await expect(page.getByRole('heading', { name: 'Dismissed error task' })).toBeVisible();
+	await expect(page.locator('[data-attempt-error]')).toHaveCount(0);
 });
 
 test('failed initial task loads can be retried', async ({ page }) => {

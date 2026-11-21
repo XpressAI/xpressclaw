@@ -2348,12 +2348,27 @@ mod tests {
                 })
                 .unwrap();
             let conversation = TaskConversation::new(db.clone());
-            let original_message = conversation
-                .add_message(&task.id, "user", &task.title)
+            let (original_message, original_dispatch) = conversation
+                .add_user_message_with_attachments_and_enqueue(
+                    &task.id,
+                    Some("atlas"),
+                    "Inspect the login flow",
+                    &[],
+                )
                 .unwrap();
             let queue = TaskQueue::new(db.clone());
-            let failed = queue.enqueue(&task.id, "atlas").unwrap();
+            let failed = queue.claim("atlas").unwrap().unwrap();
+            assert_eq!(failed.id, original_dispatch.unwrap().id);
             let sessions = SessionManager::new(db.clone());
+            sessions
+                .transition_attempt(
+                    failed.attempt_id.as_deref().unwrap(),
+                    "preparing",
+                    "Preparing",
+                    None,
+                    None,
+                )
+                .unwrap();
             let error = "backend error: ACP turn failed: Authentication required";
             sessions
                 .transition_attempt(
@@ -2395,7 +2410,7 @@ mod tests {
                 assert_ne!(Some(active_id), failed.attempt_id.as_deref());
                 let attempt = sessions.get_attempt(active_id).unwrap();
                 assert_eq!(attempt.status, expected_status);
-                assert_eq!(attempt.prompt, task.title);
+                assert_eq!(attempt.trigger_message_id, Some(original_message.id));
                 if let Some(previous) = &retry_attempt_id {
                     assert_eq!(active_id, previous);
                 }
