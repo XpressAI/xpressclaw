@@ -66,6 +66,7 @@
 		claude: 'https://code.claude.com/docs/en/skills',
 		'github-copilot': 'https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-skills',
 		opencode: 'https://opencode.ai/docs/skills/',
+		jouzu: 'https://github.com/shisa-ai/jouzu/blob/main/docs/profiles.md',
 		qwen: 'https://qwenlm.github.io/qwen-code-docs/en/users/features/skills/',
 		cline: 'https://docs.cline.bot/customization/skills'
 	};
@@ -74,6 +75,7 @@
 		{ kind: 'codex', name: 'Codex', install_url: 'https://developers.openai.com/codex/cli/', image: 'ghcr.io/xpressai/xpressclaw-runner-codex:latest', host_image: 'ghcr.io/xpressai/xpressclaw-runner-codex-docker:latest' },
 		{ kind: 'claude', name: 'Claude Agent', install_url: 'https://docs.anthropic.com/en/docs/claude-code/setup', image: 'ghcr.io/xpressai/xpressclaw-runner-claude:latest', host_image: 'ghcr.io/xpressai/xpressclaw-runner-claude-docker:latest' },
 		{ kind: 'opencode', name: 'OpenCode', install_url: 'https://opencode.ai/docs/', image: 'ghcr.io/xpressai/xpressclaw-runner-opencode:latest', host_image: 'ghcr.io/xpressai/xpressclaw-runner-opencode-docker:latest' },
+		{ kind: 'jouzu', name: 'Jouzu', install_url: 'https://platform.shisa.ai/en/jouzu/', image: 'ghcr.io/xpressai/xpressclaw-runner-jouzu:latest', host_image: 'ghcr.io/xpressai/xpressclaw-runner-jouzu-docker:latest' },
 		{ kind: 'deepseek-harness', name: 'DeepSeek Harness', install_url: 'https://github.com/openma-ai/deepseek-harness-acp', image: 'ghcr.io/xpressai/xpressclaw-runner-deepseek-harness:latest', host_image: 'ghcr.io/xpressai/xpressclaw-runner-deepseek-harness-docker:latest' }
 	];
 	let agentOptions = $derived(agentCatalog.length > 0 ? agentCatalog : fallbackAgents);

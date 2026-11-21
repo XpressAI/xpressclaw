@@ -24,6 +24,7 @@ const expectedAcpCommands = {
   junie: ['junie', '--acp=true'],
   kimi: ['kimi', 'acp'],
   opencode: ['opencode', 'acp'],
+  jouzu: ['jouzu', 'acp'],
   pi: ['pi-acp'],
   qwen: ['qwen', '--acp', '--experimental-skills'],
   cline: ['cline', '--acp'],
@@ -92,12 +93,17 @@ test('convenience native builds retain usable ACP smoke defaults', async () => {
   assert.doesNotMatch(dockerBake, /target "native-deepseek-harness(?:-docker)?"/);
 });
 
-test('Pi image startup exercises the production MCP wrapper', async () => {
+test('Pi and Jouzu image startup exercise their production MCP wrappers', async () => {
   const dockerfile = await readFile(new URL('npm/Dockerfile', nativeHarnessUrl), 'utf8');
   assert.match(dockerfile, /if \[ "\$\{AGENT_KIND\}" = "pi" \]; then/);
   assert.match(
     dockerfile,
     /XPRESSCLAW_PI_MCP_CONFIG=\/tmp\/pi-mcp-smoke\.json \\\n\s+timeout 30 \/opt\/xpressclaw\/pi-with-mcp --mode rpc --offline --no-session/,
+  );
+  assert.match(dockerfile, /if \[ "\$\{AGENT_KIND\}" = "jouzu" \]; then/);
+  assert.match(
+    dockerfile,
+    /XPRESSCLAW_JOUZU_MCP_CONFIG=\/tmp\/jouzu-mcp-smoke\.json \\\n\s+timeout 30 \/opt\/xpressclaw\/jouzu-with-mcp --mode rpc --offline --no-session/,
   );
 });
 
@@ -184,6 +190,8 @@ test('updates tracked registry and npm sources while leaving a pinned runner unc
     updated.runners['deepseek-harness'].build_args.AGENT_PACKAGE,
     '@openma/deepseek-harness-acp@8.8.8',
   );
+  assert.equal(updated.runners.jouzu.version, '8.8.8');
+  assert.equal(updated.runners.jouzu.build_args.AGENT_PACKAGE, 'jouzu@8.8.8');
   assert.equal(updated.runners.pi.build_args.AGENT_EXTRA_PACKAGES, '@earendil-works/pi-coding-agent@8.8.8');
   assert.equal(updated.runners.pi.build_args.PI_MCP_PACKAGE, 'pi-mcp-adapter@8.8.8');
   assert.equal(

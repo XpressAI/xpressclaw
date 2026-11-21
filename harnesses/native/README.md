@@ -12,6 +12,7 @@ XpressClaw publishes one product-specific image for each supported ACP agent:
 | `junie` | Junie |
 | `kimi` | Kimi CLI |
 | `opencode` | OpenCode |
+| `jouzu` | Jouzu (Shisa AI) |
 | `pi` | pi ACP |
 | `qwen` | Qwen Code |
 | `cline` | Cline |
@@ -164,16 +165,19 @@ SSE servers are remote and do not increase the runner image size. ACP
 advertised commands and session controls appear in task chat and workflows
 after the harness has completed one discovery turn.
 
-Pi is the exception at the ACP boundary: `pi-acp` accepts ACP MCP definitions
-but does not connect them to Pi. The published Pi runner therefore includes
-[`pi-mcp-adapter`](https://github.com/nicobailon/pi-mcp-adapter). XpressClaw
-writes the effective per-task server list to a private runtime file, mounts its
-directory read-only with shared SELinux relabeling, and starts the inner Pi RPC
-process with that adapter. Existing Pi MCP files are still merged normally.
-Pi receives a compact `mcp` gateway for discovery and individual calls, an
-`mcpScript` JavaScript tool for batching or composing calls, and direct tools
-for XpressClaw's control-plane and constrained GitHub servers. Credentials in
-the generated runtime configuration are stored with owner-only permissions.
+Pi and Jouzu are exceptions at the ACP boundary: `pi-acp` accepts ACP MCP
+definitions without connecting them to Pi, and `jouzu acp` rejects non-empty
+ACP `mcpServers` lists. For Pi, the published runner includes
+[`pi-mcp-adapter`](https://github.com/nicobailon/pi-mcp-adapter) and starts the
+inner Pi RPC process through `/opt/xpressclaw/pi-with-mcp`. For Jouzu,
+XpressClaw starts `jouzu acp` through `/opt/xpressclaw/jouzu-with-mcp`, which
+loads `/opt/xpressclaw/jouzu-mcp-extension.mjs` inside each `jouzu --mode rpc`
+session child and registers XpressClaw's servers via Jouzu's built-in
+`pi.registerMcpServer()` API. In both cases XpressClaw writes the effective
+per-task or per-conversation server list to a private runtime file (owner-only
+permissions), mounts its directory read-only with shared SELinux relabeling,
+preserves existing user `mcp.json` configuration, and exposes XpressClaw's
+control-plane and constrained GitHub tools directly.
 
 Runner images are intentionally product-specific. You can extend one while
 the control-plane-managed development-environment interface is being built:

@@ -299,7 +299,7 @@ async fn update_runner_image(
         .map_err(internal_error)?;
     let host_image = current_agent.runner.container_engine
         == xpressclaw_core::config::ContainerEngineAccess::Host;
-    if !runner_image_compatible(&docker, &latest_image, true, host_image, kind == "pi").await {
+    if !runner_image_compatible(&docker, &latest_image, true, host_image, Some(&kind)).await {
         return Err(internal_error(format!(
             "The newest published {kind} image is incompatible with this XpressClaw version"
         )));

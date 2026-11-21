@@ -47,6 +47,7 @@ export function harnessMark(backend: string): string {
 	if (normalized === 'antigravity') return 'AG';
 	if (normalized.includes('claude')) return 'A';
 	if (normalized.includes('opencode')) return 'O';
+	if (normalized === 'jouzu') return 'JZ';
 	if (normalized.includes('codex')) return 'C';
 	if (normalized === 'deepseek-harness') return 'DS';
 	if (normalized.includes('copilot')) return 'GH';
@@ -70,6 +71,7 @@ export function canonicalHarnessKind(backend: string): string {
 	if (normalized === 'agy') return 'antigravity';
 	if (['deepseek', 'dsh', 'dsh-acp', 'deepseek-harness-acp', '@openma/deepseek-harness-acp'].includes(normalized)) return 'deepseek-harness';
 	if (normalized === 'copilot') return 'github-copilot';
+	if (normalized === 'jz') return 'jouzu';
 	if (normalized === 'pi-acp') return 'pi';
 	return normalized;
 }
@@ -80,6 +82,7 @@ export function inferHarnessKindFromBackend(backend: string): string {
 	if (normalized.includes('deepseek-harness')) return 'deepseek-harness';
 	if (normalized.includes('claude')) return 'claude';
 	if (normalized.includes('opencode')) return 'opencode';
+	if (normalized.includes('jouzu')) return 'jouzu';
 	if (normalized.includes('codex')) return 'codex';
 	if (normalized.includes('copilot')) return 'github-copilot';
 	return normalized;
@@ -99,6 +102,7 @@ export function harnessName(backend: string): string {
 		junie: 'Junie',
 		kimi: 'Kimi CLI',
 		opencode: 'OpenCode',
+		jouzu: 'Jouzu',
 		pi: 'pi ACP',
 		qwen: 'Qwen Code',
 		cursor: 'Cursor',

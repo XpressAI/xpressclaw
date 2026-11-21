@@ -16,6 +16,7 @@ export const expectedRunnerIds = [
   'junie',
   'kimi',
   'opencode',
+  'jouzu',
   'pi',
   'qwen',
   'cline',

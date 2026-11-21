@@ -109,6 +109,68 @@ const OPENCODE_AUTH: &[AcpAuthMount] = &[
     },
 ];
 
+#[cfg(target_os = "macos")]
+const JOUZU_AUTH: &[AcpAuthMount] = &[
+    AcpAuthMount {
+        source: "Library/Application Support/Jouzu",
+        target: "/home/node/.config/jouzu",
+        read_only: false,
+    },
+    AcpAuthMount {
+        source: "Library/Application Support/Jouzu/state",
+        target: "/home/node/.local/state/jouzu",
+        read_only: false,
+    },
+    AcpAuthMount {
+        source: ".config/jouzu",
+        target: "/home/node/.config/jouzu",
+        read_only: false,
+    },
+    AcpAuthMount {
+        source: ".local/state/jouzu",
+        target: "/home/node/.local/state/jouzu",
+        read_only: false,
+    },
+];
+
+#[cfg(target_os = "windows")]
+const JOUZU_AUTH: &[AcpAuthMount] = &[
+    AcpAuthMount {
+        source: "AppData/Roaming/Jouzu",
+        target: "/home/node/.config/jouzu",
+        read_only: false,
+    },
+    AcpAuthMount {
+        source: "AppData/Local/Shisa.ai/Jouzu",
+        target: "/home/node/.config/jouzu",
+        read_only: false,
+    },
+    AcpAuthMount {
+        source: "AppData/Local/Jouzu/state",
+        target: "/home/node/.local/state/jouzu",
+        read_only: false,
+    },
+    AcpAuthMount {
+        source: "AppData/Local/Shisa.ai/Jouzu/state",
+        target: "/home/node/.local/state/jouzu",
+        read_only: false,
+    },
+];
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+const JOUZU_AUTH: &[AcpAuthMount] = &[
+    AcpAuthMount {
+        source: ".config/jouzu",
+        target: "/home/node/.config/jouzu",
+        read_only: false,
+    },
+    AcpAuthMount {
+        source: ".local/state/jouzu",
+        target: "/home/node/.local/state/jouzu",
+        read_only: false,
+    },
+];
+
 const PI_AUTH: &[AcpAuthMount] = &[AcpAuthMount {
     source: ".pi",
     target: "/home/node/.pi",
@@ -288,6 +350,17 @@ pub const ACP_AGENTS: &[AcpAgentDefinition] = &[
         OPENCODE_AUTH
     ),
     agent!(
+        "jouzu",
+        "Jouzu",
+        "JZ",
+        "Shisa AI's bilingual coding harness with its built-in ACP server.",
+        &["jouzu", "acp"],
+        &["jouzu", "jz"],
+        "jouzu",
+        "https://platform.shisa.ai/en/jouzu/",
+        JOUZU_AUTH
+    ),
+    agent!(
         "pi",
         "pi ACP",
         "π",
@@ -393,6 +466,7 @@ pub fn canonical_agent_kind(value: &str) -> Option<&'static str> {
     match normalized.as_str() {
         "agy" => Some("antigravity"),
         "copilot" => Some("github-copilot"),
+        "jz" => Some("jouzu"),
         "deepseek"
         | "dsh"
         | "dsh-acp"
@@ -657,5 +731,48 @@ mod tests {
             Some(dsh.local_minimal_image)
         );
         assert!(is_host_runner_image(dsh.local_host_image));
+    }
+
+    #[test]
+    fn jouzu_catalog_contract_and_position_are_stable() {
+        let opencode_index = ACP_AGENTS
+            .iter()
+            .position(|agent| agent.kind == "opencode")
+            .unwrap();
+        let jouzu_index = ACP_AGENTS
+            .iter()
+            .position(|agent| agent.kind == "jouzu")
+            .unwrap();
+        assert_eq!(jouzu_index, opencode_index + 1);
+
+        let jouzu = agent_definition("jouzu").unwrap();
+        assert_eq!(jouzu.name, "Jouzu");
+        assert_eq!(jouzu.mark, "JZ");
+        assert_eq!(jouzu.command, ["jouzu", "acp"]);
+        assert_eq!(jouzu.host_executables, ["jouzu", "jz"]);
+        assert_eq!(jouzu.login_command, "jouzu");
+        assert_eq!(jouzu.install_url, "https://platform.shisa.ai/en/jouzu/");
+        assert_eq!(jouzu.auth_mounts, JOUZU_AUTH);
+        assert!(jouzu.auth_mounts.iter().all(|mount| !mount.read_only));
+        assert_eq!(canonical_agent_kind("jouzu"), Some("jouzu"));
+        assert_eq!(canonical_agent_kind("jz"), Some("jouzu"));
+        assert_eq!(canonical_agent_kind("my-jouzu-runner"), None);
+        assert_eq!(
+            infer_agent_kind_from_backend("legacy-jouzu-runner"),
+            Some("jouzu")
+        );
+        assert_eq!(
+            default_runner_image("jouzu", ContainerEngineAccess::None),
+            Some(jouzu.minimal_image)
+        );
+        assert_eq!(
+            default_runner_image("jouzu", ContainerEngineAccess::Host),
+            Some(jouzu.host_image)
+        );
+        assert_eq!(
+            local_runner_image_for_tag(jouzu.minimal_image, "latest"),
+            Some(jouzu.local_minimal_image)
+        );
+        assert!(is_host_runner_image(jouzu.local_host_image));
     }
 }

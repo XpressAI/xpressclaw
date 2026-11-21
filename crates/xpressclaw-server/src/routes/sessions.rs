@@ -358,8 +358,8 @@ async fn downloaded_runner_update(
 async fn available_runner_image(docker: &DockerManager, image: &str, kind: &str) -> Option<String> {
     let host_engine_image = is_host_runner_image(image);
     let built_in = is_builtin_runner_image(image);
-    let pi_mcp_image = built_in && kind == "pi";
-    if runner_image_compatible(docker, image, built_in, host_engine_image, pi_mcp_image).await {
+    let mcp_bridge_kind = built_in.then_some(kind);
+    if runner_image_compatible(docker, image, built_in, host_engine_image, mcp_bridge_kind).await {
         return Some(image.to_string());
     }
     if let Some(local_image) = local_runner_image_alias(image) {
@@ -368,7 +368,7 @@ async fn available_runner_image(docker: &DockerManager, image: &str, kind: &str)
             local_image,
             built_in,
             host_engine_image,
-            pi_mcp_image,
+            mcp_bridge_kind,
         )
         .await
         {
