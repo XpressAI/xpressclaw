@@ -54,6 +54,7 @@
 	let error = $state('');
 	let disposed = false;
 	let agentSequence = 0;
+	let previewSequence = 0;
 
 	let exposedPorts = $derived(ports.filter((port) => port.direction === 'container_to_host'));
 	let htmlEntries = $derived(flattenHtmlEntries());
@@ -124,6 +125,12 @@
 	}
 
 	function selectPort(port: PortForward) {
+		previewSequence += 1;
+		if (htmlBlobUrl) {
+			URL.revokeObjectURL(htmlBlobUrl);
+			htmlBlobUrl = '';
+		}
+		selectedHtmlPath = '';
 		const url = `http://127.0.0.1:${port.host_port}/`;
 		sourceMode = 'port';
 		urlInput = url;
@@ -190,10 +197,11 @@
 
 	async function loadWorkspaceHtml(targetAgentId: string, filePath: string) {
 		const req = agentSequence;
+		const previewReq = ++previewSequence;
 		error = '';
 		try {
 			const file = await workspaces.readFile(targetAgentId, filePath);
-			if (disposed || req !== agentSequence || activeAgentId !== targetAgentId) return;
+			if (disposed || req !== agentSequence || previewReq !== previewSequence || activeAgentId !== targetAgentId) return;
 			if (htmlBlobUrl) URL.revokeObjectURL(htmlBlobUrl);
 			htmlBlobUrl = URL.createObjectURL(new Blob([file.content], { type: 'text/html;charset=utf-8' }));
 			sourceMode = 'workspace-html';
@@ -208,7 +216,7 @@
 				title: `App · ${file.path.split('/').pop() || file.path}`,
 			});
 		} catch (cause) {
-			if (req === agentSequence && activeAgentId === targetAgentId) {
+			if (req === agentSequence && previewReq === previewSequence && activeAgentId === targetAgentId) {
 				error = cause instanceof Error ? cause.message : String(cause);
 			}
 		}
@@ -220,6 +228,12 @@
 			error = check.blockedReason || 'Invalid app URL.';
 			return;
 		}
+		previewSequence += 1;
+		if (htmlBlobUrl) {
+			URL.revokeObjectURL(htmlBlobUrl);
+			htmlBlobUrl = '';
+		}
+		selectedHtmlPath = '';
 		error = '';
 		sourceMode = 'url';
 		activeUrl = check.normalizedUrl;
@@ -244,6 +258,7 @@
 
 	function handleAgentChange(nextId: string) {
 		agentSequence += 1;
+		previewSequence += 1;
 		loadingPorts = false;
 		loadingFiles = false;
 		addingPort = false;
