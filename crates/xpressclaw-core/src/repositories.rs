@@ -1076,9 +1076,12 @@ pub struct WorkspaceWorktree {
 }
 
 /// Validate the linked worktree checked out at `directory`. Agents usually
-/// create worktrees inside their runner, so the `.git` file and `commondir`
-/// may name the runner's view of the workspace (`container_root`) rather than
-/// the host path; those paths are translated back into `bootstrap_root`.
+/// create worktrees inside their runner, so the `.git` file may name the
+/// runner's view of the workspace (`container_root`) rather than the host
+/// path; it is translated back into `bootstrap_root` and callers pass it to
+/// Git with `--git-dir`. Git always re-reads `commondir` itself (it ignores
+/// `GIT_COMMON_DIR` when building a worktree's ref store), so that file must
+/// already resolve on the host — Git writes it relative by default.
 pub fn workspace_worktree(
     bootstrap_root: &Path,
     container_root: &Path,
@@ -1092,8 +1095,7 @@ pub fn workspace_worktree(
     let git_dir = pointer.lines().next()?.strip_prefix("gitdir:")?.trim();
     let git_dir = workspace_git_path(bootstrap_root, container_root, &directory, git_dir)?;
     let common_dir = read_small_regular_file(&git_dir.join("commondir"))?;
-    let common_dir =
-        workspace_git_path(bootstrap_root, container_root, &git_dir, common_dir.trim())?;
+    let common_dir = host_git_path(bootstrap_root, &git_dir, common_dir.trim())?;
     if !git_dir.starts_with(&common_dir)
         || !has_regular_git_metadata_tree(bootstrap_root, &git_dir, &common_dir)
         || !has_self_contained_git_config(bootstrap_root, &git_dir, &common_dir)
@@ -1127,7 +1129,16 @@ fn workspace_git_path(
     // `/workspace/...` is not absolute, so translate them before host rules.
     let path = if container_root != bootstrap_root && is_runner_path(raw, container_root) {
         runner_path_to_host(raw, container_root, bootstrap_root)?
-    } else if Path::new(raw).is_absolute() {
+    } else {
+        return host_git_path(bootstrap_root, base, raw);
+    };
+    let path = path.canonicalize().ok()?;
+    path.starts_with(bootstrap_root).then_some(path)
+}
+
+/// Resolve a Git metadata path the way host Git will, inside the workspace.
+fn host_git_path(bootstrap_root: &Path, base: &Path, raw: &str) -> Option<PathBuf> {
+    let path = if Path::new(raw).is_absolute() {
         PathBuf::from(raw)
     } else {
         base.join(raw)
@@ -1677,11 +1688,6 @@ mod tests {
             "gitdir: /workspace/.git/worktrees/feature\n",
         )
         .unwrap();
-        std::fs::write(
-            bootstrap.join(".git/worktrees/feature/commondir"),
-            "/workspace/.git\n",
-        )
-        .unwrap();
 
         let worktree = workspace_worktree(&bootstrap, Path::new("/workspace"), &linked).unwrap();
         assert_eq!(
@@ -1690,6 +1696,30 @@ mod tests {
                 .join(".git/worktrees/feature")
                 .canonicalize()
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn workspace_worktree_rejects_a_common_dir_host_git_cannot_read() {
+        let workspace = tempfile::tempdir().unwrap();
+        let bootstrap = workspace.path().canonicalize().unwrap();
+        let linked = committed_repository_with_worktree(workspace.path());
+        std::fs::write(
+            linked.join(".git"),
+            "gitdir: /workspace/.git/worktrees/feature\n",
+        )
+        .unwrap();
+        // Host Git re-reads this file itself, so a runner-only path would make
+        // every later command fail; reject it during validation instead.
+        std::fs::write(
+            bootstrap.join(".git/worktrees/feature/commondir"),
+            "/workspace/.git\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            workspace_worktree(&bootstrap, Path::new("/workspace"), &linked),
+            None
         );
     }
 

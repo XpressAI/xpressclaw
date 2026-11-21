@@ -47,8 +47,11 @@ locations, diff targets, and command working directories), maps runner paths
 such as `/workspace/...` back to the host workspace, and adds the status of each
 enclosing linked worktree with paths prefixed relative to the active checkout.
 Each worktree must pass the same metadata containment checks as an active
-repository; Git metadata recorded with runner paths is translated before host
-Git runs with explicit `--git-dir` and `--work-tree`. Diffs for paths inside a
+repository. A worktree's `.git` pointer recorded with runner paths is
+translated and passed to host Git as explicit `--git-dir` and `--work-tree`.
+Its `commondir` must already resolve on the host (Git writes it relative),
+because Git re-reads that file itself and ignores `GIT_COMMON_DIR` when building
+the worktree's ref store. Diffs for paths inside a
 linked worktree are read from that worktree. When untracked files exceed the
 status output limit, the listing collapses untracked directories instead of
 failing.
