@@ -194,6 +194,28 @@
         "AGENT_SHA256_ARM64": "9d10185acdb72336e086e699ca363a6065f410fd3c1caed0dc8046e95ac06ccb"
       }
     },
+    "jouzu": {
+      "auto_update": true,
+      "version": "0.2.6",
+      "acp_command": [
+        "jouzu",
+        "acp"
+      ],
+      "dockerfile": "npm",
+      "sources": [
+        {
+          "kind": "npm",
+          "package": "jouzu",
+          "target": "package",
+          "arg": "AGENT_PACKAGE"
+        }
+      ],
+      "build_args": {
+        "AGENT_KIND": "jouzu",
+        "AGENT_PACKAGE": "jouzu@0.2.6",
+        "AGENT_BINARY": "jouzu"
+      }
+    },
     "pi": {
       "auto_update": true,
       "version": "0.0.34",

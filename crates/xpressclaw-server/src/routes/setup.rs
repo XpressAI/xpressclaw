@@ -2652,6 +2652,15 @@ mod tests {
         assert_eq!(dsh["command"], json!(["dsh-acp"]));
         assert_eq!(dsh["login_command"], "dsh-acp login");
         assert_eq!(dsh["mark"], "DS");
+        let jouzu = agents
+            .iter()
+            .find(|agent| agent["kind"] == "jouzu")
+            .unwrap();
+        assert_eq!(jouzu["name"], "Jouzu");
+        assert_eq!(jouzu["command"], json!(["jouzu", "acp"]));
+        assert_eq!(jouzu["login_command"], "jouzu");
+        assert_eq!(jouzu["mark"], "JZ");
+        assert_eq!(jouzu["install_url"], "https://platform.shisa.ai/en/jouzu/");
         assert!(!agents.iter().any(|agent| agent["kind"] == "agoragentic"));
     }
 

@@ -1,0 +1,26 @@
+#!/usr/bin/env node
+
+import { accessSync, constants } from 'node:fs';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+const configPath = process.env.XPRESSCLAW_JOUZU_MCP_CONFIG || '/run/xpressclaw/jouzu-mcp/config.json';
+try {
+  accessSync(configPath, constants.R_OK);
+} catch {
+  process.stderr.write(`jouzu MCP configuration is not readable: ${configPath}\n`);
+  process.exit(1);
+}
+
+const args = process.argv.slice(2);
+const isRpcChild = args.some(
+  (arg, index) => arg === '--mode=rpc' || (arg === '--mode' && args[index + 1] === 'rpc'),
+);
+if (isRpcChild) {
+  const extensionPath = fileURLToPath(new URL('./jouzu-mcp-extension.mjs', import.meta.url));
+  if (!args.includes(extensionPath)) {
+    process.argv.push('--extension', extensionPath);
+  }
+}
+
+const cliPath = process.env.XPRESSCLAW_JOUZU_CLI || '/usr/local/lib/node_modules/jouzu/dist/cli.js';
+await import(pathToFileURL(cliPath).href);

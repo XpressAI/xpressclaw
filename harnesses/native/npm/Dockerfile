@@ -18,7 +18,8 @@ ARG PI_MCP_PACKAGE="pi-mcp-adapter@latest"
 LABEL io.xpressclaw.protocol="acp-xpressclaw-v2" \
     io.xpressclaw.agent="${AGENT_KIND}" \
     io.xpressclaw.runner.version="${RUNNER_VERSION}" \
-    io.xpressclaw.pi-mcp="${AGENT_KIND}-config-v1"
+    io.xpressclaw.pi-mcp="${AGENT_KIND}-config-v1" \
+    io.xpressclaw.jouzu-mcp="${AGENT_KIND}-config-v1"
 
 RUN test -n "${AGENT_KIND}" \
     && test -n "${AGENT_PACKAGE}" \
@@ -39,6 +40,8 @@ RUN test -n "${AGENT_KIND}" \
 COPY --chmod=0755 common/mcp-github.mjs /opt/xpressclaw/mcp-github.mjs
 COPY --chmod=0755 common/mcp-xpressclaw.mjs /opt/xpressclaw/mcp-xpressclaw.mjs
 COPY --chmod=0755 common/pi-with-mcp /opt/xpressclaw/pi-with-mcp
+COPY --chmod=0755 common/jouzu-with-mcp /opt/xpressclaw/jouzu-with-mcp
+COPY --chmod=0644 common/jouzu-mcp-extension.mjs /opt/xpressclaw/jouzu-mcp-extension.mjs
 COPY --chmod=0755 common/prepare-deepseek-harness.mjs /opt/xpressclaw/prepare-deepseek-harness.mjs
 COPY --chmod=0755 common/verify-acp-stdio.mjs /opt/xpressclaw/verify-acp-stdio.mjs
 COPY --chmod=0755 common/verify-acp-initialize.mjs /opt/xpressclaw/verify-acp-initialize.mjs
@@ -47,17 +50,23 @@ COPY --chmod=0755 common/git-credential-xpressclaw /usr/local/bin/git-credential
 RUN /opt/xpressclaw/libexec/gh --version \
     && node --check /opt/xpressclaw/mcp-github.mjs \
     && node --check /opt/xpressclaw/mcp-xpressclaw.mjs \
+    && node --check /opt/xpressclaw/jouzu-with-mcp \
+    && node --check /opt/xpressclaw/jouzu-mcp-extension.mjs \
     && node --check /opt/xpressclaw/prepare-deepseek-harness.mjs \
     && node --check /opt/xpressclaw/verify-acp-stdio.mjs \
     && { [ "${AGENT_DSH_RUNTIME}" != "1" ] || node /opt/xpressclaw/prepare-deepseek-harness.mjs; } \
     && npm cache clean --force \
-    && test -x /opt/xpressclaw/pi-with-mcp
+    && test -x /opt/xpressclaw/pi-with-mcp \
+    && test -x /opt/xpressclaw/jouzu-with-mcp \
+    && { [ "${AGENT_KIND}" != jouzu ] || test -f /usr/local/lib/node_modules/jouzu/dist/cli.js; }
 
 USER node
 ARG ACP_SMOKE_COMMAND_B64
 ENV HOME=/home/node \
     CI=1 \
     NO_COLOR=1 \
+    JOUZU_NO_UPDATE=1 \
+    JOUZU_NO_PI_IMPORT=1 \
     DSH_PATH="${AGENT_DSH_PATH}" \
     NODE_PATH="${AGENT_NODE_PATH}" \
     DSH_SESSION_ROOT="${AGENT_DSH_SESSION_ROOT}"
@@ -70,6 +79,14 @@ RUN if [ "${AGENT_DSH_RUNTIME}" = "1" ]; then \
       XPRESSCLAW_PI_MCP_CONFIG=/tmp/pi-mcp-smoke.json \
         timeout 30 /opt/xpressclaw/pi-with-mcp --mode rpc --offline --no-session </dev/null; \
       rm /tmp/pi-mcp-smoke.json; \
+    fi \
+    && if [ "${AGENT_KIND}" = "jouzu" ]; then \
+      printf '%s' '{"mcpServers":{}}' > /tmp/jouzu-mcp-smoke.json; \
+      XPRESSCLAW_JOUZU_MCP_CONFIG=/tmp/jouzu-mcp-smoke.json \
+        node /opt/xpressclaw/verify-acp-initialize.mjs "$(printf '["/opt/xpressclaw/jouzu-with-mcp","acp"]' | base64 -w0)"; \
+      XPRESSCLAW_JOUZU_MCP_CONFIG=/tmp/jouzu-mcp-smoke.json \
+        timeout 30 /opt/xpressclaw/jouzu-with-mcp --mode rpc --offline --no-session </dev/null; \
+      rm /tmp/jouzu-mcp-smoke.json; \
     fi \
     && if [ "${AGENT_ACP_SMOKE}" = "1" ]; then \
       node /opt/xpressclaw/verify-acp-stdio.mjs "${AGENT_BINARY}"; \

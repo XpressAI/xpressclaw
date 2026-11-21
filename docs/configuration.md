@@ -194,6 +194,7 @@ See [Agent network proxy](proxy.md) for matching rules, runtime behavior, and te
 | Claude Code | `ghcr.io/xpressai/xpressclaw-runner-claude:latest` | `ghcr.io/xpressai/xpressclaw-runner-claude-docker:latest` |
 | DeepSeek Harness | `ghcr.io/xpressai/xpressclaw-runner-deepseek-harness:latest` | `ghcr.io/xpressai/xpressclaw-runner-deepseek-harness-docker:latest` |
 | OpenCode | `ghcr.io/xpressai/xpressclaw-runner-opencode:latest` | `ghcr.io/xpressai/xpressclaw-runner-opencode-docker:latest` |
+| Jouzu | `ghcr.io/xpressai/xpressclaw-runner-jouzu:latest` | `ghcr.io/xpressai/xpressclaw-runner-jouzu-docker:latest` |
 
 The host-engine variants add Docker CLI, Compose, and Buildx. When
 `container_engine: host` is enabled, Xpressclaw discovers the local Unix

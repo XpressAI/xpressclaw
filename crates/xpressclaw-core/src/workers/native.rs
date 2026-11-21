@@ -73,6 +73,11 @@ const PI_MCP_CONFIG_TARGET: &str = "/run/xpressclaw/pi-mcp/config.json";
 const PI_MCP_CONFIG_DIR_TARGET: &str = "/run/xpressclaw/pi-mcp";
 const PI_MCP_WRAPPER: &str = "/opt/xpressclaw/pi-with-mcp";
 static PI_MCP_CONFIG_LOCK: StdMutex<()> = StdMutex::new(());
+const JOUZU_MCP_BRIDGE_LABEL: &str = "jouzu-config-v1";
+const JOUZU_MCP_CONFIG_TARGET: &str = "/run/xpressclaw/jouzu-mcp/config.json";
+const JOUZU_MCP_CONFIG_DIR_TARGET: &str = "/run/xpressclaw/jouzu-mcp";
+const JOUZU_MCP_WRAPPER: &str = "/opt/xpressclaw/jouzu-with-mcp";
+static JOUZU_MCP_CONFIG_LOCK: StdMutex<()> = StdMutex::new(());
 static GIT_WORKTREE_REDIRECT_LOCK: StdMutex<()> = StdMutex::new(());
 const BUNDLED_CONTROL_MCP_COMMAND: &str = "/usr/local/bin/node";
 const CODEX_INITIAL_AGENT_MODE: &str = "INITIAL_AGENT_MODE";
@@ -1007,8 +1012,26 @@ async fn execute_conversation_turn_once(
         && docker
             .image_has_label(&spec.image, "io.xpressclaw.pi-mcp", PI_MCP_BRIDGE_LABEL)
             .await;
+    let jouzu_mcp_bridge = kind == "jouzu"
+        && docker
+            .image_has_label(
+                &spec.image,
+                "io.xpressclaw.jouzu-mcp",
+                JOUZU_MCP_BRIDGE_LABEL,
+            )
+            .await;
     let (mcp_signature, pi_process_environment) = if pi_mcp_bridge {
         let bridge = configure_pi_mcp_bridge(
+            &config.system.data_dir,
+            &agent.name,
+            Some(&turn.conversation_id),
+            &mcp_servers,
+            &mut spec,
+        )?;
+        mcp_servers.clear();
+        (Some(bridge.signature), bridge.process_environment)
+    } else if jouzu_mcp_bridge {
+        let bridge = configure_jouzu_mcp_bridge(
             &config.system.data_dir,
             &agent.name,
             Some(&turn.conversation_id),
@@ -1758,8 +1781,26 @@ async fn execute_item_once(runtime: NativeAttemptRuntime, item: QueueItem) -> Re
         && docker
             .image_has_label(&spec.image, "io.xpressclaw.pi-mcp", PI_MCP_BRIDGE_LABEL)
             .await;
+    let jouzu_mcp_bridge = kind == "jouzu"
+        && docker
+            .image_has_label(
+                &spec.image,
+                "io.xpressclaw.jouzu-mcp",
+                JOUZU_MCP_BRIDGE_LABEL,
+            )
+            .await;
     let mcp_signature = if pi_mcp_bridge {
         let bridge = configure_pi_mcp_bridge(
+            &config.system.data_dir,
+            &agent.name,
+            None,
+            &mcp_servers,
+            &mut spec,
+        )?;
+        mcp_servers.clear();
+        Some(bridge.signature)
+    } else if jouzu_mcp_bridge {
+        let bridge = configure_jouzu_mcp_bridge(
             &config.system.data_dir,
             &agent.name,
             None,
@@ -2652,12 +2693,15 @@ async fn runner_image_ready(
     built_in_image: bool,
     agent: &AgentConfig,
 ) -> bool {
+    let mcp_bridge_kind = built_in_image
+        .then(|| resolve_runner_kind(agent).ok())
+        .flatten();
     runner_image_compatible(
         docker,
         image,
         built_in_image,
         built_in_image && agent.runner.container_engine == ContainerEngineAccess::Host,
-        built_in_image && resolve_runner_kind(agent).is_ok_and(|kind| kind == "pi"),
+        mcp_bridge_kind.as_deref(),
     )
     .await
 }
@@ -2672,8 +2716,21 @@ pub async fn runner_image_compatible(
     image: &str,
     built_in_image: bool,
     host_engine_image: bool,
-    pi_mcp_image: bool,
+    mcp_bridge_kind: Option<&str>,
 ) -> bool {
+    let mcp_bridge_ok = match mcp_bridge_kind {
+        Some("pi") => {
+            docker
+                .image_has_label(image, "io.xpressclaw.pi-mcp", PI_MCP_BRIDGE_LABEL)
+                .await
+        }
+        Some("jouzu") => {
+            docker
+                .image_has_label(image, "io.xpressclaw.jouzu-mcp", JOUZU_MCP_BRIDGE_LABEL)
+                .await
+        }
+        _ => true,
+    };
     docker.has_image(image).await
         && (!built_in_image
             || docker
@@ -2683,10 +2740,7 @@ pub async fn runner_image_compatible(
             || docker
                 .image_has_label(image, "io.xpressclaw.container-engine", "host")
                 .await)
-        && (!pi_mcp_image
-            || docker
-                .image_has_label(image, "io.xpressclaw.pi-mcp", PI_MCP_BRIDGE_LABEL)
-                .await)
+        && mcp_bridge_ok
 }
 
 /// Exact image contract for the XpressClaw-owned Codex presentation workflow.
@@ -2808,12 +2862,186 @@ fn pi_mcp_config_dir(data_dir: &Path, agent_id: &str) -> PathBuf {
     data_dir.join("runtime").join("pi-mcp").join(agent_hash)
 }
 
+fn jouzu_mcp_config_dir(data_dir: &Path, agent_id: &str) -> PathBuf {
+    let agent_hash = format!("{:x}", Sha256::digest(agent_id.as_bytes()));
+    data_dir.join("runtime").join("jouzu-mcp").join(agent_hash)
+}
+
+fn configure_jouzu_mcp_bridge(
+    data_dir: &Path,
+    agent_id: &str,
+    process_scope: Option<&str>,
+    mcp_servers: &[McpServer],
+    spec: &mut ContainerSpec,
+) -> Result<PiMcpBridge> {
+    // Jouzu's ACP server rejects non-empty ACP `mcpServers` lists and instead
+    // loads MCP servers in each `jouzu --mode rpc` session child. Mount a
+    // private per-process runtime file read-only and register its servers via
+    // `/opt/xpressclaw/jouzu-with-mcp` without touching the user's host config.
+    let _config_guard = JOUZU_MCP_CONFIG_LOCK.lock().unwrap();
+    if spec
+        .volumes
+        .iter()
+        .any(|mount| container_paths_overlap(&mount.target, JOUZU_MCP_CONFIG_DIR_TARGET))
+    {
+        return Err(Error::Backend(format!(
+            "the Jouzu MCP bridge reserves container mount target {JOUZU_MCP_CONFIG_DIR_TARGET}"
+        )));
+    }
+    let encoded = jouzu_mcp_config(mcp_servers)?;
+    let config_dir = jouzu_mcp_config_dir(data_dir, agent_id);
+    std::fs::create_dir_all(&config_dir).map_err(|error| {
+        Error::Backend(format!(
+            "failed to create Jouzu MCP runtime directory {}: {error}",
+            config_dir.display()
+        ))
+    })?;
+    set_private_directory_permissions(&config_dir)?;
+
+    let (config_path, process_environment) = if let Some(scope) = process_scope {
+        let scope_hash = format!("{:x}", Sha256::digest(scope.as_bytes()));
+        let process_dir = config_dir.join("processes").join(&scope_hash);
+        std::fs::create_dir_all(&process_dir).map_err(|error| {
+            Error::Backend(format!(
+                "failed to create scoped Jouzu MCP runtime directory {}: {error}",
+                process_dir.display()
+            ))
+        })?;
+        set_private_directory_permissions(&config_dir.join("processes"))?;
+        set_private_directory_permissions(&process_dir)?;
+
+        let bootstrap_path = config_dir.join("config.json");
+        if !bootstrap_path.exists() {
+            write_private_atomic(&bootstrap_path, &jouzu_mcp_config(&[])?)?;
+        }
+
+        (
+            process_dir.join("config.json"),
+            vec![format!(
+                "XPRESSCLAW_JOUZU_MCP_CONFIG={JOUZU_MCP_CONFIG_DIR_TARGET}/processes/{scope_hash}/config.json"
+            )],
+        )
+    } else {
+        (config_dir.join("config.json"), Vec::new())
+    };
+    write_private_atomic(&config_path, &encoded)?;
+
+    spec.volumes.push(VolumeMount {
+        source: config_dir.display().to_string(),
+        target: JOUZU_MCP_CONFIG_DIR_TARGET.to_string(),
+        read_only: true,
+        selinux_relabel: SelinuxRelabel::Shared,
+    });
+    spec.environment
+        .retain(|variable| !variable.starts_with("XPRESSCLAW_JOUZU_MCP_CONFIG="));
+    spec.environment.push(format!(
+        "XPRESSCLAW_JOUZU_MCP_CONFIG={JOUZU_MCP_CONFIG_TARGET}"
+    ));
+    if let Some(command) = spec.cmd.as_mut() {
+        rewrite_jouzu_wrapper_command(command);
+    }
+
+    Ok(PiMcpBridge {
+        signature: format!("jouzu-mcp:{:x}", Sha256::digest(&encoded)),
+        process_environment,
+    })
+}
+
+fn rewrite_jouzu_wrapper_command(command: &mut [String]) {
+    if command.first().map(String::as_str) == Some("jouzu") {
+        command[0] = JOUZU_MCP_WRAPPER.to_string();
+    } else if command.len() >= 5
+        && command[0] == "/bin/sh"
+        && command[1] == "-lc"
+        && command[3] == "xpressclaw-startup"
+        && command[4] == "jouzu"
+    {
+        command[4] = JOUZU_MCP_WRAPPER.to_string();
+    }
+}
+
+fn jouzu_mcp_config(mcp_servers: &[McpServer]) -> Result<Vec<u8>> {
+    let mut servers = serde_json::Map::new();
+    let mut namespaces = std::collections::HashSet::new();
+    for server in mcp_servers {
+        let (name, mut definition) = jouzu_mcp_server(server)?;
+        if matches!(name.as_str(), "xpressclaw" | "github") {
+            definition.insert("exposure".to_string(), json!("direct"));
+        }
+        let namespace = name.replace('-', "_");
+        if !namespaces.insert(namespace) {
+            return Err(Error::Backend(format!(
+                "Jouzu MCP configuration contains conflicting server name '{name}'"
+            )));
+        }
+        if servers
+            .insert(name.clone(), Value::Object(definition))
+            .is_some()
+        {
+            return Err(Error::Backend(format!(
+                "Jouzu MCP configuration contains duplicate server name '{name}'"
+            )));
+        }
+    }
+    serde_json::to_vec_pretty(&json!({ "mcpServers": servers })).map_err(Error::from)
+}
+
+fn jouzu_mcp_server(server: &McpServer) -> Result<(String, serde_json::Map<String, Value>)> {
+    let mut definition = serde_json::Map::new();
+    let name = match server {
+        McpServer::Stdio(server) => {
+            let command = server.command.to_str().ok_or_else(|| {
+                Error::Backend(format!(
+                    "Jouzu MCP server '{}' command is not valid UTF-8",
+                    server.name
+                ))
+            })?;
+            definition.insert("command".to_string(), json!(command));
+            if !server.args.is_empty() {
+                definition.insert("args".to_string(), json!(server.args));
+            }
+            if !server.env.is_empty() {
+                let env = server
+                    .env
+                    .iter()
+                    .map(|variable| (variable.name.clone(), json!(variable.value)))
+                    .collect::<serde_json::Map<_, _>>();
+                definition.insert("env".to_string(), Value::Object(env));
+            }
+            server.name.clone()
+        }
+        McpServer::Http(server) => {
+            definition.insert("url".to_string(), json!(server.url));
+            add_pi_mcp_headers(&mut definition, &server.headers);
+            server.name.clone()
+        }
+        McpServer::Sse(server) => {
+            return Err(Error::Backend(format!(
+                "Jouzu does not support legacy SSE MCP server '{}'; configure a streamable HTTP or stdio server instead",
+                server.name
+            )));
+        }
+        _ => {
+            return Err(Error::Backend(
+                "Jouzu MCP bridge received an unsupported ACP MCP transport".to_string(),
+            ));
+        }
+    };
+    Ok((name, definition))
+}
+
 /// Remove XpressClaw-generated per-Agent runtime files after an Agent is
 /// permanently deleted. Repository and managed-workspace directories are
 /// intentionally outside these hashed runtime roots and are never touched.
 pub fn remove_agent_runtime_state(data_dir: &Path, agent_id: &str) -> Result<()> {
     let agent_hash = format!("{:x}", Sha256::digest(agent_id.as_bytes()));
-    for runtime_kind in ["pi-mcp", "ssh-known-hosts", "ssh-config", "git-worktrees"] {
+    for runtime_kind in [
+        "pi-mcp",
+        "jouzu-mcp",
+        "ssh-known-hosts",
+        "ssh-config",
+        "git-worktrees",
+    ] {
         let path = data_dir
             .join("runtime")
             .join(runtime_kind)
@@ -3689,6 +3917,7 @@ fn build_spec(
         }
     }
     apply_codex_mode_default(kind, &agent.runner, &mut environment);
+    apply_jouzu_defaults(kind, &agent.runner, &mut environment);
     let mut runner_environment = agent.runner.environment.iter().collect::<Vec<_>>();
     runner_environment.sort_by(|left, right| left.0.cmp(right.0));
     for (name, value) in runner_environment {
@@ -3749,6 +3978,21 @@ fn apply_codex_mode_default(
         environment.push(format!(
             "{CODEX_INITIAL_AGENT_MODE}={CODEX_FULL_ACCESS_MODE}"
         ));
+    }
+}
+
+/// Keep Jouzu deterministic inside pinned runner containers by disabling
+/// launch-time auto-update checks and interactive Pi import prompts unless
+/// the operator overrides those variables explicitly.
+fn apply_jouzu_defaults(kind: &str, runner: &NativeRunnerConfig, environment: &mut Vec<String>) {
+    if kind != "jouzu" {
+        return;
+    }
+    if !runner.environment.contains_key("JOUZU_NO_UPDATE") {
+        environment.push("JOUZU_NO_UPDATE=1".to_string());
+    }
+    if !runner.environment.contains_key("JOUZU_NO_PI_IMPORT") {
+        environment.push("JOUZU_NO_PI_IMPORT=1".to_string());
     }
 }
 
@@ -4614,9 +4858,10 @@ fn mount_host_ssh_directory(host_ssh: &Path, volumes: &mut Vec<VolumeMount>) {
 }
 
 fn auth_mounts(kind: &str) -> Vec<VolumeMount> {
+    let mut seen_targets = std::collections::HashSet::new();
     auth_candidates(kind)
         .into_iter()
-        .filter(|(source, _, _)| source.exists())
+        .filter(|(source, target, _)| source.exists() && seen_targets.insert(*target))
         .map(|(source, target, read_only)| VolumeMount {
             source: source.display().to_string(),
             target: target.to_string(),
@@ -7676,9 +7921,133 @@ flows:
             vec!["opencode", "acp"]
         );
         assert_eq!(
+            acp_command_for(&config, "jouzu", "/workspace").unwrap(),
+            vec!["jouzu", "acp"]
+        );
+        assert_eq!(
             acp_command_for(&config, "deepseek-harness", "/workspace").unwrap(),
             vec!["dsh-acp"]
         );
+    }
+
+    #[test]
+    fn jouzu_mcp_config_serializes_stdio_and_http_and_rejects_sse() {
+        let encoded = jouzu_mcp_config(&[
+            McpServer::Stdio(
+                McpServerStdio::new("xpressclaw", "/usr/local/bin/node")
+                    .args(vec!["/opt/xpressclaw/mcp-xpressclaw.mjs".into()])
+                    .env(vec![EnvVariable::new("XPRESSCLAW_TASK_ID", "task-123")]),
+            ),
+            McpServer::Stdio(
+                McpServerStdio::new("github", "/usr/local/bin/node")
+                    .args(vec!["/opt/xpressclaw/mcp-github.mjs".into()]),
+            ),
+            McpServer::Http(
+                McpServerHttp::new("docs", "https://docs.example.test/mcp")
+                    .headers(vec![HttpHeader::new("Authorization", "Bearer secret")]),
+            ),
+        ])
+        .unwrap();
+        let config: Value = serde_json::from_slice(&encoded).unwrap();
+
+        assert_eq!(
+            config["mcpServers"]["xpressclaw"]["command"],
+            "/usr/local/bin/node"
+        );
+        assert_eq!(config["mcpServers"]["xpressclaw"]["exposure"], "direct");
+        assert_eq!(config["mcpServers"]["github"]["exposure"], "direct");
+        assert_eq!(
+            config["mcpServers"]["docs"]["url"],
+            "https://docs.example.test/mcp"
+        );
+        assert_eq!(
+            config["mcpServers"]["docs"]["headers"]["Authorization"],
+            "Bearer secret"
+        );
+        assert!(config["mcpServers"]["docs"]["exposure"].is_null());
+        assert!(config["mcpServers"]["docs"]["httpTransport"].is_null());
+
+        let sse_error = jouzu_mcp_config(&[McpServer::Sse(McpServerSse::new(
+            "legacy-sse",
+            "https://search.example.test/sse",
+        ))])
+        .unwrap_err();
+        assert!(sse_error.to_string().contains("legacy SSE"));
+    }
+
+    #[test]
+    fn jouzu_mcp_bridge_mounts_private_config_rewrites_cmd_and_cleans_up() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut spec = ContainerSpec {
+            cmd: Some(vec!["jouzu".into(), "acp".into()]),
+            ..Default::default()
+        };
+        let servers = [McpServer::Stdio(McpServerStdio::new(
+            "xpressclaw",
+            "/usr/local/bin/node",
+        ))];
+
+        let bridge =
+            configure_jouzu_mcp_bridge(data_dir.path(), "jouzu-agent", None, &servers, &mut spec)
+                .unwrap();
+        assert!(bridge.signature.starts_with("jouzu-mcp:"));
+        assert!(bridge.process_environment.is_empty());
+        assert_eq!(
+            spec.cmd.as_deref(),
+            Some(&[JOUZU_MCP_WRAPPER.to_string(), "acp".to_string()][..])
+        );
+        assert!(spec.environment.contains(&format!(
+            "XPRESSCLAW_JOUZU_MCP_CONFIG={JOUZU_MCP_CONFIG_TARGET}"
+        )));
+        let mount = spec
+            .volumes
+            .iter()
+            .find(|mount| mount.target == JOUZU_MCP_CONFIG_DIR_TARGET)
+            .unwrap();
+        assert!(mount.read_only);
+
+        let mut startup_spec = ContainerSpec {
+            cmd: Some(with_startup_commands(
+                vec!["jouzu".into(), "acp".into()],
+                &["echo hi".into()],
+            )),
+            ..Default::default()
+        };
+        let scoped = configure_jouzu_mcp_bridge(
+            data_dir.path(),
+            "jouzu-agent",
+            Some("conv-1"),
+            &servers,
+            &mut startup_spec,
+        )
+        .unwrap();
+        assert_eq!(scoped.process_environment.len(), 1);
+        assert!(scoped.process_environment[0]
+            .starts_with("XPRESSCLAW_JOUZU_MCP_CONFIG=/run/xpressclaw/jouzu-mcp/processes/"));
+        let wrapped = startup_spec.cmd.unwrap();
+        assert_eq!(&wrapped[4..], [JOUZU_MCP_WRAPPER, "acp"]);
+
+        remove_agent_runtime_state(data_dir.path(), "jouzu-agent").unwrap();
+        assert!(!jouzu_mcp_config_dir(data_dir.path(), "jouzu-agent").exists());
+    }
+
+    #[test]
+    fn apply_jouzu_defaults_sets_non_interactive_flags_unless_overridden() {
+        let mut env = Vec::new();
+        apply_jouzu_defaults("jouzu", &NativeRunnerConfig::default(), &mut env);
+        assert!(env.contains(&"JOUZU_NO_UPDATE=1".to_string()));
+        assert!(env.contains(&"JOUZU_NO_PI_IMPORT=1".to_string()));
+
+        let mut custom = NativeRunnerConfig::default();
+        custom
+            .environment
+            .insert("JOUZU_NO_UPDATE".into(), "0".into());
+        let mut overridden = Vec::new();
+        apply_jouzu_defaults("jouzu", &custom, &mut overridden);
+        assert!(!overridden
+            .iter()
+            .any(|entry| entry.starts_with("JOUZU_NO_UPDATE=")));
+        assert!(overridden.contains(&"JOUZU_NO_PI_IMPORT=1".to_string()));
     }
 
     #[tokio::test]
