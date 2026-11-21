@@ -1,0 +1,5 @@
+branch: fix/worktree-changed-files (PR #297 review round 3)
+codex P2: FilesTab only loaded Git status in initialize(); applyRoute() on a reused, mounted tab kept the old task scope.
+fix: track gitTask (scope of the current snapshot); applyRoute refreshes status when requested.task differs, before openFile (deleted-file detection relies on changeByPath). refreshGit(task = gitTask) ignores stale responses if the scope changed meanwhile.
+test evidence: first attempts (goBack at 1024px; second click at 1800px) passed WITHOUT the fix — WorkspacePane renders only the active tab inside {#key activeTab.id}, so tab switches remount FilesTab, and openPathInSplit creates a new pane whenever it can. Real reuse only happens when openPathInSplit falls back to openPath (canCreatePane false) and the agent tab is the active tab of another pane: 2200x1000, split to 4 panes, open src/main.ts from pane 1 (becomes Files), then open the worktree file from the last pane's task-details dialog. That test fails without the fix ('3 changed' never appears) and passes with it.
+validation: npm run check 0 errors; 15 related chromium e2e tests pass.
