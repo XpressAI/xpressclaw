@@ -399,6 +399,8 @@ async function mockApi(
 		/** Files the task edited in a linked worktree, returned only for task-scoped status. */
 		taskWorktreeFiles?: boolean;
 		gitStatusTaskIds?: (string | null)[];
+		/** Holds task-scoped Git status responses while `gate` is pending. */
+		taskGitStatusGate?: { gate?: Promise<void> };
 		conversations?: Record<string, unknown>[];
 		conversationMessages?: Record<string, unknown>[];
 		conversationTurns?: Record<string, unknown>[];
@@ -1115,6 +1117,7 @@ async function mockApi(
 		} else if (path === `/api/workspaces/${agentId}/git/status`) {
 			const statusTaskId = url.searchParams.get('task_id');
 			options.gitStatusTaskIds?.push(statusTaskId);
+			if (statusTaskId) await options.taskGitStatusGate?.gate;
 			const taskWorktree = options.taskWorktreeFiles && statusTaskId === taskId;
 			response = {
 				repository: true,
@@ -4558,8 +4561,9 @@ test('task changed files use normal navigation when the workspace is too narrow 
 
 test('a reused Files tab refreshes Git status for a newly linked task', async ({ page }) => {
 	const gitStatusTaskIds: (string | null)[] = [];
+	const taskGitStatusGate: { gate?: Promise<void> } = {};
 	await page.setViewportSize({ width: 2200, height: 1000 });
-	await mockApi(page, { taskWorktreeFiles: true, gitStatusTaskIds });
+	await mockApi(page, { taskWorktreeFiles: true, gitStatusTaskIds, taskGitStatusGate });
 	await page.goto(`/tasks/${taskId}`);
 	for (let paneCount = 2; paneCount <= 4; paneCount += 1) {
 		await page.getByRole('button', { name: 'Split active tab right' }).last().click();
@@ -4582,6 +4586,28 @@ test('a reused Files tab refreshes Git status for a newly linked task', async ({
 	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&task=${taskId}&path=.worktrees%2Fjump-arrows%2Fsrc%2FJumpArrows.svelte&tree=collapsed`);
 	await expect(panes).toHaveCount(4);
 	await expect(filesPane.getByText('feature/workspace-browser · 3 changed')).toBeVisible();
+
+	// An unscoped link clears the task scope again.
+	const openFromLastPane = async (name: string) => {
+		await panes.last().getByRole('button', { name: 'Show task details' }).click();
+		await details.getByRole('link', { name }).focus();
+		await page.keyboard.press('Enter');
+	};
+	await openFromLastPane('src/main.ts');
+	await expect(filesPane.getByText('feature/workspace-browser · 2 changed')).toBeVisible();
+	expect(gitStatusTaskIds.at(-1)).toBeNull();
+
+	// A slow scoped status load must not reopen its file after a newer link.
+	let releaseStatus!: () => void;
+	taskGitStatusGate.gate = new Promise<void>((resolve) => { releaseStatus = resolve; });
+	await openFromLastPane('.worktrees/jump-arrows/src/JumpArrows.svelte');
+	await expect.poll(() => gitStatusTaskIds.at(-1)).toBe(taskId);
+	await openFromLastPane('README.md');
+	await expect(filesPane.locator('span[title="README.md"]')).toBeVisible();
+	releaseStatus();
+	await page.waitForTimeout(500);
+	await expect(filesPane.locator('span[title="README.md"]')).toBeVisible();
+	await expect(page).toHaveURL(/path=README\.md/);
 });
 
 test('task changed-file modified clicks retain normal link behavior', async ({ page }) => {

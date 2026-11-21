@@ -79,7 +79,11 @@
 		showTree = requested.showTree;
 		// A reused tab can receive a link scoped to another task; its worktree
 		// changes must be listed before opening (deleted files need them).
-		if (requested.task !== gitTask) await refreshGit(requested.task);
+		if (requested.task !== gitTask) {
+			await loadGit(requested.task);
+			// A newer navigation may have started while status loaded.
+			if (route !== requestedRoute) return;
+		}
 		if (requested.path === selectedPath) {
 			fileOpenSequence += 1;
 			loadingFile = false;
@@ -229,7 +233,13 @@
 		}
 	}
 
-	async function refreshGit(task = gitTask) {
+	/** Reload status for the current task scope. */
+	async function refreshGit() {
+		await loadGit(gitTask);
+	}
+
+	/** Load status for `task`, or the unscoped workspace when it is undefined. */
+	async function loadGit(task: string | undefined) {
 		gitTask = task;
 		const next = await workspaces.gitStatus(agentId, undefined, task).catch(() => git);
 		if (gitTask === task) git = next;
