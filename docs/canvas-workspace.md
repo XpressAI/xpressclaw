@@ -20,8 +20,10 @@ From any Project, Agent, Task, or Conversation window's `+` menu (or the top **A
 - **Images**: Read-only preview of workspace images (served via `GET /api/workspaces/{agent_id}/raw` with capability-safe workspace checks, `X-Content-Type-Options: nosniff`, and `Content-Security-Policy: default-src 'none'; sandbox`) or direct attachment/image URLs with zoom and transparency-grid controls.
 - **Web Apps**: Embed live previews from:
   - an Agent's exposed `container_to_host` port forwards (including quick inline port exposure),
-  - workspace `.html` files rendered in a sandboxed Blob iframe (with a quick **Edit** button to open a connected Code Editor), or
+  - workspace `.html` files rendered in a sandboxed Blob iframe (with a quick **Edit** button to open a connected Code Editor),
+  - HTML task/conversation attachments rendered in a sandboxed Blob iframe, or
   - local/HTTPS preview URLs (control-plane API endpoints are blocked and same-origin URLs never combine `allow-same-origin` with `allow-scripts`).
+- **Inline link previews from Task & Conversation windows**: Clicking a file link, HTML/image attachment, or web URL inside a Task, Conversation, or Agent window opens a contextual popover offering **Preview in Canvas Image Viewer**, **Preview in Canvas App**, **Open in Canvas Editor** (for workspace files), or the default **Open / Download** action. Spawned preview windows tether directly to the window you clicked from. Hold `Ctrl`/`⌘` while clicking to bypass the popover and open/download directly.
 
 ## Navigation controls
 
