@@ -4614,6 +4614,12 @@ test('a reused Files tab refreshes Git status for a newly linked task', async ({
 	await page.waitForTimeout(500);
 	await expect(filesPane.locator('span[title="README.md"]')).toBeVisible();
 	await expect(page).toHaveURL(/path=README\.md/);
+	// The superseded task snapshot must not replace the unscoped one, and
+	// Refresh keeps the route's scope.
+	await expect(filesPane.getByText('feature/workspace-browser · 2 changed')).toBeVisible();
+	await filesPane.getByRole('button', { name: 'Refresh', exact: true }).click();
+	await expect.poll(() => gitStatusTaskIds.at(-1)).toBeNull();
+	await expect(filesPane.getByText('feature/workspace-browser · 2 changed')).toBeVisible();
 
 	// A second link for the scope still loading waits for that snapshot, so
 	// a deleted worktree file is recognised instead of rejected.

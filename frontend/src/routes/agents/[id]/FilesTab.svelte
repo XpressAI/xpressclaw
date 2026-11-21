@@ -15,6 +15,8 @@
 	let gitTask: string | undefined;
 	let loadedGitTask: string | undefined;
 	let gitLoad: Promise<void> | null = null;
+	// Only the latest status request may replace the snapshot.
+	let gitGeneration = 0;
 	let directories = $state<Record<string, WorkspaceEntry[]>>({});
 	let expanded = $state<string[]>(['']);
 	let selectedPath = $state('');
@@ -82,7 +84,15 @@
 		showTree = requested.showTree;
 		// A reused tab can receive a link scoped to another task; its worktree
 		// changes must be listed before opening (deleted files need them).
-		if (requested.task !== loadedGitTask) {
+		if (requested.task === loadedGitTask) {
+			// The snapshot already matches; supersede any load for another scope
+			// so its late response is discarded and Refresh keeps this scope.
+			if (gitTask !== requested.task) {
+				gitTask = requested.task;
+				gitGeneration += 1;
+				gitLoad = null;
+			}
+		} else {
 			// Another link for the scope already loading waits for that request.
 			await (requested.task === gitTask && gitLoad ? gitLoad : loadGit(requested.task));
 			// A newer navigation may have started while status loaded.
@@ -246,9 +256,12 @@
 	/** Load status for `task`, or the unscoped workspace when it is undefined. */
 	async function loadGit(task: string | undefined) {
 		gitTask = task;
+		const generation = ++gitGeneration;
 		const load = (async () => {
-			const next = await workspaces.gitStatus(agentId, undefined, task).catch(() => git);
-			if (gitTask !== task) return;
+			const next = await workspaces.gitStatus(agentId, undefined, task).catch(() => null);
+			// A failed load keeps the previous snapshot and its scope, so the
+			// next navigation for this scope retries.
+			if (generation !== gitGeneration || !next) return;
 			git = next;
 			loadedGitTask = task;
 		})();
