@@ -24,9 +24,10 @@ use uuid::Uuid;
 
 use xpressclaw_core::db::Database;
 use xpressclaw_core::docker::manager::DockerManager;
+use xpressclaw_core::external_tools::path_for_external_tool;
 use xpressclaw_core::repositories::{
-    workspace_worktree, AgentRepositoryManager, RepositoryInspection, RepositorySelectionState,
-    WorkspaceWorktree,
+    runner_path_to_host, workspace_worktree, AgentRepositoryManager, RepositoryInspection,
+    RepositorySelectionState, WorkspaceWorktree,
 };
 use xpressclaw_core::sessions::SessionManager;
 use xpressclaw_core::workers::{github, native};
@@ -940,8 +941,11 @@ impl GitLocation {
         let Some(git_dir) = &self.git_dir else {
             return git_output(&self.work_tree, arguments).await;
         };
+        // Canonical paths may carry Windows verbatim prefixes Git rejects.
+        let git_dir = path_for_external_tool(git_dir);
+        let work_tree = path_for_external_tool(&self.work_tree);
         let git_dir = git_dir.to_string_lossy();
-        let work_tree = self.work_tree.to_string_lossy();
+        let work_tree = work_tree.to_string_lossy();
         let mut explicit = vec![
             "--git-dir",
             git_dir.as_ref(),
@@ -1075,13 +1079,13 @@ fn tool_call_paths(payload: &Value) -> Vec<String> {
     paths
 }
 
-/// Map a runner-reported absolute path to the host workspace.
+/// Map a runner-reported absolute path to the host workspace. Runner paths
+/// are POSIX; host-engine runners may also report host paths directly.
 fn host_workspace_path(raw: &str, container_root: &FsPath, bootstrap: &FsPath) -> Option<PathBuf> {
-    let path = FsPath::new(raw);
-    let relative = path
-        .strip_prefix(container_root)
-        .or_else(|_| path.strip_prefix(bootstrap))
-        .ok()?;
+    if let Some(path) = runner_path_to_host(raw, container_root, bootstrap) {
+        return Some(path);
+    }
+    let relative = FsPath::new(raw).strip_prefix(bootstrap).ok()?;
     relative
         .components()
         .all(|component| matches!(component, Component::Normal(_)))
