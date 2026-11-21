@@ -535,10 +535,13 @@ test.describe('Spatial Canvas workspace', () => {
 		await firstEditor.getByRole('button', { name: 'main.ts' }).click();
 		await expect(firstEditor.locator('[data-monaco-editor] .view-lines')).toContainText('codex version');
 
-		// Edit buffer in first editor so it becomes dirty, then switch to Tabs and back to Canvas.
+		// Edit buffer in first editor so it becomes dirty, then verify Refresh workspace and Tabs switches preserve it.
 		await firstEditor.locator('[data-monaco-editor]').click();
 		await page.keyboard.type('unsaved-edit ');
 		await expect(firstEditor.getByRole('button', { name: /Save •/ })).toBeVisible();
+		await firstEditor.getByRole('button', { name: 'Refresh workspace' }).click();
+		await expect(firstEditor.getByRole('button', { name: /Save •/ })).toBeVisible();
+		await expect(firstEditor.locator('[data-monaco-editor] .view-lines')).toContainText('unsaved-edit');
 
 		await page.locator('[data-workspace-mode-toggle]').getByRole('button', { name: 'Tabs' }).click();
 		await expect(page.locator('[data-workspace-canvas]')).not.toBeVisible();

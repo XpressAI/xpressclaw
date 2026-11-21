@@ -43,6 +43,7 @@
 	let pathInput = $state('');
 	let sequence = 0;
 	let treeSequence = 0;
+	let saveSequence = 0;
 
 	let dirty = $derived(Boolean(selectedFile && editorValue !== selectedFile.content));
 	let changeByPath = $derived(new Map((git?.files ?? []).map((change) => [change.path, change])));
@@ -54,11 +55,11 @@
 			pathInput = initialPath;
 		}
 		if (activeAgentId) {
-			void loadAgentWorkspace(activeAgentId, initialPath);
+			void loadAgentWorkspace(activeAgentId, initialPath, true);
 		}
 	});
 
-	async function loadAgentWorkspace(targetAgentId: string, fileToOpen: string | null = null) {
+	async function loadAgentWorkspace(targetAgentId: string, fileToOpen: string | null = null, forceOpen = false) {
 		if (!targetAgentId) return;
 		const req = ++treeSequence;
 		loadingTree = true;
@@ -73,7 +74,7 @@
 			expanded = [''];
 			git = gitStatus;
 			if (fileToOpen) {
-				await openFile(fileToOpen, true);
+				await openFile(fileToOpen, forceOpen);
 			}
 		} catch (cause) {
 			if (req === treeSequence && activeAgentId === targetAgentId) {
@@ -168,13 +169,14 @@
 		if (!targetAgentId || !selectedFile || !dirty || saving) return;
 		const snapshot = selectedFile;
 		const content = editorValue;
-		const req = sequence;
+		const fileReq = sequence;
+		const saveReq = ++saveSequence;
 		saving = true;
 		error = '';
 		saveMessage = '';
 		try {
 			const saved = await workspaces.saveFile(targetAgentId, { ...snapshot, content });
-			if (req !== sequence || activeAgentId !== targetAgentId) return;
+			if (fileReq !== sequence || activeAgentId !== targetAgentId) return;
 			if (selectedFile?.path === snapshot.path) {
 				selectedFile = { ...selectedFile, content, revision: saved.revision, size: saved.size };
 				saveMessage = 'Saved';
@@ -182,16 +184,16 @@
 			}
 			const nextGit = await workspaces.gitStatus(targetAgentId).catch(() => git);
 			const nextDiff = await workspaces.gitDiff(targetAgentId, snapshot.path).catch(() => fileDiff);
-			if (req === sequence && activeAgentId === targetAgentId) {
+			if (fileReq === sequence && activeAgentId === targetAgentId) {
 				git = nextGit;
 				fileDiff = nextDiff;
 			}
 		} catch (cause) {
-			if (req === sequence && activeAgentId === targetAgentId) {
+			if (fileReq === sequence && activeAgentId === targetAgentId) {
 				error = cause instanceof Error ? cause.message : String(cause);
 			}
 		} finally {
-			if (req === sequence && activeAgentId === targetAgentId) {
+			if (saveReq === saveSequence) {
 				saving = false;
 			}
 		}
@@ -201,6 +203,7 @@
 		if (dirty && !window.confirm('Discard unsaved changes before switching agents?')) return;
 		sequence += 1;
 		treeSequence += 1;
+		saveSequence += 1;
 		loadingFile = false;
 		loadingTree = false;
 		saving = false;
@@ -289,7 +292,7 @@
 		{/if}
 		<button
 			type="button"
-			onclick={() => activeAgentId && void loadAgentWorkspace(activeAgentId, selectedPath || null)}
+			onclick={() => activeAgentId && void loadAgentWorkspace(activeAgentId, dirty ? null : (selectedPath || null), false)}
 			class="rounded p-1 text-muted-foreground hover:bg-accent hover:text-foreground"
 			title="Refresh workspace"
 			aria-label="Refresh workspace"
