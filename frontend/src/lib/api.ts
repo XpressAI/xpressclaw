@@ -841,6 +841,8 @@ export const workspaces = {
 		request<WorkspaceDirectory>(`/api/workspaces/${encodeURIComponent(agentId)}/tree?path=${encodeURIComponent(path)}`),
 	readFile: (agentId: string, path: string) =>
 		request<WorkspaceFile>(`/api/workspaces/${encodeURIComponent(agentId)}/file?path=${encodeURIComponent(path)}`),
+	rawUrl: (agentId: string, path: string) =>
+		`/api/workspaces/${encodeURIComponent(agentId)}/raw?path=${encodeURIComponent(path)}`,
 	saveFile: (agentId: string, file: WorkspaceFile) =>
 		request<{ path: string; revision: string; size: number }>(
 			`/api/workspaces/${encodeURIComponent(agentId)}/file`,

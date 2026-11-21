@@ -44,6 +44,8 @@
 	import SidebarAutomations from './SidebarAutomations.svelte';
 	import SidebarProjects from './SidebarProjects.svelte';
 	import WorkspacePane from './WorkspacePane.svelte';
+	import WorkspaceCanvas from '$lib/components/canvas/WorkspaceCanvas.svelte';
+	import type { WorkspaceViewMode } from '$lib/canvas';
 
 	let { children }: { children: Snippet } = $props();
 	type WorkspaceContextMenu =
@@ -56,6 +58,12 @@
 	const WORKSPACE_STORAGE_KEY = workspaceWindowId
 		? `xpressclaw.workspace.v1.${workspaceWindowId}`
 		: 'xpressclaw.workspace.v1';
+	const CANVAS_STORAGE_KEY = workspaceWindowId
+		? `xpressclaw.canvas.v1.${workspaceWindowId}`
+		: 'xpressclaw.canvas.v1';
+	const VIEW_MODE_STORAGE_KEY = workspaceWindowId
+		? `xpressclaw.workspace.mode.${workspaceWindowId}`
+		: 'xpressclaw.workspace.mode';
 	const MAX_PANES = 4;
 	const MAX_TABS = 10;
 	let recencyClock = Date.now();
@@ -67,6 +75,8 @@
 		{ id: 'initial-pane', tabs: [initialTab], activeTabId: initialTab.id, width: 1 },
 	]);
 	let focusedPaneId = $state('initial-pane');
+	let workspaceMode = $state<WorkspaceViewMode>('tabs');
+	let canvasRef = $state<{ openRoute: (route: string, preferredParentId?: string | null) => boolean }>();
 	let workspaceReady = $state(false);
 	let lastSyncedPath = '';
 	let workspaceEl = $state<HTMLDivElement>();
@@ -189,6 +199,27 @@
 		return null;
 	})());
 	let focusedProject = $derived(projectList.find((project) => project.id === activeProjectId) ?? null);
+	let canvasTasks = $derived(
+		[...new Map([...taskList, ...sidebarTaskList, ...Object.values(tabTaskLookup)].map((task) => [task.id, task])).values()]
+	);
+
+	function setWorkspaceMode(mode: WorkspaceViewMode) {
+		workspaceMode = mode;
+		try {
+			workspaceStateStorage().setItem(VIEW_MODE_STORAGE_KEY, mode);
+		} catch {}
+		if (mode === 'tabs' && currentRoute() === '/canvas') {
+			const nextTab = activeTabFor(focusedPane ?? panes[0]);
+			const target = nextTab?.path && nextTab.path !== '/canvas' ? nextTab.path : '/';
+			lastSyncedPath = target;
+			void goto(target, { replaceState: true, keepFocus: true, noScroll: true });
+		}
+	}
+
+	function openRouteInTabs(route: string) {
+		setWorkspaceMode('tabs');
+		openPath(route, true);
+	}
 
 	const utilityTabs: { kind: WorkspaceTabKind; label: string; href: string; icon: string }[] = [
 		{ kind: 'projects', label: 'Projects', href: '/projects', icon: 'M3.75 6.75v10.5A2.25 2.25 0 006 19.5h12a2.25 2.25 0 002.25-2.25V8.25A2.25 2.25 0 0018 6h-5.25L10.5 3.75H6A2.25 2.25 0 003.75 6z' },
@@ -200,6 +231,19 @@
 	beforeNavigate((navigation) => {
 		if (!workspaceReady || navigation.type !== 'link' || navigation.willUnload || !navigation.to?.url) return;
 		const route = routeFromUrl(navigation.to.url);
+		if (route === '/canvas') {
+			setWorkspaceMode('canvas');
+			lastSyncedPath = route;
+			return;
+		}
+		if (workspaceMode === 'canvas' && workspacePath(route)) {
+			if (canvasRef?.openRoute(route)) {
+				navigation.cancel();
+				closeMobileMenu();
+				return;
+			}
+			setWorkspaceMode('tabs');
+		}
 		if (!workspacePath(route) || route === lastSyncedPath) return;
 		lastSyncedPath = route;
 		openPath(route, false);
@@ -208,6 +252,18 @@
 	$effect(() => {
 		const route = currentRoute();
 		if (!workspaceReady || !workspacePath(route) || route === lastSyncedPath) return;
+		if (route === '/canvas') {
+			setWorkspaceMode('canvas');
+			lastSyncedPath = route;
+			return;
+		}
+		if (workspaceMode === 'canvas') {
+			if (canvasRef?.openRoute(route)) {
+				lastSyncedPath = route;
+				return;
+			}
+			setWorkspaceMode('tabs');
+		}
 		lastSyncedPath = route;
 		openPath(route, false);
 	});
@@ -907,7 +963,9 @@
 	}
 
 	function handleOpenSplit(event: Event) {
-		openPathInSplit((event as CustomEvent<WorkspaceOpenSplitDetail>).detail.path);
+		const path = (event as CustomEvent<WorkspaceOpenSplitDetail>).detail.path;
+		if (workspaceMode === 'canvas' && canvasRef?.openRoute(path)) return;
+		openPathInSplit(path);
 	}
 
 	function startResize(index: number, event: PointerEvent) {
@@ -1311,12 +1369,18 @@
 				restored = true;
 			}
 			sidebarCollapsed = localStorage.getItem('xpressclaw.sidebar.collapsed') === 'true';
+			const savedMode = workspaceStateStorage().getItem(VIEW_MODE_STORAGE_KEY);
+			if (savedMode === 'canvas' || currentRoute() === '/canvas') {
+				workspaceMode = 'canvas';
+			}
 		} catch {}
 
 		workspaceReady = true;
 		persistWorkspace();
 		const route = currentRoute();
-		if (restored && route === '/') {
+		if (route === '/canvas') {
+			lastSyncedPath = route;
+		} else if (restored && route === '/') {
 			const restoredTab = activeTabFor(panes.find((pane) => pane.id === focusedPaneId) ?? panes[0]);
 			lastSyncedPath = restoredTab.path;
 			if (restoredTab.path !== route) goto(restoredTab.path, { replaceState: true, noScroll: true });
@@ -1383,7 +1447,17 @@
 
 		{#if sidebarCollapsed}
 			<div class="flex min-h-0 flex-1 flex-col items-center gap-1 overflow-y-auto px-1.5 py-2">
-				<a href="/" class="mb-2 flex h-9 w-9 items-center justify-center rounded-lg bg-primary text-lg text-primary-foreground" title="New work">+</a>
+				<a href="/" class="mb-1 flex h-9 w-9 items-center justify-center rounded-lg bg-primary text-lg text-primary-foreground" title="New work">+</a>
+				<button
+					type="button"
+					onclick={() => setWorkspaceMode(workspaceMode === 'canvas' ? 'tabs' : 'canvas')}
+					data-workspace-mode-compact
+					aria-label={workspaceMode === 'canvas' ? 'Switch to Tabs view' : 'Switch to Canvas view'}
+					title={workspaceMode === 'canvas' ? 'Canvas view (click for Tabs)' : 'Tabs view (click for Canvas)'}
+					class="mb-2 flex h-8 w-9 items-center justify-center rounded-lg border text-xs transition-colors {workspaceMode === 'canvas' ? 'border-primary/40 bg-primary/15 text-primary' : 'border-border/70 text-muted-foreground hover:bg-accent hover:text-foreground'}"
+				>
+					<svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="7" height="6" rx="1.5" /><rect x="14" y="4" width="7" height="6" rx="1.5" /><rect x="14" y="14" width="7" height="6" rx="1.5" /><path stroke-linecap="round" d="M10 7h4M10 7c2 0 2 10 4 10" /></svg>
+				</button>
 				{#if sidebarCategory === 'tasks'}
 					<SidebarTasks {projectList} {conversationList} {agentList} taskList={sidebarTaskList} activeTaskId={focusedTaskId} compact />
 				{:else if sidebarCategory === 'automations'}
@@ -1396,9 +1470,28 @@
 			</div>
 		{:else}
 			<div class="min-h-0 flex-1 overflow-y-auto px-2 pb-3">
-				<a href="/" class="mb-3 flex items-center justify-center gap-2 rounded-lg bg-primary px-3 py-2 text-xs font-medium text-primary-foreground hover:bg-primary/90">
+				<a href="/" class="mb-2 flex items-center justify-center gap-2 rounded-lg bg-primary px-3 py-2 text-xs font-medium text-primary-foreground hover:bg-primary/90">
 					<span class="text-base leading-none">+</span><span>New work</span>
 				</a>
+
+				<div data-workspace-mode-toggle role="group" aria-label="Workspace view mode" class="mb-3 grid grid-cols-2 rounded-lg border border-border/70 bg-[hsl(var(--field))] p-0.5 text-[11px]">
+					<button
+						type="button"
+						onclick={() => setWorkspaceMode('tabs')}
+						aria-pressed={workspaceMode === 'tabs'}
+						class="rounded-md px-2 py-1 font-medium transition-all {workspaceMode === 'tabs' ? 'bg-card text-foreground shadow-[var(--shadow-control)]' : 'text-muted-foreground hover:text-foreground'}"
+					>
+						Tabs
+					</button>
+					<button
+						type="button"
+						onclick={() => setWorkspaceMode('canvas')}
+						aria-pressed={workspaceMode === 'canvas'}
+						class="rounded-md px-2 py-1 font-medium transition-all {workspaceMode === 'canvas' ? 'bg-card text-foreground shadow-[var(--shadow-control)]' : 'text-muted-foreground hover:text-foreground'}"
+					>
+						Canvas
+					</button>
+				</div>
 
 				{#if sidebarCategory === 'tasks'}
 					<SidebarTasks {projectList} {conversationList} {agentList} taskList={sidebarTaskList} activeTaskId={focusedTaskId} />
@@ -1449,17 +1542,41 @@
 			</button>
 			<a href="/dashboard" aria-label="Open Control center" title="Control center" class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"><img src="/icon-32.png" alt="" class="h-5 w-5 rounded" /></a>
 			<div class="min-w-0 flex-1">
-				<div class="truncate text-sm font-semibold">{focusedTab?.title || focusedProject?.name || 'xpressclaw'}</div>
-				{#if focusedAgent}
+				<div class="truncate text-sm font-semibold">{workspaceMode === 'canvas' ? 'Canvas' : (focusedTab?.title || focusedProject?.name || 'xpressclaw')}</div>
+				{#if focusedAgent && workspaceMode === 'tabs'}
 					<div class="flex min-w-0 items-center gap-1.5 text-[10px] text-muted-foreground" title={agentRuntimeTitle(focusedAgent)}><span class="h-1.5 w-1.5 shrink-0 rounded-full {statusDot(projectStatus(focusedAgent))}"></span><span class="truncate">{agentRuntimeSummary(focusedAgent)}</span></div>
-				{:else if focusedProject}
+				{:else if focusedProject && workspaceMode === 'tabs'}
 					<div class="truncate text-[10px] text-muted-foreground">{focusedProject.conversation_count} conversations · {focusedProject.agent_ids.length} Agents</div>
 				{/if}
 			</div>
+			<button
+				type="button"
+				onclick={() => setWorkspaceMode(workspaceMode === 'canvas' ? 'tabs' : 'canvas')}
+				aria-label={workspaceMode === 'canvas' ? 'Switch to Tabs view' : 'Switch to Canvas view'}
+				title={workspaceMode === 'canvas' ? 'Switch to Tabs view' : 'Switch to Canvas view'}
+				class="flex h-10 shrink-0 items-center justify-center rounded-lg border px-2.5 text-xs font-medium {workspaceMode === 'canvas' ? 'border-primary/40 bg-primary/15 text-primary' : 'border-border text-muted-foreground hover:bg-accent'}"
+			>
+				{workspaceMode === 'canvas' ? 'Tabs' : 'Canvas'}
+			</button>
 			<a href="/" aria-label="New work" class="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg bg-primary text-lg text-primary-foreground">+</a>
 		</div>
 
 		{#if workspacePath($page.url.pathname)}
+			{#if workspaceMode === 'canvas'}
+				<div class="flex min-h-0 flex-1 overflow-hidden">
+					<WorkspaceCanvas
+						bind:this={canvasRef}
+						storageKey={CANVAS_STORAGE_KEY}
+						storage={workspaceStateStorage()}
+						projects={projectList}
+						agents={agentList}
+						conversations={conversationList}
+						tasks={canvasTasks}
+						onOpenInTabs={openRouteInTabs}
+					/>
+				</div>
+			{/if}
+
 			<!-- The compact strip gets its own provider: it renders the same tab ids
 			     as the pane strips, and ids only have to be unique within a provider. -->
 			<DragDropProvider sensors={tabDragSensors} onDragMove={handleTabDragMove} onDragEnd={handleTabDragEnd}>
@@ -1468,7 +1585,7 @@
 					bind:element={compactTabStrip}
 					role="group"
 					aria-label="Open tabs"
-					style={`display:${showGlobalTabs ? 'flex' : 'none'};${layout.regions[0] ? `max-width:${layout.regions[0].width}px;margin-left:${layout.regions[0].x}px` : ''}`}
+					style={`display:${workspaceMode === 'tabs' && showGlobalTabs ? 'flex' : 'none'};${layout.regions[0] ? `max-width:${layout.regions[0].width}px;margin-left:${layout.regions[0].x}px` : ''}`}
 					class="workspace-mobile-tabs h-9 shrink-0 items-stretch overflow-x-auto border-b border-border bg-[hsl(var(--field))] scrollbar-hide"
 				>
 					{#each openTabs as item (item.tab.id)}
@@ -1491,7 +1608,7 @@
 				</TabStripDropZone>
 			</DragDropProvider>
 
-			<div bind:this={workspaceEl} data-workspace-layout={layout.regions.length ? layout.axis : 'flow'} class="relative flex min-h-0 flex-1 overflow-hidden">
+			<div bind:this={workspaceEl} data-workspace-layout={layout.regions.length ? layout.axis : 'flow'} style:display={workspaceMode === 'tabs' ? 'flex' : 'none'} class="relative min-h-0 flex-1 overflow-hidden">
 				<!-- One provider spans every pane so a tab can be dragged across them. -->
 				<DragDropProvider sensors={tabDragSensors} onDragMove={handleTabDragMove} onDragEnd={handleTabDragEnd}>
 				{#each panes as pane, index (pane.id)}
@@ -1500,7 +1617,7 @@
 						style={`display:${index >= paneStart && index < paneEnd ? 'flex' : 'none'};${region ? regionStyle(region) : `flex:${pane.width} 1 0%;min-width:${paneEnd - paneStart > 1 ? 280 : 0}px`}`}>
 						<WorkspacePane
 							{pane}
-							visible={index >= paneStart && index < paneEnd}
+							visible={workspaceMode === 'tabs' && index >= paneStart && index < paneEnd}
 							focused={pane.id === focusedPaneId}
 							compact={paneEnd - paneStart > 1}
 							showTabs={showPaneTabs}
