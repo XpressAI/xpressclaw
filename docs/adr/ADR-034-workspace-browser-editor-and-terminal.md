@@ -39,6 +39,20 @@ into the Agent's Files view. The UI deliberately calls these **workspace
 changes**, not task changes, because Git cannot prove which task produced an
 uncommitted edit.
 
+Agents often isolate work in linked worktrees (for example `.worktrees/<name>`)
+beneath the active checkout, whose edits never appear in the primary
+checkout's status. Task details therefore request status with the task ID. The
+server collects the paths that task's recorded ACP tool calls touched (edit
+locations, diff targets, and command working directories), maps runner paths
+such as `/workspace/...` back to the host workspace, and adds the status of each
+enclosing linked worktree with paths prefixed relative to the active checkout.
+Each worktree must pass the same metadata containment checks as an active
+repository; Git metadata recorded with runner paths is translated before host
+Git runs with explicit `--git-dir` and `--work-tree`. Diffs for paths inside a
+linked worktree are read from that worktree. When untracked files exceed the
+status output limit, the listing collapses untracked directories instead of
+failing.
+
 The configured workspace remains the outer writable capability boundary. An
 active repository (ADR-041) may narrow Files and Git operations to a canonical
 checkout beneath it. When repository discovery is ambiguous or explicitly

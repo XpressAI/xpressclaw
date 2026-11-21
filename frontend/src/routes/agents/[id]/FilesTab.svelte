@@ -49,13 +49,14 @@
 		void applyRoute(requestedRoute);
 	});
 
-	function routeState(value: string): { path: string; showTree: boolean; terminal: string | null } {
+	function routeState(value: string): { path: string; showTree: boolean; terminal: string | null; task: string | undefined } {
 		const search = value.includes('?') ? value.slice(value.indexOf('?')) : window.location.search;
 		const params = new URLSearchParams(search);
 		return {
 			path: params.get('path') ?? '',
 			showTree: params.get('tree') !== 'collapsed',
 			terminal: params.get('terminal'),
+			task: params.get('task') || undefined,
 		};
 	}
 
@@ -112,7 +113,7 @@
 			const [workspaceStatus, rootDirectory, gitStatus] = await Promise.all([
 				workspaces.status(agentId),
 				workspaces.tree(agentId),
-				workspaces.gitStatus(agentId).catch(() => null),
+				workspaces.gitStatus(agentId, undefined, routeState(route).task).catch(() => null),
 			]);
 			status = workspaceStatus;
 			directories = { '': rootDirectory.entries };
@@ -224,7 +225,7 @@
 	}
 
 	async function refreshGit() {
-		git = await workspaces.gitStatus(agentId).catch(() => git);
+		git = await workspaces.gitStatus(agentId, undefined, routeState(route).task).catch(() => git);
 	}
 
 	async function toggleTree() {

@@ -1066,6 +1066,82 @@ pub(crate) fn inspect_repository(
     })
 }
 
+/// A linked Git worktree inside an Agent workspace. Its metadata passed the
+/// same containment checks as an active repository, so host Git may run in it
+/// with these explicit paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceWorktree {
+    pub root: PathBuf,
+    pub git_dir: PathBuf,
+}
+
+/// Validate the linked worktree checked out at `directory`. Agents usually
+/// create worktrees inside their runner, so the `.git` file and `commondir`
+/// may name the runner's view of the workspace (`container_root`) rather than
+/// the host path; those paths are translated back into `bootstrap_root`.
+pub fn workspace_worktree(
+    bootstrap_root: &Path,
+    container_root: &Path,
+    directory: &Path,
+) -> Option<WorkspaceWorktree> {
+    let directory = directory.canonicalize().ok()?;
+    if directory == bootstrap_root || !directory.starts_with(bootstrap_root) {
+        return None;
+    }
+    let pointer = read_small_regular_file(&directory.join(".git"))?;
+    let git_dir = pointer.lines().next()?.strip_prefix("gitdir:")?.trim();
+    let git_dir = workspace_git_path(bootstrap_root, container_root, &directory, git_dir)?;
+    let common_dir = read_small_regular_file(&git_dir.join("commondir"))?;
+    let common_dir =
+        workspace_git_path(bootstrap_root, container_root, &git_dir, common_dir.trim())?;
+    if !git_dir.starts_with(&common_dir)
+        || !has_regular_git_metadata_tree(bootstrap_root, &git_dir, &common_dir)
+        || !has_self_contained_git_config(bootstrap_root, &git_dir, &common_dir)
+        || !has_self_contained_object_store(bootstrap_root, &common_dir)
+    {
+        return None;
+    }
+    Some(WorkspaceWorktree {
+        root: directory,
+        git_dir,
+    })
+}
+
+fn read_small_regular_file(path: &Path) -> Option<String> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > 4096 {
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
+}
+
+/// Resolve a Git metadata path recorded by either host or runner Git and keep
+/// it inside the approved workspace.
+fn workspace_git_path(
+    bootstrap_root: &Path,
+    container_root: &Path,
+    base: &Path,
+    raw: &str,
+) -> Option<PathBuf> {
+    let raw = Path::new(raw);
+    let path = if !raw.is_absolute() {
+        base.join(raw)
+    } else if container_root != bootstrap_root && raw.starts_with(container_root) {
+        let relative = raw.strip_prefix(container_root).ok()?;
+        if relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return None;
+        }
+        bootstrap_root.join(relative)
+    } else {
+        raw.to_path_buf()
+    };
+    let path = path.canonicalize().ok()?;
+    path.starts_with(bootstrap_root).then_some(path)
+}
+
 fn git_origin(repository: &Path) -> Option<String> {
     let mut command = Command::new("git");
     command
@@ -1506,6 +1582,109 @@ mod tests {
             .select("agent", workspace.path(), "feature")
             .unwrap();
         assert_eq!(selected.inspection.active_relative_path(), Some("feature"));
+    }
+
+    fn committed_repository_with_worktree(bootstrap: &Path) -> PathBuf {
+        repository(bootstrap, None);
+        git(
+            bootstrap,
+            &[
+                "-c",
+                "user.name=XpressClaw Tests",
+                "-c",
+                "user.email=tests@xpressclaw.invalid",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "initial",
+            ],
+        );
+        let linked = bootstrap.join(".worktrees").join("feature");
+        git(
+            bootstrap,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                linked.to_str().unwrap(),
+            ],
+        );
+        linked
+    }
+
+    #[test]
+    fn workspace_worktree_validates_host_recorded_worktrees() {
+        let workspace = tempfile::tempdir().unwrap();
+        let bootstrap = workspace.path().canonicalize().unwrap();
+        let linked = committed_repository_with_worktree(&bootstrap);
+
+        let worktree = workspace_worktree(&bootstrap, Path::new("/workspace"), &linked).unwrap();
+        assert_eq!(worktree.root, linked.canonicalize().unwrap());
+        assert_eq!(
+            worktree.git_dir,
+            bootstrap
+                .join(".git/worktrees/feature")
+                .canonicalize()
+                .unwrap()
+        );
+        assert_eq!(
+            workspace_worktree(&bootstrap, Path::new("/workspace"), &bootstrap),
+            None
+        );
+    }
+
+    #[test]
+    fn workspace_worktree_translates_runner_recorded_paths() {
+        let workspace = tempfile::tempdir().unwrap();
+        let bootstrap = workspace.path().canonicalize().unwrap();
+        let linked = committed_repository_with_worktree(&bootstrap);
+        // Runner Git records its own view of the workspace mount.
+        std::fs::write(
+            linked.join(".git"),
+            "gitdir: /workspace/.git/worktrees/feature\n",
+        )
+        .unwrap();
+        std::fs::write(
+            bootstrap.join(".git/worktrees/feature/commondir"),
+            "/workspace/.git\n",
+        )
+        .unwrap();
+
+        let worktree = workspace_worktree(&bootstrap, Path::new("/workspace"), &linked).unwrap();
+        assert_eq!(
+            worktree.git_dir,
+            bootstrap
+                .join(".git/worktrees/feature")
+                .canonicalize()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn workspace_worktree_rejects_metadata_outside_the_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let bootstrap = workspace.path().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_root = outside.path().canonicalize().unwrap();
+        let foreign = committed_repository_with_worktree(&outside_root);
+        let decoy = bootstrap.join("decoy");
+        std::fs::create_dir_all(&decoy).unwrap();
+        std::fs::copy(foreign.join(".git"), decoy.join(".git")).unwrap();
+
+        assert_eq!(
+            workspace_worktree(&bootstrap, Path::new("/workspace"), &decoy),
+            None
+        );
+        std::fs::write(
+            decoy.join(".git"),
+            "gitdir: /workspace/../escape/.git/worktrees/feature\n",
+        )
+        .unwrap();
+        assert_eq!(
+            workspace_worktree(&bootstrap, Path::new("/workspace"), &decoy),
+            None
+        );
     }
 
     #[test]

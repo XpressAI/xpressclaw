@@ -825,6 +825,8 @@ export interface WorkspaceGitStatus {
 	repository: boolean;
 	branch: string | null;
 	files: GitChange[];
+	/** Linked worktrees included for a task, relative to the active repository. */
+	worktrees?: { path: string; branch: string | null }[];
 	repository_status: WorkspaceRepositoryStatus;
 }
 
@@ -855,8 +857,9 @@ export const workspaces = {
 				}),
 			}
 		),
-	gitStatus: (agentId: string, signal?: AbortSignal) =>
-		request<WorkspaceGitStatus>(`/api/workspaces/${encodeURIComponent(agentId)}/git/status`, { signal }),
+	/** With a task, also lists the linked worktrees that task edited. */
+	gitStatus: (agentId: string, signal?: AbortSignal, taskId?: string) =>
+		request<WorkspaceGitStatus>(`/api/workspaces/${encodeURIComponent(agentId)}/git/status${taskId ? `?task_id=${encodeURIComponent(taskId)}` : ''}`, { signal }),
 	gitDiff: (agentId: string, path: string) =>
 		request<WorkspaceGitDiff>(`/api/workspaces/${encodeURIComponent(agentId)}/git/diff?path=${encodeURIComponent(path)}`),
 	repository: (agentId: string) =>

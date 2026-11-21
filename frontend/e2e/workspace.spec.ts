@@ -396,6 +396,9 @@ async function mockApi(
 		repositoryStatus?: Record<string, unknown>;
 		repositorySelections?: (string | null)[];
 		includeDeletedWorkspaceFile?: boolean;
+		/** Files the task edited in a linked worktree, returned only for task-scoped status. */
+		taskWorktreeFiles?: boolean;
+		gitStatusTaskIds?: (string | null)[];
 		conversations?: Record<string, unknown>[];
 		conversationMessages?: Record<string, unknown>[];
 		conversationTurns?: Record<string, unknown>[];
@@ -1110,11 +1113,18 @@ async function mockApi(
 				};
 			}
 		} else if (path === `/api/workspaces/${agentId}/git/status`) {
+			const statusTaskId = url.searchParams.get('task_id');
+			options.gitStatusTaskIds?.push(statusTaskId);
+			const taskWorktree = options.taskWorktreeFiles && statusTaskId === taskId;
 			response = {
 				repository: true,
 				branch: 'feature/workspace-browser',
 				repository_status: repositoryStatus,
+				worktrees: taskWorktree ? [{ path: '.worktrees/jump-arrows', branch: 'fix/jump-arrows' }] : [],
 				files: [
+					...(taskWorktree
+						? [{ path: '.worktrees/jump-arrows/src/JumpArrows.svelte', original_path: null, status: ' M', index_status: ' ', worktree_status: 'M' }]
+						: []),
 					{ path: 'src/main.ts', original_path: null, status: ' M', index_status: ' ', worktree_status: 'M' },
 					{ path: 'README.md', original_path: null, status: '??', index_status: '?', worktree_status: '?' },
 					...(options.includeDeletedWorkspaceFile
@@ -4460,6 +4470,28 @@ test('deleted workspace changes remain available as diff-only selections', async
 	await expect(page.getByRole('button', { name: 'Code' })).toBeDisabled();
 	await expect(page.locator('[data-monaco-editor]')).toContainText('deleted file mode', { timeout: 20_000 });
 	await expect(page.getByText('workspace path was not found')).toBeHidden();
+});
+
+test('task changed files include the worktrees the task edited', async ({ page }) => {
+	const gitStatusTaskIds: (string | null)[] = [];
+	await mockApi(page, { taskWorktreeFiles: true, gitStatusTaskIds });
+	await page.goto(`/tasks/${taskId}`);
+
+	const changedFiles = page.locator('[data-task-changed-files]');
+	const worktreeFile = changedFiles.getByRole('link', { name: '.worktrees/jump-arrows/src/JumpArrows.svelte' });
+	await expect(worktreeFile).toHaveAttribute(
+		'href',
+		`/agents/${agentId}?tab=files&task=${taskId}&path=.worktrees%2Fjump-arrows%2Fsrc%2FJumpArrows.svelte`,
+	);
+	await expect(changedFiles.getByRole('link', { name: 'src/main.ts' })).toHaveAttribute(
+		'href',
+		`/agents/${agentId}?tab=files&path=src%2Fmain.ts`,
+	);
+	expect(gitStatusTaskIds).toContain(taskId);
+
+	await worktreeFile.click();
+	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&task=${taskId}&path=.worktrees%2Fjump-arrows%2Fsrc%2FJumpArrows.svelte&tree=collapsed`);
+	await expect.poll(() => gitStatusTaskIds.filter((id) => id === taskId).length).toBeGreaterThanOrEqual(2);
 });
 
 test('task changed files open beside the task with the file tree collapsed', async ({ page }) => {
@@ -8195,7 +8227,7 @@ test('task messages and completion keep updating while Git status is stalled', a
     let releaseGit!: () => void;
     const gitGate = new Promise<void>(resolve => { releaseGit = resolve; });
     let gitRequests = 0;
-    await page.route(`**/api/workspaces/${agentId}/git/status`, async route => {
+    await page.route(url => url.pathname === `/api/workspaces/${agentId}/git/status`, async route => {
         gitRequests++;
         await gitGate;
         await route.fulfill({ json: { repository: true, branch: 'main', files: [] } }).catch(() => {});
@@ -8230,7 +8262,7 @@ test('stalled Git refresh times out and a later refresh recovers', async ({ page
     page.on('requestfailed', request => {
         if (new URL(request.url()).pathname.endsWith('/git/status')) failedRequests.push(request.url());
     });
-    await page.route(`**/api/workspaces/${agentId}/git/status`, async route => {
+    await page.route(url => url.pathname === `/api/workspaces/${agentId}/git/status`, async route => {
         if (++requests === 1) await gitGate;
         await route.fulfill({ json: { repository: true, branch: 'git-recovered', files: [] } }).catch(() => {});
     });
