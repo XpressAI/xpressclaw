@@ -9523,3 +9523,165 @@ for (const width of [1280, 390]) {
         await expect(dialog.getByLabel('Select worktree ongoing-feature')).toBeDisabled();
     });
 }
+
+async function openWorkflowConnections(page: Page) {
+	const definition = {
+		name: 'Connection routing',
+		flows: {
+			main: { color: '#4A90D9', steps: [
+				{ id: 'start', type: 'step', label: 'Start locally', prompt: 'Initial work.' },
+				{ id: 'gate', type: 'when', label: 'Choose a destination', switch: '@start.status', arms: [
+					{ match: 'ready', goto: 'step finish' },
+					{ match: 'retry', goto: 'step start' },
+					{ match: 'default', goto: 'flow fallback step finish' },
+				] },
+				{ id: 'retry', type: 'jump', label: 'Try again', target: 'step start' },
+				{ id: 'group', type: 'loop', label: 'Nested checks', over: '@start.items', steps: [
+					{ id: 'nested_gate', type: 'when', label: 'Nested decision', switch: '@item.ok', arms: [
+						{ match: 'true', continue: true }, { match: 'default', goto: 'step start' },
+					] },
+					{ id: 'nested_jump', type: 'jump', label: 'Leave the loop', target: 'flow fallback step start' },
+				] },
+				...Array.from({ length: 5 }, (_, i) => ({ id: `check_${i}`, type: 'step', label: `Check ${i + 1}`, prompt: 'A detailed check.' })),
+				{ id: 'finish', type: 'step', label: 'Finish locally', prompt: 'Finish the local work.' },
+				{ id: 'self', type: 'jump', label: 'Repeat this step', target: 'step self' },
+			] },
+			fallback: { color: '#ef4444', steps: [
+				{ id: 'start', type: 'step', label: 'Fallback start', prompt: 'Recover.' },
+				{ id: 'finish', type: 'step', label: 'Fallback finish', prompt: 'Finish recovery.' },
+				{ id: 'only_remote', type: 'jump', label: 'Return to main', target: 'flow main step gate' },
+			] },
+		},
+	};
+	await mockApi(page, { workflows: [{ id: 'connections', name: definition.name, description: null, yaml_content: yaml.dump(definition), enabled: true, version: 1, created_at: timestamp(0), updated_at: timestamp(0) }] });
+	await page.goto('/workflows/connections');
+	await expect(page.locator('[data-step-id="gate"]')).toBeVisible();
+	return definition;
+}
+
+async function expectConnectedWorkflowArrows(page: Page, count: number) {
+	await expect(page.locator('[data-jump-connection]')).toHaveCount(count);
+	await expect.poll(async () => page.locator('[data-workflow-content]').evaluate(content => {
+		const bounds = content.getBoundingClientRect();
+		return Array.from(content.querySelectorAll('[data-jump-connection]')).every(connection => {
+			const from = content.querySelector(`[data-step-id="${connection.getAttribute('data-from-step')}"]`)!.getBoundingClientRect();
+			const to = content.querySelector(`[data-step-id="${connection.getAttribute('data-to-step')}"]`)!.getBoundingClientRect();
+			const path = connection.querySelector('path')!;
+			const end = connection.querySelectorAll('path')[1];
+			const startPoint = path.getPointAtLength(0).matrixTransform(path.getScreenCTM()!);
+			const endPoint = end.getPointAtLength(0).matrixTransform(end.getScreenCTM()!);
+			const lineBounds = path.getBoundingClientRect();
+			return Math.abs(startPoint.x - from.right) <= 3
+				&& startPoint.y >= from.top && startPoint.y <= from.bottom
+				&& Math.abs(endPoint.x - to.right) <= 3
+				&& endPoint.y > to.top && endPoint.y < to.top + 36
+				&& lineBounds.right <= bounds.right && lineBounds.bottom <= bounds.bottom;
+		});
+	})).toBe(true);
+}
+
+test('workflow connections stay attached with separate lanes through scroll, expansion, compact mode and resize', async ({ page, browserName }) => {
+	await page.setViewportSize({ width: 1440, height: 900 });
+	await openWorkflowConnections(page);
+	await expectConnectedWorkflowArrows(page, 5);
+	const returning = page.locator('[data-jump-connection][data-to-step="start"]');
+	expect(new Set(await returning.evaluateAll(edges => edges.map(edge => edge.getAttribute('data-lane')))).size).toBe(3);
+	const scroll = page.locator('[data-workflow-scroll]');
+	await scroll.evaluate(element => element.scrollTo({ top: 600 }));
+	await expectConnectedWorkflowArrows(page, 5);
+	await page.locator('[data-step-id="gate"]').getByRole('button', { name: 'Expand condition' }).click();
+	await expectConnectedWorkflowArrows(page, 5);
+	// Chromium can construct the native HTML5 payload independently of
+	// pointer auto-scrolling between offscreen cards.
+	if (browserName === 'chromium') {
+		const transfer = await page.evaluateHandle(() => new DataTransfer());
+		const source = page.locator('[data-step-id="retry"]');
+		const destination = page.locator('[data-step-id="finish"]');
+		await source.dispatchEvent('dragstart', { dataTransfer: transfer });
+		await destination.dispatchEvent('dragover', { dataTransfer: transfer });
+		await destination.dispatchEvent('drop', { dataTransfer: transfer });
+		await source.dispatchEvent('dragend', { dataTransfer: transfer });
+		await transfer.dispose();
+		await expect.poll(() => page.locator('[data-step-id][draggable="true"]').evaluateAll(blocks => {
+			const ids = blocks.map(block => block.getAttribute('data-step-id'));
+			return ids.indexOf('retry') > 2 && ids.indexOf('retry') === ids.indexOf('finish') - 1;
+		})).toBe(true);
+		await expectConnectedWorkflowArrows(page, 5);
+	}
+	await page.getByRole('button', { name: 'Compact', exact: true }).click();
+	await expectConnectedWorkflowArrows(page, 4);
+	await page.getByRole('button', { name: 'Full', exact: true }).click();
+	await expectConnectedWorkflowArrows(page, 5);
+	await page.setViewportSize({ width: 760, height: 900 });
+	await expectConnectedWorkflowArrows(page, 5);
+	await scroll.evaluate(element => element.scrollTo({ top: 300, left: 200 }));
+	await expectConnectedWorkflowArrows(page, 5);
+	const height = await scroll.evaluate(element => element.scrollHeight);
+	await page.waitForTimeout(300);
+	expect(await scroll.evaluate(element => element.scrollHeight)).toBe(height);
+	await page.screenshot({ path: test.info().outputPath('workflow-connections-narrow.png') });
+});
+
+test('workflow connections navigate exact flow and step targets and keep target options scoped', async ({ page }) => {
+	const definition = await openWorkflowConnections(page);
+	await page.locator('[data-step-id="nested_jump"]').getByRole('button', { name: 'Go to flow fallback step start', exact: true }).click();
+	await expect(page.locator('[data-step-id="start"]')).toBeFocused();
+	await expect(page.locator('[data-step-id="start"]')).toContainText('Fallback start');
+	await expect(page.locator('[data-jump-connection]')).toHaveCount(0);
+	await page.getByRole('button', { name: 'Go to flow main step gate', exact: true }).click();
+	const gate = page.locator('[data-step-id="gate"]');
+	await gate.getByRole('button', { name: 'Expand condition' }).click();
+	const destinations = gate.getByLabel('Destination for branch 3');
+	await expect(destinations.locator('option[value="step only_remote"]')).toHaveCount(0);
+	await expect(destinations.locator('option[value="flow fallback step only_remote"]')).toHaveCount(1);
+	await expect(destinations.locator('option[value="flow fallback step gate"]')).toHaveCount(0);
+	await gate.getByRole('button', { name: 'Go to flow fallback step finish', exact: true }).click();
+	await expect(page.locator('[data-flow-name="fallback"]')).toHaveAttribute('aria-pressed', 'true');
+	const finish = page.locator('[data-step-id="finish"]');
+	await expect(finish).toContainText('Fallback finish');
+	await expect(finish).toBeFocused();
+	await page.getByRole('button', { name: 'Go to flow main step gate', exact: true }).click();
+	await expect(page.locator('[data-step-id="gate"]')).toBeFocused();
+	await page.locator('[data-step-id="retry"]').getByRole('button', { name: 'Go to step start', exact: true }).click();
+	await expect(page.locator('[data-step-id="start"]')).toBeFocused();
+	const save = page.waitForRequest(request => request.url().endsWith('/api/workflows/connections') && request.method() === 'PUT');
+	await page.getByRole('button', { name: 'Save', exact: true }).click();
+	const saved = yaml.load((await save).postDataJSON().yaml_content) as typeof definition;
+	expect(saved.flows.main.steps.find(step => step.id === 'gate')!.arms).toEqual(definition.flows.main.steps[1].arms);
+});
+
+test('workflow connections replace choose-best flow stubs with visible destination links', async ({ page }) => {
+	await page.setViewportSize({ width: 1600, height: 1000 });
+	await mockApi(page);
+	await page.goto('/workflows/new');
+	await page.getByRole('button', { name: /Implement alternatives → choose best/ }).click();
+	await page.getByRole('button', { name: 'Create workflow' }).click();
+	const gate = page.locator('[data-step-id="improvement_gate"]');
+	await gate.scrollIntoViewIfNeeded();
+	await expect(gate.getByRole('button', { name: 'Go to flow adopt_refined', exact: true })).toBeVisible();
+	await expect(gate.getByRole('button', { name: 'Go to flow adopt_original', exact: true })).toBeVisible();
+	await expect(page.locator('[data-jump-connection][data-from-step="improvement_gate"]')).toHaveCount(0);
+	await page.screenshot({ path: test.info().outputPath('workflow-connections-choose-best.png') });
+	await page.emulateMedia({ colorScheme: 'dark' });
+	await page.screenshot({ path: test.info().outputPath('workflow-connections-choose-best-dark.png') });
+	await gate.getByRole('button', { name: 'Go to flow adopt_original', exact: true }).click();
+	await expect(page.locator('[data-flow-name="adopt_original"]')).toHaveAttribute('aria-pressed', 'true');
+	await page.getByRole('button', { name: 'Go to flow finish', exact: true }).click();
+	await expect(page.locator('[data-flow-name="finish"]')).toHaveAttribute('aria-pressed', 'true');
+	await expect(page.locator('[data-step-id="verify"]')).toBeVisible();
+});
+
+test('workflow connections identify missing destinations without drawing dangling paths', async ({ page }) => {
+	await openWorkflowConnections(page);
+	await page.getByRole('button', { name: 'YAML', exact: true }).click();
+	await page.locator('[data-workflow-scroll] textarea').fill(yaml.dump({ name: 'Missing targets', flows: { main: { steps: [
+		{ id: 'gate', type: 'when', switch: '@result.ok', arms: [
+			{ match: 'true', goto: 'step missing_step' }, { match: 'default', goto: 'flow missing_flow' },
+		] },
+	] } } }));
+	await page.getByRole('button', { name: 'Apply', exact: true }).click();
+	await expect(page.getByRole('button', { name: 'Go to step missing_step', exact: true })).toBeDisabled();
+	await expect(page.getByRole('button', { name: 'Go to flow missing_flow', exact: true })).toBeDisabled();
+	await expect(page.locator('[data-step-id="gate"]')).toContainText('(missing)');
+	await expect(page.locator('[data-jump-connection]')).toHaveCount(0);
+});

@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { workflows, agents, sessions } from '$lib/api';
 	import type { AcpCommand, AcpConfigOption, AcpModeState, Workflow, WorkflowInstance, Agent, SessionEvent } from '$lib/api';
-	import { onMount } from 'svelte';
+	import { onMount, tick } from 'svelte';
 	import yaml from 'js-yaml';
 	import StepBlock from '$lib/components/blocks/StepBlock.svelte';
 	import ContinueTaskBlock from '$lib/components/blocks/ContinueTaskBlock.svelte';
@@ -14,7 +14,8 @@
 	import WorkflowConfiguration from '$lib/components/blocks/WorkflowConfiguration.svelte';
 	import type { WorkflowInputDefinition, WorkflowScheduleDefinition } from '$lib/components/blocks/WorkflowConfiguration.svelte';
 	import VariablePopup from '$lib/components/blocks/VariablePopup.svelte';
-	import JumpArrows from '$lib/components/blocks/JumpArrows.svelte';
+	import JumpArrows, { type JumpArrow } from '$lib/components/blocks/JumpArrows.svelte';
+	import { parseWorkflowTarget } from '$lib/workflows/targets';
 	import { serverTimestampMs } from '$lib/serverTime';
 
 	let { workflowId }: { workflowId: string } = $props();
@@ -559,12 +560,25 @@
 	let stepNumbers = $derived(computeStepNumbers(currentBlocks));
 	function stepNum(id: string): string { return stepNumbers.find(s => s.id === id)?.number ?? ''; }
 
-	// All step IDs across flows for when block goto targets
-	let allStepIds = $derived(
-		Object.entries(flows).flatMap(([, flow]) =>
-			computeStepNumbers(flow.blocks).filter((step) => flow.blocks.some((block) => block.id === step.id))
-		)
-	);
+	let stepsByFlow = $derived(Object.fromEntries(Object.entries(flows).map(([name, flow]) => [
+		name, computeStepNumbers(flow.blocks).filter(step => flow.blocks.some(block => block.id === step.id)),
+	])));
+
+	async function navigateTarget(target: string) {
+		const destination = parseWorkflowTarget(target, currentFlow);
+		if (!destination || !flows[destination.flow]) return;
+		if (destination.step && !stepsByFlow[destination.flow].some(step => step.id === destination.step)) return;
+		currentFlow = destination.flow;
+		await tick();
+		if (destination.step) {
+			const block = arrowContainerEl?.querySelector<HTMLElement>(`[data-step-id="${CSS.escape(destination.step)}"]`);
+			block?.scrollIntoView({ block: 'center', inline: 'nearest' });
+			block?.focus({ preventScroll: true });
+		} else {
+			scrollContainerEl?.scrollTo({ top: 0, left: 0 });
+			scrollContainerEl?.parentElement?.querySelector<HTMLElement>(`[data-flow-name="${CSS.escape(destination.flow)}"]`)?.focus();
+		}
+	}
 
 	// --- Variables ---
 
@@ -655,7 +669,7 @@
 			const caretX = rect.left + 12;
 
 			// Determine block index and loop context from DOM ancestry
-			const blockEl = el.closest('[data-step-id]');
+			const blockEl = el.closest('[data-step-id][draggable="true"]');
 			const loopEl = el.closest('[data-loop-id]');
 			let blockIdx = currentBlocks.length;
 			let loopContext: { asVar: string; overVar: string } | undefined;
@@ -697,38 +711,36 @@
 	let dragIdx = $state<number | null>(null);
 	let dragOverIdx = $state<number | null>(null);
 	let scrollContainerEl = $state<HTMLElement | null>(null);
+	let arrowContainerEl = $state<HTMLElement | null>(null);
+	let jumpGutter = $state(0);
 
 	// Compute jump arrows from when arms and jump blocks
 	const armColors = ['#22c55e', '#ef4444', '#f97316', '#8b5cf6', '#06b6d4', '#eab308'];
 
 	let jumpArrows = $derived((() => {
-		const arrows: { fromId: string; toId: string; color: string; label?: string; side: 'right' | 'left' }[] = [];
-		const blocks = currentBlocks;
-		for (const block of blocks) {
-			if (block.type === 'when' && block.arms) {
-				for (let ai = 0; ai < block.arms.length; ai++) {
-					const arm = block.arms[ai];
-					const color = armColors[ai % armColors.length];
-					if (arm.goto?.startsWith('step ')) {
-						const targetId = arm.goto.replace('step ', '');
-						arrows.push({ fromId: block.id, toId: targetId, color, label: arm.match || '', side: 'right' });
-					} else if (arm.goto?.startsWith('flow ')) {
-						const flowName = arm.goto.replace('flow ', '').split(' ')[0];
-						const fColor = flowColors[flowName] || color;
-						arrows.push({ fromId: block.id, toId: block.id, color: fColor, label: `→ ${flowName}`, side: 'right' });
-					}
-				}
-			}
-			if (block.type === 'jump' && block.target?.startsWith('step ')) {
-				const targetId = block.target.replace('step ', '');
-				arrows.push({ fromId: block.id, toId: targetId, color: '#818cf8', label: '', side: 'right' });
+		const arrows: JumpArrow[] = [];
+		function add(block: Block, target: string, color: string, armIndex?: number, label = '') {
+			const destination = parseWorkflowTarget(target, currentFlow);
+			if (!destination || destination.flow !== currentFlow) return;
+			const toId = destination.step ?? currentBlocks[0]?.id;
+			if (!toId || !stepsByFlow[currentFlow]?.some(step => step.id === toId)) return;
+			arrows.push({ fromId: block.id, toId, color, armIndex, label: `${block.label}${label ? ` (${label})` : ''} → ${toId}` });
+		}
+		function visit(blocks: Block[]) {
+			for (const block of blocks) {
+				if (block.type === 'when') block.arms?.forEach((arm, index) => {
+					if (!arm.continue && arm.goto) add(block, arm.goto, armColors[index % armColors.length], index, arm.match || 'default');
+				});
+				if (block.type === 'jump' && block.target) add(block, block.target, '#818cf8');
+				visit(block.children ?? []);
 			}
 		}
+		visit(currentBlocks);
 		return arrows;
 	})());
 </script>
 
-<div class="flex h-full flex-col overflow-hidden">
+<div data-workflow-editor class="flex h-full flex-col overflow-hidden">
 	<!-- Toolbar -->
 	<div class="flex items-center gap-3 border-b border-border bg-card px-4 py-2 flex-shrink-0">
 		<a href="/automations" class="text-muted-foreground hover:text-foreground" title="Back to automations">
@@ -781,7 +793,7 @@
 						oninput={(e) => { flows = { ...flows, [name]: { ...flow, color: e.currentTarget.value } }; }}
 						class="absolute inset-0 opacity-0 w-full h-full cursor-pointer" />
 				</label>
-				<button type="button" onclick={() => (currentFlow = name)} class="flex items-center gap-1.5">
+				<button type="button" data-flow-name={name} aria-pressed={currentFlow === name} onclick={() => (currentFlow = name)} class="flex items-center gap-1.5">
 					<span>{name}</span>
 					<span class="text-[10px] text-muted-foreground/60">{flow.blocks.length}</span>
 				</button>
@@ -817,7 +829,7 @@
 
 	<!-- Main content -->
 	<!-- svelte-ignore a11y_no_static_element_interactions -->
-	<div class="flex-1 overflow-y-auto relative" bind:this={scrollContainerEl} onkeydown={handleGlobalKeydown}>
+	<div data-workflow-scroll class="flex-1 overflow-auto relative" bind:this={scrollContainerEl} onkeydown={handleGlobalKeydown}>
 		{#if showYaml}
 			<div class="absolute inset-0 z-20 flex flex-col bg-background/95 backdrop-blur-sm">
 				<div class="flex items-center justify-between px-4 py-2 border-b border-border">
@@ -831,8 +843,10 @@
 			</div>
 		{/if}
 
+		<div data-workflow-content bind:this={arrowContainerEl} class="relative min-h-full"
+			style={`--jump-gutter: ${jumpGutter}px; min-width: ${jumpGutter ? 360 + jumpGutter : 0}px;`}>
 		<!-- Column header -->
-		<div class="max-w-3xl mx-auto px-4">
+		<div class="mx-auto w-full pl-4" style:max-width="calc(48rem + var(--jump-gutter))" style:padding-right="calc(1rem + var(--jump-gutter))">
 			<div class="flex items-center text-[10px] font-medium text-muted-foreground/50 uppercase tracking-wider pt-3 pb-1 px-1">
 				<span class="w-10">Line</span>
 				<span class="flex-1">Block</span>
@@ -840,7 +854,7 @@
 		</div>
 
 		<!-- Block list -->
-		<div class="max-w-3xl mx-auto px-4 pb-6">
+		<div class="mx-auto w-full pl-4 pb-6" style:max-width="calc(48rem + var(--jump-gutter))" style:padding-right="calc(1rem + var(--jump-gutter))">
 			{#if currentFlow === 'main'}
 				<WorkflowConfiguration
 					inputs={inputDefs}
@@ -875,7 +889,7 @@
 			<!-- Steps -->
 			{#each currentBlocks as block, idx (block.id)}
 				<!-- svelte-ignore a11y_no_static_element_interactions -->
-				<div class="flex items-start gap-0" data-step-id={block.id}
+				<div class="flex items-start gap-0 rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/70" data-step-id={block.id} tabindex="-1"
 					draggable="true"
 					ondragstart={(e) => { e.dataTransfer?.setData('text/plain', String(idx)); dragIdx = idx; }}
 					ondragover={(e) => { e.preventDefault(); dragOverIdx = idx; }}
@@ -889,7 +903,7 @@
 					</div>
 
 					<!-- Block -->
-					<div class="flex-1 {dragOverIdx === idx ? 'ring-2 ring-primary/30 rounded-lg' : ''}">
+					<div class="min-w-0 flex-1 {dragOverIdx === idx ? 'ring-2 ring-primary/30 rounded-lg' : ''}">
 						{#if block.type === 'step'}
 							<StepBlock
 								label={block.label} agent={block.agent || ''} prompt={block.prompt || ''} command={block.command || ''} procedure={block.procedure || ''}
@@ -921,7 +935,7 @@
 								label={block.label} switchVar={block.switchVar || ''}
 								arms={block.arms || []}
 								{flowNames} {flowColors}
-								stepIds={allStepIds}
+								{stepsByFlow} {currentFlow} onnavigate={navigateTarget}
 								expanded={block.expanded} compact={compactView}
 								onupdate={(u) => updateBlock(currentFlow, idx, u)}
 								ontoggle={() => updateBlock(currentFlow, idx, { expanded: !block.expanded })}
@@ -951,11 +965,11 @@
 												{@const childRemove = () => {
 													updateBlock(currentFlow, idx, { children: (block.children || []).filter((_: Block, i: number) => i !== ci) });
 												}}
-											<div class="flex items-start gap-0">
+											<div class="flex items-start gap-0" data-step-id={child.id}>
 												<div class="w-8 pt-2 text-right pr-2 text-[10px] font-mono text-muted-foreground/30">
 													{stepNum(block.id)}.{String.fromCharCode(97 + ci)}
 												</div>
-											<div class="flex-1">
+												<div class="min-w-0 flex-1">
 												{#if child.type === 'step'}
 							<StepBlock label={child.label} agent={child.agent || ''} prompt={child.prompt || ''} command={child.command || ''} outputs={child.outputs || {}}
 								sessionConfig={child.sessionConfig || {}} newSession={child.newSession || false}
@@ -975,10 +989,15 @@
 									/>
 								{:else if child.type === 'when'}
 													<WhenBlock label={child.label} switchVar={child.switchVar || ''} arms={child.arms || []}
-														{flowNames} {flowColors} stepIds={allStepIds}
+														{flowNames} {flowColors} {stepsByFlow} {currentFlow} onnavigate={navigateTarget}
 														expanded={child.expanded} compact={compactView}
 														onupdate={childUpdate} ontoggle={childToggle} onremove={childRemove}
-													/>
+														/>
+												{:else if child.type === 'jump'}
+													<JumpBlock label={child.label} target={child.target || ''}
+														{flowNames} {flowColors} {stepsByFlow} {currentFlow} onnavigate={navigateTarget}
+														expanded={child.expanded} compact={compactView}
+														onupdate={childUpdate} ontoggle={childToggle} onremove={childRemove} />
 												{:else if child.type === 'sink'}
 													<div class="rounded-lg border border-dashed border-amber-500/25 bg-amber-500/5 px-3 py-2">
 														<div class="text-[10px] font-semibold uppercase tracking-wider text-amber-300/70">Notification · disabled</div>
@@ -1019,7 +1038,7 @@
 						{:else if block.type === 'jump'}
 							<JumpBlock
 								label={block.label} target={block.target || ''}
-								{flowNames} {flowColors} stepIds={allStepIds}
+								{flowNames} {flowColors} {stepsByFlow} {currentFlow} onnavigate={navigateTarget}
 								expanded={block.expanded} compact={compactView}
 								onupdate={(u) => updateBlock(currentFlow, idx, u)}
 								ontoggle={() => updateBlock(currentFlow, idx, { expanded: !block.expanded })}
@@ -1087,7 +1106,8 @@
 		</div>
 
 		<!-- Jump arrows overlay -->
-		<JumpArrows arrows={jumpArrows} containerEl={scrollContainerEl} />
+		<JumpArrows arrows={jumpArrows} containerEl={arrowContainerEl} ongutter={width => jumpGutter = width} />
+		</div>
 	</div>
 
 	<!-- Instance tracking panel -->

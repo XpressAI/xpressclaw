@@ -1,141 +1,131 @@
 <script lang="ts">
-	import { onMount, tick } from 'svelte';
-
-	interface Arrow {
+	export interface JumpArrow {
 		fromId: string;
 		toId: string;
+		armIndex?: number;
 		color: string;
-		label?: string;
-		side: 'right' | 'left';
+		label: string;
 	}
 
-	let {
-		arrows = [],
-		containerEl = null as HTMLElement | null
-	}: {
-		arrows?: Arrow[];
+	let { arrows = [], containerEl = null, ongutter = () => {} }: {
+		arrows?: JumpArrow[];
 		containerEl?: HTMLElement | null;
+		ongutter?: (width: number) => void;
 	} = $props();
 
-	let paths = $state<{ d: string; color: string; label?: string; labelX: number; labelY: number }[]>([]);
-	let svgHeight = $state(0);
-	let svgWidth = $state(0);
+	interface RoutedArrow extends JumpArrow {
+		d: string;
+		fromX: number;
+		fromY: number;
+		toX: number;
+		toY: number;
+		lane: number;
+	}
+	let paths = $state<RoutedArrow[]>([]);
+	let svgEl: SVGSVGElement;
 
-	function computePaths() {
-		if (!containerEl || arrows.length === 0) { paths = []; return; }
+	$effect(() => {
+		const container = containerEl;
+		const connections = arrows;
+		if (!container) return;
+		let frame = 0;
+		let gutter = -1;
+		const observed = new Set<Element>();
+		const schedule = () => {
+			if (!frame) frame = requestAnimationFrame(measure);
+		};
+		const resizeObserver = new ResizeObserver(schedule);
 
-		const containerRect = containerEl.getBoundingClientRect();
-		const scrollTop = containerEl.scrollTop;
-		svgHeight = containerEl.scrollHeight;
-		svgWidth = containerEl.scrollWidth;
+		function measure() {
+			frame = 0;
+			const blocks = Array.from(container!.querySelectorAll<HTMLElement>('[data-step-id]'));
+			const elements = new Set<Element>([container!, ...blocks]);
+			for (const element of observed) {
+				if (!elements.has(element)) { resizeObserver.unobserve(element); observed.delete(element); }
+			}
+			for (const element of elements) {
+				if (!observed.has(element)) { resizeObserver.observe(element); observed.add(element); }
+			}
+			const bounds = container!.getBoundingClientRect();
+			if (!bounds.width || !bounds.height) return;
+			const scaleX = container!.clientWidth / bounds.width;
+			const scaleY = container!.clientHeight / bounds.height;
+			const byId = new Map(blocks.map(block => [block.dataset.stepId, block]));
+			const right = Math.max(0, ...blocks.map(block => (block.getBoundingClientRect().right - bounds.left) * scaleX));
+			const measured = connections.flatMap(arrow => {
+				const source = byId.get(arrow.fromId);
+				const target = byId.get(arrow.toId);
+				if (!source || !target) return [];
+				const from = source.getBoundingClientRect();
+				const to = target.getBoundingClientRect();
+				const arm = arrow.armIndex === undefined ? null : source.querySelector<HTMLElement>(`[data-jump-arm="${arrow.armIndex}"]`);
+				const port = arm?.getBoundingClientRect();
+				let fromY = port ? (port.top + port.height / 2 - bounds.top) * scaleY : (from.top - bounds.top) * scaleY + 18;
+				let toY = (to.top - bounds.top) * scaleY + 18;
+				if (Math.abs(fromY - toY) < 12) { fromY += 8; toY -= 8; }
+				return [{ ...arrow, fromX: (from.right - bounds.left) * scaleX + 2, fromY, toX: (to.right - bounds.left) * scaleX + 2, toY }];
+			});
 
-		const result: typeof paths = [];
-		const R = 8; // corner radius
-
-		for (const arrow of arrows) {
-			const fromEl = containerEl.querySelector(`[data-step-id="${arrow.fromId}"]`);
-			const toEl = containerEl.querySelector(`[data-step-id="${arrow.toId}"]`);
-			if (!fromEl || !toEl) continue;
-
-			const fromRect = fromEl.getBoundingClientRect();
-			const toRect = toEl.getBoundingClientRect();
-
-			// Y positions relative to scroll container
-			const fromY = fromRect.top - containerRect.top + scrollTop + fromRect.height / 2;
-			const toY = toRect.top - containerRect.top + scrollTop + toRect.height / 2;
-
-			// X: right edge of the blocks + offset
-			const rightEdge = Math.max(fromRect.right, toRect.right) - containerRect.left + 16;
-			const offset = 28; // how far right the vertical line goes
-			const xRight = rightEdge + offset;
-
-			// Arrowhead tip goes to the right edge of the target block
-			const toX = toRect.right - containerRect.left + 4;
-			const fromX = fromRect.right - containerRect.left + 4;
-
-			// Draw a rounded rectangle path: right from source → down/up → left to target
-			// Like a bracket on the right side: ┐ │ └→
-			const goingDown = toY > fromY;
-
-			let d: string;
-			if (goingDown) {
-				d = [
-					`M ${fromX} ${fromY}`,              // start at source right edge
-					`L ${xRight - R} ${fromY}`,         // horizontal to near corner
-					`Q ${xRight} ${fromY} ${xRight} ${fromY + R}`,  // round top-right corner
-					`L ${xRight} ${toY - R}`,           // vertical down
-					`Q ${xRight} ${toY} ${xRight - R} ${toY}`,      // round bottom-right corner
-					`L ${toX + 6} ${toY}`,              // horizontal to arrowhead
-					// Arrowhead
-					`M ${toX + 6} ${toY} L ${toX + 12} ${toY - 4}`,
-					`M ${toX + 6} ${toY} L ${toX + 12} ${toY + 4}`,
-				].join(' ');
-			} else {
-				d = [
-					`M ${fromX} ${fromY}`,
-					`L ${xRight - R} ${fromY}`,
-					`Q ${xRight} ${fromY} ${xRight} ${fromY - R}`,
-					`L ${xRight} ${toY + R}`,
-					`Q ${xRight} ${toY} ${xRight - R} ${toY}`,
-					`L ${toX + 6} ${toY}`,
-					`M ${toX + 6} ${toY} L ${toX + 12} ${toY - 4}`,
-					`M ${toX + 6} ${toY} L ${toX + 12} ${toY + 4}`,
-				].join(' ');
+			// Keep incoming arrowheads distinct when several branches share a step.
+			const targets = new Map<string, typeof measured>();
+			for (const arrow of measured) {
+				const group = targets.get(arrow.toId) ?? [];
+				group.push(arrow);
+				targets.set(arrow.toId, group);
+			}
+			for (const group of targets.values()) {
+				group.sort((a, b) => a.fromY - b.fromY);
+				const spacing = Math.min(6, 24 / group.length);
+				group.forEach((arrow, index) => arrow.toY += (index - (group.length - 1) / 2) * spacing);
 			}
 
-			result.push({
-				d,
-				color: arrow.color,
-				label: arrow.label,
-				labelX: xRight + 6,
-				labelY: (fromY + toY) / 2,
+			// Reuse a lane only after its earlier connection has ended.
+			measured.sort((a, b) => Math.min(a.fromY, a.toY) - Math.min(b.fromY, b.toY) || Math.max(a.fromY, a.toY) - Math.max(b.fromY, b.toY));
+			const ends: number[] = [];
+			paths = measured.map(arrow => {
+				const start = Math.min(arrow.fromY, arrow.toY) - 12;
+				let lane = ends.findIndex(end => end < start);
+				if (lane < 0) lane = ends.length;
+				ends[lane] = Math.max(arrow.fromY, arrow.toY) + 12;
+				const x = right + 24 + lane * 20;
+				const direction = arrow.toY > arrow.fromY ? 1 : -1;
+				const radius = Math.min(8, Math.abs(arrow.toY - arrow.fromY) / 2);
+				const d = `M ${arrow.fromX} ${arrow.fromY} H ${x - radius} Q ${x} ${arrow.fromY} ${x} ${arrow.fromY + direction * radius} V ${arrow.toY - direction * radius} Q ${x} ${arrow.toY} ${x - radius} ${arrow.toY} H ${arrow.toX + 7}`;
+				return { ...arrow, lane, d };
 			});
+			const width = ends.length ? 48 + (ends.length - 1) * 20 : 0;
+			if (width !== gutter) { gutter = width; ongutter(width); }
 		}
 
-		paths = result;
-	}
-
-	// Recompute on any change
-	$effect(() => {
-		arrows;
-		tick().then(computePaths);
-	});
-
-	onMount(() => {
-		computePaths();
-
-		// Recompute on resize, scroll, and DOM mutations (compact toggle)
-		const resizeObs = new ResizeObserver(computePaths);
-		const mutationObs = new MutationObserver(() => { requestAnimationFrame(computePaths); });
-
-		if (containerEl) {
-			resizeObs.observe(containerEl);
-			containerEl.addEventListener('scroll', computePaths);
-			mutationObs.observe(containerEl, { childList: true, subtree: true, attributes: true });
-		}
-
-		// Also recompute on window resize
-		window.addEventListener('resize', computePaths);
-
+		// Observe the cards, not SVG mutations produced by measuring them.
+		const mutationObserver = new MutationObserver(records => {
+			if (records.some(record => !svgEl?.contains(record.target))) schedule();
+		});
+		mutationObserver.observe(container, { childList: true, subtree: true, attributes: true, characterData: true });
+		resizeObserver.observe(container);
+		observed.add(container);
+		schedule();
 		return () => {
-			resizeObs.disconnect();
-			mutationObs.disconnect();
-			containerEl?.removeEventListener('scroll', computePaths);
-			window.removeEventListener('resize', computePaths);
+			cancelAnimationFrame(frame);
+			resizeObserver.disconnect();
+			mutationObserver.disconnect();
 		};
 	});
 </script>
 
-{#if paths.length > 0}
-	<svg class="absolute inset-0 pointer-events-none z-10" style="width: {svgWidth}px; height: {svgHeight}px; overflow: visible;">
-		{#each paths as path}
-			<path d={path.d} fill="none" stroke={path.color} stroke-width="1.5"
-				stroke-dasharray="4 3" opacity="0.5" />
-			{#if path.label}
-				<text x={path.labelX} y={path.labelY} fill={path.color} font-size="9"
-					dominant-baseline="middle" opacity="0.6"
-					font-family="monospace">{path.label}</text>
-			{/if}
-		{/each}
-	</svg>
-{/if}
+<svg bind:this={svgEl} data-workflow-arrows aria-hidden="true" class="pointer-events-none absolute inset-0 z-10 h-full w-full overflow-visible">
+	{#each paths as path}
+		<g data-jump-connection data-from-step={path.fromId} data-to-step={path.toId} data-lane={path.lane}>
+			<path d={path.d} fill="none" stroke={path.color} stroke-width="2" stroke-linecap="round" class="connection">
+				<title>{path.label}</title>
+			</path>
+			<circle cx={path.fromX} cy={path.fromY} r="3" fill={path.color} />
+			<path d="M {path.toX} {path.toY} l 7 -4 v 8 Z" fill={path.color} />
+		</g>
+	{/each}
+</svg>
+
+<style>
+	.connection { pointer-events: stroke; opacity: 0.75; }
+	.connection:hover { stroke-width: 3; opacity: 1; }
+</style>
