@@ -211,19 +211,19 @@ export function extractActiveWorkspaceRoots(status: {
 		active?: { root?: string | null } | null;
 	} | null;
 }): string[] {
-	// Only include roots representing the active workspace (never repository.bootstrap_root):
-	// workspace file APIs resolve relative paths against active_root(), so including an outer
-	// bootstrap root when a nested repository is active would map sibling files to the wrong path.
-	const seen = new Set<string>();
-	const roots: string[] = [];
-	for (const candidate of [status.root, status.container_root, status.repository?.active?.root]) {
-		if (typeof candidate !== 'string') continue;
-		const trimmed = candidate.trim();
-		if (!trimmed || seen.has(trimmed)) continue;
-		seen.add(trimmed);
-		roots.push(trimmed);
+	// `/api/environments/{agent_id}/download?path=...` addresses the agent's execution
+	// environment / container path namespace (`container_root`), which equals `root` for
+	// host-backed agents and `/workspace[/<repo>]` for container-backed agents. Keep this
+	// strictly in the container namespace (never mixing host `root` or `bootstrap_root`) so
+	// an overlapping host root (e.g. root `/workspace/project` with container_root `/workspace`)
+	// cannot mis-resolve `/workspace/project/notes.txt` to `notes.txt`.
+	const containerRoot = typeof status.container_root === 'string' ? status.container_root.trim() : '';
+	if (containerRoot) {
+		return [containerRoot];
 	}
-	return roots;
+	const fallback = [status.root, status.repository?.active?.root]
+		.find((candidate): candidate is string => typeof candidate === 'string' && candidate.trim().length > 0);
+	return fallback ? [fallback.trim()] : [];
 }
 
 export interface CanvasLinkPreviewTarget {

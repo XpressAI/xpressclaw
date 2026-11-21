@@ -803,9 +803,9 @@ test.describe('Spatial Canvas workspace', () => {
 						sender_name: 'Codex Builder',
 						content: [
 							'Files:',
-							'- [outside.txt](file:///srv/agent/outside.txt)',
-							'- [main.ts](file:///srv/agent/repo/main.ts)',
-							'- [other.ts](file:///srv/agent/repo-b/other.ts)',
+							'- [outside.txt](file:///workspace/outside.txt)',
+							'- [main.ts](file:///workspace/repo/main.ts)',
+							'- [other.ts](file:///workspace/repo-b/other.ts)',
 						].join('\n'),
 						created_at: now,
 						attachments: [
@@ -953,7 +953,8 @@ test.describe('Spatial Canvas workspace', () => {
 		expect(resolveWorkspaceRelativePath('/tmp/outside.html', ['/workspace'])).toBeNull();
 		expect(resolveWorkspaceRelativePath('/workspace/../etc/passwd', ['/workspace'])).toBeNull();
 
-		// Nested repository active roots exclude bootstrap_root so sibling files outside the active repo never alias into it.
+		// Nested repository active roots use container_root and exclude bootstrap_root / host root
+		// so container download paths stay in the container namespace and sibling files outside the active repo never alias into it.
 		const nestedRoots = extractActiveWorkspaceRoots({
 			root: '/srv/agent/repo',
 			container_root: '/workspace/repo',
@@ -962,11 +963,37 @@ test.describe('Spatial Canvas workspace', () => {
 				bootstrap_root: '/srv/agent',
 			} as { active: { root: string }; bootstrap_root: string },
 		});
-		expect(nestedRoots).toEqual(['/srv/agent/repo', '/workspace/repo']);
+		expect(nestedRoots).toEqual(['/workspace/repo']);
 		expect(resolveWorkspaceRelativePath('/srv/agent/notes.txt', nestedRoots)).toBeNull();
 		expect(resolveWorkspaceRelativePath('/workspace/notes.txt', nestedRoots)).toBeNull();
-		expect(resolveWorkspaceRelativePath('/srv/agent/repo/notes.txt', nestedRoots)).toBe('notes.txt');
+		expect(resolveWorkspaceRelativePath('/srv/agent/repo/notes.txt', nestedRoots)).toBeNull();
 		expect(resolveWorkspaceRelativePath('/workspace/repo/notes.txt', nestedRoots)).toBe('notes.txt');
+
+		// Overlapping host/container roots (e.g. host root `/workspace/project` vs container_root `/workspace`)
+		// must resolve container downloads against `container_root` rather than stripping the host prefix.
+		const overlappingRoots = extractActiveWorkspaceRoots({
+			root: '/workspace/project',
+			container_root: '/workspace',
+			repository: {
+				active: { root: '/workspace/project' },
+				bootstrap_root: '/workspace/project',
+			} as { active: { root: string }; bootstrap_root: string },
+		});
+		expect(overlappingRoots).toEqual(['/workspace']);
+		expect(resolveWorkspaceRelativePath('/workspace/project/notes.txt', overlappingRoots)).toBe('project/notes.txt');
+
+		// Host-backed agents report container_root === root, still excluding bootstrap_root.
+		const hostRoots = extractActiveWorkspaceRoots({
+			root: '/srv/agent/repo',
+			container_root: '/srv/agent/repo',
+			repository: {
+				active: { root: '/srv/agent/repo' },
+				bootstrap_root: '/srv/agent',
+			} as { active: { root: string }; bootstrap_root: string },
+		});
+		expect(hostRoots).toEqual(['/srv/agent/repo']);
+		expect(resolveWorkspaceRelativePath('/srv/agent/notes.txt', hostRoots)).toBeNull();
+		expect(resolveWorkspaceRelativePath('/srv/agent/repo/notes.txt', hostRoots)).toBe('notes.txt');
 
 		expect(classifyCanvasLink({ href: '/tasks/task-1' }, origin)).toBeNull();
 		expect(classifyCanvasLink({ href: '/projects/proj-alpha' }, origin)).toBeNull();
