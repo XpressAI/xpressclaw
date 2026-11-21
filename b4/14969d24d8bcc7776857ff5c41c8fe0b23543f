@@ -1,0 +1,6 @@
+branch: fix/worktree-changed-files (PR #297 review round 2)
+codex P2: validation translated an absolute runner commondir (/workspace/.git) but Git kept reading the original file -> 'fatal: not a git repository'.
+evidence: reproduced in shell (git 2.39). Tried GIT_COMMON_DIR=<translated>: status no longer fatal, but HEAD became unresolvable ('ambiguous argument HEAD'), and tracked files showed as 'A'/'AM'. Git builds the worktree ref store from the commondir FILE (get_common_dir_noenv), ignoring the env var. With git's default relative commondir ('../..') plus a runner-recorded .git pointer, --git-dir/--work-tree works correctly (' M app.txt', HEAD resolves).
+decision: drop GIT_COMMON_DIR plumbing; resolve commondir exactly as host Git does (host_git_path: absolute as-is, else relative to git_dir; must canonicalize inside bootstrap) and reject otherwise. The absolute-runner commondir layout only existed because my own test fabricated it; git always writes commondir relative.
+tests: new workspace_worktree_rejects_a_common_dir_host_git_cannot_read; translate test now rewrites only the .git pointer; server end-to-end status/diff test unchanged (runner .git pointer, relative commondir).
+validation: core repositories+sessions 51 pass, server lib 234 pass, clippy -D warnings clean, rustfmt --check ok.
