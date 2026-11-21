@@ -440,9 +440,9 @@ test.describe('Spatial Canvas workspace', () => {
 		const restoredWindow = page.locator('[data-canvas-node][data-canvas-node-kind="project"]').first();
 		await expect(restoredWindow).toHaveAttribute('style', afterStyle!);
 
-		// Switching back to Tabs hides the canvas without breaking tabbed panes.
+		// Switching back to Tabs hides the canvas (while keeping it mounted to preserve buffers) without breaking tabbed panes.
 		await page.locator('[data-workspace-mode-toggle]').getByRole('button', { name: 'Tabs' }).click();
-		await expect(page.locator('[data-workspace-canvas]')).toHaveCount(0);
+		await expect(page.locator('[data-workspace-canvas]')).not.toBeVisible();
 		await expect(page.locator('[data-workspace-pane]').first()).toBeVisible();
 	});
 
@@ -494,6 +494,77 @@ test.describe('Spatial Canvas workspace', () => {
 		await page.locator('[data-canvas-tidy]').click();
 		const contextEdges = await page.locator('[data-canvas-edge-kind="context"]').count();
 		expect(contextEdges).toBeGreaterThanOrEqual(4);
+	});
+
+	test('preserves unsaved editor buffers across Tabs switches, supports duplicate file paths across editors, and discards stale agent loads', async ({ page }) => {
+		let releaseSlowAgentRead = () => {};
+		const slowAgentReadGate = new Promise<void>((resolve) => {
+			releaseSlowAgentRead = resolve;
+		});
+		let codexReadCount = 0;
+
+		await mockCanvasApi(page);
+		// Override workspace file reads so agent-codex's second read can be delayed while agent-claude returns distinct content.
+		await page.route('**/api/workspaces/*/file**', async (route) => {
+			const url = new URL(route.request().url());
+			const agentId = decodeURIComponent(url.pathname.split('/')[3]);
+			const filePath = url.searchParams.get('path') ?? 'main.ts';
+			if (agentId === 'agent-codex') {
+				codexReadCount += 1;
+				if (codexReadCount === 2) {
+					await slowAgentReadGate;
+				}
+				return route.fulfill({
+					json: { path: filePath, content: '// codex version\n', revision: 'rev-codex', size: 17 },
+				});
+			}
+			return route.fulfill({
+				json: { path: filePath, content: '// claude version\n', revision: 'rev-claude', size: 18 },
+			});
+		});
+
+		await page.setViewportSize({ width: 1440, height: 900 });
+		await page.goto('/canvas');
+		const alphaCard = page.locator('[data-canvas-project-card="proj-alpha"]');
+		await expect(alphaCard).toBeVisible();
+
+		// Open two editors for different agents on the exact same relative path `main.ts`.
+		await alphaCard.getByRole('button', { name: 'Open Codex Builder editor' }).click();
+		const firstEditor = page.locator('[data-canvas-editor-card]').nth(0);
+		await expect(firstEditor).toBeVisible();
+		await firstEditor.getByRole('button', { name: 'main.ts' }).click();
+		await expect(firstEditor.locator('[data-monaco-editor] .view-lines')).toContainText('codex version');
+
+		// Edit buffer in first editor so it becomes dirty, then switch to Tabs and back to Canvas.
+		await firstEditor.locator('[data-monaco-editor]').click();
+		await page.keyboard.type('unsaved-edit ');
+		await expect(firstEditor.getByRole('button', { name: /Save •/ })).toBeVisible();
+
+		await page.locator('[data-workspace-mode-toggle]').getByRole('button', { name: 'Tabs' }).click();
+		await expect(page.locator('[data-workspace-canvas]')).not.toBeVisible();
+		await page.locator('[data-workspace-mode-toggle]').getByRole('button', { name: 'Canvas' }).click();
+		await expect(firstEditor.getByRole('button', { name: /Save •/ })).toBeVisible();
+		await expect(firstEditor.locator('[data-monaco-editor] .view-lines')).toContainText('unsaved-edit');
+
+		// Open a second editor for Claude Reviewer on the exact same relative path `main.ts` — Monaco must mount cleanly with no URI collision.
+		await page.locator('[data-canvas-fit]').click();
+		await alphaCard.getByRole('button', { name: 'Open Claude Reviewer editor' }).click();
+		const secondEditor = page.locator('[data-canvas-editor-card]').nth(1);
+		await expect(secondEditor).toBeVisible();
+		await secondEditor.getByRole('button', { name: 'main.ts' }).click();
+		await expect(secondEditor.locator('[data-monaco-editor] .view-lines')).toContainText('claude version');
+
+		// Trigger a slow file read for agent-codex in a third editor, immediately switch to agent-claude, then release the slow response.
+		await page.locator('[data-canvas-fit]').click();
+		await alphaCard.getByRole('button', { name: 'Open Codex Builder editor' }).click();
+		const thirdEditor = page.locator('[data-canvas-editor-card]').nth(2);
+		await expect(thirdEditor).toBeVisible();
+		await thirdEditor.getByRole('button', { name: 'main.ts' }).click();
+		await thirdEditor.getByLabel('Editor agent').selectOption('agent-claude');
+		releaseSlowAgentRead();
+		// Stale codex response must NOT populate the editor now scoped to agent-claude.
+		await expect(thirdEditor.getByLabel('Workspace file path')).toHaveValue('');
+		await expect(thirdEditor.locator('[data-monaco-editor]')).toHaveCount(0);
 	});
 
 	test('canvas model enforces safe app URLs, non-overlapping placement, delegation edges, and layout persistence', () => {

@@ -20,6 +20,7 @@
 		Trash2,
 	} from '@lucide/svelte';
 	import type { Agent, Conversation, Project, Task } from '$lib/api';
+	import { notifyLiveUpdatesVisibilityChanged } from '$lib/liveUpdates';
 	import {
 		bezierEdgePath,
 		CANVAS_GRID_SIZE,
@@ -53,6 +54,7 @@
 	interface Props {
 		storageKey: string;
 		storage?: Storage;
+		visible?: boolean;
 		projects: Project[];
 		agents: Agent[];
 		conversations: Conversation[];
@@ -63,12 +65,17 @@
 	let {
 		storageKey,
 		storage,
+		visible = true,
 		projects,
 		agents,
 		conversations,
 		tasks,
 		onOpenInTabs,
 	}: Props = $props();
+
+	$effect(() => {
+		if (visible) notifyLiveUpdatesVisibilityChanged();
+	});
 
 	let viewportEl = $state<HTMLDivElement>();
 	let viewportWidth = $state(1280);
@@ -1123,6 +1130,7 @@
 				<CanvasWindow
 					{node}
 					focused={focusedNodeId === node.id}
+					{visible}
 					zoom={camera.zoom}
 					canvasInteracting={panning || spacePressed}
 					status={nodeStatus(node)}

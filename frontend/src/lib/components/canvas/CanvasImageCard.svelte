@@ -42,6 +42,7 @@
 	let loadingTree = $state(false);
 	let imageError = $state('');
 	let naturalSize = $state<{ width: number; height: number } | null>(null);
+	let treeSequence = 0;
 
 	let visibleEntries = $derived(flattenEntries());
 	let resolvedSrc = $derived((() => {
@@ -71,15 +72,21 @@
 	});
 
 	async function loadRoot(targetAgentId: string) {
+		const req = ++treeSequence;
 		loadingTree = true;
 		try {
 			const dir = await workspaces.tree(targetAgentId);
+			if (req !== treeSequence || activeAgentId !== targetAgentId) return;
 			directories = { '': dir.entries };
 			expanded = [''];
 		} catch (cause) {
-			imageError = cause instanceof Error ? cause.message : String(cause);
+			if (req === treeSequence && activeAgentId === targetAgentId) {
+				imageError = cause instanceof Error ? cause.message : String(cause);
+			}
 		} finally {
-			loadingTree = false;
+			if (req === treeSequence && activeAgentId === targetAgentId) {
+				loadingTree = false;
+			}
 		}
 	}
 
@@ -101,15 +108,18 @@
 	}
 
 	async function toggleDirectory(path: string) {
-		if (!activeAgentId) return;
+		const targetAgentId = activeAgentId;
+		if (!targetAgentId) return;
 		if (expanded.includes(path)) {
 			expanded = expanded.filter((item) => item !== path);
 			return;
 		}
 		expanded = [...expanded, path];
 		if (directories[path]) return;
+		const req = treeSequence;
 		try {
-			const dir = await workspaces.tree(activeAgentId, path);
+			const dir = await workspaces.tree(targetAgentId, path);
+			if (req !== treeSequence || activeAgentId !== targetAgentId) return;
 			directories = { ...directories, [path]: dir.entries };
 		} catch {}
 	}
@@ -192,8 +202,15 @@
 						aria-label="Image workspace agent"
 						value={activeAgentId}
 						onchange={(event) => {
+							treeSequence += 1;
+							loadingTree = false;
 							activeAgentId = event.currentTarget.value;
-							onUpdateNode({ agentId: activeAgentId || null });
+							directories = {};
+							expanded = [''];
+							selectedPath = '';
+							imageError = '';
+							naturalSize = null;
+							onUpdateNode({ agentId: activeAgentId || null, filePath: null });
 							if (activeAgentId) void loadRoot(activeAgentId);
 						}}
 						class="mb-2 w-full rounded border border-input bg-background px-1.5 py-1 text-[11px]"

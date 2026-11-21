@@ -53,6 +53,7 @@
 	let reloadNonce = $state(0);
 	let error = $state('');
 	let disposed = false;
+	let agentSequence = 0;
 
 	let exposedPorts = $derived(ports.filter((port) => port.direction === 'container_to_host'));
 	let htmlEntries = $derived(flattenHtmlEntries());
@@ -85,32 +86,40 @@
 	});
 
 	async function loadPorts(targetAgentId: string) {
+		const req = agentSequence;
 		loadingPorts = true;
 		try {
-			ports = (await environments.ports(targetAgentId)).ports;
+			const loaded = (await environments.ports(targetAgentId)).ports;
+			if (req !== agentSequence || activeAgentId !== targetAgentId) return;
+			ports = loaded;
 		} catch {
-			ports = [];
+			if (req === agentSequence && activeAgentId === targetAgentId) ports = [];
 		} finally {
-			loadingPorts = false;
+			if (req === agentSequence && activeAgentId === targetAgentId) loadingPorts = false;
 		}
 	}
 
 	async function exposePort() {
-		if (!activeAgentId || addingPort) return;
+		const targetAgentId = activeAgentId;
+		if (!targetAgentId || addingPort) return;
+		const req = agentSequence;
 		addingPort = true;
 		error = '';
 		try {
-			const created = await environments.addPort(activeAgentId, {
+			const created = await environments.addPort(targetAgentId, {
 				direction: 'container_to_host',
 				host_port: Number(newHostPort),
 				container_port: Number(newContainerPort),
 			});
-			await loadPorts(activeAgentId);
-			selectPort(created);
+			if (req !== agentSequence || activeAgentId !== targetAgentId) return;
+			await loadPorts(targetAgentId);
+			if (req === agentSequence && activeAgentId === targetAgentId) selectPort(created);
 		} catch (cause) {
-			error = cause instanceof Error ? cause.message : String(cause);
+			if (req === agentSequence && activeAgentId === targetAgentId) {
+				error = cause instanceof Error ? cause.message : String(cause);
+			}
 		} finally {
-			addingPort = false;
+			if (req === agentSequence && activeAgentId === targetAgentId) addingPort = false;
 		}
 	}
 
@@ -131,15 +140,17 @@
 	}
 
 	async function loadWorkspaceHtmlTree(targetAgentId: string) {
+		const req = agentSequence;
 		loadingFiles = true;
 		try {
 			const dir = await workspaces.tree(targetAgentId);
+			if (req !== agentSequence || activeAgentId !== targetAgentId) return;
 			directories = { '': dir.entries };
 			expanded = [''];
 		} catch {
-			directories = {};
+			if (req === agentSequence && activeAgentId === targetAgentId) directories = {};
 		} finally {
-			loadingFiles = false;
+			if (req === agentSequence && activeAgentId === targetAgentId) loadingFiles = false;
 		}
 	}
 
@@ -161,24 +172,28 @@
 	}
 
 	async function toggleDirectory(path: string) {
-		if (!activeAgentId) return;
+		const targetAgentId = activeAgentId;
+		if (!targetAgentId) return;
 		if (expanded.includes(path)) {
 			expanded = expanded.filter((item) => item !== path);
 			return;
 		}
 		expanded = [...expanded, path];
 		if (directories[path]) return;
+		const req = agentSequence;
 		try {
-			const dir = await workspaces.tree(activeAgentId, path);
+			const dir = await workspaces.tree(targetAgentId, path);
+			if (req !== agentSequence || activeAgentId !== targetAgentId) return;
 			directories = { ...directories, [path]: dir.entries };
 		} catch {}
 	}
 
 	async function loadWorkspaceHtml(targetAgentId: string, filePath: string) {
+		const req = agentSequence;
 		error = '';
 		try {
 			const file = await workspaces.readFile(targetAgentId, filePath);
-			if (disposed) return;
+			if (disposed || req !== agentSequence || activeAgentId !== targetAgentId) return;
 			if (htmlBlobUrl) URL.revokeObjectURL(htmlBlobUrl);
 			htmlBlobUrl = URL.createObjectURL(new Blob([file.content], { type: 'text/html;charset=utf-8' }));
 			sourceMode = 'workspace-html';
@@ -193,7 +208,9 @@
 				title: `App · ${file.path.split('/').pop() || file.path}`,
 			});
 		} catch (cause) {
-			error = cause instanceof Error ? cause.message : String(cause);
+			if (req === agentSequence && activeAgentId === targetAgentId) {
+				error = cause instanceof Error ? cause.message : String(cause);
+			}
 		}
 	}
 
@@ -226,7 +243,15 @@
 	}
 
 	function handleAgentChange(nextId: string) {
+		agentSequence += 1;
+		loadingPorts = false;
+		loadingFiles = false;
+		addingPort = false;
 		activeAgentId = nextId;
+		ports = [];
+		directories = {};
+		expanded = [''];
+		error = '';
 		onUpdateNode({ agentId: nextId || null });
 		if (nextId) {
 			void loadPorts(nextId);

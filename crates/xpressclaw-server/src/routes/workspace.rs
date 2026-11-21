@@ -32,6 +32,7 @@ use crate::state::AppState;
 
 const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_RAW_ASSET_BYTES: u64 = 16 * 1024 * 1024;
+const RAW_ASSET_CSP: &str = "default-src 'none'; sandbox";
 const MAX_DIRECTORY_ENTRIES: usize = 2_000;
 const MAX_GIT_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 
@@ -744,7 +745,7 @@ async fn read_raw_asset(
         .header(header::CONTENT_TYPE, mime_type)
         .header(header::CACHE_CONTROL, "no-store")
         .header("x-content-type-options", "nosniff")
-        .header("content-security-policy", "default-src 'none'; sandbox")
+        .header("content-security-policy", RAW_ASSET_CSP)
         .body(axum::body::Body::from(bytes))
         .map_err(|error| internal_error(format!("failed to build asset response: {error}")))
 }
@@ -1809,8 +1810,10 @@ mod tests {
     #[tokio::test]
     async fn raw_workspace_asset_serves_images_with_sandbox_headers_and_rejects_non_images() {
         let (app, _internal, _db, workspace) = repository_app();
-        std::fs::write(workspace.path().join("product/logo.png"), b"\x89PNG\r\n\x1a\n").unwrap();
-        std::fs::write(workspace.path().join("product/notes.txt"), b"hello").unwrap();
+        let logo_path = workspace.path().join("product/logo.png");
+        let notes_path = workspace.path().join("product/notes.txt");
+        std::fs::write(&logo_path, b"\x89PNG\r\n\x1a\n").unwrap();
+        std::fs::write(&notes_path, b"hello").unwrap();
 
         let png = app
             .clone()
@@ -1823,10 +1826,7 @@ mod tests {
             .unwrap();
         assert_eq!(png.status(), StatusCode::OK);
         assert_eq!(png.headers()[header::CONTENT_TYPE], "image/png");
-        assert_eq!(
-            png.headers()["content-security-policy"],
-            "default-src 'none'; sandbox"
-        );
+        assert_eq!(png.headers()["content-security-policy"], RAW_ASSET_CSP);
         assert_eq!(png.headers()["x-content-type-options"], "nosniff");
         let bytes = png.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&bytes[..], b"\x89PNG\r\n\x1a\n");

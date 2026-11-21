@@ -76,6 +76,7 @@
 	]);
 	let focusedPaneId = $state('initial-pane');
 	let workspaceMode = $state<WorkspaceViewMode>('tabs');
+	let canvasMounted = $state(false);
 	let canvasRef = $state<{ openRoute: (route: string, preferredParentId?: string | null) => boolean }>();
 	let workspaceReady = $state(false);
 	let lastSyncedPath = '';
@@ -205,6 +206,7 @@
 
 	function setWorkspaceMode(mode: WorkspaceViewMode) {
 		workspaceMode = mode;
+		if (mode === 'canvas') canvasMounted = true;
 		try {
 			workspaceStateStorage().setItem(VIEW_MODE_STORAGE_KEY, mode);
 		} catch {}
@@ -1372,6 +1374,7 @@
 			const savedMode = workspaceStateStorage().getItem(VIEW_MODE_STORAGE_KEY);
 			if (savedMode === 'canvas' || currentRoute() === '/canvas') {
 				workspaceMode = 'canvas';
+				canvasMounted = true;
 			}
 		} catch {}
 
@@ -1562,10 +1565,11 @@
 		</div>
 
 		{#if workspacePath($page.url.pathname)}
-			{#if workspaceMode === 'canvas'}
-				<div class="flex min-h-0 flex-1 overflow-hidden">
+			{#if canvasMounted}
+				<div style:display={workspaceMode === 'canvas' ? 'flex' : 'none'} class="min-h-0 flex-1 overflow-hidden">
 					<WorkspaceCanvas
 						bind:this={canvasRef}
+						visible={workspaceMode === 'canvas'}
 						storageKey={CANVAS_STORAGE_KEY}
 						storage={workspaceStateStorage()}
 						projects={projectList}

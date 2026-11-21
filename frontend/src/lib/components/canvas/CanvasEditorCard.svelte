@@ -42,6 +42,7 @@
 	let saveMessage = $state('');
 	let pathInput = $state('');
 	let sequence = 0;
+	let treeSequence = 0;
 
 	let dirty = $derived(Boolean(selectedFile && editorValue !== selectedFile.content));
 	let changeByPath = $derived(new Map((git?.files ?? []).map((change) => [change.path, change])));
@@ -59,6 +60,7 @@
 
 	async function loadAgentWorkspace(targetAgentId: string, fileToOpen: string | null = null) {
 		if (!targetAgentId) return;
+		const req = ++treeSequence;
 		loadingTree = true;
 		error = '';
 		try {
@@ -66,6 +68,7 @@
 				workspaces.tree(targetAgentId),
 				workspaces.gitStatus(targetAgentId).catch(() => null),
 			]);
+			if (req !== treeSequence || activeAgentId !== targetAgentId) return;
 			directories = { '': rootDir.entries };
 			expanded = [''];
 			git = gitStatus;
@@ -73,9 +76,13 @@
 				await openFile(fileToOpen, true);
 			}
 		} catch (cause) {
-			error = cause instanceof Error ? cause.message : String(cause);
+			if (req === treeSequence && activeAgentId === targetAgentId) {
+				error = cause instanceof Error ? cause.message : String(cause);
+			}
 		} finally {
-			loadingTree = false;
+			if (req === treeSequence && activeAgentId === targetAgentId) {
+				loadingTree = false;
+			}
 		}
 	}
 
@@ -95,27 +102,33 @@
 	}
 
 	async function toggleDirectory(path: string) {
-		if (!activeAgentId) return;
+		const targetAgentId = activeAgentId;
+		if (!targetAgentId) return;
 		if (expanded.includes(path)) {
 			expanded = expanded.filter((item) => item !== path);
 			return;
 		}
 		expanded = [...expanded, path];
 		if (directories[path]) return;
+		const req = treeSequence;
 		try {
-			const dir = await workspaces.tree(activeAgentId, path);
+			const dir = await workspaces.tree(targetAgentId, path);
+			if (req !== treeSequence || activeAgentId !== targetAgentId) return;
 			directories = { ...directories, [path]: dir.entries };
 		} catch (cause) {
-			error = cause instanceof Error ? cause.message : String(cause);
+			if (req === treeSequence && activeAgentId === targetAgentId) {
+				error = cause instanceof Error ? cause.message : String(cause);
+			}
 		}
 	}
 
 	async function openFile(path: string, force = false) {
 		const cleanPath = path.trim();
-		if (!activeAgentId || !cleanPath) return;
+		const targetAgentId = activeAgentId;
+		if (!targetAgentId || !cleanPath) return;
 		if (!force && dirty && !window.confirm('Discard unsaved changes in this editor?')) return;
 		if (isImageFilePath(cleanPath)) {
-			onOpenImage(activeAgentId, cleanPath, nodeId);
+			onOpenImage(targetAgentId, cleanPath, nodeId);
 			return;
 		}
 		const req = ++sequence;
@@ -124,10 +137,10 @@
 		saveMessage = '';
 		try {
 			const [file, diff] = await Promise.all([
-				workspaces.readFile(activeAgentId, cleanPath),
-				workspaces.gitDiff(activeAgentId, cleanPath).catch(() => null),
+				workspaces.readFile(targetAgentId, cleanPath),
+				workspaces.gitDiff(targetAgentId, cleanPath).catch(() => null),
 			]);
-			if (req !== sequence) return;
+			if (req !== sequence || activeAgentId !== targetAgentId) return;
 			selectedPath = file.path;
 			pathInput = file.path;
 			selectedFile = file;
@@ -135,48 +148,73 @@
 			fileDiff = diff;
 			viewMode = 'code';
 			onUpdateNode({
-				agentId: activeAgentId,
+				agentId: targetAgentId,
 				filePath: file.path,
 				title: file.path.split('/').pop() || file.path,
 			});
 		} catch (cause) {
-			if (req === sequence) error = cause instanceof Error ? cause.message : String(cause);
+			if (req === sequence && activeAgentId === targetAgentId) {
+				error = cause instanceof Error ? cause.message : String(cause);
+			}
 		} finally {
-			if (req === sequence) loadingFile = false;
+			if (req === sequence && activeAgentId === targetAgentId) {
+				loadingFile = false;
+			}
 		}
 	}
 
 	async function saveFile() {
-		if (!activeAgentId || !selectedFile || !dirty || saving) return;
+		const targetAgentId = activeAgentId;
+		if (!targetAgentId || !selectedFile || !dirty || saving) return;
 		const snapshot = selectedFile;
 		const content = editorValue;
+		const req = sequence;
 		saving = true;
 		error = '';
 		saveMessage = '';
 		try {
-			const saved = await workspaces.saveFile(activeAgentId, { ...snapshot, content });
+			const saved = await workspaces.saveFile(targetAgentId, { ...snapshot, content });
+			if (req !== sequence || activeAgentId !== targetAgentId) return;
 			if (selectedFile?.path === snapshot.path) {
 				selectedFile = { ...selectedFile, content, revision: saved.revision, size: saved.size };
 				saveMessage = 'Saved';
 				setTimeout(() => { saveMessage = ''; }, 2000);
 			}
-			git = await workspaces.gitStatus(activeAgentId).catch(() => git);
-			fileDiff = await workspaces.gitDiff(activeAgentId, snapshot.path).catch(() => fileDiff);
+			const nextGit = await workspaces.gitStatus(targetAgentId).catch(() => git);
+			const nextDiff = await workspaces.gitDiff(targetAgentId, snapshot.path).catch(() => fileDiff);
+			if (req === sequence && activeAgentId === targetAgentId) {
+				git = nextGit;
+				fileDiff = nextDiff;
+			}
 		} catch (cause) {
-			error = cause instanceof Error ? cause.message : String(cause);
+			if (req === sequence && activeAgentId === targetAgentId) {
+				error = cause instanceof Error ? cause.message : String(cause);
+			}
 		} finally {
-			saving = false;
+			if (req === sequence && activeAgentId === targetAgentId) {
+				saving = false;
+			}
 		}
 	}
 
 	function handleAgentChange(nextId: string) {
 		if (dirty && !window.confirm('Discard unsaved changes before switching agents?')) return;
+		sequence += 1;
+		treeSequence += 1;
+		loadingFile = false;
+		loadingTree = false;
+		saving = false;
 		activeAgentId = nextId;
+		directories = {};
+		expanded = [''];
+		git = null;
 		selectedPath = '';
 		selectedFile = null;
 		editorValue = '';
 		pathInput = '';
 		fileDiff = null;
+		error = '';
+		saveMessage = '';
 		onUpdateNode({ agentId: nextId || null, filePath: null });
 		if (nextId) void loadAgentWorkspace(nextId, null);
 	}
@@ -305,10 +343,11 @@
 					<pre class="workspace-scroll-y m-0 flex-1 bg-[hsl(var(--code-background))] p-3 font-mono text-[11px] text-[hsl(var(--code-foreground))]">{fileDiff?.diff || 'No git diff for this file.'}</pre>
 				{:else}
 					<div class="min-h-0 flex-1">
-						{#key `${activeAgentId}:${selectedFile.path}`}
+						{#key `${nodeId}:${activeAgentId}:${selectedFile.path}`}
 							<MonacoEditor
 								value={editorValue}
 								path={selectedFile.path}
+								modelId={`${nodeId}:${activeAgentId}`}
 								onChange={(value) => { editorValue = value; }}
 								onSave={saveFile}
 							/>

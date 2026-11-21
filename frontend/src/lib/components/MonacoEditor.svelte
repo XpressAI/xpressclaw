@@ -5,13 +5,15 @@
 	interface Props {
 		value: string;
 		path: string;
+		modelId?: string;
 		readOnly?: boolean;
 		language?: string;
 		onChange?: (value: string) => void;
 		onSave?: () => void;
 	}
 
-	let { value, path, readOnly = false, language, onChange, onSave }: Props = $props();
+	let { value, path, modelId, readOnly = false, language, onChange, onSave }: Props = $props();
+	const instanceId = $props.id();
 	let host = $state<HTMLDivElement>();
 	let ready = $state(false);
 	let editor: import('monaco-editor').editor.IStandaloneCodeEditor | null = null;
@@ -36,10 +38,11 @@
 			const module = await import('$lib/monaco');
 			if (disposed || !host) return;
 			monaco = module.loadMonaco();
+			const modelScope = modelId || instanceId;
 			const model = monaco.editor.createModel(
 				value,
 				language || languageForPath(path),
-				monaco.Uri.parse(`inmemory://xpressclaw/${encodeURIComponent(path || 'untitled')}`),
+				monaco.Uri.parse(`inmemory://xpressclaw/${encodeURIComponent(modelScope)}/${encodeURIComponent(path || 'untitled')}`),
 			);
 			editor = monaco.editor.create(host, {
 				model,

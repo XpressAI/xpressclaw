@@ -24,6 +24,7 @@
 	interface Props {
 		node: CanvasNode;
 		focused: boolean;
+		visible?: boolean;
 		zoom: number;
 		canvasInteracting: boolean;
 		status?: string | null;
@@ -46,6 +47,7 @@
 	let {
 		node,
 		focused,
+		visible = true,
 		zoom,
 		canvasInteracting,
 		status = null,
@@ -65,7 +67,7 @@
 		children,
 	}: Props = $props();
 
-	providePaneActive(() => !node.collapsed);
+	providePaneActive(() => visible && !node.collapsed);
 
 	let dragging = $state(false);
 	let resizing = $state(false);
