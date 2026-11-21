@@ -90,6 +90,7 @@ export function projectSection(route: string): ProjectSection {
 export function workspacePath(route: string): boolean {
 	const pathname = pathnameFromRoute(route);
 	return pathname === '/'
+		|| pathname === '/canvas'
 		|| pathname === '/dashboard'
 		|| pathname === '/projects'
 		|| pathname.startsWith('/projects/')

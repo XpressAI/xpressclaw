@@ -31,6 +31,8 @@ use xpressclaw_core::workers::{github, native};
 use crate::state::AppState;
 
 const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_RAW_ASSET_BYTES: u64 = 16 * 1024 * 1024;
+const RAW_ASSET_CSP: &str = "default-src 'none'; sandbox";
 const MAX_DIRECTORY_ENTRIES: usize = 2_000;
 const MAX_GIT_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 
@@ -99,6 +101,7 @@ pub fn routes() -> Router<AppState> {
         .route("/{agent_id}", get(workspace_status))
         .route("/{agent_id}/tree", get(list_directory))
         .route("/{agent_id}/file", get(read_file).put(write_file))
+        .route("/{agent_id}/raw", get(read_raw_asset))
         .route("/{agent_id}/git/status", get(git_status))
         .route("/{agent_id}/git/diff", get(git_diff))
         .route(
@@ -663,6 +666,88 @@ async fn read_file(
         "revision": content_revision(&bytes),
         "size": bytes.len(),
     })))
+}
+
+fn image_mime_for_path(path: &FsPath) -> Option<&'static str> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "svg" => Some("image/svg+xml"),
+        "bmp" => Some("image/bmp"),
+        "ico" => Some("image/x-icon"),
+        "avif" => Some("image/avif"),
+        _ => None,
+    }
+}
+
+async fn read_raw_asset(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+    Query(query): Query<WorkspacePathQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    require_same_origin(&headers)?;
+    let root = workspace_root(&state, &agent_id).await?;
+    let relative = normalize_relative_path(&query.path)?;
+    let mime_type = image_mime_for_path(&relative).ok_or_else(|| {
+        api_error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "only image assets can be previewed directly from a workspace",
+        )
+    })?;
+    let workspace = open_workspace_dir(&root)?;
+    let symlink_meta = workspace
+        .symlink_metadata(&relative)
+        .map_err(|error| workspace_path_error("inspect file", error))?;
+    if symlink_meta.file_type().is_symlink() {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "symlinks cannot be previewed directly",
+        ));
+    }
+    let mut file = workspace
+        .open(&relative)
+        .map_err(|error| workspace_path_error("open file", error))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| internal_error(format!("failed to inspect file: {error}")))?;
+    if !metadata.is_file() {
+        return Err(api_error(StatusCode::BAD_REQUEST, "path is not a file"));
+    }
+    if metadata.len() > MAX_RAW_ASSET_BYTES {
+        return Err(api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "assets larger than {} MiB cannot be previewed",
+                MAX_RAW_ASSET_BYTES / 1024 / 1024
+            ),
+        ));
+    }
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(MAX_RAW_ASSET_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| internal_error(format!("failed to read asset: {error}")))?;
+    if bytes.len() as u64 > MAX_RAW_ASSET_BYTES {
+        return Err(api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "assets larger than {} MiB cannot be previewed",
+                MAX_RAW_ASSET_BYTES / 1024 / 1024
+            ),
+        ));
+    }
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, mime_type)
+        .header(header::CACHE_CONTROL, "no-store")
+        .header("x-content-type-options", "nosniff")
+        .header("content-security-policy", RAW_ASSET_CSP)
+        .body(axum::body::Body::from(bytes))
+        .map_err(|error| internal_error(format!("failed to build asset response: {error}")))
 }
 
 async fn write_file(
@@ -1720,5 +1805,51 @@ mod tests {
             require_same_origin(&headers).unwrap_err().0,
             StatusCode::FORBIDDEN
         );
+    }
+
+    #[tokio::test]
+    async fn raw_workspace_asset_serves_images_with_sandbox_headers_and_rejects_non_images() {
+        let (app, _internal, _db, workspace) = repository_app();
+        let logo_path = workspace.path().join("product/logo.png");
+        let notes_path = workspace.path().join("product/notes.txt");
+        std::fs::write(&logo_path, b"\x89PNG\r\n\x1a\n").unwrap();
+        std::fs::write(&notes_path, b"hello").unwrap();
+
+        let png = app
+            .clone()
+            .oneshot(
+                Request::get("/workspaces/workspace-agent/raw?path=product/logo.png")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(png.status(), StatusCode::OK);
+        assert_eq!(png.headers()[header::CONTENT_TYPE], "image/png");
+        assert_eq!(png.headers()["content-security-policy"], RAW_ASSET_CSP);
+        assert_eq!(png.headers()["x-content-type-options"], "nosniff");
+        let bytes = png.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&bytes[..], b"\x89PNG\r\n\x1a\n");
+
+        let txt = app
+            .clone()
+            .oneshot(
+                Request::get("/workspaces/workspace-agent/raw?path=product/notes.txt")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(txt.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        let escape = app
+            .oneshot(
+                Request::get("/workspaces/workspace-agent/raw?path=../secret.png")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(escape.status(), StatusCode::BAD_REQUEST);
     }
 }

@@ -37,7 +37,7 @@ Codex, Claude Code, DeepSeek Harness, and OpenCode already supply excellent agen
 - **Multiplayer Project spaces** — Coordinate people and specialized Agents through shared Conversations, Tasks, workflows, files, and memory.
 - **Distributed by design** — Keep Agents working on an always-on desktop or server while browsers and future native clients reconnect from other devices.
 - **Harness-owned intelligence** — The selected product owns reasoning, tools, and subagents; xpressclaw is its ACP client, not another agent framework in front of it.
-- **Structured interface** — See tasks, attempts, artifacts, questions, and review decisions without watching a terminal.
+- **Structured interface** — See tasks, attempts, artifacts, questions, and review decisions without watching a terminal, using either multi-pane tabs or the optional [Spatial Canvas workspace](docs/canvas-workspace.md).
 - **Native desktop app** — Tauri installers for macOS, Windows, and Linux with a system tray. Runs in the background, always available.
 - **Automation-first** — Queue tasks, run recurring schedules, and express implementation/review loops as workflows.
 - **Isolated and continuous** — Every Agent reuses one initialized Docker/Podman environment while Project Conversations stay available alongside task work.
