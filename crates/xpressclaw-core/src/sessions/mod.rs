@@ -294,6 +294,26 @@ impl SessionManager {
         self.list_events_filtered(session_id, after, None, limit)
     }
 
+    /// Raw ACP tool-call payloads recorded for one task, newest first. Their
+    /// locations and working directories show where the task edited files.
+    pub fn task_tool_call_payloads(&self, task_id: &str, limit: i64) -> Result<Vec<Value>> {
+        self.db.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT payload FROM session_events
+                 WHERE task_id = ?1 AND event_type IN ('tool_call', 'tool_call_update')
+                 ORDER BY id DESC LIMIT ?2",
+            )?;
+            let payloads = stmt
+                .query_map(rusqlite::params![task_id, limit], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .filter_map(|row| row.ok())
+                .filter_map(|payload| serde_json::from_str(&payload).ok())
+                .collect();
+            Ok(payloads)
+        })
+    }
+
     pub fn list_events_filtered(
         &self,
         session_id: &str,

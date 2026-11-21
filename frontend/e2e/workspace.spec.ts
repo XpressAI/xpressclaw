@@ -396,6 +396,11 @@ async function mockApi(
 		repositoryStatus?: Record<string, unknown>;
 		repositorySelections?: (string | null)[];
 		includeDeletedWorkspaceFile?: boolean;
+		/** Files the task edited in a linked worktree, returned only for task-scoped status. */
+		taskWorktreeFiles?: boolean;
+		gitStatusTaskIds?: (string | null)[];
+		/** Holds task-scoped Git status responses while `gate` is pending. */
+		taskGitStatusGate?: { gate?: Promise<void> };
 		conversations?: Record<string, unknown>[];
 		conversationMessages?: Record<string, unknown>[];
 		conversationTurns?: Record<string, unknown>[];
@@ -1098,7 +1103,8 @@ async function mockApi(
 				options.workspaceReadRequests?.push(filePath);
 				const readDelayMs = options.workspaceReadDelaysMs?.[filePath] ?? 0;
 				if (readDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, readDelayMs));
-				if (options.includeDeletedWorkspaceFile && filePath === 'src/removed.ts') {
+				if ((options.includeDeletedWorkspaceFile && filePath === 'src/removed.ts')
+					|| (options.taskWorktreeFiles && filePath === '.worktrees/jump-arrows/src/Old.svelte')) {
 					await route.fulfill({ status: 404, contentType: 'application/json', body: JSON.stringify({ error: 'workspace path was not found' }) });
 					return;
 				}
@@ -1110,11 +1116,22 @@ async function mockApi(
 				};
 			}
 		} else if (path === `/api/workspaces/${agentId}/git/status`) {
+			const statusTaskId = url.searchParams.get('task_id');
+			options.gitStatusTaskIds?.push(statusTaskId);
+			if (statusTaskId) await options.taskGitStatusGate?.gate;
+			const taskWorktree = options.taskWorktreeFiles && statusTaskId === taskId;
 			response = {
 				repository: true,
 				branch: 'feature/workspace-browser',
 				repository_status: repositoryStatus,
+				worktrees: taskWorktree ? [{ path: '.worktrees/jump-arrows', branch: 'fix/jump-arrows' }] : [],
 				files: [
+					...(taskWorktree
+						? [
+						{ path: '.worktrees/jump-arrows/src/JumpArrows.svelte', original_path: null, status: ' M', index_status: ' ', worktree_status: 'M' },
+						{ path: '.worktrees/jump-arrows/src/Old.svelte', original_path: null, status: ' D', index_status: ' ', worktree_status: 'D' },
+					]
+						: []),
 					{ path: 'src/main.ts', original_path: null, status: ' M', index_status: ' ', worktree_status: 'M' },
 					{ path: 'README.md', original_path: null, status: '??', index_status: '?', worktree_status: '?' },
 					...(options.includeDeletedWorkspaceFile
@@ -1130,7 +1147,9 @@ async function mockApi(
 					? 'diff --git a/src/main.ts b/src/main.ts\n--- a/src/main.ts\n+++ b/src/main.ts\n@@ -1 +1 @@\n-export const greeting = "hi";\n+export const greeting = "hello";\n'
 					: filePath === 'src/removed.ts'
 						? 'diff --git a/src/removed.ts b/src/removed.ts\ndeleted file mode 100644\n--- a/src/removed.ts\n+++ /dev/null\n@@ -1 +0,0 @@\n-export const removed = true;\n'
-						: '',
+						: filePath === '.worktrees/jump-arrows/src/Old.svelte'
+							? 'diff --git a/src/Old.svelte b/src/Old.svelte\ndeleted file mode 100644\n--- a/src/Old.svelte\n+++ /dev/null\n@@ -1 +0,0 @@\n-<p>old</p>\n'
+							: '',
 				truncated: false,
 			};
 		} else if (path === '/api/tasks/planning') {
@@ -4462,6 +4481,28 @@ test('deleted workspace changes remain available as diff-only selections', async
 	await expect(page.getByText('workspace path was not found')).toBeHidden();
 });
 
+test('task changed files include the worktrees the task edited', async ({ page }) => {
+	const gitStatusTaskIds: (string | null)[] = [];
+	await mockApi(page, { taskWorktreeFiles: true, gitStatusTaskIds });
+	await page.goto(`/tasks/${taskId}`);
+
+	const changedFiles = page.locator('[data-task-changed-files]');
+	const worktreeFile = changedFiles.getByRole('link', { name: '.worktrees/jump-arrows/src/JumpArrows.svelte' });
+	await expect(worktreeFile).toHaveAttribute(
+		'href',
+		`/agents/${agentId}?tab=files&task=${taskId}&path=.worktrees%2Fjump-arrows%2Fsrc%2FJumpArrows.svelte`,
+	);
+	await expect(changedFiles.getByRole('link', { name: 'src/main.ts' })).toHaveAttribute(
+		'href',
+		`/agents/${agentId}?tab=files&path=src%2Fmain.ts`,
+	);
+	expect(gitStatusTaskIds).toContain(taskId);
+
+	await worktreeFile.click();
+	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&task=${taskId}&path=.worktrees%2Fjump-arrows%2Fsrc%2FJumpArrows.svelte&tree=collapsed`);
+	await expect.poll(() => gitStatusTaskIds.filter((id) => id === taskId).length).toBeGreaterThanOrEqual(2);
+});
+
 test('task changed files open beside the task with the file tree collapsed', async ({ page }) => {
 	await mockApi(page);
 	await page.goto(`/tasks/${taskId}`);
@@ -4522,6 +4563,73 @@ test('task changed files use normal navigation when the workspace is too narrow 
 	await expect(page.locator('[data-monaco-editor]')).toBeVisible({ timeout: 20_000 });
 	await expect(page.getByRole('button', { name: 'Show files' })).toBeVisible();
 	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+});
+
+test('a reused Files tab refreshes Git status for a newly linked task', async ({ page }) => {
+	const gitStatusTaskIds: (string | null)[] = [];
+	const taskGitStatusGate: { gate?: Promise<void> } = {};
+	await page.setViewportSize({ width: 2200, height: 1000 });
+	await mockApi(page, { taskWorktreeFiles: true, gitStatusTaskIds, taskGitStatusGate });
+	await page.goto(`/tasks/${taskId}`);
+	for (let paneCount = 2; paneCount <= 4; paneCount += 1) {
+		await page.getByRole('button', { name: 'Split active tab right' }).last().click();
+		await expect(page.locator('[data-workspace-pane]')).toHaveCount(paneCount);
+	}
+
+	// At the pane limit, file links navigate in place instead of splitting.
+	const panes = page.locator('[data-workspace-pane]');
+	const filesPane = panes.first();
+	const details = page.getByRole('dialog', { name: 'Task details', exact: true });
+	await filesPane.getByRole('button', { name: 'Show task details' }).click();
+	await details.getByRole('link', { name: 'src/main.ts' }).focus();
+	await page.keyboard.press('Enter');
+	await expect(filesPane.getByText('feature/workspace-browser · 2 changed')).toBeVisible();
+
+	// A link from another pane reuses that mounted Files tab with a task scope.
+	await panes.last().getByRole('button', { name: 'Show task details' }).click();
+	await details.getByRole('link', { name: '.worktrees/jump-arrows/src/JumpArrows.svelte' }).focus();
+	await page.keyboard.press('Enter');
+	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&task=${taskId}&path=.worktrees%2Fjump-arrows%2Fsrc%2FJumpArrows.svelte&tree=collapsed`);
+	await expect(panes).toHaveCount(4);
+	await expect(filesPane.getByText('feature/workspace-browser · 4 changed')).toBeVisible();
+
+	// An unscoped link clears the task scope again.
+	const openFromLastPane = async (name: string) => {
+		await panes.last().getByRole('button', { name: 'Show task details' }).click();
+		await details.getByRole('link', { name }).focus();
+		await page.keyboard.press('Enter');
+	};
+	await openFromLastPane('src/main.ts');
+	await expect(filesPane.getByText('feature/workspace-browser · 2 changed')).toBeVisible();
+	expect(gitStatusTaskIds.at(-1)).toBeNull();
+
+	// A slow scoped status load must not reopen its file after a newer link.
+	let releaseStatus!: () => void;
+	taskGitStatusGate.gate = new Promise<void>((resolve) => { releaseStatus = resolve; });
+	await openFromLastPane('.worktrees/jump-arrows/src/JumpArrows.svelte');
+	await expect.poll(() => gitStatusTaskIds.at(-1)).toBe(taskId);
+	await openFromLastPane('README.md');
+	await expect(filesPane.locator('span[title="README.md"]')).toBeVisible();
+	releaseStatus();
+	await page.waitForTimeout(500);
+	await expect(filesPane.locator('span[title="README.md"]')).toBeVisible();
+	await expect(page).toHaveURL(/path=README\.md/);
+	// The superseded task snapshot must not replace the unscoped one, and
+	// Refresh keeps the route's scope.
+	await expect(filesPane.getByText('feature/workspace-browser · 2 changed')).toBeVisible();
+	await filesPane.getByRole('button', { name: 'Refresh', exact: true }).click();
+	await expect.poll(() => gitStatusTaskIds.at(-1)).toBeNull();
+	await expect(filesPane.getByText('feature/workspace-browser · 2 changed')).toBeVisible();
+
+	// A second link for the scope still loading waits for that snapshot, so
+	// a deleted worktree file is recognised instead of rejected.
+	taskGitStatusGate.gate = new Promise<void>((resolve) => { releaseStatus = resolve; });
+	await openFromLastPane('.worktrees/jump-arrows/src/JumpArrows.svelte');
+	await expect.poll(() => gitStatusTaskIds.at(-1)).toBe(taskId);
+	await openFromLastPane('.worktrees/jump-arrows/src/Old.svelte');
+	releaseStatus();
+	await expect(filesPane.locator('span[title=".worktrees/jump-arrows/src/Old.svelte"]')).toBeVisible();
+	await expect(page).toHaveURL(/path=\.worktrees%2Fjump-arrows%2Fsrc%2FOld\.svelte/);
 });
 
 test('task changed-file modified clicks retain normal link behavior', async ({ page }) => {
@@ -8195,7 +8303,7 @@ test('task messages and completion keep updating while Git status is stalled', a
     let releaseGit!: () => void;
     const gitGate = new Promise<void>(resolve => { releaseGit = resolve; });
     let gitRequests = 0;
-    await page.route(`**/api/workspaces/${agentId}/git/status`, async route => {
+    await page.route(url => url.pathname === `/api/workspaces/${agentId}/git/status`, async route => {
         gitRequests++;
         await gitGate;
         await route.fulfill({ json: { repository: true, branch: 'main', files: [] } }).catch(() => {});
@@ -8230,7 +8338,7 @@ test('stalled Git refresh times out and a later refresh recovers', async ({ page
     page.on('requestfailed', request => {
         if (new URL(request.url()).pathname.endsWith('/git/status')) failedRequests.push(request.url());
     });
-    await page.route(`**/api/workspaces/${agentId}/git/status`, async route => {
+    await page.route(url => url.pathname === `/api/workspaces/${agentId}/git/status`, async route => {
         if (++requests === 1) await gitGate;
         await route.fulfill({ json: { repository: true, branch: 'git-recovered', files: [] } }).catch(() => {});
     });

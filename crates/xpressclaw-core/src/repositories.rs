@@ -1066,6 +1066,125 @@ pub(crate) fn inspect_repository(
     })
 }
 
+/// A linked Git worktree inside an Agent workspace. Its metadata passed the
+/// same containment checks as an active repository, so host Git may run in it
+/// with these explicit paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceWorktree {
+    pub root: PathBuf,
+    pub git_dir: PathBuf,
+}
+
+/// Validate the linked worktree checked out at `directory`. Agents usually
+/// create worktrees inside their runner, so the `.git` file may name the
+/// runner's view of the workspace (`container_root`) rather than the host
+/// path; it is translated back into `bootstrap_root` and callers pass it to
+/// Git with `--git-dir`. Git always re-reads `commondir` itself (it ignores
+/// `GIT_COMMON_DIR` when building a worktree's ref store), so that file must
+/// already resolve on the host — Git writes it relative by default.
+pub fn workspace_worktree(
+    bootstrap_root: &Path,
+    container_root: &Path,
+    directory: &Path,
+) -> Option<WorkspaceWorktree> {
+    let directory = directory.canonicalize().ok()?;
+    if directory == bootstrap_root || !directory.starts_with(bootstrap_root) {
+        return None;
+    }
+    let pointer = read_small_regular_file(&directory.join(".git"))?;
+    let git_dir = pointer.lines().next()?.strip_prefix("gitdir:")?.trim();
+    let git_dir = workspace_git_path(bootstrap_root, container_root, &directory, git_dir)?;
+    let common_dir = read_small_regular_file(&git_dir.join("commondir"))?;
+    let common_dir = host_git_path(bootstrap_root, &git_dir, common_dir.trim())?;
+    if !git_dir.starts_with(&common_dir)
+        || !has_regular_git_metadata_tree(bootstrap_root, &git_dir, &common_dir)
+        || !has_self_contained_git_config(bootstrap_root, &git_dir, &common_dir)
+        || !has_self_contained_object_store(bootstrap_root, &common_dir)
+    {
+        return None;
+    }
+    Some(WorkspaceWorktree {
+        root: directory,
+        git_dir,
+    })
+}
+
+fn read_small_regular_file(path: &Path) -> Option<String> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > 4096 {
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
+}
+
+/// Resolve a Git metadata path recorded by either host or runner Git and keep
+/// it inside the approved workspace.
+fn workspace_git_path(
+    bootstrap_root: &Path,
+    container_root: &Path,
+    base: &Path,
+    raw: &str,
+) -> Option<PathBuf> {
+    // Runner paths are POSIX even on Windows hosts, where a drive-less
+    // `/workspace/...` is not absolute, so translate them before host rules.
+    let path = if container_root != bootstrap_root && is_runner_path(raw, container_root) {
+        runner_path_to_host(raw, container_root, bootstrap_root)?
+    } else {
+        return host_git_path(bootstrap_root, base, raw);
+    };
+    let path = path.canonicalize().ok()?;
+    path.starts_with(bootstrap_root).then_some(path)
+}
+
+/// Resolve a Git metadata path the way host Git will, inside the workspace.
+fn host_git_path(bootstrap_root: &Path, base: &Path, raw: &str) -> Option<PathBuf> {
+    let path = if Path::new(raw).is_absolute() {
+        PathBuf::from(raw)
+    } else {
+        base.join(raw)
+    };
+    let path = path.canonicalize().ok()?;
+    path.starts_with(bootstrap_root).then_some(path)
+}
+
+fn runner_relative<'a>(raw: &'a str, container_root: &Path) -> Option<&'a str> {
+    let root = container_root.to_str()?.trim_end_matches('/');
+    if !root.starts_with('/') {
+        return None;
+    }
+    let rest = raw.strip_prefix(root)?;
+    if rest.is_empty() {
+        Some(rest)
+    } else {
+        rest.strip_prefix('/')
+    }
+}
+
+fn is_runner_path(raw: &str, container_root: &Path) -> bool {
+    runner_relative(raw, container_root).is_some()
+}
+
+/// Map a POSIX path the runner reported beneath `container_root` (its view of
+/// the workspace, such as `/workspace`) to the host workspace. Paths outside
+/// that mount or containing `.`/`..` segments are rejected.
+pub fn runner_path_to_host(
+    raw: &str,
+    container_root: &Path,
+    bootstrap_root: &Path,
+) -> Option<PathBuf> {
+    let mut path = bootstrap_root.to_path_buf();
+    for segment in runner_relative(raw, container_root)?
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+    {
+        if matches!(segment, "." | "..") || segment.contains('\\') {
+            return None;
+        }
+        path.push(segment);
+    }
+    Some(path)
+}
+
 fn git_origin(repository: &Path) -> Option<String> {
     let mut command = Command::new("git");
     command
@@ -1506,6 +1625,155 @@ mod tests {
             .select("agent", workspace.path(), "feature")
             .unwrap();
         assert_eq!(selected.inspection.active_relative_path(), Some("feature"));
+    }
+
+    fn committed_repository_with_worktree(bootstrap: &Path) -> PathBuf {
+        repository(bootstrap, None);
+        git(
+            bootstrap,
+            &[
+                "-c",
+                "user.name=XpressClaw Tests",
+                "-c",
+                "user.email=tests@xpressclaw.invalid",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "initial",
+            ],
+        );
+        let linked = bootstrap.join(".worktrees").join("feature");
+        git(
+            bootstrap,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                linked.to_str().unwrap(),
+            ],
+        );
+        linked
+    }
+
+    #[test]
+    fn workspace_worktree_validates_host_recorded_worktrees() {
+        let workspace = tempfile::tempdir().unwrap();
+        let bootstrap = workspace.path().canonicalize().unwrap();
+        let linked = committed_repository_with_worktree(workspace.path());
+
+        let worktree = workspace_worktree(&bootstrap, Path::new("/workspace"), &linked).unwrap();
+        assert_eq!(worktree.root, linked.canonicalize().unwrap());
+        assert_eq!(
+            worktree.git_dir,
+            bootstrap
+                .join(".git/worktrees/feature")
+                .canonicalize()
+                .unwrap()
+        );
+        assert_eq!(
+            workspace_worktree(&bootstrap, Path::new("/workspace"), &bootstrap),
+            None
+        );
+    }
+
+    #[test]
+    fn workspace_worktree_translates_runner_recorded_paths() {
+        let workspace = tempfile::tempdir().unwrap();
+        let bootstrap = workspace.path().canonicalize().unwrap();
+        let linked = committed_repository_with_worktree(workspace.path());
+        // Runner Git records its own view of the workspace mount.
+        std::fs::write(
+            linked.join(".git"),
+            "gitdir: /workspace/.git/worktrees/feature\n",
+        )
+        .unwrap();
+
+        let worktree = workspace_worktree(&bootstrap, Path::new("/workspace"), &linked).unwrap();
+        assert_eq!(
+            worktree.git_dir,
+            bootstrap
+                .join(".git/worktrees/feature")
+                .canonicalize()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn workspace_worktree_rejects_a_common_dir_host_git_cannot_read() {
+        let workspace = tempfile::tempdir().unwrap();
+        let bootstrap = workspace.path().canonicalize().unwrap();
+        let linked = committed_repository_with_worktree(workspace.path());
+        std::fs::write(
+            linked.join(".git"),
+            "gitdir: /workspace/.git/worktrees/feature\n",
+        )
+        .unwrap();
+        // Host Git re-reads this file itself, so a runner-only path would make
+        // every later command fail; reject it during validation instead.
+        std::fs::write(
+            bootstrap.join(".git/worktrees/feature/commondir"),
+            "/workspace/.git\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            workspace_worktree(&bootstrap, Path::new("/workspace"), &linked),
+            None
+        );
+    }
+
+    #[test]
+    fn runner_paths_map_into_the_host_workspace_on_every_host() {
+        let host = Path::new("/srv/project");
+        let runner = Path::new("/workspace");
+        let map = |raw| runner_path_to_host(raw, runner, host);
+        assert_eq!(
+            map("/workspace/.git/worktrees/feature"),
+            Some(host.join(".git").join("worktrees").join("feature"))
+        );
+        assert_eq!(map("/workspace"), Some(host.to_path_buf()));
+        assert_eq!(map("/workspace/"), Some(host.to_path_buf()));
+        assert_eq!(map("/workspaces/other"), None);
+        assert_eq!(map("/workspace/../etc"), None);
+        assert_eq!(map("/workspace/./a"), None);
+        assert_eq!(map(r"/workspace/a\..\b"), None);
+        assert_eq!(map("relative/path"), None);
+        // Host-engine runners see the workspace at its host path.
+        assert_eq!(
+            runner_path_to_host("/srv/project/src", host, host),
+            Some(host.join("src"))
+        );
+        // A Windows host root is never a POSIX runner mount.
+        assert_eq!(
+            runner_path_to_host(r"C:\work\src", Path::new(r"C:\work"), host),
+            None
+        );
+    }
+
+    #[test]
+    fn workspace_worktree_rejects_metadata_outside_the_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let bootstrap = workspace.path().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let foreign = committed_repository_with_worktree(outside.path());
+        let decoy = bootstrap.join("decoy");
+        std::fs::create_dir_all(&decoy).unwrap();
+        std::fs::copy(foreign.join(".git"), decoy.join(".git")).unwrap();
+
+        assert_eq!(
+            workspace_worktree(&bootstrap, Path::new("/workspace"), &decoy),
+            None
+        );
+        std::fs::write(
+            decoy.join(".git"),
+            "gitdir: /workspace/../escape/.git/worktrees/feature\n",
+        )
+        .unwrap();
+        assert_eq!(
+            workspace_worktree(&bootstrap, Path::new("/workspace"), &decoy),
+            None
+        );
     }
 
     #[test]

@@ -1215,7 +1215,7 @@
 		lastWorkspaceGitRefresh = Date.now();
 		const timeout = setTimeout(() => controller.abort(), 10_000);
 		try {
-			const git = await workspaces.gitStatus(agentId, controller.signal);
+			const git = await workspaces.gitStatus(agentId, controller.signal, id);
 			if (!disposed && workspaceGitRequest === controller && task?.id === id && task.agent_id === agentId) workspaceGit = git;
 		} catch { /* Preserve the last Git snapshot; task polling continues. */ }
 		finally {
@@ -1637,7 +1637,10 @@
 
 	function workspaceFileUrl(agentId: string, path?: string): string {
 		const base = `/agents/${encodeURIComponent(agentId)}?tab=files`;
-		return path ? `${base}&path=${encodeURIComponent(path)}` : base;
+		if (!path) return base;
+		// Worktree files keep the task scope so Files lists that worktree too.
+		const inWorktree = workspaceGit?.worktrees?.some((worktree) => path.startsWith(`${worktree.path}/`));
+		return `${base}${inWorktree ? `&task=${encodeURIComponent(taskId)}` : ''}&path=${encodeURIComponent(path)}`;
 	}
 
 	function openChangedFile(event: MouseEvent, agentId: string, path: string) {

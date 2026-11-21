@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::path::{Component, Path as FsPath, PathBuf};
@@ -23,9 +24,12 @@ use uuid::Uuid;
 
 use xpressclaw_core::db::Database;
 use xpressclaw_core::docker::manager::DockerManager;
+use xpressclaw_core::external_tools::path_for_external_tool;
 use xpressclaw_core::repositories::{
-    AgentRepositoryManager, RepositoryInspection, RepositorySelectionState,
+    runner_path_to_host, workspace_worktree, AgentRepositoryManager, RepositoryInspection,
+    RepositorySelectionState, WorkspaceWorktree,
 };
+use xpressclaw_core::sessions::SessionManager;
 use xpressclaw_core::workers::{github, native};
 
 use crate::state::AppState;
@@ -35,6 +39,8 @@ const MAX_RAW_ASSET_BYTES: u64 = 16 * 1024 * 1024;
 const RAW_ASSET_CSP: &str = "default-src 'none'; sandbox";
 const MAX_DIRECTORY_ENTRIES: usize = 2_000;
 const MAX_GIT_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_TASK_TOOL_EVENTS: i64 = 500;
+const MAX_TASK_WORKTREES: usize = 8;
 
 type ApiError = (StatusCode, Json<Value>);
 type ApiResult<T> = Result<T, ApiError>;
@@ -824,9 +830,11 @@ async fn write_file(
 async fn git_status(
     State(state): State<AppState>,
     Path(agent_id): Path<String>,
+    Query(query): Query<GitStatusQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_same_origin(&headers)?;
+    let (agent, bootstrap) = agent_workspace(&state, &agent_id)?;
     let root = workspace_root(&state, &agent_id).await?;
     let repository_status = repository_status_json(&state, &agent_id).await?;
     if repository_status
@@ -855,38 +863,245 @@ async fn git_status(
         .filter(|output| output.status.success())
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
         .filter(|branch| !branch.is_empty());
-    let status = git_output(
-        &root,
-        &[
-            "-c",
-            "core.quotepath=false",
-            "-c",
-            "status.relativePaths=true",
-            "status",
-            "--porcelain=v1",
-            "-z",
-            "--untracked-files=all",
-            "--",
-            ".",
-        ],
-    )
-    .await?;
-    if !status.status.success() {
-        return Err(git_command_error("git status", &status));
+    let mut files = porcelain_status(&GitLocation::checkout(&root)).await?;
+    let mut worktrees = Vec::new();
+    if let Some(task_id) = query
+        .task_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        for worktree in task_worktrees(&state, &agent, &bootstrap, &root, task_id).await? {
+            let Ok(relative) = worktree.root.strip_prefix(&root) else {
+                continue;
+            };
+            let relative = relative_path_string(relative);
+            let location = GitLocation::worktree(&worktree);
+            let changes = match porcelain_status(&location).await {
+                Ok(changes) => changes,
+                Err((_, Json(error))) => {
+                    tracing::warn!(%agent_id, %task_id, worktree = %relative, %error, "skipping task worktree status");
+                    continue;
+                }
+            };
+            // The primary checkout reports a nested worktree as one untracked
+            // directory, or file by file when a runner-only `.git` pointer hides
+            // it from host Git; the worktree's own status replaces all of them.
+            let prefix = format!("{relative}/");
+            files.retain(|change| change.path != relative && !change.path.starts_with(&prefix));
+            files.extend(changes.into_iter().map(|change| GitChange {
+                path: format!("{prefix}{}", change.path),
+                original_path: change.original_path.map(|path| format!("{prefix}{path}")),
+                ..change
+            }));
+            worktrees.push(json!({
+                "path": relative,
+                "branch": git_branch(&location).await,
+            }));
+        }
+        files.sort_by(|left, right| left.path.cmp(&right.path));
     }
-    if status.stdout.len() > MAX_GIT_OUTPUT_BYTES {
-        return Err(api_error(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "git status returned too many changed paths",
-        ));
-    }
-    let files = parse_porcelain_status(&status.stdout);
     Ok(Json(json!({
         "repository": true,
         "branch": branch,
         "files": files,
+        "worktrees": worktrees,
         "repository_status": repository_status,
     })))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GitStatusQuery {
+    #[serde(default)]
+    task_id: Option<String>,
+}
+
+/// Where host Git runs: the active checkout, or a validated linked worktree
+/// whose metadata may have been recorded with the runner's paths.
+struct GitLocation {
+    work_tree: PathBuf,
+    git_dir: Option<PathBuf>,
+}
+
+impl GitLocation {
+    fn checkout(root: &FsPath) -> Self {
+        Self {
+            work_tree: root.to_path_buf(),
+            git_dir: None,
+        }
+    }
+
+    fn worktree(worktree: &WorkspaceWorktree) -> Self {
+        Self {
+            work_tree: worktree.root.clone(),
+            git_dir: Some(worktree.git_dir.clone()),
+        }
+    }
+
+    async fn git(&self, arguments: &[&str]) -> ApiResult<Output> {
+        let Some(git_dir) = &self.git_dir else {
+            return git_output(&self.work_tree, arguments).await;
+        };
+        // Canonical paths may carry Windows verbatim prefixes Git rejects.
+        let git_dir = path_for_external_tool(git_dir);
+        let work_tree = path_for_external_tool(&self.work_tree);
+        let git_dir = git_dir.to_string_lossy();
+        let work_tree = work_tree.to_string_lossy();
+        let mut explicit = vec![
+            "--git-dir",
+            git_dir.as_ref(),
+            "--work-tree",
+            work_tree.as_ref(),
+        ];
+        explicit.extend_from_slice(arguments);
+        git_output(&self.work_tree, &explicit).await
+    }
+}
+
+async fn git_branch(location: &GitLocation) -> Option<String> {
+    location
+        .git(&["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .await
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|branch| !branch.is_empty())
+}
+
+/// List changed paths. Large untracked trees (dependency stores, build output)
+/// collapse to one entry per directory instead of failing the whole listing.
+async fn porcelain_status(location: &GitLocation) -> ApiResult<Vec<GitChange>> {
+    porcelain_status_within(location, MAX_GIT_OUTPUT_BYTES).await
+}
+
+async fn porcelain_status_within(
+    location: &GitLocation,
+    max_bytes: usize,
+) -> ApiResult<Vec<GitChange>> {
+    for untracked in ["--untracked-files=all", "--untracked-files=normal"] {
+        let status = location
+            .git(&[
+                "-c",
+                "core.quotepath=false",
+                "-c",
+                "status.relativePaths=true",
+                "status",
+                "--porcelain=v1",
+                "-z",
+                untracked,
+                "--",
+                ".",
+            ])
+            .await?;
+        if !status.status.success() {
+            return Err(git_command_error("git status", &status));
+        }
+        if status.stdout.len() <= max_bytes {
+            return Ok(parse_porcelain_status(&status.stdout));
+        }
+    }
+    Err(api_error(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "git status returned too many changed paths",
+    ))
+}
+
+/// Linked worktrees, inside the active checkout, that a task's tool calls
+/// edited or ran commands in.
+async fn task_worktrees(
+    state: &AppState,
+    agent: &xpressclaw_core::config::AgentConfig,
+    bootstrap: &FsPath,
+    root: &FsPath,
+    task_id: &str,
+) -> ApiResult<Vec<WorkspaceWorktree>> {
+    let payloads = SessionManager::new(state.db.clone())
+        .task_tool_call_payloads(task_id, MAX_TASK_TOOL_EVENTS)
+        .map_err(|error| internal_error(format!("failed to read task tool calls: {error}")))?;
+    let container_root = PathBuf::from(native::container_workspace_path(
+        bootstrap,
+        agent.runner.container_engine,
+    ));
+    let bootstrap = bootstrap.to_path_buf();
+    let root = root.to_path_buf();
+    run_blocking(move || {
+        let mut directories = BTreeSet::new();
+        for raw in payloads.iter().flat_map(tool_call_paths) {
+            if directories.len() >= MAX_TASK_WORKTREES {
+                break;
+            }
+            if let Some(directory) = host_workspace_path(&raw, &container_root, &bootstrap)
+                .and_then(|path| enclosing_worktree(&path, &root))
+            {
+                directories.insert(directory);
+            }
+        }
+        Ok(directories
+            .into_iter()
+            .filter_map(|directory| workspace_worktree(&bootstrap, &container_root, &directory))
+            .filter(|worktree| worktree.root != root && worktree.root.starts_with(&root))
+            .collect())
+    })
+    .await
+}
+
+/// Paths an ACP tool call touched: edit locations, diff targets, and the
+/// working directory of commands (Codex records it in `rawInput.cwd`).
+fn tool_call_paths(payload: &Value) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut push = |value: Option<&Value>| {
+        if let Some(path) = value.and_then(Value::as_str) {
+            paths.push(path.to_string());
+        }
+    };
+    for location in payload
+        .get("locations")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        push(location.get("path"));
+    }
+    for content in payload
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|content| content.get("type").and_then(Value::as_str) == Some("diff"))
+    {
+        push(content.get("path"));
+    }
+    if let Some(input) = payload.get("rawInput") {
+        for key in ["cwd", "workdir", "file_path", "notebook_path"] {
+            push(input.get(key));
+        }
+    }
+    push(payload.pointer("/_meta/terminal_info/cwd"));
+    paths
+}
+
+/// Map a runner-reported absolute path to the host workspace. Runner paths
+/// are POSIX; host-engine runners may also report host paths directly.
+fn host_workspace_path(raw: &str, container_root: &FsPath, bootstrap: &FsPath) -> Option<PathBuf> {
+    if let Some(path) = runner_path_to_host(raw, container_root, bootstrap) {
+        return Some(path);
+    }
+    let relative = FsPath::new(raw).strip_prefix(bootstrap).ok()?;
+    relative
+        .components()
+        .all(|component| matches!(component, Component::Normal(_)))
+        .then(|| bootstrap.join(relative))
+}
+
+/// The nearest directory below `root` holding a linked worktree's `.git` file.
+fn enclosing_worktree(path: &FsPath, root: &FsPath) -> Option<PathBuf> {
+    path.ancestors()
+        .take_while(|ancestor| *ancestor != root && ancestor.starts_with(root))
+        .find(|ancestor| {
+            std::fs::symlink_metadata(ancestor.join(".git"))
+                .is_ok_and(|metadata| metadata.file_type().is_file())
+        })
+        .map(FsPath::to_path_buf)
 }
 
 async fn git_diff(
@@ -896,8 +1111,8 @@ async fn git_diff(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_same_origin(&headers)?;
-    let (_, bootstrap) = agent_workspace(&state, &agent_id)?;
-    let root = inspect_repository(&state, &agent_id, bootstrap)
+    let (agent, bootstrap) = agent_workspace(&state, &agent_id)?;
+    let root = inspect_repository(&state, &agent_id, bootstrap.clone())
         .await?
         .active
         .map(|candidate| candidate.root)
@@ -910,34 +1125,53 @@ async fn git_diff(
         ));
     }
     let path = relative_path_string(&relative);
-    let staged = git_output(
-        &root,
-        &[
+    // Files inside a linked worktree belong to that worktree's index.
+    let container_root = PathBuf::from(native::container_workspace_path(
+        &bootstrap,
+        agent.runner.container_engine,
+    ));
+    let file = root.join(&relative);
+    let worktree_root = root.clone();
+    let worktree = run_blocking(move || {
+        Ok(enclosing_worktree(&file, &worktree_root)
+            .and_then(|directory| workspace_worktree(&bootstrap, &container_root, &directory)))
+    })
+    .await?;
+    let (location, git_path) = match &worktree {
+        Some(worktree) => {
+            let inner = root
+                .join(&relative)
+                .strip_prefix(&worktree.root)
+                .map(relative_path_string)
+                .unwrap_or_default();
+            (GitLocation::worktree(worktree), inner)
+        }
+        None => (GitLocation::checkout(&root), path.clone()),
+    };
+    let staged = location
+        .git(&[
             "diff",
             "--cached",
             "--no-ext-diff",
             "--no-color",
             "--unified=3",
             "--",
-            &path,
-        ],
-    )
-    .await?;
+            &git_path,
+        ])
+        .await?;
     if !staged.status.success() {
         return Err(git_command_error("git diff --cached", &staged));
     }
-    let working = git_output(
-        &root,
-        &[
+    let working = location
+        .git(&[
             "diff",
             "--no-ext-diff",
             "--no-color",
             "--unified=3",
             "--",
-            &path,
-        ],
-    )
-    .await?;
+            &git_path,
+        ])
+        .await?;
     if !working.status.success() {
         return Err(git_command_error("git diff", &working));
     }
@@ -1444,6 +1678,339 @@ mod tests {
     async fn response_json(response: axum::response::Response) -> Value {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn git(path: &FsPath, arguments: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args([
+                "-c",
+                "user.name=XpressClaw Tests",
+                "-c",
+                "user.email=tests@xpressclaw.invalid",
+            ])
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output);
+    }
+
+    /// A workspace that is itself the active repository, with an Agent
+    /// worktree under `.worktrees/feature` recorded with runner paths.
+    fn worktree_app() -> (Router, Arc<Database>, tempfile::TempDir) {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path().canonicalize().unwrap();
+        git_repository(&root);
+        std::fs::write(root.join(".gitignore"), "/.worktrees/\n/.xpressclaw/\n").unwrap();
+        std::fs::write(root.join("app.txt"), "one\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-qm", "initial"]);
+        let feature = root.join(".worktrees").join("feature");
+        git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                feature.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(
+            feature.join(".git"),
+            "gitdir: /workspace/.git/worktrees/feature\n",
+        )
+        .unwrap();
+        std::fs::write(feature.join("app.txt"), "one\ntwo\n").unwrap();
+        std::fs::write(feature.join("added.txt"), "new\n").unwrap();
+
+        let db = Arc::new(Database::open_memory().unwrap());
+        AgentRegistry::new(db.clone())
+            .ensure("workspace-agent", "codex")
+            .unwrap();
+        // The first turn boundary activates the workspace repository.
+        AgentRepositoryManager::new(db.clone())
+            .apply_boundary("workspace-agent", &root)
+            .unwrap();
+        let mut config = Config::default();
+        config.system.data_dir = root.join(".xpressclaw");
+        let mut agent = AgentConfig {
+            name: "workspace-agent".into(),
+            backend: "codex".into(),
+            ..AgentConfig::default()
+        };
+        agent.runner.kind = "auto".into();
+        agent.runner.workspace = Some(root.display().to_string());
+        config.agents = vec![agent];
+        let state = AppState::new(
+            Arc::new(config),
+            db.clone(),
+            None,
+            root.join("xpressclaw.yaml"),
+            true,
+        );
+        let app = Router::new()
+            .nest("/workspaces", routes())
+            .with_state(state);
+        (app, db, workspace)
+    }
+
+    /// Record the tool calls Codex reports when it edits inside a worktree.
+    fn task_with_worktree_edits(db: &Arc<Database>) -> String {
+        let task = xpressclaw_core::tasks::board::TaskBoard::new(db.clone())
+            .create(&xpressclaw_core::tasks::board::CreateTask {
+                title: "Edit in a worktree".into(),
+                agent_id: Some("workspace-agent".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let sessions = SessionManager::new(db.clone());
+        sessions.ensure("workspace-agent", None).unwrap();
+        for (event_type, payload) in [
+            (
+                "tool_call",
+                json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "exec-1",
+                    "kind": "execute",
+                    "rawInput": { "cwd": "/workspace/.worktrees/feature" },
+                }),
+            ),
+            (
+                "tool_call",
+                json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "patch-1",
+                    "kind": "edit",
+                    "locations": [{ "path": "/workspace/.worktrees/feature/app.txt" }],
+                    "content": [{
+                        "type": "diff",
+                        "path": "/workspace/.worktrees/feature/app.txt",
+                        "oldText": "one\n",
+                        "newText": "one\ntwo\n",
+                    }],
+                }),
+            ),
+        ] {
+            sessions
+                .append_event(
+                    "workspace-agent",
+                    xpressclaw_core::sessions::NewEvent {
+                        attempt_id: None,
+                        task_id: Some(&task.id),
+                        source_type: "acp",
+                        source_id: Some("codex"),
+                        event_type,
+                        summary: "Tool call",
+                        payload,
+                    },
+                )
+                .unwrap();
+        }
+        task.id
+    }
+
+    fn changed_paths(status: &Value) -> Vec<String> {
+        status["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|file| file["path"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn task_git_status_includes_worktrees_the_task_edited() {
+        let (app, db, _workspace) = worktree_app();
+        let task_id = task_with_worktree_edits(&db);
+
+        let checkout = response_json(
+            app.clone()
+                .oneshot(
+                    Request::get("/workspaces/workspace-agent/git/status")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(checkout["repository"], true, "{checkout}");
+        assert!(changed_paths(&checkout).is_empty(), "{checkout}");
+
+        let task = response_json(
+            app.clone()
+                .oneshot(
+                    Request::get(format!(
+                        "/workspaces/workspace-agent/git/status?task_id={task_id}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            changed_paths(&task),
+            vec![".worktrees/feature/added.txt", ".worktrees/feature/app.txt"],
+            "{task}"
+        );
+        assert_eq!(
+            task["worktrees"],
+            json!([{ "path": ".worktrees/feature", "branch": "feature" }])
+        );
+
+        let diff = response_json(
+            app.oneshot(
+                Request::get(
+                    "/workspaces/workspace-agent/git/diff?path=.worktrees/feature/app.txt",
+                )
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(diff["path"], ".worktrees/feature/app.txt");
+        assert!(diff["diff"].as_str().unwrap().contains("+two"), "{diff}");
+    }
+
+    #[tokio::test]
+    async fn task_git_status_replaces_unignored_worktree_entries() {
+        let (app, db, workspace) = worktree_app();
+        // Without the ignore rule, host Git cannot follow the runner-only
+        // `.git` pointer and lists every worktree file as untracked.
+        let root = workspace.path().canonicalize().unwrap();
+        std::fs::write(root.join(".gitignore"), "/.xpressclaw/\n").unwrap();
+        let task_id = task_with_worktree_edits(&db);
+
+        let status = response_json(
+            app.oneshot(
+                Request::get(format!(
+                    "/workspaces/workspace-agent/git/status?task_id={task_id}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            changed_paths(&status),
+            vec![
+                ".gitignore",
+                ".worktrees/feature/added.txt",
+                ".worktrees/feature/app.txt",
+            ],
+            "{status}"
+        );
+        let app_change = status["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|change| change["path"] == ".worktrees/feature/app.txt")
+            .unwrap();
+        assert_eq!(app_change["status"], " M");
+    }
+
+    #[tokio::test]
+    async fn task_git_status_ignores_worktrees_outside_the_task() {
+        let (app, db, _workspace) = worktree_app();
+        let task = xpressclaw_core::tasks::board::TaskBoard::new(db.clone())
+            .create(&xpressclaw_core::tasks::board::CreateTask {
+                title: "Unrelated".into(),
+                agent_id: Some("workspace-agent".into()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let status = response_json(
+            app.oneshot(
+                Request::get(format!(
+                    "/workspaces/workspace-agent/git/status?task_id={}",
+                    task.id
+                ))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert!(changed_paths(&status).is_empty(), "{status}");
+        assert_eq!(status["worktrees"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn large_untracked_trees_collapse_instead_of_failing() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path().canonicalize().unwrap();
+        git_repository(&root);
+        let store = root.join("store");
+        std::fs::create_dir_all(&store).unwrap();
+        for index in 0..50 {
+            std::fs::write(store.join(format!("blob-{index:04}")), "x").unwrap();
+        }
+        let location = GitLocation::checkout(&root);
+
+        let full = porcelain_status_within(&location, MAX_GIT_OUTPUT_BYTES)
+            .await
+            .unwrap();
+        assert_eq!(full.len(), 50);
+        let collapsed = porcelain_status_within(&location, 64).await.unwrap();
+        assert_eq!(
+            collapsed
+                .iter()
+                .map(|change| change.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["store/"]
+        );
+    }
+
+    #[test]
+    fn tool_call_paths_cover_edits_diffs_and_command_directories() {
+        let paths = tool_call_paths(&json!({
+            "locations": [{ "path": "/workspace/a.rs" }],
+            "content": [
+                { "type": "diff", "path": "/workspace/b.rs" },
+                { "type": "content", "content": { "type": "text", "text": "x" } },
+            ],
+            "rawInput": { "cwd": "/workspace/.worktrees/x", "file_path": "/workspace/c.rs" },
+            "_meta": { "terminal_info": { "cwd": "/workspace/.worktrees/y" } },
+        }));
+        assert_eq!(
+            paths,
+            vec![
+                "/workspace/a.rs",
+                "/workspace/b.rs",
+                "/workspace/.worktrees/x",
+                "/workspace/c.rs",
+                "/workspace/.worktrees/y",
+            ]
+        );
+        let bootstrap = FsPath::new("/srv/project");
+        let container = FsPath::new("/workspace");
+        assert_eq!(
+            host_workspace_path("/workspace/.worktrees/x/a.rs", container, bootstrap),
+            Some(PathBuf::from("/srv/project/.worktrees/x/a.rs"))
+        );
+        assert_eq!(
+            host_workspace_path("/srv/project/src/a.rs", container, bootstrap),
+            Some(PathBuf::from("/srv/project/src/a.rs"))
+        );
+        assert_eq!(
+            host_workspace_path("/workspace/../etc/passwd", container, bootstrap),
+            None
+        );
+        assert_eq!(
+            host_workspace_path("/etc/passwd", container, bootstrap),
+            None
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

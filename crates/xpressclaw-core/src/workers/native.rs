@@ -4066,7 +4066,11 @@ fn with_startup_commands(command: Vec<String>, startup_commands: &[String]) -> V
     wrapped
 }
 
-fn container_workspace_path(workspace: &Path, container_engine: ContainerEngineAccess) -> String {
+/// Path at which the runner sees the Agent workspace.
+pub fn container_workspace_path(
+    workspace: &Path,
+    container_engine: ContainerEngineAccess,
+) -> String {
     if container_engine == ContainerEngineAccess::Host && cfg!(unix) {
         workspace.display().to_string()
     } else {
