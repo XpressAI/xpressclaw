@@ -770,18 +770,19 @@ test.describe('Spatial Canvas workspace', () => {
 	});
 
 	test('previews Conversation attachments and excludes bootstrap_root when a nested repository is active', async ({ page }) => {
+		let activeRepoName = 'repo';
 		await mockCanvasApi(page);
 		await page.route('**/api/workspaces/agent-codex', (route) =>
 			route.fulfill({
 				json: {
 					agent_id: 'agent-codex',
-					root: '/srv/agent/repo',
-					container_root: '/workspace/repo',
+					root: `/srv/agent/${activeRepoName}`,
+					container_root: `/workspace/${activeRepoName}`,
 					repository: {
 						state: 'attached',
 						message: '',
 						bootstrap_root: '/srv/agent',
-						active: { relative_path: 'repo', root: '/srv/agent/repo', github_repository: null },
+						active: { relative_path: activeRepoName, root: `/srv/agent/${activeRepoName}`, github_repository: null },
 						candidates: [],
 						discovery_truncated: false,
 					},
@@ -804,6 +805,7 @@ test.describe('Spatial Canvas workspace', () => {
 							'Files:',
 							'- [outside.txt](file:///srv/agent/outside.txt)',
 							'- [main.ts](file:///srv/agent/repo/main.ts)',
+							'- [other.ts](file:///srv/agent/repo-b/other.ts)',
 						].join('\n'),
 						created_at: now,
 						attachments: [
@@ -874,6 +876,23 @@ test.describe('Spatial Canvas workspace', () => {
 		const editorCard = page.locator('[data-canvas-editor-card]').first();
 		await expect(editorCard).toBeVisible();
 		await expect(editorCard.getByLabel('Workspace file path')).toHaveValue('main.ts');
+
+		// 5. After switching the active repository to repo-b while Canvas remains mounted,
+		// links into the old repo no longer resolve into the new active workspace, while repo-b links do.
+		activeRepoName = 'repo-b';
+		await page.locator('[data-canvas-fit]').click();
+		await convWindow.getByRole('link', { name: 'main.ts' }).click();
+		await expect(popover).toBeVisible();
+		await popover.getByRole('menuitem', { name: 'Open in Canvas Editor' }).click();
+		await expect(popover.getByRole('status')).toContainText('outside the agent workspace');
+		await page.keyboard.press('Escape');
+
+		await convWindow.getByRole('link', { name: 'other.ts' }).click();
+		await expect(popover).toBeVisible();
+		await popover.getByRole('menuitem', { name: 'Open in Canvas Editor' }).click();
+		const secondEditorCard = page.locator('[data-canvas-editor-card]').nth(1);
+		await expect(secondEditorCard).toBeVisible();
+		await expect(secondEditorCard.getByLabel('Workspace file path')).toHaveValue('other.ts');
 	});
 
 	test('canvas model enforces safe app URLs, non-overlapping placement, delegation edges, and layout persistence', () => {

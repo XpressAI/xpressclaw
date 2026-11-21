@@ -123,7 +123,6 @@
 
 	let linkPopover = $state<LinkPopoverState | null>(null);
 	let linkPopoverSequence = 0;
-	const workspaceRootsCache = new Map<string, string[]>();
 	const workspaceRootsPending = new Map<string, Promise<string[]>>();
 
 	let agentById = $derived(new Map(agents.map((agent) => [agent.id, agent])));
@@ -487,16 +486,10 @@
 	}
 
 	async function loadWorkspaceRoots(agentId: string): Promise<string[]> {
-		const cached = workspaceRootsCache.get(agentId);
-		if (cached) return cached;
 		const inflight = workspaceRootsPending.get(agentId);
 		if (inflight) return inflight;
 		const req = workspaces.status(agentId)
-			.then((status) => {
-				const roots = extractActiveWorkspaceRoots(status);
-				workspaceRootsCache.set(agentId, roots);
-				return roots;
-			})
+			.then((status) => extractActiveWorkspaceRoots(status))
 			.catch(() => [])
 			.finally(() => {
 				workspaceRootsPending.delete(agentId);
@@ -552,12 +545,7 @@
 			if (classified.href.startsWith('/api/workspaces/')) {
 				workspaceRelativePath = resolveWorkspaceRelativePath(classified.downloadPath, []);
 			} else {
-				const cachedRoots = workspaceRootsCache.get(classified.downloadAgentId);
-				if (cachedRoots) {
-					workspaceRelativePath = resolveWorkspaceRelativePath(classified.downloadPath, cachedRoots);
-				} else {
-					resolvingWorkspace = true;
-				}
+				resolvingWorkspace = true;
 			}
 		}
 
@@ -588,7 +576,6 @@
 	}
 
 	async function resolvePopoverWorkspacePath(state: LinkPopoverState): Promise<string | null> {
-		if (state.workspaceRelativePath) return state.workspaceRelativePath;
 		if (!state.target.downloadAgentId || !state.target.downloadPath) return null;
 		if (state.target.href.startsWith('/api/workspaces/')) {
 			return resolveWorkspaceRelativePath(state.target.downloadPath, []);
@@ -667,6 +654,7 @@
 		linkPopover = {
 			...state,
 			resolvingWorkspace: false,
+			workspaceRelativePath: null,
 			notice: 'This file is outside the agent workspace; download it instead.',
 		};
 	}
