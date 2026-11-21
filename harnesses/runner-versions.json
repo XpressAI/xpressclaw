@@ -42,7 +42,7 @@
     },
     "antigravity": {
       "auto_update": true,
-      "version": "1.5.13",
+      "version": "1.5.14",
       "acp_command": [
         "agy",
         "acp",
@@ -64,10 +64,10 @@
         "AGENT_KIND": "antigravity",
         "AGENT_BINARY": "agy",
         "AGENT_PATH": "antigravity",
-        "AGENT_ARCHIVE_AMD64": "https://github.com/google-antigravity/antigravity-cli/releases/download/1.5.13/agy_cli_linux_x64.tar.gz",
-        "AGENT_ARCHIVE_ARM64": "https://github.com/google-antigravity/antigravity-cli/releases/download/1.5.13/agy_cli_linux_arm64.tar.gz",
-        "AGENT_SHA256_AMD64": "7fa9cc6df0d09562693d637c406a86c1b0f52ab3364714b1fd2d79cc6060d4b2",
-        "AGENT_SHA256_ARM64": "36596ad8038531fd75f0e97b5ba8967a30f2fd67f8d9c61959d2e4761d7b215f"
+        "AGENT_ARCHIVE_AMD64": "https://github.com/google-antigravity/antigravity-cli/releases/download/1.5.14/agy_cli_linux_x64.tar.gz",
+        "AGENT_ARCHIVE_ARM64": "https://github.com/google-antigravity/antigravity-cli/releases/download/1.5.14/agy_cli_linux_arm64.tar.gz",
+        "AGENT_SHA256_AMD64": "d58386322d2073e96b33f7cc32b4e9ae2db6228f58440369725967b2de48c7b5",
+        "AGENT_SHA256_ARM64": "e5f69a3123fac66974b303d9a201f381a0fb32b3ef869d9139da85d5caf67a2a"
       }
     },
     "deepseek-harness": {
@@ -121,7 +121,7 @@
     },
     "junie": {
       "auto_update": true,
-      "version": "4100.10.0",
+      "version": "4100.11.0",
       "acp_command": [
         "junie",
         "--acp=true"
@@ -138,8 +138,8 @@
         "AGENT_KIND": "junie",
         "AGENT_BINARY": "junie",
         "AGENT_PATH": "junie-app/bin/junie",
-        "AGENT_ARCHIVE_AMD64": "https://github.com/JetBrains/junie-acp-release/releases/download/4100.10/junie-release-4100.10-linux-amd64.zip",
-        "AGENT_ARCHIVE_ARM64": "https://github.com/JetBrains/junie-acp-release/releases/download/4100.10/junie-release-4100.10-linux-aarch64.zip",
+        "AGENT_ARCHIVE_AMD64": "https://github.com/JetBrains/junie-acp-release/releases/download/4100.11/junie-release-4100.11-linux-amd64.zip",
+        "AGENT_ARCHIVE_ARM64": "https://github.com/JetBrains/junie-acp-release/releases/download/4100.11/junie-release-4100.11-linux-aarch64.zip",
         "AGENT_SHA256_AMD64": "",
         "AGENT_SHA256_ARM64": ""
       }
@@ -249,7 +249,7 @@
         "AGENT_KIND": "pi",
         "AGENT_PACKAGE": "pi-acp@0.0.34",
         "AGENT_BINARY": "pi-acp",
-        "AGENT_EXTRA_PACKAGES": "@earendil-works/pi-coding-agent@1.5.2",
+        "AGENT_EXTRA_PACKAGES": "@earendil-works/pi-coding-agent@1.6.0",
         "AGENT_EXTRA_BINARY": "pi",
         "PI_MCP_PACKAGE": "pi-mcp-adapter@7.0.1"
       }
@@ -348,7 +348,7 @@
     },
     "grok": {
       "auto_update": true,
-      "version": "1.0.92",
+      "version": "1.0.93",
       "acp_command": [
         "grok",
         "agent",
@@ -365,13 +365,13 @@
       ],
       "build_args": {
         "AGENT_KIND": "grok",
-        "AGENT_PACKAGE": "@xai-official/grok@1.0.92",
+        "AGENT_PACKAGE": "@xai-official/grok@1.0.93",
         "AGENT_BINARY": "grok"
       }
     },
     "kilo": {
       "auto_update": true,
-      "version": "7.8.27",
+      "version": "7.8.32",
       "acp_command": [
         "kilo",
         "acp"
@@ -387,7 +387,7 @@
       ],
       "build_args": {
         "AGENT_KIND": "kilo",
-        "AGENT_PACKAGE": "@kilocode/cli@7.8.27",
+        "AGENT_PACKAGE": "@kilocode/cli@7.8.32",
         "AGENT_BINARY": "kilo"
       }
     },
