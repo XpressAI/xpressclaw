@@ -1,0 +1,17 @@
+branch: fix/worktree-changed-files
+symptom: Task pane 'Changed files' section missing entirely for agents working in .worktrees/<name>.
+root causes (evidence-backed):
+  1. git status --untracked-files=all in the user's checkout emitted 5.88MB (untracked .pnpm-store/) > MAX_GIT_OUTPUT_BYTES 4MB -> 413 -> TaskView swallowed error, workspaceGit stayed null, section hidden. With --untracked-files=normal it is 190 bytes. Fix: porcelain_status retries with 'normal' before failing.
+  2. Status only ran in the active checkout; linked worktrees never appear there.
+design:
+  - GET /git/status?task_id=: SessionManager::task_tool_call_payloads (idx_session_events_task) -> tool_call_paths (locations[].path, diff content path, rawInput.cwd/workdir/file_path/notebook_path, _meta.terminal_info.cwd) -> host_workspace_path (strip container_workspace_path or bootstrap) -> enclosing_worktree (nearest ancestor below root with a .git FILE) -> core repositories::workspace_worktree validation -> status via --git-dir/--work-tree, paths prefixed with the worktree's path relative to root; response gains worktrees[{path,branch}].
+  - Why task-scoped rather than all worktrees: one agent workspace here has ~50 worktrees; listing all would mix other tasks' work.
+  - Default container engine is None (workspace mounted at /workspace), so agent-created worktrees record gitdir/commondir as /workspace/...; host git -C fails. workspace_worktree translates container paths and then reuses has_regular_git_metadata_tree/has_self_contained_git_config/has_self_contained_object_store (git config can run commands e.g. core.fsmonitor; same containment as active repos).
+  - git_diff resolves the enclosing validated worktree so clicking a worktree file shows its diff.
+  - Frontend: TaskView sends task_id; only worktree file links carry &task= so FilesTab requests the same scoped status (existing exact-URL tests stay valid).
+  - Evidence for ACP payload shapes: claude-agent-acp 0.95 dist (locations with absolute file_path) and zed-industries/codex-acp src/thread.rs (patch apply locations/diff paths; exec raw_input = ExecCommandBeginEvent incl. cwd).
+limits: worktrees outside the active checkout (e.g. /tmp) are not listed — Files cannot browse them; edits made purely via shell heredoc with cwd at the root and no path-reporting tool call are not attributed.
+validation:
+  - cargo test -p xpressclaw-server --lib (234 pass), core repositories+sessions (49 pass, incl. 3 new workspace_worktree tests), rustfmt --check, clippy -D warnings for core+server.
+  - e2e chromium full suite: 327 pass; remaining failures are the known environmental ones (file-downloads x2, 1024px tab strip) plus 'stalled Git refresh' which was a **/git/status glob that no longer matched with ?task_id=; both such intercepts now use a pathname predicate (6 git tests pass).
+env: host-built target/ has GLIBC_2.39 build scripts; use CARGO_TARGET_DIR=/home/node/.cache/xc-target in the container. Server tests rewrite crates/xpressclaw-server/test.yaml — restore it after running.
