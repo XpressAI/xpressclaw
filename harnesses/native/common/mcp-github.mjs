@@ -862,7 +862,7 @@ async function handle(message) {
     result(id, {
       protocolVersion: params?.protocolVersion ?? '2024-11-05',
       capabilities: { tools: {} },
-      serverInfo: { name: 'xpressclaw-github', version: '0.4.35' },
+      serverInfo: { name: 'xpressclaw-github', version: '0.5.0' },
       instructions: toolDescription(),
     });
     return;
