@@ -142,6 +142,10 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/{id}/activity", get(get_activity))
         .route(
+            "/{id}/attempts/{attempt_id}/error-dismissal",
+            post(dismiss_attempt_error),
+        )
+        .route(
             "/{id}/config",
             get(super::task_controls::get).post(super::task_controls::set),
         )
@@ -891,6 +895,22 @@ async fn get_message_visualization(
             )
         })?;
     visualizations::artifact_response(artifact).map_err(internal_error)
+}
+
+async fn dismiss_attempt_error(
+    State(state): State<AppState>,
+    Path((task_id, attempt_id)): Path<(String, String)>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let attempt = SessionManager::new(state.db.clone())
+        .dismiss_task_attempt_error(&task_id, &attempt_id)
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "attempt error not found" })),
+            )
+        })?;
+    Ok(Json(json!(attempt)))
 }
 
 async fn get_activity(
@@ -3552,6 +3572,139 @@ flows:
         let _ = mock.await;
         process.shutdown();
         let _ = work.await;
+    }
+
+    #[tokio::test]
+    async fn attempt_error_dismissal_is_durable_scoped_and_does_not_restart_work() {
+        let (app, db) = test_app_with_db();
+        let board = TaskBoard::new(db.clone());
+        let sessions = SessionManager::new(db.clone());
+        let task = board
+            .create(&CreateTask {
+                title: "Dismiss a notice".into(),
+                agent_id: Some("atlas".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let other = board
+            .create(&CreateTask {
+                title: "Other task".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let queue = TaskQueue::new(db.clone());
+        let queued = queue.enqueue(&task.id, "atlas").unwrap();
+        let attempt_id = queued.attempt_id.as_deref().unwrap();
+        sessions
+            .transition_attempt(attempt_id, "failed", "Failed", None, Some("An old error"))
+            .unwrap();
+        queue.fail(queued.id, "An old error").unwrap();
+        board.update_status(&task.id, "blocked", None).unwrap();
+        let original = board.get(&task.id).unwrap();
+
+        for (task_id, attempt) in [(&other.id, attempt_id), (&task.id, "missing")] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!(
+                            "/tasks/{task_id}/attempts/{attempt}/error-dismissal"
+                        ))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+        assert!(sessions
+            .get_attempt(attempt_id)
+            .unwrap()
+            .error_dismissed_at
+            .is_none());
+        let mut dismissal = None;
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!(
+                            "/tasks/{}/attempts/{attempt_id}/error-dismissal",
+                            task.id
+                        ))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = body_json(response.into_body()).await;
+            let saved = body["error_dismissed_at"].as_str().unwrap().to_owned();
+            if let Some(first) = &dismissal {
+                assert_eq!(&saved, first);
+            }
+            dismissal = Some(saved);
+            assert_eq!(body["error_message"], "An old error");
+            assert_eq!(body["status"], "failed");
+        }
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/tasks/{}/activity", task.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body_json(response.into_body()).await;
+        assert_eq!(
+            body["attempts"][0]["error_dismissed_at"].as_str(),
+            dismissal.as_deref()
+        );
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/tasks/{}", task.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(body_json(response.into_body()).await["error_message"].is_null());
+        assert_eq!(board.get(&task.id).unwrap().status, original.status);
+        assert_eq!(board.get(&task.id).unwrap().revision, original.revision);
+        assert_eq!(queue.list(None, None, 10).unwrap().len(), 1);
+        assert_eq!(queue.get(queued.id).unwrap().status, "failed");
+        assert!(TaskConversation::new(db.clone())
+            .get_messages(&task.id)
+            .unwrap()
+            .is_empty());
+
+        let fresh = queue.enqueue(&task.id, "atlas").unwrap();
+        let fresh_id = fresh.attempt_id.as_deref().unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/tasks/{}/attempts/{fresh_id}/error-dismissal",
+                        task.id
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(sessions
+            .get_attempt(fresh_id)
+            .unwrap()
+            .error_dismissed_at
+            .is_none());
     }
 
     #[tokio::test]

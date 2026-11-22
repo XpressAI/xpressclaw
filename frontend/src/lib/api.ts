@@ -555,6 +555,7 @@ export interface WorkAttempt {
 	container_id: string | null;
 	result: string | null;
 	error_message: string | null;
+	error_dismissed_at?: string | null;
 	created_at: string;
 	started_at: string | null;
 	completed_at: string | null;
@@ -1006,6 +1007,8 @@ export const tasks = {
 		const query = params.size ? `?${params}` : '';
 		return request<TaskActivity>(`/api/tasks/${id}/activity${query}`);
 	},
+	dismissAttemptError: (taskId: string, attemptId: string) =>
+		request<WorkAttempt>(`/api/tasks/${encodeURIComponent(taskId)}/attempts/${encodeURIComponent(attemptId)}/error-dismissal`, { method: 'POST' }),
 	config: (id: string) => request<TaskControlSnapshot>(`/api/tasks/${id}/config`),
 	setConfig: (id: string, configId: string | null, value: string | boolean, context: TaskControlContext, revision: string | null) =>
 		request<TaskControlSnapshot>(`/api/tasks/${id}/config`, { method: 'POST', body: JSON.stringify({ config_id: configId ?? undefined, value, context, revision, reset: configId === null }) }),

@@ -40,6 +40,9 @@ pub struct WorkAttempt {
     pub container_id: Option<String>,
     pub result: Option<String>,
     pub error_message: Option<String>,
+    /// Acknowledged notices remain dismissed independently of browser storage.
+    #[serde(default)]
+    pub error_dismissed_at: Option<String>,
     pub created_at: String,
     pub started_at: Option<String>,
     pub completed_at: Option<String>,
@@ -454,12 +457,47 @@ impl SessionManager {
                 "SELECT id, session_id, task_id, queue_id, kind, runner, status, prompt,
                         native_session_id, container_id, result, error_message,
                         created_at, started_at, completed_at, context_used, context_size,
-                        trigger_message_id, response_queued_at, response_started_at
+                        trigger_message_id, response_queued_at, response_started_at, error_dismissed_at
                  FROM work_attempts WHERE id = ?1",
                 [attempt_id],
                 row_to_attempt,
             )
             .map_err(|e| Error::Task(format!("attempt {attempt_id} not found: {e}")))
+        })
+    }
+
+    /// Acknowledge an existing task notice without changing execution state.
+    pub fn dismiss_task_attempt_error(
+        &self,
+        task_id: &str,
+        attempt_id: &str,
+    ) -> Result<Option<WorkAttempt>> {
+        self.db.with_conn(|conn| {
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            transaction.execute(
+                "UPDATE work_attempts SET error_dismissed_at = CURRENT_TIMESTAMP
+                 WHERE id = ?1 AND task_id = ?2 AND error_message IS NOT NULL
+                   AND error_message != '' AND error_dismissed_at IS NULL",
+                rusqlite::params![attempt_id, task_id],
+            )?;
+            let attempt = transaction
+                .query_row(
+                    "SELECT id, session_id, task_id, queue_id, kind, runner, status, prompt,
+                            native_session_id, container_id, result, error_message,
+                            created_at, started_at, completed_at, context_used, context_size,
+                            trigger_message_id, response_queued_at, response_started_at,
+                            error_dismissed_at
+                     FROM work_attempts WHERE id = ?1 AND task_id = ?2
+                       AND error_message IS NOT NULL AND error_message != ''",
+                    rusqlite::params![attempt_id, task_id],
+                    row_to_attempt,
+                )
+                .optional()?;
+            transaction.commit()?;
+            Ok(attempt)
         })
     }
 
@@ -478,7 +516,7 @@ impl SessionManager {
                 "SELECT id, session_id, task_id, queue_id, kind, runner, status, prompt,
                     native_session_id, container_id, result, error_message,
                     created_at, started_at, completed_at, context_used, context_size,
-                    trigger_message_id, response_queued_at, response_started_at
+                    trigger_message_id, response_queued_at, response_started_at, error_dismissed_at
              FROM work_attempts WHERE task_id=?1 AND session_id=?2 AND runner=?3
                AND ((status IN ('completed','interrupted')
                     AND native_session_id IS NOT NULL AND TRIM(native_session_id) != '')
@@ -535,7 +573,7 @@ impl SessionManager {
                 "SELECT id, session_id, task_id, queue_id, kind, runner, status, prompt,
                         native_session_id, container_id, result, error_message,
                         created_at, started_at, completed_at, context_used, context_size,
-                        trigger_message_id, response_queued_at, response_started_at
+                        trigger_message_id, response_queued_at, response_started_at, error_dismissed_at
                  FROM work_attempts WHERE session_id = ?1",
             );
             let mut values: Vec<Box<dyn rusqlite::types::ToSql>> =
@@ -595,7 +633,7 @@ impl SessionManager {
                 "SELECT id, session_id, task_id, queue_id, kind, runner, status, prompt,
                         native_session_id, container_id, result, error_message,
                         created_at, started_at, completed_at, context_used, context_size,
-                        trigger_message_id, response_queued_at, response_started_at
+                        trigger_message_id, response_queued_at, response_started_at, error_dismissed_at
                  FROM work_attempts WHERE task_id = ?1
                  ORDER BY created_at DESC, rowid DESC LIMIT ?2",
             )?;
@@ -806,7 +844,7 @@ impl SessionManager {
             "SELECT id, session_id, task_id, queue_id, kind, runner, status, prompt,
                         native_session_id, container_id, result, error_message,
                         created_at, started_at, completed_at, context_used, context_size,
-                        trigger_message_id, response_queued_at, response_started_at
+                        trigger_message_id, response_queued_at, response_started_at, error_dismissed_at
                  FROM work_attempts
                  WHERE task_id = ?1
                    AND status NOT IN ('completed', 'failed', 'cancelled', 'interrupted')
@@ -902,7 +940,7 @@ impl SessionManager {
                 "SELECT id, session_id, task_id, queue_id, kind, runner, status, prompt,
                         native_session_id, container_id, result, error_message,
                         created_at, started_at, completed_at, context_used, context_size,
-                        trigger_message_id, response_queued_at, response_started_at
+                        trigger_message_id, response_queued_at, response_started_at, error_dismissed_at
                  FROM work_attempts WHERE id = ?1",
                 [attempt_id],
                 row_to_attempt,
@@ -1346,6 +1384,7 @@ fn row_to_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkAttempt> {
         trigger_message_id: row.get(17)?,
         response_queued_at: row.get(18)?,
         response_started_at: row.get(19)?,
+        error_dismissed_at: row.get(20)?,
     })
 }
 

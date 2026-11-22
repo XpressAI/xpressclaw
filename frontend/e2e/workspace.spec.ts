@@ -252,6 +252,7 @@ function attempt(
 		container_id: 'container-browser-test',
 		result,
 		error_message: errorMessage,
+		error_dismissed_at: null,
 		created_at: timestamp(0),
 		started_at: timestamp(1),
 		completed_at: status === 'completed' ? timestamp(61) : null,
@@ -330,6 +331,8 @@ async function mockApi(
 		taskMessages?: Record<string, unknown>[];
 		taskActivityEvents?: Record<string, unknown>[];
 		taskAttempts?: Record<string, unknown>[];
+		taskErrorDismissals?: Map<string, string>;
+		taskErrorDismissalRequests?: string[];
 		attemptResult?: string;
 		mcpServers?: {
 			name: string;
@@ -477,6 +480,10 @@ async function mockApi(
 		options.attemptError ?? null,
 		options.attemptResult ?? null,
 	);
+	const taskErrorDismissals = options.taskErrorDismissals ?? new Map<string, string>();
+	const mockTaskAttempts = () => (options.taskAttempts ?? [mockAttempt()]).map(attempt => ({
+		...attempt, error_dismissed_at: taskErrorDismissals.get(String(attempt.id)) ?? attempt.error_dismissed_at ?? null,
+	}));
 	const firstAnswer = options.agentResponseLinks
 		? 'First answer with [agent docs](https://example.com/agent-docs).'
 		: 'First answer';
@@ -1293,10 +1300,17 @@ async function mockApi(
 			const payload = request.postDataJSON() as Record<string, unknown>;
 			options.elicitationResponses?.push({ elicitationId, payload });
 			response = { resolved: true, action: payload.action };
+		} else if (path.startsWith(`/api/tasks/${taskId}/attempts/`) && path.endsWith('/error-dismissal')) {
+			const attemptId = decodeURIComponent(path.split('/')[5]);
+			const failed = mockTaskAttempts().find(attempt => attempt.id === attemptId && attempt.error_message);
+			if (!failed) { await route.fulfill({ status: 404, json: { error: 'attempt error not found' } }); return; }
+			options.taskErrorDismissalRequests?.push(attemptId);
+			if (!taskErrorDismissals.has(attemptId)) taskErrorDismissals.set(attemptId, timestamp(80));
+			response = { ...failed, error_dismissed_at: taskErrorDismissals.get(attemptId) };
 		} else if (path === `/api/tasks/${taskId}/activity`) {
 			if (options.agentTimeline) {
 				response = {
-					attempts: options.taskAttempts ?? [mockAttempt()],
+					attempts: mockTaskAttempts(),
 					events: [
 						timelineEvent(1, 10, 'runner_progress', firstAgentUpdate, { item_type: 'agent_message', message_id: 'status-1' }),
 						timelineEvent(2, 15, 'tool_call', 'Read the project', { toolCallId: 'tool-1', status: 'in_progress' }),
@@ -1308,7 +1322,7 @@ async function mockApi(
 				};
 			} else if (url.searchParams.has('before')) {
 				response = {
-					attempts: options.taskAttempts ?? [mockAttempt()],
+					attempts: mockTaskAttempts(),
 					events: Array.from({ length: 20 }, (_, index) => activityEvent(index + 1)),
 					has_more_before: false,
 					has_more_after: true,
@@ -1317,14 +1331,14 @@ async function mockApi(
 				liveEvent += 1;
 				contextUsed += 1_000;
 				response = {
-					attempts: options.taskAttempts ?? [mockAttempt()],
+					attempts: mockTaskAttempts(),
 					events: options.live ? [activityEvent(60 + liveEvent, 'New background activity')] : [],
 					has_more_before: false,
 					has_more_after: false,
 				};
 			} else {
 				response = {
-					attempts: options.taskAttempts ?? [mockAttempt()],
+					attempts: mockTaskAttempts(),
 					events: options.taskActivityEvents ?? (options.pendingElicitation ? [
 						timelineEvent(42, 58, 'elicitation_pending', 'The agent needs your input', {
 							elicitationId: 'elicitation-browser-test',
@@ -1750,6 +1764,68 @@ test('attempt errors dismissed in one window disappear in another', async ({ pag
 	} finally {
 		await otherPage.close();
 	}
+});
+
+test('attempt errors remain dismissed after clearing storage and opening a fresh browser', async ({ page, browser }) => {
+	const taskErrorDismissals = new Map<string, string>();
+	const taskErrorDismissalRequests: string[] = [];
+	const options = { taskStatus: 'blocked', attemptError: 'An old dismissed notice', taskErrorDismissals, taskErrorDismissalRequests };
+	await mockApi(page, options);
+	await page.goto(`/tasks/${taskId}`);
+	await page.getByRole('button', { name: 'Dismiss attempt error' }).click();
+	await expect(page.locator('[data-attempt-error]')).toHaveCount(0);
+	await page.evaluate(() => localStorage.clear());
+	await page.reload();
+	await expect(page.getByRole('heading', { name: 'Browser-tested workspace' })).toBeVisible();
+	await expect(page.locator('[data-attempt-error]')).toHaveCount(0);
+	const fresh = await browser.newContext();
+	try {
+		const other = await fresh.newPage();
+		await mockApi(other, options);
+		await other.goto(new URL(`/tasks/${taskId}`, page.url()).href);
+		await expect(other.getByRole('heading', { name: 'Browser-tested workspace' })).toBeVisible();
+		await expect(other.locator('[data-attempt-error]')).toHaveCount(0);
+		expect(taskErrorDismissalRequests).toEqual(['attempt-browser-test']);
+	} finally { await fresh.close(); }
+});
+
+test('attempt errors migrate existing dismissals and retain every acknowledged notice', async ({ page }) => {
+	const taskErrorDismissals = new Map<string, string>();
+	const taskErrorDismissalRequests: string[] = [];
+	const attempts = [attempt('failed', 128_000, 'First old error')];
+	await mockApi(page, { taskStatus: 'blocked', taskAttempts: attempts, taskErrorDismissals, taskErrorDismissalRequests });
+	await page.goto(`/tasks/${taskId}`);
+	await page.evaluate(id => localStorage.setItem(`xpressclaw.dismissed-task-attempt.v1.${id}`, 'attempt-browser-test'), taskId);
+	await page.reload();
+	await expect(page.getByRole('heading', { name: 'Browser-tested workspace' })).toBeVisible();
+	await expect(page.locator('[data-attempt-error]')).toHaveCount(0);
+	await expect.poll(() => taskErrorDismissals.has('attempt-browser-test')).toBe(true);
+	attempts.unshift(attempt('failed', 128_000, 'Second old error', null, { id: 'second-failure' }));
+	await page.reload();
+	await expect(page.locator('[data-attempt-error]')).toContainText('Second old error');
+	await page.getByRole('button', { name: 'Dismiss attempt error' }).click();
+	await expect(page.locator('[data-attempt-error]')).toHaveCount(0);
+	expect([...taskErrorDismissals.keys()].sort()).toEqual(['attempt-browser-test', 'second-failure']);
+	// A stale activity response must not revive an earlier dismissed attempt.
+	await page.route(`**/api/tasks/${taskId}/activity*`, route => route.fulfill({ json: { attempts: [attempts[1]], events: [], has_more_before: false, has_more_after: false } }));
+	await page.reload();
+	await expect(page.getByRole('heading', { name: 'Browser-tested workspace' })).toBeVisible();
+	await expect(page.locator('[data-attempt-error]')).toHaveCount(0);
+});
+
+test('attempt errors stay visible when saving dismissal fails and can be dismissed after retry', async ({ page }) => {
+	await mockApi(page, { taskStatus: 'blocked', attemptError: 'Old notice' });
+	await page.route(`**/api/tasks/${taskId}/attempts/*/error-dismissal`, route => route.fulfill({ status: 503, json: { error: 'Could not write the database' } }), { times: 1 });
+	await page.goto(`/tasks/${taskId}`);
+	const notice = page.locator('[data-attempt-error]');
+	await notice.getByRole('button', { name: 'Dismiss attempt error' }).click();
+	await expect(notice).toContainText('Could not save dismissal: Could not write the database');
+	await notice.getByRole('button', { name: 'Dismiss attempt error' }).click();
+	await expect(notice).toHaveCount(0);
+	await page.evaluate(() => localStorage.clear());
+	await page.reload();
+	await expect(page.getByRole('heading', { name: 'Browser-tested workspace' })).toBeVisible();
+	await expect(notice).toHaveCount(0);
 });
 
 test('attempt errors remain dismissed during navigation when storage fills up', async ({ page }) => {

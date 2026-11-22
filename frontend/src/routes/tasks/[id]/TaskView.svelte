@@ -24,7 +24,7 @@
 	import AiMessage from '$lib/components/AiMessage.svelte';
 	import ImageAttachmentPreviews from '$lib/components/ImageAttachmentPreviews.svelte';
 	import { clearComposerDraft, loadComposerDraft, saveComposerDraft } from '$lib/composerDrafts';
-	import { dismissTaskAttemptError, subscribeTaskErrorDismissal } from '$lib/taskErrorDismissals';
+	import { rememberTaskAttemptDismissal, subscribeTaskErrorDismissal } from '$lib/taskErrorDismissals';
 	import { appendImageFiles, imageDataUrl, MAX_IMAGE_ATTACHMENTS, pastedImageFiles, shouldHandleImagePaste } from '$lib/imageAttachments';
 	import { coalesceAgentMessageFragments } from '$lib/agentMessageFragments';
 	import { WORKSPACE_OPEN_SPLIT_EVENT, type WorkspaceOpenSplitDetail } from '$lib/workspace';
@@ -163,7 +163,10 @@
 	let allTasks = $state<Task[]>([]);
 	let workspaceGit = $state<WorkspaceGitStatus | null>(null);
 	let error = $state<string | null>(null);
-	let dismissedAttemptId = $state<string | null>(null);
+	let dismissedAttemptIds = $state<ReadonlySet<string>>(new Set());
+	let dismissingAttemptError = $state(false);
+	let dismissalError = $state('');
+	const syncingDismissals = new Set<string>();
 	let retryingLoad = $state(false);
 	let loading = $state(true);
 	let editing = $state(false);
@@ -366,11 +369,11 @@
 		|| latestErrorAttempt.error_message?.startsWith('backend error: ACP turn failed: Authentication required')
 	)));
 	let latestError = $derived(
-		latestErrorAttempt && latestErrorAttempt.id !== dismissedAttemptId
+		latestErrorAttempt && !latestErrorAttempt.error_dismissed_at && !dismissedAttemptIds.has(latestErrorAttempt.id)
 			? latestErrorAttempt?.error_message ?? null
 			: null
 	);
-	$effect(() => subscribeTaskErrorDismissal(taskId, (attemptId) => dismissedAttemptId = attemptId));
+	$effect(() => subscribeTaskErrorDismissal(taskId, (attemptIds) => dismissedAttemptIds = attemptIds));
 	let platformManaged = $derived(task?.provenance === 'xpress_ai_connect');
 	let blockingDelegates = $derived(delegatedWork.filter(item => item.blocks_parent));
 	let failedDelegates = $derived(blockingDelegates.filter(item => ['blocked', 'failed', 'cancelled', 'interrupted', 'waiting_for_input'].includes(item.activity_status)));
@@ -1128,7 +1131,7 @@
 			void refreshModelMenu(true);
 			agentList = loadedAgents;
 			messages = loadedMessages;
-			attempts = activity.attempts;
+			applyAttempts(activity.attempts);
 			delegatedWork = activity.delegated_work ?? [];
 			activityEvents = activity.events;
 			hasEarlierActivity = activity.has_more_before;
@@ -1200,9 +1203,39 @@
 		void goto('/tasks');
 	}
 
-	function dismissAttemptError() {
-		if (latestErrorAttempt) dismissTaskAttemptError(taskId, latestErrorAttempt.id);
-		requestAnimationFrame(() => messagesEl?.focus({ preventScroll: true }));
+	function applyAttempts(incoming: WorkAttempt[]) {
+		const id = taskId;
+		attempts = incoming;
+		for (const attempt of incoming) {
+			if (attempt.error_dismissed_at) {
+				if (!dismissedAttemptIds.has(attempt.id)) rememberTaskAttemptDismissal(id, attempt.id);
+			} else if (attempt.error_message && dismissedAttemptIds.has(attempt.id) && !syncingDismissals.has(attempt.id)) {
+				// Carry dismissals made by older clients into durable task storage.
+				syncingDismissals.add(attempt.id);
+				void tasks.dismissAttemptError(id, attempt.id).then(saved => {
+					if (!disposed && taskId === id) attempts = attempts.map(current => current.id === saved.id ? { ...current, error_dismissed_at: saved.error_dismissed_at } : current);
+				}).catch(() => {}).finally(() => syncingDismissals.delete(attempt.id));
+			}
+		}
+	}
+
+	async function dismissAttemptError() {
+		if (!latestErrorAttempt || dismissingAttemptError) return;
+		const id = taskId;
+		const attemptId = latestErrorAttempt.id;
+		dismissingAttemptError = true;
+		dismissalError = '';
+		try {
+			const saved = await tasks.dismissAttemptError(id, attemptId);
+			rememberTaskAttemptDismissal(id, attemptId);
+			if (disposed || taskId !== id) return;
+			attempts = attempts.map(attempt => attempt.id === attemptId ? { ...attempt, error_dismissed_at: saved.error_dismissed_at } : attempt);
+			requestAnimationFrame(() => messagesEl?.focus({ preventScroll: true }));
+		} catch (cause) {
+			if (!disposed && taskId === id) dismissalError = `Could not save dismissal: ${cause instanceof Error ? cause.message : String(cause)}`;
+		} finally {
+			if (!disposed && taskId === id) dismissingAttemptError = false;
+		}
 	}
 
 	// Git is auxiliary metadata. A slow repository must not delay the task,
@@ -1264,7 +1297,7 @@
 			error = null;
 			if (!hadActivityCursor) hasEarlierActivity = newActivity.has_more_before;
 			resetHarnessControls(newTask.agent_id);
-			attempts = newActivity.attempts;
+			applyAttempts(newActivity.attempts);
 			delegatedWork = newActivity.delegated_work ?? [];
 			subtaskList = subResult.tasks;
 			let shouldScroll = false;
@@ -2111,6 +2144,7 @@
 								<button
 									type="button"
 									onclick={dismissAttemptError}
+									disabled={dismissingAttemptError}
 									aria-label="Dismiss attempt error"
 									class="flex h-6 w-6 shrink-0 items-center justify-center rounded text-lg leading-none text-red-300/70 hover:bg-red-500/10 hover:text-red-200"
 								>&times;</button>
@@ -2118,6 +2152,7 @@
 							{#if authenticationRequired && authenticatedAttemptId === latestErrorAttempt?.id}
 								<p class="text-sm text-foreground">Retry this task to continue.</p>
 							{:else}<div class="whitespace-pre-wrap text-sm text-red-200">{latestError}</div>{/if}
+							{#if dismissalError}<p role="alert" class="mt-2 text-sm text-destructive">{dismissalError}</p>{/if}
 							{#if authenticationRequired && task?.agent_id}
 								<div class="mt-3 flex items-center gap-3">
 									{#if authenticatedAttemptId === latestErrorAttempt?.id}
