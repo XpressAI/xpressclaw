@@ -17,7 +17,7 @@
 		SquareTerminal,
 		X,
 	} from '@lucide/svelte';
-	import { providePaneActive } from '$lib/liveUpdates';
+	import { providePaneActive, providePaneRetainState } from '$lib/liveUpdates';
 	import { measurePane } from '$lib/workspaceLayout';
 	import { CANVAS_COLLAPSED_HEIGHT, CANVAS_DEFAULT_SIZE, type CanvasNode, type CanvasNodeKind } from '$lib/canvas';
 
@@ -42,6 +42,7 @@
 		onCenter: () => void;
 		onOpenInTabs?: () => void;
 		onClose: () => void;
+		onRetainChange?: (retained: boolean) => void;
 		onSpawnTool?: (kind: 'editor' | 'terminal' | 'image' | 'app') => void;
 		onExpandDelegated?: () => void;
 		children: Snippet;
@@ -68,12 +69,14 @@
 		onCenter,
 		onOpenInTabs,
 		onClose,
+		onRetainChange,
 		onSpawnTool,
 		onExpandDelegated,
 		children,
 	}: Props = $props();
 
 	providePaneActive(() => visible && active && !hidden && !node.collapsed);
+	providePaneRetainState((retained) => onRetainChange?.(retained));
 
 	let dragging = $state(false);
 	let resizing = $state(false);
@@ -83,6 +86,7 @@
 	onDestroy(() => {
 		cancelInteraction?.();
 		cancelInteraction = null;
+		onRetainChange?.(false);
 	});
 
 	let shieldActive = $derived(dragging || resizing || canvasInteracting || dragOffset !== null);

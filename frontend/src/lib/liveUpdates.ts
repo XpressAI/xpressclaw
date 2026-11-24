@@ -34,6 +34,8 @@ export interface SubscribeLiveUpdatesOptions {
 	 * `/api/ui/stream` nor `/api/ui/revisions` is available (e.g. partial mocks).
 	 */
 	fallbackActive?: () => boolean;
+	/** High-priority subscribers (e.g. shell/sidebar) drain ahead of per-window views. */
+	priority?: 'high' | 'normal';
 }
 
 const ALL_DOMAINS: readonly UiDomain[] = [
@@ -47,6 +49,7 @@ const ALL_DOMAINS: readonly UiDomain[] = [
 ];
 
 const PANE_ACTIVE_CONTEXT = Symbol('xpressclaw.workspace.paneActive');
+const PANE_RETAIN_CONTEXT = Symbol('xpressclaw.workspace.paneRetain');
 
 export function providePaneActive(getActive: () => boolean): void {
 	setContext(PANE_ACTIVE_CONTEXT, getActive);
@@ -59,6 +62,17 @@ export function usePaneActive(): () => boolean {
 	return () => true;
 }
 
+export function providePaneRetainState(report: (retained: boolean) => void): void {
+	setContext(PANE_RETAIN_CONTEXT, report);
+}
+
+export function useReportPaneRetainState(): (retained: boolean) => void {
+	if (hasContext(PANE_RETAIN_CONTEXT)) {
+		return getContext<(retained: boolean) => void>(PANE_RETAIN_CONTEXT);
+	}
+	return () => {};
+}
+
 interface Subscriber {
 	id: number;
 	domains: UiDomain[];
@@ -66,6 +80,7 @@ interface Subscriber {
 	isActive: () => boolean;
 	fallbackIntervalMs: number;
 	fallbackActive: () => boolean;
+	priority: 'high' | 'normal';
 	lastRunAt: number;
 	inFlight: boolean;
 	queuedSource: LiveUpdateSource | null;
@@ -82,11 +97,13 @@ interface Subscriber {
 }
 
 const MAX_CONCURRENT_SUBSCRIBER_RUNS = 4;
+const SUBSCRIBER_SLOT_TIMEOUT_MS = 15_000;
 
 let nextSubscriberId = 1;
 const subscribers = new Map<number, Subscriber>();
 const streamStatusListeners = new Set<(connected: boolean) => void>();
 const visibilityListeners = new Set<() => void>();
+const highPriorityQueuedIds = new Set<number>();
 const queuedSubscriberIds = new Set<number>();
 let activeSubscriberRuns = 0;
 
@@ -185,8 +202,8 @@ function notifyVisibilityListeners(): void {
 	for (const listener of visibilityListeners) {
 		try {
 			listener();
-		} catch {
-			// Ignore listener errors.
+		} catch (err) {
+			console.warn('Live-update visibility listener failed:', err);
 		}
 	}
 }
@@ -211,6 +228,7 @@ function installGlobalListeners(): void {
 					for (const domain of sub.queuedDomains) sub.dirtyDomains.add(domain);
 					sub.queuedSource = null;
 					sub.queuedDomains.clear();
+					highPriorityQueuedIds.delete(sub.id);
 					queuedSubscriberIds.delete(sub.id);
 				}
 				if (sub.retryDomains.size > 0) {
@@ -254,13 +272,41 @@ export function notifyLiveUpdatesVisibilityChanged(): void {
 	flushDirtySubscribers();
 }
 
-function drainSubscriberQueue(): void {
-	while (activeSubscriberRuns < MAX_CONCURRENT_SUBSCRIBER_RUNS && queuedSubscriberIds.size > 0) {
+function enqueueSubscriber(
+	sub: Subscriber,
+	source: LiveUpdateSource,
+	domains: Iterable<UiDomain>
+): void {
+	sub.queuedSource = sub.queuedSource === 'sse' ? 'sse' : source;
+	for (const domain of domains) sub.queuedDomains.add(domain);
+	const queue = sub.priority === 'high' ? highPriorityQueuedIds : queuedSubscriberIds;
+	queue.add(sub.id);
+}
+
+function takeNextQueuedSubscriberId(): number | undefined {
+	if (highPriorityQueuedIds.size > 0) {
+		const nextId = highPriorityQueuedIds.values().next().value;
+		if (nextId !== undefined) {
+			highPriorityQueuedIds.delete(nextId);
+			return nextId;
+		}
+	}
+	if (queuedSubscriberIds.size > 0) {
 		const nextId = queuedSubscriberIds.values().next().value;
+		if (nextId !== undefined) {
+			queuedSubscriberIds.delete(nextId);
+			return nextId;
+		}
+	}
+	return undefined;
+}
+
+function drainSubscriberQueue(): void {
+	while (activeSubscriberRuns < MAX_CONCURRENT_SUBSCRIBER_RUNS) {
+		const nextId = takeNextQueuedSubscriberId();
 		if (nextId === undefined) break;
-		queuedSubscriberIds.delete(nextId);
 		const sub = subscribers.get(nextId);
-		if (!sub || sub.queuedSource === null) continue;
+		if (!sub || sub.queuedSource === null || sub.inFlight) continue;
 		const nextSource = sub.queuedSource;
 		const nextDomains = new Set(sub.queuedDomains);
 		sub.queuedSource = null;
@@ -284,6 +330,22 @@ function executeSubscriber(
 	activeSubscriberRuns += 1;
 	sub.lastRunAt = Date.now();
 	let transientFailure = false;
+	let slotReleased = false;
+
+	const releaseSlot = () => {
+		if (slotReleased) return;
+		slotReleased = true;
+		activeSubscriberRuns = Math.max(0, activeSubscriberRuns - 1);
+		drainSubscriberQueue();
+	};
+
+	const slotTimer = setTimeout(() => {
+		if (slotReleased) return;
+		console.warn(
+			`Live-update subscriber #${sub.id} (${sub.domains.join(',')}) exceeded ${SUBSCRIBER_SLOT_TIMEOUT_MS}ms; releasing concurrency slot.`
+		);
+		releaseSlot();
+	}, SUBSCRIBER_SLOT_TIMEOUT_MS);
 
 	Promise.resolve()
 		.then(() => sub.callback(revisions, { source, changedDomains: domainSet }))
@@ -304,15 +366,22 @@ function executeSubscriber(
 			}
 		})
 		.finally(() => {
+			clearTimeout(slotTimer);
 			sub.inFlight = false;
-			activeSubscriberRuns = Math.max(0, activeSubscriberRuns - 1);
 			if (subscribers.has(sub.id)) {
 				if (sub.pendingSource !== null) {
 					const nextSource = sub.pendingSource;
 					const nextDomains = new Set(sub.pendingDomains);
 					sub.pendingSource = null;
 					sub.pendingDomains.clear();
-					triggerSubscriber(sub, currentRevisions ?? revisions, nextSource, nextDomains);
+					// Queue pending reruns at the back of the FIFO queue so waiting
+					// subscribers are never starved by a continuously streaming view.
+					if (isDocumentHidden() || !sub.isActive()) {
+						sub.dirty = true;
+						for (const domain of nextDomains) sub.dirtyDomains.add(domain);
+					} else {
+						enqueueSubscriber(sub, nextSource, nextDomains);
+					}
 				} else if (transientFailure && sub.retryDomains.size > 0) {
 					if (isDocumentHidden() || !sub.isActive()) {
 						sub.dirty = true;
@@ -333,7 +402,10 @@ function executeSubscriber(
 					}
 				}
 			}
-			drainSubscriberQueue();
+			const releasedBeforeFinally = slotReleased;
+			releaseSlot();
+			// If the slot was already released early by timeout, drain any newly enqueued pending rerun.
+			if (releasedBeforeFinally) drainSubscriberQueue();
 		});
 }
 
@@ -375,10 +447,13 @@ function triggerSubscriber(
 		return;
 	}
 
-	if (activeSubscriberRuns >= MAX_CONCURRENT_SUBSCRIBER_RUNS) {
-		sub.queuedSource = sub.queuedSource === 'sse' ? 'sse' : source;
-		for (const domain of mergedDomains) sub.queuedDomains.add(domain);
-		queuedSubscriberIds.add(sub.id);
+	if (
+		activeSubscriberRuns >= MAX_CONCURRENT_SUBSCRIBER_RUNS
+		|| highPriorityQueuedIds.size > 0
+		|| queuedSubscriberIds.size > 0
+	) {
+		enqueueSubscriber(sub, source, mergedDomains);
+		drainSubscriberQueue();
 		return;
 	}
 
@@ -752,6 +827,7 @@ export function subscribeLiveUpdates(
 		isActive: () => paneActive() && (options.active ? options.active() : true),
 		fallbackIntervalMs: options.fallbackIntervalMs ?? 3000,
 		fallbackActive: options.fallbackActive ?? (() => true),
+		priority: options.priority ?? 'normal',
 		lastRunAt: Date.now(),
 		inFlight: false,
 		queuedSource: null,
@@ -781,11 +857,13 @@ export function subscribeLiveUpdates(
 
 	return () => {
 		clearSubscriberRetryTimer(subscriber);
+		highPriorityQueuedIds.delete(id);
 		queuedSubscriberIds.delete(id);
 		subscribers.delete(id);
 		if (subscribers.size === 0) {
 			stopStream();
 			stopFallbackLoop();
+			highPriorityQueuedIds.clear();
 			queuedSubscriberIds.clear();
 			currentRevisions = null;
 			serverProvidesRevisionHeaders = false;

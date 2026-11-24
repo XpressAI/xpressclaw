@@ -9,7 +9,7 @@
 	import { MIN_DETAILS_WIDTH } from '$lib/workspaceLayout';
 	import { goto } from '$app/navigation';
 	import { tasks, agents, sessions, workspaces, ApiError } from '$lib/api';
-	import { isTransientRefreshError, subscribeLiveUpdates, usePaneActive, type UiDomain } from '$lib/liveUpdates';
+	import { isTransientRefreshError, subscribeLiveUpdates, usePaneActive, useReportPaneRetainState, type UiDomain } from '$lib/liveUpdates';
 	import { selectChoices, isModelOption, isReasoningOption, isAdditionalModelOption, reconcileConfig, duplicatesReasoningMode } from '$lib/acpConfig';
 	import type { TaskControlSnapshot, AcpCommand, AcpConfigOption, AcpModeState, DelegatedWork, Task, TaskMessage, Agent, WorkAttempt, SessionEvent, ImageAttachmentUpload, GitChange, WorkspaceGitStatus, MessageVisualization } from '$lib/api';
 	import { timeAgo, openExternal } from '$lib/utils';
@@ -208,6 +208,7 @@
 	let controlsInitializedFor = '';
 	let composing = $state(false);
 	const paneActive = usePaneActive();
+	const reportPaneRetainState = useReportPaneRetainState();
 	let unsubscribeLiveUpdates: (() => void) | null = null;
 	let messagesEl = $state<HTMLDivElement>();
 	let composerEl = $state<HTMLDivElement>();
@@ -221,11 +222,14 @@
 	let showDetailsSidebar = $derived(detailsSidebarFits && !detailsCollapsed && !detailsSheetOpen);
 	let prevMessageCount = 0;
 	let lastActivityEventId = 0;
+	let oldestContiguousActivityId: number | null = null;
 	let lastCommandsEventId = 0;
+	let lastTerminalCheckAt = 0;
 	let allTasksLoaded = false;
 	let allTasksLoading = false;
 	const MAX_LIVE_ACTIVITY_EVENTS = 400;
 	const TRIMMED_LIVE_ACTIVITY_EVENTS = 300;
+	const TERMINAL_COMPACT_RECHECK_MS = 10_000;
 	let hasEarlierActivity = $state(false);
 	let loadingEarlierActivity = $state(false);
 	let userLoadedEarlierActivity = false;
@@ -241,6 +245,15 @@
 
 	$effect(() => {
 		if (messageDraftReady) saveComposerDraft(messageDraftScope(), messageInput);
+	});
+
+	$effect(() => {
+		const hasUnsavedState =
+			messageAttachments.length > 0
+			|| editing
+			|| Boolean(planningTask)
+			|| Object.keys(elicitationAnswers).length > 0;
+		reportPaneRetainState(hasUnsavedState);
 	});
 
 	let availableDeps = $derived(
@@ -1087,12 +1100,16 @@
 					return;
 				}
 				const activeTask = isTaskOrDelegatesActive();
-				// Completed/cancelled tasks do not need to re-poll on unrelated agent/session churn.
-				if (!activeTask && !modelMenuOpen && !hasPendingControls() && ctx.source !== 'resume' && !ctx.changedDomains.has('tasks')) {
-					return;
+				// Completed/cancelled tasks skip pure session/agent churn, and in Canvas
+				// (compact) mode rate-limit repeated unrelated task-domain checks.
+				if (!activeTask && !modelMenuOpen && !hasPendingControls() && ctx.source !== 'resume') {
+					if (!ctx.changedDomains.has('tasks')) return;
+					if (compact && task !== null && Date.now() - lastTerminalCheckAt < TERMINAL_COMPACT_RECHECK_MS) {
+						return;
+					}
 				}
 				// Live SSE / revision push (including updates arriving during initial load or scheduled wake-ups!):
-				await poll(true, ctx.changedDomains);
+				await poll(true, ctx.source === 'resume' ? undefined : ctx.changedDomains);
 				if (
 					!controlSnapshot
 					|| modelMenuOpen
@@ -1112,6 +1129,7 @@
 
 	onDestroy(() => {
 		disposed = true;
+		reportPaneRetainState(false);
 		if (scrollTimer !== null) {
 			clearTimeout(scrollTimer);
 			scrollTimer = null;
@@ -1147,6 +1165,8 @@
 			subtaskList = subResult.tasks;
 			prevMessageCount = messages.length;
 			lastActivityEventId = activityEvents.at(-1)?.id ?? 0;
+			oldestContiguousActivityId = activityEvents.at(0)?.id ?? null;
+			if (!isTaskOrDelegatesActive()) lastTerminalCheckAt = Date.now();
 			if (loadedTask.agent_id) {
 				void refreshWorkspaceGit(loadedTask.agent_id);
 				const events = await sessions.events(loadedTask.agent_id, {
@@ -1219,8 +1239,13 @@
 
 	// Git is auxiliary metadata. A slow repository must not delay the task,
 	// its saved messages, or terminal attempt state, or accumulate requests.
-	async function refreshWorkspaceGit(agentId: string) {
-		if (disposed || workspaceGitRequest || Date.now() - lastWorkspaceGitRefresh < 10_000) return;
+	async function refreshWorkspaceGit(agentId: string, force = false) {
+		if (disposed) return;
+		if (!force && (workspaceGitRequest || Date.now() - lastWorkspaceGitRefresh < 10_000)) return;
+		if (force && workspaceGitRequest) {
+			workspaceGitRequest.abort();
+			workspaceGitRequest = null;
+		}
 		const id = taskId;
 		const controller = new AbortController();
 		workspaceGitRequest = controller;
@@ -1229,7 +1254,11 @@
 		try {
 			const git = await workspaces.gitStatus(agentId, controller.signal, id);
 			if (!disposed && workspaceGitRequest === controller && task?.id === id && task.agent_id === agentId) workspaceGit = git;
-		} catch { /* Preserve the last Git snapshot; task polling continues. */ }
+		} catch (err) {
+			if (!controller.signal.aborted) {
+				console.debug(`Failed to refresh git status for task ${id}:`, err);
+			}
+		}
 		finally {
 			clearTimeout(timeout);
 			if (workspaceGitRequest === controller) workspaceGitRequest = null;
@@ -1239,13 +1268,20 @@
 	function sameSnapshot(left: unknown, right: unknown): boolean {
 		try {
 			return JSON.stringify(left) === JSON.stringify(right);
-		} catch {
+		} catch (err) {
+			console.warn('Failed to compare task snapshot:', err);
 			return false;
 		}
 	}
 
-	function trimLiveActivityEvents(events: SessionEvent[]): { events: SessionEvent[]; trimmed: boolean } {
-		if (events.length <= MAX_LIVE_ACTIVITY_EVENTS) return { events, trimmed: false };
+	function trimLiveActivityEvents(events: SessionEvent[]): {
+		events: SessionEvent[];
+		trimmed: boolean;
+		oldestContiguousId: number | null;
+	} {
+		if (events.length <= MAX_LIVE_ACTIVITY_EVENTS) {
+			return { events, trimmed: false, oldestContiguousId: oldestContiguousActivityId };
+		}
 		const cutoffIndex = events.length - TRIMMED_LIVE_ACTIVITY_EVENTS;
 		const head = events.slice(0, cutoffIndex);
 		const tail = events.slice(cutoffIndex);
@@ -1263,6 +1299,7 @@
 		return {
 			events: retainedHead.length > 0 ? [...retainedHead, ...tail] : tail,
 			trimmed: true,
+			oldestContiguousId: tail[0]?.id ?? null,
 		};
 	}
 
@@ -1292,15 +1329,43 @@
 			const wasActiveBeforePoll = isTaskOrDelegatesActive();
 			const hadActivityCursor = Boolean(lastActivityEventId);
 			const afterMessageId = incrementalMessagePivot(messages);
-			const [newTask, incomingMessages, newActivity, subResult] = await Promise.all([
-				tasks.get(id),
-				tasks.messages(id, afterMessageId),
-				tasks.activity(id, { after: lastActivityEventId || undefined }),
-				tasks.subtasks(id).catch((err) => {
-					if (isTransientRefreshError(err)) throw err;
-					return { tasks: subtaskList };
-				}),
-			]);
+			let newTask: Task;
+			let incomingMessages: TaskMessage[];
+			let newActivity: Awaited<ReturnType<typeof tasks.activity>>;
+			let subResult: { tasks: Task[] };
+
+			// For an already-terminal task (completed/cancelled with no active delegates),
+			// check the single task record first on background live-update ticks so unrelated
+			// global task/session ticks do not fan out across messages, activity, subtasks, git, and commands.
+			if (!wasActiveBeforePoll && task !== null && !initialLoad && changedDomains !== undefined) {
+				newTask = await tasks.get(id);
+				if (disposed || taskId !== id) return;
+				if (sameSnapshot(task, newTask)) {
+					error = null;
+					lastTerminalCheckAt = Date.now();
+					return;
+				}
+				[incomingMessages, newActivity, subResult] = await Promise.all([
+					tasks.messages(id, afterMessageId),
+					tasks.activity(id, { after: lastActivityEventId || undefined }),
+					tasks.subtasks(id).catch((err) => {
+						if (isTransientRefreshError(err)) throw err;
+						console.warn(`Failed to load subtasks for task ${id}:`, err);
+						return { tasks: subtaskList };
+					}),
+				]);
+			} else {
+				[newTask, incomingMessages, newActivity, subResult] = await Promise.all([
+					tasks.get(id),
+					tasks.messages(id, afterMessageId),
+					tasks.activity(id, { after: lastActivityEventId || undefined }),
+					tasks.subtasks(id).catch((err) => {
+						if (isTransientRefreshError(err)) throw err;
+						console.warn(`Failed to load subtasks for task ${id}:`, err);
+						return { tasks: subtaskList };
+					}),
+				]);
+			}
 			if (disposed || taskId !== id) return;
 			// Update task status/details in-place only when changed to avoid cascading $derived recomputations.
 			if (!sameSnapshot(task, newTask)) task = newTask;
@@ -1341,21 +1406,29 @@
 				if (disposed || taskId !== id) return;
 				if (appended.length > 0) {
 					let nextEvents = [...activityEvents, ...appended];
+					if (oldestContiguousActivityId === null && nextEvents.length > 0) {
+						oldestContiguousActivityId = nextEvents[0].id;
+					}
 					if (followLatest && !userLoadedEarlierActivity) {
 						const trimmedResult = trimLiveActivityEvents(nextEvents);
 						nextEvents = trimmedResult.events;
-						if (trimmedResult.trimmed) hasEarlierActivity = true;
+						if (trimmedResult.trimmed) {
+							hasEarlierActivity = true;
+							oldestContiguousActivityId = trimmedResult.oldestContiguousId;
+						}
 					}
 					activityEvents = nextEvents;
 					lastActivityEventId = Math.max(cursor, nextEvents.at(-1)?.id ?? lastActivityEventId);
 					shouldScroll = true;
 				}
 			}
+			const activeAfterPoll = isTaskOrDelegatesActive();
+			if (!activeAfterPoll) lastTerminalCheckAt = Date.now();
 			if (newTask.agent_id) {
-				const activeAfterPoll = isTaskOrDelegatesActive();
+				const justFinished = wasActiveBeforePoll && !activeAfterPoll;
 				const activeOrJustFinished = wasActiveBeforePoll || activeAfterPoll;
 				if (activeOrJustFinished || !workspaceGit) {
-					void refreshWorkspaceGit(newTask.agent_id);
+					void refreshWorkspaceGit(newTask.agent_id, justFinished);
 				}
 				const shouldRefreshCommands =
 					lastCommandsEventId === 0
@@ -1368,6 +1441,7 @@
 						limit: 1,
 					}).catch((err) => {
 						if (isTransientRefreshError(err)) throw err;
+						console.warn(`Failed to load available commands for agent ${newTask.agent_id}:`, err);
 						return [];
 					});
 					if (disposed || task?.id !== id || task.agent_id !== newTask.agent_id) return;
@@ -1388,7 +1462,7 @@
 	}
 
 	async function loadEarlierActivity() {
-		const oldestId = activityEvents.at(0)?.id;
+		const oldestId = oldestContiguousActivityId ?? activityEvents.at(0)?.id;
 		if (!oldestId || loadingEarlierActivity || !hasEarlierActivity) return;
 		userLoadedEarlierActivity = true;
 		loadingEarlierActivity = true;
@@ -1397,10 +1471,13 @@
 		try {
 			const older = await tasks.activity(taskId, { before: oldestId });
 			const known = new Set(activityEvents.map((event) => event.id));
-			activityEvents = [
-				...older.events.filter((event) => !known.has(event.id)),
-				...activityEvents,
-			];
+			const added = older.events.filter((event) => !known.has(event.id));
+			if (added.length > 0) {
+				activityEvents = [...added, ...activityEvents].sort((left, right) => left.id - right.id);
+			}
+			if (older.events.length > 0) {
+				oldestContiguousActivityId = older.events[0].id;
+			}
 			hasEarlierActivity = older.has_more_before;
 			requestAnimationFrame(() => requestAnimationFrame(() => {
 				if (!messagesEl) return;

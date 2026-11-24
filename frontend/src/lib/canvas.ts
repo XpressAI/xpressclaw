@@ -944,6 +944,60 @@ export function tidyCanvasLayout(
 	});
 }
 
+/**
+ * Tidy a filtered subset of nodes while keeping them anchored at their existing
+ * origin and clear of hidden nodes from other projects.
+ */
+export function tidyFilteredCanvasNodes(
+	allNodes: CanvasNode[],
+	visibleNodes: CanvasNode[],
+	tasks: Task[],
+	projects: Project[],
+	snap = true,
+): { nodes: CanvasNode[]; tidiedVisible: CanvasNode[] } {
+	if (visibleNodes.length === 0) {
+		return { nodes: allNodes, tidiedVisible: [] };
+	}
+	const visibleIds = new Set(visibleNodes.map((node) => node.id));
+	const hiddenNodes = allNodes.filter((node) => !visibleIds.has(node.id));
+	const originX = Math.min(...visibleNodes.map((node) => node.x));
+	const originY = Math.min(...visibleNodes.map((node) => node.y));
+
+	const rawTidied = tidyCanvasLayout(visibleNodes, tasks, projects);
+	const tidiedMinX = Math.min(...rawTidied.map((node) => node.x));
+	const tidiedMinY = Math.min(...rawTidied.map((node) => node.y));
+
+	let shiftX = snapCoordinate(originX - tidiedMinX, snap);
+	let shiftY = snapCoordinate(originY - tidiedMinY, snap);
+
+	const overlapsHidden = (sx: number, sy: number) =>
+		rawTidied.some((node) => {
+			const nx = node.x + sx;
+			const ny = node.y + sy;
+			const nh = nodeVisualHeight(node);
+			return hiddenNodes.some((hidden) =>
+				rectsOverlap(nx, ny, node.width, nh, hidden.x, hidden.y, hidden.width, nodeVisualHeight(hidden), 40)
+			);
+		});
+
+	if (hiddenNodes.length > 0 && overlapsHidden(shiftX, shiftY)) {
+		const maxHiddenBottom = Math.max(...hiddenNodes.map((node) => node.y + nodeVisualHeight(node)));
+		const laneGap = 130;
+		shiftY = snapCoordinate(maxHiddenBottom + laneGap - tidiedMinY, snap);
+	}
+
+	const tidiedVisible = rawTidied.map((node) => ({
+		...node,
+		x: node.x + shiftX,
+		y: node.y + shiftY,
+	}));
+	const byId = new Map(tidiedVisible.map((node) => [node.id, node]));
+	return {
+		nodes: allNodes.map((node) => byId.get(node.id) ?? node),
+		tidiedVisible,
+	};
+}
+
 export function seedCanvasNodes(
 	projects: Project[],
 	agents: Agent[],

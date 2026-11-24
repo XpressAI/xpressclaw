@@ -9,10 +9,22 @@
 	}
 
 	const PROJECT_CACHE_TTL_MS = 30_000;
+	const MAX_PROJECT_CACHE_ENTRIES = 200;
 	const projectCache = new Map<string, CachedProjectEntry>();
 	const inflightProjectLoads = new Map<string, Promise<Project | null>>();
 	const projectListeners = new Map<string, Set<(entry: CachedProjectEntry) => void>>();
 	let mutationListenerAttached = false;
+
+	function writeProjectCache(projectId: string, entry: CachedProjectEntry) {
+		ensureMutationListener();
+		projectCache.delete(projectId);
+		projectCache.set(projectId, entry);
+		while (projectCache.size > MAX_PROJECT_CACHE_ENTRIES) {
+			const oldest = projectCache.keys().next().value;
+			if (oldest === undefined) break;
+			projectCache.delete(oldest);
+		}
+	}
 
 	function notifyProjectListeners(projectId: string, entry: CachedProjectEntry) {
 		const listeners = projectListeners.get(projectId);
@@ -25,14 +37,14 @@
 		if (!mutation) return;
 		if (mutation.kind === 'deleted') {
 			const entry: CachedProjectEntry = { project: null, deleted: true, fetchedAt: Date.now() };
-			projectCache.set(mutation.projectId, entry);
+			writeProjectCache(mutation.projectId, entry);
 			notifyProjectListeners(mutation.projectId, entry);
 			return;
 		}
 		const existing = projectCache.get(mutation.project.id);
 		if (!existing?.project || mutation.authoritative || existing.project.updated_at < mutation.project.updated_at) {
 			const entry: CachedProjectEntry = { project: mutation.project, deleted: false, fetchedAt: Date.now() };
-			projectCache.set(mutation.project.id, entry);
+			writeProjectCache(mutation.project.id, entry);
 			notifyProjectListeners(mutation.project.id, entry);
 		}
 	}
@@ -55,7 +67,9 @@
 			listeners.delete(listener);
 			if (listeners.size === 0) {
 				projectListeners.delete(projectId);
-				if (projectListeners.size === 0 && mutationListenerAttached && typeof window !== 'undefined') {
+				// Keep the single module-level mutation listener active while cached entries exist
+				// so renames/deletes made when no ProjectLink is mounted still update the cache.
+				if (projectListeners.size === 0 && projectCache.size === 0 && mutationListenerAttached && typeof window !== 'undefined') {
 					window.removeEventListener(PROJECT_MUTATION_EVENT, handleGlobalProjectMutation);
 					mutationListenerAttached = false;
 				}
@@ -75,7 +89,7 @@
 				const existing = projectCache.get(id);
 				if (!existing || (!existing.deleted && (!existing.project || existing.project.updated_at <= loaded.updated_at))) {
 					const entry: CachedProjectEntry = { project: loaded, deleted: false, fetchedAt: Date.now() };
-					projectCache.set(id, entry);
+					writeProjectCache(id, entry);
 					notifyProjectListeners(id, entry);
 				}
 				return projectCache.get(id)?.project ?? loaded;

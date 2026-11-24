@@ -3,7 +3,7 @@
 	import { goto } from '$app/navigation';
 	import { sessions, tasks } from '$lib/api';
 	import type { ImageAttachmentUpload, SessionOverview, RunnerReadiness, Task } from '$lib/api';
-	import { isTransientRefreshError, subscribeLiveUpdates, usePaneActive } from '$lib/liveUpdates';
+	import { isTransientRefreshError, subscribeLiveUpdates, subscribeLiveUpdatesVisibility, usePaneActive, useReportPaneRetainState } from '$lib/liveUpdates';
 	import ImageAttachmentPreviews from '$lib/components/ImageAttachmentPreviews.svelte';
 	import DictationButton from '$lib/components/DictationButton.svelte';
 	import { clearComposerDraft, loadComposerDraft, saveComposerDraft } from '$lib/composerDrafts';
@@ -33,7 +33,9 @@
 		src: imageDataUrl(attachment),
 	})));
 	const paneActive = usePaneActive();
+	const reportPaneRetainState = useReportPaneRetainState();
 	let unsubscribeLiveUpdates: (() => void) | null = null;
+	let unsubscribeVisibility: (() => void) | null = null;
 	let readinessTimer: ReturnType<typeof setInterval> | null = null;
 	let preparationTimer: ReturnType<typeof setInterval> | null = null;
 	let readinessRequest = 0;
@@ -60,6 +62,10 @@
 		if (messageDraftReady) saveComposerDraft(messageDraftScope(), message);
 	});
 
+	$effect(() => {
+		reportPaneRetainState(imageAttachments.length > 0);
+	});
+
 	function handleVisibilityChange() {
 		if (!document.hidden && paneActive() && (!readiness?.ready || Date.now() - lastReadinessCheck >= 60_000)) {
 			void loadReadiness();
@@ -76,7 +82,7 @@
 			() => load(true),
 			{ active: paneActive, fallbackIntervalMs: 2500 }
 		);
-		document.addEventListener('visibilitychange', handleVisibilityChange);
+		unsubscribeVisibility = subscribeLiveUpdatesVisibility(handleVisibilityChange);
 		readinessTimer = setInterval(() => {
 			if (document.hidden || !paneActive()) return;
 			if (!readiness?.ready || Date.now() - lastReadinessCheck >= 60_000) void loadReadiness();
@@ -84,9 +90,11 @@
 	});
 
 	onDestroy(() => {
+		reportPaneRetainState(false);
 		unsubscribeLiveUpdates?.();
 		unsubscribeLiveUpdates = null;
-		document.removeEventListener('visibilitychange', handleVisibilityChange);
+		unsubscribeVisibility?.();
+		unsubscribeVisibility = null;
 		if (readinessTimer) clearInterval(readinessTimer);
 		if (preparationTimer) clearInterval(preparationTimer);
 		readinessRequest++;

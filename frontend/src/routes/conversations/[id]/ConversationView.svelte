@@ -3,7 +3,7 @@
 	import { onDestroy, onMount } from 'svelte';
 	import yaml from 'js-yaml';
 	import { agents, conversations, projects, workflows, type Agent, type Conversation, type ConversationMessage, type ConversationMessageUpload, type ConversationTurn, type Project, type Task, type Workflow } from '$lib/api';
-	import { isTransientRefreshError, subscribeLiveUpdates, subscribeLiveUpdatesVisibility, usePaneActive } from '$lib/liveUpdates';
+	import { isTransientRefreshError, subscribeLiveUpdates, subscribeLiveUpdatesVisibility, usePaneActive, useReportPaneRetainState } from '$lib/liveUpdates';
 	import { clearComposerDraft, loadComposerDraft, saveComposerDraft } from '$lib/composerDrafts';
 	import { clipboardFiles, imageDataUrl, pastedImageFiles, shouldHandleImagePaste } from '$lib/imageAttachments';
 	import { PROJECT_MUTATION_EVENT, type ProjectMutation } from '$lib/projectEvents';
@@ -52,6 +52,7 @@
 	let composerInput = $state<HTMLTextAreaElement>();
 	let messagePane = $state<HTMLDivElement>();
 	const paneActive = usePaneActive();
+	const reportPaneRetainState = useReportPaneRetainState();
 	let unsubscribeLiveUpdates: (() => void) | null = null;
 	let unsubscribeVisibility: (() => void) | null = null;
 	let eventSource: EventSource | null = null;
@@ -93,6 +94,14 @@
 
 	$effect(() => { if (draftReady) saveComposerDraft(draftScope, content); });
 
+	$effect(() => {
+		const hasUnsavedState =
+			attachments.length > 0
+			|| showTaskComposer
+			|| Boolean(taskTitle.trim() || taskDescription.trim());
+		reportPaneRetainState(hasUnsavedState);
+	});
+
 	let initialLoadPromise: Promise<void> | null = null;
 	let activityGeneration = 0;
 	let appliedActivityGeneration = 0;
@@ -120,6 +129,7 @@
 
 	onDestroy(() => {
 		disposed = true;
+		reportPaneRetainState(false);
 		unsubscribeLiveUpdates?.();
 		unsubscribeLiveUpdates = null;
 		unsubscribeVisibility?.();
@@ -214,7 +224,8 @@
 	function sameSnapshot(left: unknown, right: unknown): boolean {
 		try {
 			return JSON.stringify(left) === JSON.stringify(right);
-		} catch {
+		} catch (err) {
+			console.warn('Failed to compare conversation snapshot:', err);
 			return false;
 		}
 	}

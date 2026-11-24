@@ -15,6 +15,7 @@ import {
 	resolveWorkspaceRelativePath,
 	seedCanvasNodes,
 	tidyCanvasLayout,
+	tidyFilteredCanvasNodes,
 	type CanvasNode,
 } from '../src/lib/canvas';
 
@@ -897,6 +898,45 @@ test.describe('Spatial Canvas workspace', () => {
 
 	test('zooms when scrolling on the minimap, isolates projects via the project picker, and drags an entire project zone group', async ({ page }) => {
 		let alphaTaskPolls = 0;
+		await page.addInitScript(() => {
+			const listeners: Array<(chunk: string) => void> = [];
+			const originalFetch = window.fetch.bind(window);
+			const encoder = new TextEncoder();
+			let revisions = { seq: 1, projects: 1, agents: 1, conversations: 1, tasks: 1, sessions: 1, schedules: 1, workflows: 1 };
+			window.fetch = (input, init) => {
+				const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+				if (new URL(url, window.location.origin).pathname === '/api/ui/stream') {
+					const stream = new ReadableStream<Uint8Array>({
+						start(controller) {
+							let closed = false;
+							const push = (chunk: string) => {
+								if (closed) return;
+								controller.enqueue(encoder.encode(chunk));
+							};
+							listeners.push(push);
+							push(`event: revisions\ndata: ${JSON.stringify(revisions)}\n\n`);
+							init?.signal?.addEventListener('abort', () => {
+								if (closed) return;
+								closed = true;
+								const idx = listeners.indexOf(push);
+								if (idx >= 0) listeners.splice(idx, 1);
+								controller.close();
+							});
+						},
+					});
+					return Promise.resolve(new Response(stream, {
+						status: 200,
+						headers: { 'Content-Type': 'text/event-stream' },
+					}));
+				}
+				return originalFetch(input, init);
+			};
+			(window as unknown as { __emitCanvasRevisions?: (patch: Partial<typeof revisions>) => void }).__emitCanvasRevisions = (patch) => {
+				revisions = { ...revisions, ...patch, seq: revisions.seq + 1 };
+				const frame = `event: revisions\ndata: ${JSON.stringify(revisions)}\n\n`;
+				for (const push of [...listeners]) push(frame);
+			};
+		});
 		await mockCanvasApi(page);
 		await page.route('**/api/tasks/task-parent/activity**', async (route) => {
 			alphaTaskPolls += 1;
@@ -917,6 +957,13 @@ test.describe('Spatial Canvas workspace', () => {
 		await expect(canvas).toBeVisible();
 		await expect(page.locator('[data-canvas-project-card="proj-alpha"]')).toBeVisible();
 		await expect(page.locator('[data-canvas-project-card="proj-beta"]')).toBeVisible();
+
+		// Verify live SSE revision events actually trigger polls on active Alpha Core tasks (makes the later isolation check falsifiable).
+		const pollsBeforeActiveEmit = alphaTaskPolls;
+		await page.evaluate(() => {
+			(window as unknown as { __emitCanvasRevisions?: (patch: Record<string, number>) => void }).__emitCanvasRevisions?.({ tasks: 2, sessions: 2 });
+		});
+		await expect.poll(() => alphaTaskPolls).toBeGreaterThan(pollsBeforeActiveEmit);
 
 		// 1. Scrolling inside the minimap zooms the canvas without requiring Ctrl/Cmd.
 		const minimap = page.locator('[data-canvas-minimap]');
@@ -977,6 +1024,12 @@ test.describe('Spatial Canvas workspace', () => {
 		const alphaRestored = await Promise.all(alphaWindowLocators.map(async (loc) => parseCoords(await loc.getAttribute('style'))));
 		expect(alphaRestored).toEqual(alphaAfter);
 
+		// Opening a project from the Add menu while in All Projects does NOT isolate/unmount other projects.
+		await page.locator('[data-canvas-add-button]').click();
+		await page.locator('[data-canvas-add-menu]').getByRole('button', { name: 'Alpha Core' }).click();
+		await expect(canvas).toHaveAttribute('data-canvas-project-filter', 'all');
+		await expect(page.locator('[data-canvas-project-card="proj-beta"]')).toBeVisible();
+
 		// 3. Selecting a project in the top project picker isolates it and hides/deactivates other projects.
 		const alphaCard = page.locator('[data-canvas-project-card="proj-alpha"]');
 		await alphaCard.getByRole('button', { name: 'Editor', exact: true }).click();
@@ -988,7 +1041,19 @@ test.describe('Spatial Canvas workspace', () => {
 		await page.keyboard.type('draft-keep ');
 		await expect(alphaEditor.getByRole('button', { name: /Save •/ })).toBeVisible();
 
-		// Switch to Beta UI: Alpha Core windows/edges/zones are hidden & unmounted (dirty editor stays hidden, not visible).
+		// Also open a Conversation window with an unsaved attachment so we verify non-editor windows with unsaved state are retained too.
+		await page.locator('[data-canvas-fit]').click();
+		await alphaCard.getByRole('button', { name: /Release Sync/ }).click();
+		const alphaConvWindow = page.locator('[data-canvas-node-kind="conversation"]').first();
+		await expect(alphaConvWindow).toBeVisible();
+		await alphaConvWindow.locator('[data-conversation-attachment-input]').setInputFiles({
+			name: 'draft.png',
+			mimeType: 'image/png',
+			buffer: png1x1,
+		});
+		await expect(alphaConvWindow.locator('img[alt="draft.png"]')).toBeVisible();
+
+		// Switch to Beta UI: clean Alpha Core windows/edges/zones unmount, while dirty editor & unsaved conversation stay hidden.
 		await page.locator('[data-canvas-hud]').getByRole('button', { name: /Beta UI/ }).click();
 		await expect(canvas).toHaveAttribute('data-canvas-project-filter', 'proj-beta');
 		await expect(page.locator('[data-canvas-project-card="proj-beta"]')).toBeVisible();
@@ -997,27 +1062,49 @@ test.describe('Spatial Canvas workspace', () => {
 		await expect(page.locator('[data-canvas-edge-kind="delegation"]')).toHaveCount(0);
 		await expect(page.locator('[data-canvas-project-zone="proj-alpha"]')).toHaveCount(0);
 		await expect(alphaEditor).not.toBeVisible();
+		await expect(alphaConvWindow).not.toBeVisible();
 
-		// Hidden Alpha Core tasks stop polling while isolated to Beta UI.
+		// Emit a real SSE revision push while isolated to Beta UI: unmounted Alpha Core tasks make 0 polls.
 		const pollsAfterSwitch = alphaTaskPolls;
-		await page.waitForTimeout(400);
+		await page.evaluate(() => {
+			(window as unknown as { __emitCanvasRevisions?: (patch: Record<string, number>) => void }).__emitCanvasRevisions?.({ tasks: 3, sessions: 3 });
+		});
+		await page.waitForTimeout(250);
 		expect(alphaTaskPolls).toBe(pollsAfterSwitch);
 
-		// Switching to Alpha Core restores Alpha windows & preserves the dirty editor buffer, while hiding Beta UI.
+		// Clearing while filtered to Beta UI removes only Beta UI windows and preserves hidden Alpha Core windows.
+		await page.getByRole('button', { name: 'Clear Beta UI windows' }).click();
+		await expect(page.locator('[data-canvas-project-card="proj-beta"]')).toHaveCount(0);
+		await expect(page.locator('[data-canvas-empty]')).toContainText('No windows open in Beta UI');
+
+		// Switching to Alpha Core restores Alpha windows, preserves both dirty editor & unsaved attachment state, and resumes live updates.
 		await page.locator('[data-canvas-hud]').getByRole('button', { name: /Alpha Core/ }).click();
 		await expect(canvas).toHaveAttribute('data-canvas-project-filter', 'proj-alpha');
 		await expect(page.locator('[data-canvas-project-card="proj-alpha"]')).toBeVisible();
-		await expect(page.locator('[data-canvas-project-card="proj-beta"]')).toHaveCount(0);
 		await expect(page.locator('[data-canvas-node-kind="task"]')).toHaveCount(3);
 		await expect(alphaEditor).toBeVisible();
 		await expect(alphaEditor.getByRole('button', { name: /Save •/ })).toBeVisible();
 		await expect(alphaEditor.locator('[data-monaco-editor] .view-lines')).toContainText('draft-keep');
+		await expect(alphaConvWindow).toBeVisible();
+		await expect(alphaConvWindow.locator('img[alt="draft.png"]')).toBeVisible();
+		await expect.poll(() => alphaTaskPolls).toBeGreaterThan(pollsAfterSwitch);
 
-		// Clicking All Projects restores all projects on the canvas.
+		// Expanding a collapsed task window resumes live SSE updates for it immediately.
+		const parentTaskWindow = page.locator('[data-canvas-node-kind="task"]', { hasText: 'Implement Spatial Canvas' }).first();
+		await parentTaskWindow.getByRole('button', { name: /^Collapse / }).click();
+		const pollsWhileCollapsed = alphaTaskPolls;
+		await page.evaluate(() => {
+			(window as unknown as { __emitCanvasRevisions?: (patch: Record<string, number>) => void }).__emitCanvasRevisions?.({ tasks: 4, sessions: 4 });
+		});
+		await page.waitForTimeout(250);
+		expect(alphaTaskPolls).toBe(pollsWhileCollapsed);
+		await parentTaskWindow.getByRole('button', { name: /^Expand / }).click();
+		await expect.poll(() => alphaTaskPolls).toBeGreaterThan(pollsWhileCollapsed);
+
+		// Clicking All Projects returns to the unfiltered view.
 		await page.locator('[data-canvas-hud]').getByRole('button', { name: 'All Projects' }).click();
 		await expect(canvas).toHaveAttribute('data-canvas-project-filter', 'all');
 		await expect(page.locator('[data-canvas-project-card="proj-alpha"]')).toBeVisible();
-		await expect(page.locator('[data-canvas-project-card="proj-beta"]')).toBeVisible();
 	});
 
 	test('canvas model enforces safe app URLs, non-overlapping placement, delegation edges, and layout persistence', () => {
@@ -1052,6 +1139,14 @@ test.describe('Spatial Canvas workspace', () => {
 		const childTaskNode = laidOut.find((n) => n.taskId === 'task-child-1')!;
 		expect(projNode.x).toBeLessThan(parentTaskNode.x);
 		expect(parentTaskNode.x).toBeLessThan(childTaskNode.x);
+
+		// Tidying an isolated project keeps it anchored at its own origin rather than stacking onto hidden projects at (80, 80).
+		const betaNodes = laidOut.filter((n) => n.projectId === 'proj-beta');
+		const betaOriginY = Math.min(...betaNodes.map((n) => n.y));
+		const filteredTidy = tidyFilteredCanvasNodes(laidOut, betaNodes, mockTasks, mockProjects, true);
+		const tidiedBeta = filteredTidy.tidiedVisible[0];
+		expect(tidiedBeta.y).toBeGreaterThanOrEqual(betaOriginY);
+		expect(filteredTidy.nodes.find((n) => n.id === projNode.id)?.y).toBe(projNode.y);
 
 		const edges = deriveCanvasEdges(laidOut, mockTasks, mockAgents, mockConversations);
 		expect(edges.some((e) => e.fromId === parentTaskNode.id && e.toId === childTaskNode.id && e.kind === 'delegation')).toBe(true);

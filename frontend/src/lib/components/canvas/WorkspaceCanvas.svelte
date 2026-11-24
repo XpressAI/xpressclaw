@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onDestroy, onMount } from 'svelte';
+	import { onDestroy, onMount, untrack } from 'svelte';
 	import {
 		Bot,
 		Code2,
@@ -44,6 +44,7 @@
 		seedCanvasNodes,
 		snapCoordinate,
 		tidyCanvasLayout,
+		tidyFilteredCanvasNodes,
 		type CanvasCamera,
 		type CanvasLinkPreviewTarget,
 		type CanvasNode,
@@ -110,6 +111,7 @@
 	let activeZoneDrag = $state<{ projectId: string; dx: number; dy: number } | null>(null);
 	let seenDelegatedTaskIds = new Set<string>();
 	let dirtyEditorIds = $state<Record<string, boolean>>({});
+	let retainedNodeIds = $state<Record<string, boolean>>({});
 	let activeInteractionCleanup: (() => void) | null = null;
 	let persistTimer: ReturnType<typeof setTimeout> | null = null;
 	let visibilityNotifyTimer: ReturnType<typeof setTimeout> | null = null;
@@ -156,14 +158,16 @@
 			? nodes
 			: nodes.filter((node) => resolveNodeProjectId(node) === activeProjectFilter)
 	);
-	// Unmount non-selected project windows to free DOM/timers/observers/network,
-	// while keeping any editor with unsaved edits hidden in the background so work is never lost.
+	// Unmount clean non-selected project windows to free DOM/timers/observers/network,
+	// while keeping any window with unsaved local state (dirty editors, attachments,
+	// open edit/task forms, elicitation drafts) hidden in the background so work is never lost.
 	let renderedNodes = $derived(
 		activeProjectFilter === null
 			? nodes
 			: nodes.filter(
 				(node) => resolveNodeProjectId(node) === activeProjectFilter
 					|| (node.kind === 'editor' && Boolean(dirtyEditorIds[node.id]))
+					|| Boolean(retainedNodeIds[node.id])
 			)
 	);
 	let visibleNodeById = $derived(new Map(visibleNodes.map((node) => [node.id, node])));
@@ -255,16 +259,22 @@
 		}, 180);
 	}
 
+	let activeNodeSignature = $derived(
+		!visible
+			? ''
+			: renderedNodes
+				.filter((node) => {
+					const nodeHidden = activeProjectFilter !== null && resolveNodeProjectId(node) !== activeProjectFilter;
+					return !nodeHidden && !node.collapsed && (focusedNodeId === node.id || isNodeNearViewport(node));
+				})
+				.map((node) => node.id)
+				.join(',')
+	);
+
 	$effect(() => {
-		// Notify live-update subscribers whenever viewport/filter/focus visibility changes.
-		void visible;
-		void camera.x;
-		void camera.y;
-		void camera.zoom;
-		void viewportWidth;
-		void viewportHeight;
-		void activeProjectFilter;
-		void focusedNodeId;
+		// Notify live-update subscribers whenever the active window set changes
+		// (pan, zoom, drag, group drag, resize, expand/collapse, tidy, filter, focus, or tab switch).
+		void activeNodeSignature;
 		scheduleVisibilityRefresh(!visible);
 	});
 
@@ -289,10 +299,13 @@
 
 	$effect(() => {
 		// Keep seenDelegatedTaskIds bounded over multi-hour sessions.
+		// Read reactive props before the size guard so Svelte tracks updates.
+		const currentTasks = tasks;
+		const currentNodes = nodes;
 		if (seenDelegatedTaskIds.size <= 200) return;
 		const keep = new Set<string>();
-		for (const task of tasks) keep.add(task.id);
-		for (const node of nodes) {
+		for (const task of currentTasks) keep.add(task.id);
+		for (const node of currentNodes) {
 			if (node.taskId) keep.add(node.taskId);
 		}
 		for (const id of seenDelegatedTaskIds) {
@@ -329,7 +342,12 @@
 
 	function activeStorage(): Storage | null {
 		if (storage) return storage;
-		try { return localStorage; } catch { return null; }
+		try {
+			return localStorage;
+		} catch (err) {
+			console.warn('Canvas storage is unavailable:', err);
+			return null;
+		}
 	}
 
 	function flushPersist() {
@@ -368,7 +386,9 @@
 		};
 		try {
 			target.setItem(storageKey, JSON.stringify(state));
-		} catch {}
+		} catch (err) {
+			console.warn(`Failed to persist canvas state under ${storageKey}:`, err);
+		}
 	}
 
 	onDestroy(() => {
@@ -397,7 +417,9 @@
 					seededOnce = restored.nodes.length > 0;
 				}
 			}
-		} catch {}
+		} catch (err) {
+			console.warn(`Failed to restore canvas state from ${storageKey}:`, err);
+		}
 		initialized = true;
 
 		const observer = new ResizeObserver(() => {
@@ -584,10 +606,9 @@
 			nodes = tidyCanvasLayout(nodes, tasks, projects);
 			camera = computeFitCamera(nodes, viewportWidth, viewportHeight);
 		} else {
-			const tidiedVisible = tidyCanvasLayout(visibleNodes, tasks, projects);
-			const byId = new Map(tidiedVisible.map((node) => [node.id, node]));
-			nodes = nodes.map((node) => byId.get(node.id) ?? node);
-			camera = computeFitCamera(tidiedVisible, viewportWidth, viewportHeight);
+			const result = tidyFilteredCanvasNodes(nodes, visibleNodes, tasks, projects, snapToGrid);
+			nodes = result.nodes;
+			camera = computeFitCamera(result.tidiedVisible, viewportWidth, viewportHeight);
 		}
 		persist();
 	}
@@ -981,13 +1002,27 @@
 	}
 
 	function setEditorDirty(id: string, dirty: boolean) {
-		if (dirty) {
-			if (!dirtyEditorIds[id]) dirtyEditorIds = { ...dirtyEditorIds, [id]: true };
-		} else if (dirtyEditorIds[id]) {
-			const next = { ...dirtyEditorIds };
-			delete next[id];
-			dirtyEditorIds = next;
-		}
+		untrack(() => {
+			if (dirty) {
+				if (!dirtyEditorIds[id]) dirtyEditorIds = { ...dirtyEditorIds, [id]: true };
+			} else if (dirtyEditorIds[id]) {
+				const next = { ...dirtyEditorIds };
+				delete next[id];
+				dirtyEditorIds = next;
+			}
+		});
+	}
+
+	function setNodeRetained(id: string, retained: boolean) {
+		untrack(() => {
+			if (retained) {
+				if (!retainedNodeIds[id]) retainedNodeIds = { ...retainedNodeIds, [id]: true };
+			} else if (retainedNodeIds[id]) {
+				const next = { ...retainedNodeIds };
+				delete next[id];
+				retainedNodeIds = next;
+			}
+		});
 	}
 
 	function ensureFilterShowsProject(projectId: string | null) {
@@ -1002,23 +1037,44 @@
 			if (!window.confirm(`Discard unsaved changes in ${label}?`)) return;
 		}
 		setEditorDirty(id, false);
+		setNodeRetained(id, false);
 		nodes = nodes.filter((node) => node.id !== id).map((node) => node.parentId === id ? { ...node, parentId: null } : node);
 		if (focusedNodeId === id) focusedNodeId = visibleNodes.at(-1)?.id ?? nodes.at(-1)?.id ?? null;
 		persist();
 	}
 
 	function clearCanvas() {
-		const dirtyNodes = nodes.filter((node) => node.kind === 'editor' && Boolean(dirtyEditorIds[node.id]));
-		if (dirtyNodes.length > 0) {
-			const message = dirtyNodes.length === 1
-				? `Discard unsaved changes in ${dirtyNodes[0].filePath || dirtyNodes[0].title || '1 editor'} and clear the canvas?`
-				: `Discard unsaved changes in ${dirtyNodes.length} editors and clear the canvas?`;
+		const targetNodes = activeProjectFilter === null ? nodes : visibleNodes;
+		if (targetNodes.length === 0) return;
+		const targetIds = new Set(targetNodes.map((node) => node.id));
+		const scopeLabel = activeProject ? `${activeProject.name}` : 'the canvas';
+		const dirtyEditors = targetNodes.filter((node) => node.kind === 'editor' && Boolean(dirtyEditorIds[node.id]));
+		const unsavedOthers = targetNodes.filter((node) => node.kind !== 'editor' && Boolean(retainedNodeIds[node.id]));
+		if (dirtyEditors.length > 0) {
+			const message = dirtyEditors.length === 1
+				? `Discard unsaved changes in ${dirtyEditors[0].filePath || dirtyEditors[0].title || '1 editor'} and clear ${scopeLabel}?`
+				: `Discard unsaved changes in ${dirtyEditors.length} editors and clear ${scopeLabel}?`;
+			if (!window.confirm(message)) return;
+		} else if (unsavedOthers.length > 0) {
+			const message = unsavedOthers.length === 1
+				? `Discard unsaved form or attachment state in ${unsavedOthers[0].title} and clear ${scopeLabel}?`
+				: `Discard unsaved form or attachment state in ${unsavedOthers.length} windows and clear ${scopeLabel}?`;
 			if (!window.confirm(message)) return;
 		}
-		dirtyEditorIds = {};
-		nodes = [];
-		activeProjectFilter = null;
-		focusedNodeId = null;
+		const nextDirty = { ...dirtyEditorIds };
+		const nextRetained = { ...retainedNodeIds };
+		for (const id of targetIds) {
+			delete nextDirty[id];
+			delete nextRetained[id];
+		}
+		dirtyEditorIds = nextDirty;
+		retainedNodeIds = nextRetained;
+		nodes = nodes
+			.filter((node) => !targetIds.has(node.id))
+			.map((node) => node.parentId && targetIds.has(node.parentId) ? { ...node, parentId: null } : node);
+		if (focusedNodeId && targetIds.has(focusedNodeId)) {
+			focusedNodeId = visibleNodes.at(-1)?.id ?? nodes.at(-1)?.id ?? null;
+		}
 		persist();
 	}
 
@@ -1048,7 +1104,6 @@
 
 	function spawnProjectNode(project: Project) {
 		addMenuOpen = false;
-		activeProjectFilter = project.id;
 		addOrFocusNode(
 			(node) => node.kind === 'project' && node.projectId === project.id,
 			{
@@ -1255,10 +1310,9 @@
 			camera = computeFitCamera(nodes, viewportWidth, viewportHeight);
 		} else {
 			const filtered = nextNodes.filter((node) => resolveNodeProjectId(node) === activeProjectFilter);
-			const tidied = tidyCanvasLayout(filtered, tasks, projects);
-			const byId = new Map(tidied.map((node) => [node.id, node]));
-			nodes = nextNodes.map((node) => byId.get(node.id) ?? node);
-			camera = computeFitCamera(tidied, viewportWidth, viewportHeight);
+			const result = tidyFilteredCanvasNodes(nextNodes, filtered, tasks, projects, snapToGrid);
+			nodes = result.nodes;
+			camera = computeFitCamera(result.tidiedVisible, viewportWidth, viewportHeight);
 		}
 		persist();
 	}
@@ -1698,13 +1752,13 @@
 				<MapIcon class="h-3.5 w-3.5" />
 			</button>
 
-			{#if nodes.length > 0}
+			{#if visibleNodes.length > 0}
 				<button
 					type="button"
 					onclick={clearCanvas}
 					class="rounded-lg p-1.5 text-muted-foreground hover:bg-destructive/15 hover:text-destructive"
-					title="Clear canvas"
-					aria-label="Clear canvas"
+					title={activeProject ? `Clear ${activeProject.name} windows` : 'Clear canvas'}
+					aria-label={activeProject ? `Clear ${activeProject.name} windows` : 'Clear canvas'}
 				>
 					<Trash2 class="h-3.5 w-3.5" />
 				</button>
@@ -1828,6 +1882,7 @@
 					onCenter={() => centerOnNode(node)}
 					onOpenInTabs={node.route ? () => onOpenInTabs(node.route!) : undefined}
 					onClose={() => closeNode(node.id)}
+					onRetainChange={(retained) => setNodeRetained(node.id, retained)}
 					onSpawnTool={(kind) => spawnToolNode(kind, node.agentId, node.id)}
 					onExpandDelegated={node.taskId ? () => expandDelegatedForTask(node.taskId!, node.id) : undefined}
 				>
