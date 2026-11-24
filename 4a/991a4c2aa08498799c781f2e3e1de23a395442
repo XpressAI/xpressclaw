@@ -1,0 +1,11 @@
+branch: feat/canvas-perf-and-controls (PR #301 Astra review fixes)
+fixes: Verified and fixed all 8 findings reproduced on 13e7a835:
+1. P1 Agent Files tab dirty edits lost on project switch: token-scoped providePaneRetainState in liveUpdates.ts; FilesTab (dirty || containerDirty), RunnerTab, SchedulesTab, WorkspaceTab now report retained state.
+2. P1 5+ visible conversations exhausting 6 HTTP/1.1 sockets: ConversationView closes per-conversation EventSource whenever /api/ui/stream is connected and caps fallback EventSources at 2 via a shared module registry, with near-bottom auto-scroll on refreshActivity.
+3. P1 Readiness polling loop on Canvas return: wrapped notifyLiveUpdatesVisibilityChanged() in untrack() so visibility listeners reading Svelte state never subscribe caller effects, and added a 5s visibility cooldown in SessionTab.
+4. P2 Reopened task stuck completed during 10s Canvas cooldown: added trailing terminalRecheckTimer + visibility flush so wake-ups during cooldown are coalesced rather than dropped.
+5. P2 Blocked task misses remote error dismissals: restricted terminal deferral and single-GET short-circuit to completed/cancelled tasks with no active latestError banner.
+6. P2 Overlapping live update erasing retryDomains: merge retryDomains into queued pendingDomains and delete only refreshed domains from retryDomains on success.
+7. P2 Load earlier activity permanently disabling trimming: jumpToLatest() resets userLoadedEarlierActivity and trims immediately.
+8. P2 Stationary minimap click panning twice: snapshot startRect and startMetrics at pointerdown and only pan on pointerup when hasPendingMove is true.
+validation: npm run check (0 errors, 0 warnings); npm run build clean; chromium E2E canvas.spec.ts + mermaid.spec.ts (15/15 passed) and targeted workspace.spec.ts including durable notice dismissals (39/39 passed).
