@@ -2963,6 +2963,10 @@ CREATE INDEX idx_workflows_project ON workflows(project_id);
 
 const MIGRATION_V56: &str = include_str!("tasks/delegation_handoffs.sql");
 
+const MIGRATION_V57: &str = "
+ALTER TABLE work_attempts ADD COLUMN error_dismissed_at TIMESTAMP;
+";
+
 fn schema_migrations() -> &'static [(u32, &'static str)] {
     &[
         (1, MIGRATION_V1),
@@ -3021,12 +3025,113 @@ fn schema_migrations() -> &'static [(u32, &'static str)] {
         (54, MIGRATION_V54),
         (55, MIGRATION_V55),
         (56, MIGRATION_V56),
+        (57, MIGRATION_V57),
     ]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_error_dismissals_upgrade_and_survive_database_reopening() {
+        use crate::sessions::SessionManager;
+        use crate::tasks::board::TaskBoard;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dismissals.db");
+        ensure_sqlite_vec();
+        let conn = Connection::open(&path).unwrap();
+        register_sql_functions(&conn).unwrap();
+        conn.execute_batch("CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)").unwrap();
+        for &(_, sql) in schema_migrations()
+            .iter()
+            .filter(|(version, _)| *version <= 56)
+        {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT OR REPLACE INTO config(key,value) VALUES('schema_version','56');
+            INSERT INTO agents(id,name,backend,config) VALUES('agent','Agent','native','{}');
+            INSERT INTO tasks(id,title,status) VALUES('task','Existing task','blocked');
+            INSERT INTO logical_sessions(id,agent_id) VALUES('session','agent');
+            INSERT INTO work_attempts(id,session_id,task_id,runner,status,error_message)
+                VALUES('first','session','task','codex','failed','Old error'),
+                      ('second','session','task','codex','failed','Another notice');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let dismissed_at = {
+            let db = Arc::new(Database::open(&path).unwrap());
+            let sessions = SessionManager::new(db.clone());
+            assert!(sessions
+                .get_attempt("first")
+                .unwrap()
+                .error_dismissed_at
+                .is_none());
+            let before = db.ui_revisions();
+            let first = sessions
+                .dismiss_task_attempt_error("task", "first")
+                .unwrap()
+                .unwrap();
+            let after = db.ui_revisions();
+            assert!(after.tasks > before.tasks && after.sessions > before.sessions);
+            let repeated = sessions
+                .dismiss_task_attempt_error("task", "first")
+                .unwrap()
+                .unwrap();
+            assert_eq!(first.error_dismissed_at, repeated.error_dismissed_at);
+            assert_eq!(db.ui_revisions(), after);
+            sessions
+                .dismiss_task_attempt_error("task", "second")
+                .unwrap()
+                .unwrap();
+            assert!(sessions
+                .get_attempt("first")
+                .unwrap()
+                .error_dismissed_at
+                .is_some());
+            first.error_dismissed_at.unwrap()
+        };
+
+        let db = Arc::new(Database::open(&path).unwrap());
+        let sessions = SessionManager::new(db.clone());
+        let first = sessions.get_attempt("first").unwrap();
+        assert_eq!(
+            first.error_dismissed_at.as_deref(),
+            Some(dismissed_at.as_str())
+        );
+        assert_eq!(first.error_message.as_deref(), Some("Old error"));
+        assert_eq!(first.status, "failed");
+        let activity = sessions
+            .task_activity("task", Some(0), None, 100, 20)
+            .unwrap();
+        assert_eq!(activity.attempts.len(), 2);
+        assert!(activity
+            .attempts
+            .iter()
+            .all(|attempt| attempt.error_dismissed_at.is_some()));
+        let board = TaskBoard::new(db.clone());
+        assert!(board
+            .current_error(&board.get("task").unwrap())
+            .unwrap()
+            .is_none());
+        db.conn().execute("INSERT INTO work_attempts(id,session_id,task_id,runner,status,error_message) VALUES('third','session','task','codex','failed','New error')", []).unwrap();
+        assert_eq!(
+            board
+                .current_error(&board.get("task").unwrap())
+                .unwrap()
+                .as_deref(),
+            Some("New error")
+        );
+        assert!(sessions
+            .get_attempt("first")
+            .unwrap()
+            .error_dismissed_at
+            .is_some());
+    }
 
     #[test]
     fn v51_preserves_legacy_connect_receipts_and_transcripts() {
@@ -3158,7 +3263,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "56");
+        assert_eq!(version, "57");
         let visualization_table: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
