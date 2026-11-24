@@ -1,0 +1,8 @@
+branch: feat/canvas-perf-and-controls (PR #301 review fixes)
+fixes: Addressed all 15 review findings:
+- liveUpdates.ts: FIFO queueing for pending reruns (no starvation), 15s slot-release watchdog, high-priority queue for WorkspaceShell sidebar.
+- WorkspaceCanvas/canvas.ts/CanvasWindow/CanvasEditorCard/views: spawnProjectNode no longer isolates in All Projects; tidyFilteredCanvasNodes anchors filtered tidy and avoids hidden overlaps; Clear scopes to visible project windows and prompts on unsaved editors/forms/attachments; providePaneRetainState retains hidden windows with unsaved non-editor state; untrack + onDestroy prevents Svelte effect_update_depth_exceeded loops; activeNodeSignature triggers visibility refresh on move/drag/resize/expand/collapse; seenDelegatedTaskIds pruning reads reactive deps before size guard.
+- TaskView.svelte: oldestContiguousActivityId cursor prevents skipped history when unresolved elicitations stay pinned at head; force final git refresh on completion; single-GET short-circuit + 10s compact cooldown for terminal tasks on unrelated ticks.
+- ProjectLink.svelte: keep module mutation listener while cache is non-empty and bound cache to 200 entries.
+- Logging & tests: contextual logging for all added catch blocks; controllable SSE mock in canvas.spec.ts verifying active/isolated/collapsed polling, scoped Clear, Add-menu non-isolation, retained unsaved attachments, and tidyFilteredCanvasNodes.
+validation: npm run check (0 errors, 0 warnings); npm run build clean; chromium E2E canvas.spec.ts + mermaid.spec.ts (14/14 passed) and targeted workspace.spec.ts (31/31 passed).
