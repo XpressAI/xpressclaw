@@ -939,6 +939,7 @@ mod tests {
         db.conn()
             .execute_batch(
                 "DROP TABLE task_delegation_automatic_responses;
+            ALTER TABLE work_attempts DROP COLUMN error_dismissed_at;
             ALTER TABLE tasks DROP COLUMN parent_review_required;
             DROP INDEX idx_workflows_project;
             ALTER TABLE workflows DROP COLUMN project_id;

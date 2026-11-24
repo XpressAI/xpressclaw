@@ -1470,7 +1470,8 @@ impl TaskBoard {
         self.db.with_conn(|conn| {
             Ok(conn
                 .query_row(
-                    "SELECT CASE WHEN status='failed' THEN error_message END FROM work_attempts
+                    "SELECT CASE WHEN status='failed' AND error_dismissed_at IS NULL
+                     THEN error_message END FROM work_attempts
                  WHERE task_id=?1 ORDER BY created_at DESC, rowid DESC LIMIT 1",
                     [&task.id],
                     |row| row.get::<_, Option<String>>(0),
