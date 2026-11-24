@@ -4,7 +4,7 @@
   "runners": {
     "codex": {
       "auto_update": true,
-      "version": "2.8.0",
+      "version": "2.10.0",
       "acp_command": [
         "codex-acp"
       ],
@@ -18,12 +18,12 @@
         }
       ],
       "build_args": {
-        "CODEX_ACP_VERSION": "2.8.0"
+        "CODEX_ACP_VERSION": "2.10.0"
       }
     },
     "claude": {
       "auto_update": true,
-      "version": "0.109.0",
+      "version": "0.110.0",
       "acp_command": [
         "claude-agent-acp"
       ],
@@ -37,12 +37,12 @@
         }
       ],
       "build_args": {
-        "CLAUDE_ACP_VERSION": "0.109.0"
+        "CLAUDE_ACP_VERSION": "0.110.0"
       }
     },
     "antigravity": {
       "auto_update": true,
-      "version": "1.5.13",
+      "version": "1.5.16",
       "acp_command": [
         "agy",
         "acp",
@@ -64,10 +64,10 @@
         "AGENT_KIND": "antigravity",
         "AGENT_BINARY": "agy",
         "AGENT_PATH": "antigravity",
-        "AGENT_ARCHIVE_AMD64": "https://github.com/google-antigravity/antigravity-cli/releases/download/1.5.13/agy_cli_linux_x64.tar.gz",
-        "AGENT_ARCHIVE_ARM64": "https://github.com/google-antigravity/antigravity-cli/releases/download/1.5.13/agy_cli_linux_arm64.tar.gz",
-        "AGENT_SHA256_AMD64": "7fa9cc6df0d09562693d637c406a86c1b0f52ab3364714b1fd2d79cc6060d4b2",
-        "AGENT_SHA256_ARM64": "36596ad8038531fd75f0e97b5ba8967a30f2fd67f8d9c61959d2e4761d7b215f"
+        "AGENT_ARCHIVE_AMD64": "https://github.com/google-antigravity/antigravity-cli/releases/download/1.5.16/agy_cli_linux_x64.tar.gz",
+        "AGENT_ARCHIVE_ARM64": "https://github.com/google-antigravity/antigravity-cli/releases/download/1.5.16/agy_cli_linux_arm64.tar.gz",
+        "AGENT_SHA256_AMD64": "9bdab234d06bad1a61be2321072652eb06be78baff1acbfae47331da5a090abc",
+        "AGENT_SHA256_ARM64": "7ddeec790084e550af18adb04a5b6c5fdf2db3e1026854f49901a04cb4265c7e"
       }
     },
     "deepseek-harness": {
@@ -121,7 +121,7 @@
     },
     "junie": {
       "auto_update": true,
-      "version": "4100.10.0",
+      "version": "4171.4.0",
       "acp_command": [
         "junie",
         "--acp=true"
@@ -138,8 +138,8 @@
         "AGENT_KIND": "junie",
         "AGENT_BINARY": "junie",
         "AGENT_PATH": "junie-app/bin/junie",
-        "AGENT_ARCHIVE_AMD64": "https://github.com/JetBrains/junie-acp-release/releases/download/4100.10/junie-release-4100.10-linux-amd64.zip",
-        "AGENT_ARCHIVE_ARM64": "https://github.com/JetBrains/junie-acp-release/releases/download/4100.10/junie-release-4100.10-linux-aarch64.zip",
+        "AGENT_ARCHIVE_AMD64": "https://github.com/JetBrains/junie-acp-release/releases/download/4171.4/junie-release-4171.4-linux-amd64.zip",
+        "AGENT_ARCHIVE_ARM64": "https://github.com/JetBrains/junie-acp-release/releases/download/4171.4/junie-release-4171.4-linux-aarch64.zip",
         "AGENT_SHA256_AMD64": "",
         "AGENT_SHA256_ARM64": ""
       }
@@ -171,7 +171,7 @@
     },
     "opencode": {
       "auto_update": true,
-      "version": "2.3.2",
+      "version": "2.4.1",
       "acp_command": [
         "opencode",
         "acp"
@@ -188,10 +188,10 @@
         "AGENT_KIND": "opencode",
         "AGENT_BINARY": "opencode",
         "AGENT_PATH": "opencode",
-        "AGENT_ARCHIVE_AMD64": "https://github.com/anomalyco/opencode/releases/download/v2.3.2/opencode-linux-x64.tar.gz",
-        "AGENT_ARCHIVE_ARM64": "https://github.com/anomalyco/opencode/releases/download/v2.3.2/opencode-linux-arm64.tar.gz",
-        "AGENT_SHA256_AMD64": "563b5d663637226b6e3bb4bb6803281bc39b0d2cd88db06d674b6420aab009b0",
-        "AGENT_SHA256_ARM64": "9d10185acdb72336e086e699ca363a6065f410fd3c1caed0dc8046e95ac06ccb"
+        "AGENT_ARCHIVE_AMD64": "https://github.com/anomalyco/opencode/releases/download/v2.4.1/opencode-linux-x64.tar.gz",
+        "AGENT_ARCHIVE_ARM64": "https://github.com/anomalyco/opencode/releases/download/v2.4.1/opencode-linux-arm64.tar.gz",
+        "AGENT_SHA256_AMD64": "9ddd18e3faf64eaeccf6a0fcbc96a5c7a14520ae5fd5b61e5be51d894f478b47",
+        "AGENT_SHA256_ARM64": "cb28cf94541aeb62a4b2ea5997a99b5dd6bae595a772f36fbe279299f2032a4f"
       }
     },
     "jouzu": {
@@ -218,7 +218,7 @@
     },
     "pi": {
       "auto_update": true,
-      "version": "0.0.34",
+      "version": "0.0.35",
       "acp_command": [
         "pi-acp"
       ],
@@ -247,9 +247,9 @@
       ],
       "build_args": {
         "AGENT_KIND": "pi",
-        "AGENT_PACKAGE": "pi-acp@0.0.34",
+        "AGENT_PACKAGE": "pi-acp@0.0.35",
         "AGENT_BINARY": "pi-acp",
-        "AGENT_EXTRA_PACKAGES": "@earendil-works/pi-coding-agent@1.5.2",
+        "AGENT_EXTRA_PACKAGES": "@earendil-works/pi-coding-agent@1.6.0",
         "AGENT_EXTRA_BINARY": "pi",
         "PI_MCP_PACKAGE": "pi-mcp-adapter@7.0.1"
       }
@@ -280,7 +280,7 @@
     },
     "cline": {
       "auto_update": true,
-      "version": "3.0.74",
+      "version": "3.0.75",
       "acp_command": [
         "cline",
         "--acp"
@@ -296,13 +296,13 @@
       ],
       "build_args": {
         "AGENT_KIND": "cline",
-        "AGENT_PACKAGE": "cline@3.0.74",
+        "AGENT_PACKAGE": "cline@3.0.75",
         "AGENT_BINARY": "cline"
       }
     },
     "cursor": {
       "auto_update": true,
-      "version": "2026.11.19",
+      "version": "2026.11.22",
       "acp_command": [
         "cursor-agent",
         "acp"
@@ -319,8 +319,8 @@
         "AGENT_KIND": "cursor",
         "AGENT_BINARY": "cursor-agent",
         "AGENT_PATH": "dist-package/cursor-agent",
-        "AGENT_ARCHIVE_AMD64": "https://downloads.cursor.com/lab/2026.11.19-f005e9d/linux/x64/agent-cli-package.tar.gz",
-        "AGENT_ARCHIVE_ARM64": "https://downloads.cursor.com/lab/2026.11.19-f005e9d/linux/arm64/agent-cli-package.tar.gz",
+        "AGENT_ARCHIVE_AMD64": "https://downloads.cursor.com/lab/2026.11.22-e9042b2/linux/x64/agent-cli-package.tar.gz",
+        "AGENT_ARCHIVE_ARM64": "https://downloads.cursor.com/lab/2026.11.22-e9042b2/linux/arm64/agent-cli-package.tar.gz",
         "AGENT_SHA256_AMD64": "",
         "AGENT_SHA256_ARM64": ""
       }
@@ -348,7 +348,7 @@
     },
     "grok": {
       "auto_update": true,
-      "version": "1.0.92",
+      "version": "1.0.93",
       "acp_command": [
         "grok",
         "agent",
@@ -365,13 +365,13 @@
       ],
       "build_args": {
         "AGENT_KIND": "grok",
-        "AGENT_PACKAGE": "@xai-official/grok@1.0.92",
+        "AGENT_PACKAGE": "@xai-official/grok@1.0.93",
         "AGENT_BINARY": "grok"
       }
     },
     "kilo": {
       "auto_update": true,
-      "version": "7.8.27",
+      "version": "7.8.32",
       "acp_command": [
         "kilo",
         "acp"
@@ -387,13 +387,13 @@
       ],
       "build_args": {
         "AGENT_KIND": "kilo",
-        "AGENT_PACKAGE": "@kilocode/cli@7.8.27",
+        "AGENT_PACKAGE": "@kilocode/cli@7.8.32",
         "AGENT_BINARY": "kilo"
       }
     },
     "mistral-vibe": {
       "auto_update": true,
-      "version": "3.1.1",
+      "version": "3.1.4",
       "acp_command": [
         "vibe-acp"
       ],
@@ -409,10 +409,10 @@
         "AGENT_KIND": "mistral-vibe",
         "AGENT_BINARY": "vibe-acp",
         "AGENT_PATH": "vibe-acp",
-        "AGENT_ARCHIVE_AMD64": "https://github.com/mistralai/mistral-vibe/releases/download/v3.1.1/vibe-acp-linux-x86_64-3.1.1.tar.gz",
-        "AGENT_ARCHIVE_ARM64": "https://github.com/mistralai/mistral-vibe/releases/download/v3.1.1/vibe-acp-linux-aarch64-3.1.1.tar.gz",
-        "AGENT_SHA256_AMD64": "ea3b33b2faebbd5cd2c4bc1c5226e865a8cafeb7486fb7fbd869418b4e4f6fec",
-        "AGENT_SHA256_ARM64": "c2dbf99928f80b368a795af5ae870c6ccf2137ac06ad5478d52c44856ea6a219"
+        "AGENT_ARCHIVE_AMD64": "https://github.com/mistralai/mistral-vibe/releases/download/v3.1.4/vibe-acp-linux-x86_64-3.1.4.tar.gz",
+        "AGENT_ARCHIVE_ARM64": "https://github.com/mistralai/mistral-vibe/releases/download/v3.1.4/vibe-acp-linux-aarch64-3.1.4.tar.gz",
+        "AGENT_SHA256_AMD64": "934a79356755821a31e6ce1aee7f7f1eacb6b1e6c78901acf1eb7fc4650aece7",
+        "AGENT_SHA256_ARM64": "3db34e9f64920ddc819687e848ac3ebb730112538a56b0b64633bce6beccaf74"
       }
     }
   }
