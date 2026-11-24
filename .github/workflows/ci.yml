@@ -153,8 +153,8 @@ jobs:
       - name: Clippy
         run: cargo clippy -p xpressclaw-core -p xpressclaw-server -p xpressclaw-cli -p xpressclaw-tauri --all-targets -- -D warnings
 
-  # Repository discovery invokes native Git and must retain Windows path
-  # semantics. Keep this pre-release gate focused on the core library.
+  # Repository discovery and workspace routes invoke native Git and must
+  # retain Windows path semantics. Reuse one build for both sets of tests.
   windows-core:
     name: Windows Core Tests
     needs: lint
@@ -164,14 +164,20 @@ jobs:
         with:
           submodules: true
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
         with:
           key: ci-windows-core
 
-      - name: Test Windows core behavior
-        run: cargo test -p xpressclaw-core --lib
+      - name: Test Windows core and server behavior
+        run: cargo test -p xpressclaw-core -p xpressclaw-server --lib
 
   # Integration tests that require API keys
   integration:

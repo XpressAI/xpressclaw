@@ -1634,7 +1634,7 @@ mod tests {
         std::fs::create_dir_all(path).unwrap();
         assert!(std::process::Command::new("git")
             .arg("-C")
-            .arg(path)
+            .arg(path_for_external_tool(path))
             .args(["init", "--quiet"])
             .status()
             .unwrap()
@@ -1683,7 +1683,7 @@ mod tests {
     fn git(path: &FsPath, arguments: &[&str]) {
         let output = std::process::Command::new("git")
             .arg("-C")
-            .arg(path)
+            .arg(path_for_external_tool(path))
             .args([
                 "-c",
                 "user.name=XpressClaw Tests",
@@ -1707,6 +1707,7 @@ mod tests {
         git(&root, &["add", "."]);
         git(&root, &["commit", "-qm", "initial"]);
         let feature = root.join(".worktrees").join("feature");
+        let feature_arg = path_for_external_tool(&feature);
         git(
             &root,
             &[
@@ -1715,7 +1716,7 @@ mod tests {
                 "-q",
                 "-b",
                 "feature",
-                feature.to_str().unwrap(),
+                feature_arg.to_str().unwrap(),
             ],
         );
         std::fs::write(
