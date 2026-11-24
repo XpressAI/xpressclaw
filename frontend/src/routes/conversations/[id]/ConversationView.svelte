@@ -1,9 +1,35 @@
+<script lang="ts" module>
+	// Browsers cap HTTP/1.1 connections per origin at 6. Keep per-conversation
+	// EventSource fallbacks strictly bounded (and closed whenever the shared
+	// /api/ui/stream is connected) so opening many visible conversations on
+	// Canvas never starves regular API requests.
+	const MAX_CONVERSATION_EVENT_SOURCES = 2;
+	const activeConversationEventStreams = new Set<symbol>();
+	const conversationStreamReconcilers = new Set<() => void>();
+	let reconcileScheduled = false;
+
+	function scheduleConversationStreamReconcile(): void {
+		if (reconcileScheduled) return;
+		reconcileScheduled = true;
+		queueMicrotask(() => {
+			reconcileScheduled = false;
+			for (const reconcile of [...conversationStreamReconcilers]) {
+				try {
+					reconcile();
+				} catch (err) {
+					console.warn('Conversation stream reconciler failed:', err);
+				}
+			}
+		});
+	}
+</script>
+
 <script lang="ts">
 	import DictationButton from '$lib/components/DictationButton.svelte';
 	import { onDestroy, onMount } from 'svelte';
 	import yaml from 'js-yaml';
 	import { agents, conversations, projects, workflows, type Agent, type Conversation, type ConversationMessage, type ConversationMessageUpload, type ConversationTurn, type Project, type Task, type Workflow } from '$lib/api';
-	import { isTransientRefreshError, subscribeLiveUpdates, subscribeLiveUpdatesVisibility, usePaneActive, useReportPaneRetainState } from '$lib/liveUpdates';
+	import { isLiveStreamConnected, isTransientRefreshError, subscribeLiveStreamStatus, subscribeLiveUpdates, subscribeLiveUpdatesVisibility, usePaneActive, useReportPaneRetainState } from '$lib/liveUpdates';
 	import { clearComposerDraft, loadComposerDraft, saveComposerDraft } from '$lib/composerDrafts';
 	import { clipboardFiles, imageDataUrl, pastedImageFiles, shouldHandleImagePaste } from '$lib/imageAttachments';
 	import { PROJECT_MUTATION_EVENT, type ProjectMutation } from '$lib/projectEvents';
@@ -53,8 +79,10 @@
 	let messagePane = $state<HTMLDivElement>();
 	const paneActive = usePaneActive();
 	const reportPaneRetainState = useReportPaneRetainState();
+	const streamOwnerId = Symbol('conversation-event-stream');
 	let unsubscribeLiveUpdates: (() => void) | null = null;
 	let unsubscribeVisibility: (() => void) | null = null;
+	let unsubscribeStreamStatus: (() => void) | null = null;
 	let eventSource: EventSource | null = null;
 	let disposed = false;
 	let stopInitialScrollPin: (() => void) | null = null;
@@ -114,8 +142,10 @@
 			if (initialLoadPromise === initial) initialLoadPromise = null;
 		});
 		initialLoadPromise = initial;
+		conversationStreamReconcilers.add(syncEventSource);
 		syncEventSource();
-		unsubscribeVisibility = subscribeLiveUpdatesVisibility(syncEventSource);
+		unsubscribeStreamStatus = subscribeLiveStreamStatus(() => scheduleConversationStreamReconcile());
+		unsubscribeVisibility = subscribeLiveUpdatesVisibility(() => scheduleConversationStreamReconcile());
 		unsubscribeLiveUpdates = subscribeLiveUpdates(
 			['conversations', 'tasks', 'agents'],
 			async () => {
@@ -130,10 +160,13 @@
 	onDestroy(() => {
 		disposed = true;
 		reportPaneRetainState(false);
+		conversationStreamReconcilers.delete(syncEventSource);
 		unsubscribeLiveUpdates?.();
 		unsubscribeLiveUpdates = null;
 		unsubscribeVisibility?.();
 		unsubscribeVisibility = null;
+		unsubscribeStreamStatus?.();
+		unsubscribeStreamStatus = null;
 		disconnectEvents();
 		stopInitialScrollPin?.();
 	});
@@ -233,6 +266,7 @@
 	async function refreshActivity(rethrowTransient = false) {
 		const gen = ++activityGeneration;
 		const latestMessageIdAtRequest = messages.at(-1)?.id ?? 0;
+		const nearBottom = !messagePane || (messagePane.scrollHeight - messagePane.scrollTop - messagePane.clientHeight <= 80);
 		const reconcileLoadedHistory = olderMessagesLoaded;
 		try {
 			const [nextMessages, nextTurns, nextTasks, deletedMessageIds] = await Promise.all([
@@ -247,7 +281,12 @@
 				? reconcileRecentMessages(messages, nextMessages, latestMessageIdAtRequest, deletedMessageIds)
 				: nextMessages;
 			if (!sameSnapshot(messages, mergedMessages)) {
+				const prevLastId = messages.at(-1)?.id ?? 0;
+				const nextLastId = mergedMessages.at(-1)?.id ?? 0;
 				messages = mergedMessages;
+				if (nextLastId > prevLastId && nearBottom) {
+					void scrollToLatest();
+				}
 			}
 			if (!reconcileLoadedHistory) {
 				hasOlderMessages = nextMessages.length === MESSAGE_PAGE_SIZE;
@@ -306,23 +345,32 @@
 	}
 
 	function disconnectEvents() {
+		const released = activeConversationEventStreams.delete(streamOwnerId);
 		if (eventSource) {
 			eventSource.close();
 			eventSource = null;
 		}
+		if (released) {
+			scheduleConversationStreamReconcile();
+		}
 	}
 
 	function syncEventSource() {
-		if (disposed) {
+		// When the single shared /api/ui/stream is connected, conversation changes
+		// already push via subscribeLiveUpdates without occupying per-window sockets.
+		const shouldConnect =
+			!disposed
+			&& paneActive()
+			&& (typeof document === 'undefined' || !document.hidden)
+			&& !isLiveStreamConnected();
+		if (!shouldConnect) {
 			disconnectEvents();
 			return;
 		}
-		const shouldConnect = paneActive() && (typeof document === 'undefined' || !document.hidden);
-		if (shouldConnect) {
-			if (!eventSource) connectEvents();
-		} else {
-			disconnectEvents();
-		}
+		if (eventSource) return;
+		if (activeConversationEventStreams.size >= MAX_CONVERSATION_EVENT_SOURCES) return;
+		activeConversationEventStreams.add(streamOwnerId);
+		connectEvents();
 	}
 
 	function connectEvents() {

@@ -1482,15 +1482,19 @@
 		if (event.button !== 0) return;
 		activeInteractionCleanup?.();
 		const el = event.currentTarget as HTMLElement;
+		const startRect = el.getBoundingClientRect();
+		// Snapshot minimap bounds at pointerdown so panning the viewport does not
+		// shift the coordinate system underneath the pointer during click/drag.
+		const startMetrics = { ...minimapMetrics };
 		let latestClientX = event.clientX;
 		let latestClientY = event.clientY;
+		let hasPendingMove = false;
 		let frame = 0;
 		const panTo = (clientX: number, clientY: number) => {
-			const rect = el.getBoundingClientRect();
-			const mx = clientX - rect.left - 6;
-			const my = clientY - rect.top - 6;
-			const worldX = minimapMetrics.minX + mx / minimapMetrics.scale;
-			const worldY = minimapMetrics.minY + my / minimapMetrics.scale;
+			const mx = clientX - startRect.left - 6;
+			const my = clientY - startRect.top - 6;
+			const worldX = startMetrics.minX + mx / startMetrics.scale;
+			const worldY = startMetrics.minY + my / startMetrics.scale;
 			camera = {
 				...camera,
 				x: Math.round(viewportWidth / 2 - worldX * camera.zoom),
@@ -1500,11 +1504,14 @@
 		panTo(latestClientX, latestClientY);
 		const flush = () => {
 			frame = 0;
+			if (!hasPendingMove) return;
+			hasPendingMove = false;
 			panTo(latestClientX, latestClientY);
 		};
 		const move = (moveEvent: PointerEvent) => {
 			latestClientX = moveEvent.clientX;
 			latestClientY = moveEvent.clientY;
+			hasPendingMove = true;
 			if (!frame) frame = requestAnimationFrame(flush);
 		};
 		const teardown = (commit: boolean) => {
@@ -1517,7 +1524,10 @@
 			window.removeEventListener('pointercancel', up);
 			if (activeInteractionCleanup === abort) activeInteractionCleanup = null;
 			if (commit) {
-				panTo(latestClientX, latestClientY);
+				if (hasPendingMove) {
+					hasPendingMove = false;
+					panTo(latestClientX, latestClientY);
+				}
 				persist();
 			}
 		};

@@ -67,7 +67,11 @@
 	});
 
 	function handleVisibilityChange() {
-		if (!document.hidden && paneActive() && (!readiness?.ready || Date.now() - lastReadinessCheck >= 60_000)) {
+		if (document.hidden || !paneActive()) return;
+		const elapsed = Date.now() - lastReadinessCheck;
+		if (!readiness) {
+			void loadReadiness();
+		} else if ((!readiness.ready && elapsed >= 5_000) || elapsed >= 60_000) {
 			void loadReadiness();
 		}
 	}

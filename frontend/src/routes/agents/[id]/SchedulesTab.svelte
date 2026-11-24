@@ -2,7 +2,7 @@
 	import { onMount, onDestroy } from 'svelte';
 	import { schedules } from '$lib/api';
 	import type { Schedule } from '$lib/api';
-	import { isTransientRefreshError, subscribeLiveUpdates, usePaneActive } from '$lib/liveUpdates';
+	import { isTransientRefreshError, subscribeLiveUpdates, usePaneActive, useReportPaneRetainState } from '$lib/liveUpdates';
 	import { timeAgo } from '$lib/utils';
 	import { serverTimestampMs } from '$lib/serverTime';
 
@@ -17,6 +17,7 @@
 	let error = $state<string | null>(null);
 	let includeCompletedOnce = $state(false);
 	const paneActive = usePaneActive();
+	const reportPaneRetainState = useReportPaneRetainState();
 	let unsubscribeLiveUpdates: (() => void) | null = null;
 	let loadGeneration = 0;
 
@@ -30,6 +31,10 @@
 	let togglingId = $state<string | null>(null);
 	let triggeringId = $state<string | null>(null);
 
+	$effect(() => {
+		reportPaneRetainState(showCreateForm || Boolean(newName.trim() || newCron.trim() || newTitle.trim()));
+	});
+
 	onMount(() => {
 		void loadSchedules();
 		unsubscribeLiveUpdates = subscribeLiveUpdates(
@@ -40,6 +45,7 @@
 	});
 
 	onDestroy(() => {
+		reportPaneRetainState(false);
 		unsubscribeLiveUpdates?.();
 		unsubscribeLiveUpdates = null;
 	});

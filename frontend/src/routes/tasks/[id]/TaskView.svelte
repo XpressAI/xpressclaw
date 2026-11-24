@@ -9,7 +9,7 @@
 	import { MIN_DETAILS_WIDTH } from '$lib/workspaceLayout';
 	import { goto } from '$app/navigation';
 	import { tasks, agents, sessions, workspaces, ApiError } from '$lib/api';
-	import { isTransientRefreshError, subscribeLiveUpdates, usePaneActive, useReportPaneRetainState, type UiDomain } from '$lib/liveUpdates';
+	import { isTransientRefreshError, subscribeLiveUpdates, subscribeLiveUpdatesVisibility, usePaneActive, useReportPaneRetainState, type UiDomain } from '$lib/liveUpdates';
 	import { selectChoices, isModelOption, isReasoningOption, isAdditionalModelOption, reconcileConfig, duplicatesReasoningMode } from '$lib/acpConfig';
 	import type { TaskControlSnapshot, AcpCommand, AcpConfigOption, AcpModeState, DelegatedWork, Task, TaskMessage, Agent, WorkAttempt, SessionEvent, ImageAttachmentUpload, GitChange, WorkspaceGitStatus, MessageVisualization } from '$lib/api';
 	import { timeAgo, openExternal } from '$lib/utils';
@@ -213,6 +213,7 @@
 	const paneActive = usePaneActive();
 	const reportPaneRetainState = useReportPaneRetainState();
 	let unsubscribeLiveUpdates: (() => void) | null = null;
+	let unsubscribeVisibility: (() => void) | null = null;
 	let messagesEl = $state<HTMLDivElement>();
 	let composerEl = $state<HTMLDivElement>();
 	let taskViewEl = $state<HTMLDivElement>();
@@ -228,6 +229,8 @@
 	let oldestContiguousActivityId: number | null = null;
 	let lastCommandsEventId = 0;
 	let lastTerminalCheckAt = 0;
+	let terminalRecheckTimer: ReturnType<typeof setTimeout> | null = null;
+	let terminalRecheckPending = false;
 	let allTasksLoaded = false;
 	let allTasksLoading = false;
 	const MAX_LIVE_ACTIVITY_EVENTS = 400;
@@ -1073,6 +1076,34 @@
 		}
 	}
 
+	function clearTerminalRecheckTimer() {
+		if (terminalRecheckTimer !== null) {
+			clearTimeout(terminalRecheckTimer);
+			terminalRecheckTimer = null;
+		}
+	}
+
+	function scheduleTerminalRecheck(delayMs: number) {
+		terminalRecheckPending = true;
+		if (terminalRecheckTimer !== null) return;
+		terminalRecheckTimer = setTimeout(() => {
+			terminalRecheckTimer = null;
+			if (disposed || !terminalRecheckPending) return;
+			if (document.hidden || !paneActive()) return;
+			terminalRecheckPending = false;
+			void poll(false, new Set<UiDomain>(['tasks']));
+		}, Math.max(50, delayMs));
+	}
+
+	function canDeferTerminalChecks(): boolean {
+		return Boolean(
+			!isTaskOrDelegatesActive()
+			&& task !== null
+			&& ['completed', 'cancelled'].includes(task.status)
+			&& !latestError
+		);
+	}
+
 	onMount(() => {
 		try { detailsCollapsed = localStorage.getItem(detailsPreferenceKey) === 'true'; } catch { /* Use the default when storage is unavailable. */ }
 		document.addEventListener('pointerdown', handleComposerPointerDown);
@@ -1087,6 +1118,13 @@
 			if (!disposed) loading = false;
 		});
 		pollPromise = initialLoadPromise;
+
+		unsubscribeVisibility = subscribeLiveUpdatesVisibility(() => {
+			if (disposed || !terminalRecheckPending || document.hidden || !paneActive()) return;
+			clearTerminalRecheckTimer();
+			terminalRecheckPending = false;
+			void poll(false, new Set<UiDomain>(['tasks']));
+		});
 
 		unsubscribeLiveUpdates = subscribeLiveUpdates(
 			['tasks', 'sessions', 'agents'],
@@ -1103,11 +1141,14 @@
 					return;
 				}
 				const activeTask = isTaskOrDelegatesActive();
-				// Completed/cancelled tasks skip pure session/agent churn, and in Canvas
-				// (compact) mode rate-limit repeated unrelated task-domain checks.
-				if (!activeTask && !modelMenuOpen && !hasPendingControls() && ctx.source !== 'resume') {
+				// Truly terminal tasks (completed/cancelled with no error banner) skip pure
+				// session/agent churn, and in Canvas (compact) mode coalesce repeated task ticks
+				// behind a trailing cooldown check so wake-ups/reopens are never dropped.
+				if (canDeferTerminalChecks() && !modelMenuOpen && !hasPendingControls() && ctx.source !== 'resume') {
 					if (!ctx.changedDomains.has('tasks')) return;
-					if (compact && task !== null && Date.now() - lastTerminalCheckAt < TERMINAL_COMPACT_RECHECK_MS) {
+					const elapsed = Date.now() - lastTerminalCheckAt;
+					if (compact && elapsed < TERMINAL_COMPACT_RECHECK_MS) {
+						scheduleTerminalRecheck(TERMINAL_COMPACT_RECHECK_MS - elapsed);
 						return;
 					}
 				}
@@ -1133,6 +1174,8 @@
 	onDestroy(() => {
 		disposed = true;
 		reportPaneRetainState(false);
+		clearTerminalRecheckTimer();
+		terminalRecheckPending = false;
 		if (scrollTimer !== null) {
 			clearTimeout(scrollTimer);
 			scrollTimer = null;
@@ -1141,6 +1184,8 @@
 		++configRequestVersion;
 		unsubscribeLiveUpdates?.();
 		unsubscribeLiveUpdates = null;
+		unsubscribeVisibility?.();
+		unsubscribeVisibility = null;
 		taskViewResizeObserver?.disconnect();
 		document.removeEventListener('pointerdown', handleComposerPointerDown);
 	});
@@ -1359,6 +1404,8 @@
 	async function runPollOnce(rethrowTransient: boolean, changedDomains?: ReadonlySet<UiDomain>) {
 		try {
 			const id = taskId;
+			clearTerminalRecheckTimer();
+			terminalRecheckPending = false;
 			const wasActiveBeforePoll = isTaskOrDelegatesActive();
 			const hadActivityCursor = Boolean(lastActivityEventId);
 			const afterMessageId = incrementalMessagePivot(messages);
@@ -1367,10 +1414,12 @@
 			let newActivity: Awaited<ReturnType<typeof tasks.activity>>;
 			let subResult: { tasks: Task[] };
 
-			// For an already-terminal task (completed/cancelled with no active delegates),
-			// check the single task record first on background live-update ticks so unrelated
-			// global task/session ticks do not fan out across messages, activity, subtasks, git, and commands.
-			if (!wasActiveBeforePoll && task !== null && !initialLoad && changedDomains !== undefined) {
+			// For a completed/cancelled task with no active delegates and no undismissed
+			// error notice, check the single task record first on background live-update ticks
+			// so unrelated global task/session ticks do not fan out across messages, activity,
+			// subtasks, git, and commands. Blocked tasks and tasks showing an attempt error
+			// always fetch activity so cross-browser notice dismissals appear immediately.
+			if (canDeferTerminalChecks() && !initialLoad && changedDomains !== undefined) {
 				newTask = await tasks.get(id);
 				if (disposed || taskId !== id) return;
 				if (sameSnapshot(task, newTask)) {
@@ -1554,6 +1603,13 @@
 	}
 
 	function jumpToLatest() {
+		userLoadedEarlierActivity = false;
+		const trimmedResult = trimLiveActivityEvents(activityEvents);
+		if (trimmedResult.trimmed) {
+			activityEvents = trimmedResult.events;
+			hasEarlierActivity = true;
+			oldestContiguousActivityId = trimmedResult.oldestContiguousId;
+		}
 		scrollToBottom(true);
 	}
 

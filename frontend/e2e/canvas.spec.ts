@@ -1107,6 +1107,206 @@ test.describe('Spatial Canvas workspace', () => {
 		await expect(page.locator('[data-canvas-project-card="proj-alpha"]')).toBeVisible();
 	});
 
+	test('preserves Agent Files tab edits across isolation, avoids readiness loops on Canvas return, bounds conversation EventSources, and pans once on stationary minimap clicks', async ({ page }) => {
+		let readinessRequests = 0;
+		const fiveConversations = Array.from({ length: 5 }, (_, idx) => ({
+			id: `conv-multi-${idx + 1}`,
+			project_id: 'proj-alpha',
+			title: `Thread ${idx + 1}`,
+			icon: '#',
+			created_at: now,
+			updated_at: now,
+			last_message_at: now,
+			participants: [
+				{ participant_type: 'agent', participant_id: 'agent-codex', joined_at: now },
+			],
+		}));
+
+		await page.addInitScript(() => {
+			const originalFetch = window.fetch.bind(window);
+			const encoder = new TextEncoder();
+			const revisions = { seq: 1, projects: 1, agents: 1, conversations: 1, tasks: 1, sessions: 1, schedules: 1, workflows: 1 };
+			window.fetch = (input, init) => {
+				const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+				if (new URL(url, window.location.origin).pathname === '/api/ui/stream') {
+					const stream = new ReadableStream<Uint8Array>({
+						start(controller) {
+							let closed = false;
+							controller.enqueue(encoder.encode(`event: revisions\ndata: ${JSON.stringify(revisions)}\n\n`));
+							init?.signal?.addEventListener('abort', () => {
+								if (closed) return;
+								closed = true;
+								controller.close();
+							});
+						},
+					});
+					return Promise.resolve(new Response(stream, {
+						status: 200,
+						headers: { 'Content-Type': 'text/event-stream' },
+					}));
+				}
+				return originalFetch(input, init);
+			};
+			const openedConversationStreams: string[] = [];
+			let activeConversationStreams = 0;
+			let maxActiveConversationStreams = 0;
+			const NativeEventSource = window.EventSource;
+			window.EventSource = class extends NativeEventSource {
+				#isConv: boolean;
+				#closed = false;
+				constructor(url: string | URL, config?: EventSourceInit) {
+					super(url, config);
+					this.#isConv = String(url).includes('/api/conversations/');
+					if (this.#isConv) {
+						openedConversationStreams.push(String(url));
+						activeConversationStreams += 1;
+						maxActiveConversationStreams = Math.max(maxActiveConversationStreams, activeConversationStreams);
+					}
+				}
+				override close() {
+					if (this.#isConv && !this.#closed) {
+						this.#closed = true;
+						activeConversationStreams = Math.max(0, activeConversationStreams - 1);
+					}
+					super.close();
+				}
+			};
+			(window as unknown as {
+				__convStreamStats?: () => { opened: number; active: number; maxActive: number };
+			}).__convStreamStats = () => ({
+				opened: openedConversationStreams.length,
+				active: activeConversationStreams,
+				maxActive: maxActiveConversationStreams,
+			});
+		});
+
+		await mockCanvasApi(page);
+		await page.route('**/api/conversations**', async (route) => {
+			const url = new URL(route.request().url());
+			const path = url.pathname;
+			if (path === '/api/conversations') {
+				const projectId = url.searchParams.get('project_id');
+				return route.fulfill({
+					json: projectId ? fiveConversations.filter((c) => c.project_id === projectId) : fiveConversations,
+				});
+			}
+			if (path.endsWith('/messages')) return route.fulfill({ json: [] });
+			if (path.endsWith('/turns')) return route.fulfill({ json: [] });
+			if (path.endsWith('/tasks')) return route.fulfill({ json: [] });
+			if (path.endsWith('/events')) return route.fulfill({ status: 200, contentType: 'text/event-stream', body: ': connected\n\n' });
+			const id = decodeURIComponent(path.split('/')[3]);
+			const found = fiveConversations.find((c) => c.id === id);
+			return route.fulfill({ status: found ? 200 : 404, json: found ?? { error: 'not found' } });
+		});
+		await page.route('**/api/sessions/agent-codex/readiness', async (route) => {
+			readinessRequests += 1;
+			return route.fulfill({
+				json: { ready: false, image_present: false, issues: ['Runner image not built'], warnings: [] },
+			});
+		});
+		await page.route('**/api/sessions/agent-codex', async (route) =>
+			route.fulfill({
+				json: {
+					agent_id: 'agent-codex',
+					status: 'idle',
+					active_task: null,
+					recent_tasks: [],
+				},
+			}),
+		);
+		await page.route('**/api/environments/agent-codex/tree**', async (route) =>
+			route.fulfill({
+				json: {
+					path: '/tmp',
+					entries: [
+						{ name: 'notes.txt', path: '/tmp/notes.txt', kind: 'file', symlink: false, size: 15, modified_at: now },
+					],
+					truncated: false,
+				},
+			}),
+		);
+		await page.route('**/api/environments/agent-codex/file**', async (route) =>
+			route.fulfill({
+				json: {
+					path: '/tmp/notes.txt',
+					content: 'original notes\n',
+					revision: 'rev-container-1',
+					size: 15,
+				},
+			}),
+		);
+
+		await page.setViewportSize({ width: 1440, height: 900 });
+		await page.goto('/canvas');
+		const canvas = page.locator('[data-workspace-canvas]');
+		const alphaCard = page.locator('[data-canvas-project-card="proj-alpha"]');
+		await expect(alphaCard).toBeVisible();
+
+		// 1. Stationary minimap click pans once on pointerdown and never jumps again on pointerup.
+		const worldLayer = page.locator('[data-canvas-pan-surface]');
+		const minimap = page.locator('[data-canvas-minimap]');
+		await expect(minimap).toBeVisible();
+		const minimapBox = await minimap.boundingBox();
+		expect(minimapBox).not.toBeNull();
+		const beforeClickTransform = await worldLayer.getAttribute('style');
+		await page.mouse.move(minimapBox!.x + minimapBox!.width - 14, minimapBox!.y + minimapBox!.height - 14);
+		await page.mouse.down();
+		const afterDownTransform = await worldLayer.getAttribute('style');
+		expect(afterDownTransform).not.toEqual(beforeClickTransform);
+		await page.waitForTimeout(50);
+		await page.mouse.up();
+		const afterUpTransform = await worldLayer.getAttribute('style');
+		expect(afterUpTransform).toEqual(afterDownTransform);
+
+		// 2. Five visible conversations on Canvas keep active EventSource sockets at 0 once /api/ui/stream is connected.
+		await page.locator('[data-canvas-fit]').click();
+		for (const conv of fiveConversations) {
+			await alphaCard.getByRole('button', { name: new RegExp(conv.title) }).click();
+			await page.locator('[data-canvas-fit]').click();
+		}
+		await expect(page.locator('[data-canvas-node-kind="conversation"]')).toHaveCount(5);
+		await expect.poll(async () => page.evaluate(() =>
+			(window as unknown as { __convStreamStats?: () => { active: number; maxActive: number } }).__convStreamStats?.()
+		)).toMatchObject({ active: 0 });
+		const convStats = await page.evaluate(() =>
+			(window as unknown as { __convStreamStats?: () => { active: number; maxActive: number } }).__convStreamStats?.()
+		);
+		expect(convStats!.maxActive).toBeLessThanOrEqual(2);
+
+		// 3. Unready agent Work tab does not enter a readiness polling loop when switching back to Canvas.
+		await page.locator('[data-canvas-fit]').click();
+		await alphaCard.locator('button[title="Open Agent window on canvas"]', { hasText: 'Codex Builder' }).click();
+		const agentWindow = page.locator('[data-canvas-node-kind="agent"]').first();
+		await expect(agentWindow).toBeVisible();
+		await expect.poll(() => readinessRequests).toBeGreaterThanOrEqual(1);
+		const readinessBeforeToggle = readinessRequests;
+		await page.locator('[data-workspace-mode-toggle]').getByRole('button', { name: 'Tabs' }).click();
+		await expect(canvas).not.toBeVisible();
+		await page.locator('[data-workspace-mode-toggle]').getByRole('button', { name: 'Canvas' }).click();
+		await expect(canvas).toBeVisible();
+		await page.waitForTimeout(450);
+		expect(readinessRequests - readinessBeforeToggle).toBeLessThanOrEqual(1);
+
+		// 4. Editing a container file inside the Agent's Files tab retains the window across project switches.
+		await agentWindow.getByRole('tab', { name: 'Files' }).click();
+		await agentWindow.getByLabel('File location').selectOption('container');
+		await agentWindow.getByRole('button', { name: /notes\.txt/ }).click();
+		await expect(agentWindow.locator('[data-monaco-editor] .view-lines')).toContainText('original notes');
+		await agentWindow.locator('[data-monaco-editor]').click();
+		await page.keyboard.type('files-tab-unsaved ');
+		await expect(agentWindow.getByRole('button', { name: 'Save', exact: true })).toBeEnabled();
+
+		await page.locator('[data-canvas-hud]').getByRole('button', { name: /Beta UI/ }).click();
+		await expect(canvas).toHaveAttribute('data-canvas-project-filter', 'proj-beta');
+		await expect(agentWindow).not.toBeVisible();
+
+		await page.locator('[data-canvas-hud]').getByRole('button', { name: /Alpha Core/ }).click();
+		await expect(canvas).toHaveAttribute('data-canvas-project-filter', 'proj-alpha');
+		await expect(agentWindow).toBeVisible();
+		await expect(agentWindow.locator('[data-monaco-editor] .view-lines')).toContainText('files-tab-unsaved');
+		await expect(agentWindow.getByRole('button', { name: 'Save', exact: true })).toBeEnabled();
+	});
+
 	test('canvas model enforces safe app URLs, non-overlapping placement, delegation edges, and layout persistence', () => {
 		const origin = 'http://127.0.0.1:8935';
 		const localApp = classifyAppUrl('http://127.0.0.1:3000/dashboard', origin);

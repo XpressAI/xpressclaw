@@ -1,8 +1,9 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onDestroy, onMount } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { workspaces, environments } from '$lib/api';
 	import type { GitChange, WorkspaceEntry, WorkspaceFile, WorkspaceGitDiff, WorkspaceGitStatus, WorkspaceStatus } from '$lib/api';
+	import { useReportPaneRetainState } from '$lib/liveUpdates';
 	import MonacoEditor from '$lib/components/MonacoEditor.svelte';
 	import TerminalPanel from '$lib/components/TerminalPanel.svelte';
 	import ContainerFiles from '$lib/components/ContainerFiles.svelte';
@@ -39,9 +40,18 @@
 	let saveMessage = $state('');
 	type FileOpenResult = 'opened' | 'cancelled' | 'stale' | 'failed';
 
+	const reportPaneRetainState = useReportPaneRetainState();
 	let visibleEntries = $derived(flattenEntries());
 	let dirty = $derived(Boolean(selectedFile && editorValue !== selectedFile.content));
 	let changeByPath = $derived(new Map((git?.files ?? []).map((change) => [change.path, change])));
+
+	$effect(() => {
+		reportPaneRetainState(dirty || containerDirty);
+	});
+
+	onDestroy(() => {
+		reportPaneRetainState(false);
+	});
 
 	onMount(() => {
 		showTerminal = Boolean(routeState(route).terminal);

@@ -1,4 +1,4 @@
-import { getContext, hasContext, setContext } from 'svelte';
+import { getContext, hasContext, setContext, untrack } from 'svelte';
 import { ApiError, sendToLogin, setApiRevisionObserver, ui, type UiRevisions } from './api';
 
 export function isTransientRefreshError(err: unknown): boolean {
@@ -63,12 +63,19 @@ export function usePaneActive(): () => boolean {
 }
 
 export function providePaneRetainState(report: (retained: boolean) => void): void {
-	setContext(PANE_RETAIN_CONTEXT, report);
+	const retainedTokens = new Set<symbol>();
+	setContext(PANE_RETAIN_CONTEXT, (token: symbol, retained: boolean) => {
+		if (retained) retainedTokens.add(token);
+		else retainedTokens.delete(token);
+		report(retainedTokens.size > 0);
+	});
 }
 
 export function useReportPaneRetainState(): (retained: boolean) => void {
 	if (hasContext(PANE_RETAIN_CONTEXT)) {
-		return getContext<(retained: boolean) => void>(PANE_RETAIN_CONTEXT);
+		const reportToken = getContext<(token: symbol, retained: boolean) => void>(PANE_RETAIN_CONTEXT);
+		const token = Symbol('xpressclaw.workspace.paneRetainToken');
+		return (retained: boolean) => reportToken(token, retained);
 	}
 	return () => {};
 }
@@ -267,9 +274,13 @@ function installGlobalListeners(): void {
 }
 
 export function notifyLiveUpdatesVisibilityChanged(): void {
-	notifyVisibilityListeners();
-	if (isDocumentHidden()) return;
-	flushDirtySubscribers();
+	// Untrack so callers invoking this inside a Svelte $effect never subscribe to
+	// reactive $state read by visibility listeners or subscriber active predicates.
+	untrack(() => {
+		notifyVisibilityListeners();
+		if (isDocumentHidden()) return;
+		flushDirtySubscribers();
+	});
 }
 
 function enqueueSubscriber(
@@ -350,9 +361,13 @@ function executeSubscriber(
 	Promise.resolve()
 		.then(() => sub.callback(revisions, { source, changedDomains: domainSet }))
 		.then(() => {
-			sub.retryAttempt = 0;
-			sub.retryDomains.clear();
-			sub.retrySource = null;
+			for (const domain of domainSet) {
+				sub.retryDomains.delete(domain);
+			}
+			if (sub.retryDomains.size === 0) {
+				sub.retryAttempt = 0;
+				sub.retrySource = null;
+			}
 		})
 		.catch((err) => {
 			if (isTransientRefreshError(err)) {
@@ -360,9 +375,13 @@ function executeSubscriber(
 				for (const domain of domainSet) sub.retryDomains.add(domain);
 				sub.retrySource = sub.retrySource === 'sse' ? 'sse' : source;
 			} else {
-				sub.retryAttempt = 0;
-				sub.retryDomains.clear();
-				sub.retrySource = null;
+				for (const domain of domainSet) {
+					sub.retryDomains.delete(domain);
+				}
+				if (sub.retryDomains.size === 0) {
+					sub.retryAttempt = 0;
+					sub.retrySource = null;
+				}
 			}
 		})
 		.finally(() => {
@@ -372,6 +391,11 @@ function executeSubscriber(
 				if (sub.pendingSource !== null) {
 					const nextSource = sub.pendingSource;
 					const nextDomains = new Set(sub.pendingDomains);
+					// Preserve any unrecovered retry domains across overlapping updates so a
+					// narrower pending refresh cannot discard a previously failed domain.
+					for (const domain of sub.retryDomains) {
+						nextDomains.add(domain);
+					}
 					sub.pendingSource = null;
 					sub.pendingDomains.clear();
 					// Queue pending reruns at the back of the FIFO queue so waiting
@@ -382,7 +406,7 @@ function executeSubscriber(
 					} else {
 						enqueueSubscriber(sub, nextSource, nextDomains);
 					}
-				} else if (transientFailure && sub.retryDomains.size > 0) {
+				} else if ((transientFailure || sub.retryDomains.size > 0) && sub.retryDomains.size > 0) {
 					if (isDocumentHidden() || !sub.isActive()) {
 						sub.dirty = true;
 						for (const domain of sub.retryDomains) sub.dirtyDomains.add(domain);

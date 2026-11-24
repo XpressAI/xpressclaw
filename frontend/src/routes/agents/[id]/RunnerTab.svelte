@@ -1,6 +1,7 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onDestroy, onMount } from 'svelte';
 	import { agents, mcpServers, sessions, setup } from '$lib/api';
+	import { useReportPaneRetainState } from '$lib/liveUpdates';
 	import { canonicalHarnessKind, harnessName, inferHarnessKindFromBackend, openExternal } from '$lib/utils';
 	import DirectoryPicker from '$lib/components/DirectoryPicker.svelte';
 	import HostSshAccess from '$lib/components/HostSshAccess.svelte';
@@ -16,6 +17,7 @@
 	}
 
 	let { agentConfig, agentId, saveSignal, onSave }: Props = $props();
+	const reportPaneRetainState = useReportPaneRetainState();
 	let kind = $state('auto');
 	let image = $state('');
 	let workspace = $state('');
@@ -82,6 +84,19 @@
 	let selectedAgent = $derived(agentOptions.find((agent) => agent.kind === kind));
 	let extensionDocumentationUrl = $derived(skillsDocumentation[kind] ?? selectedAgent?.install_url ?? '');
 	let hasSkillsGuide = $derived(Boolean(skillsDocumentation[kind]));
+
+	$effect(() => {
+		reportPaneRetainState(
+			addingMcp
+			|| editingMcpName !== null
+			|| showSignIn
+			|| Boolean(mcpName.trim() || mcpCommandOrUrl.trim())
+		);
+	});
+
+	onDestroy(() => {
+		reportPaneRetainState(false);
+	});
 
 	function defaultImage(): string {
 		const agent = agentOptions.find((option) => option.kind === kind);
