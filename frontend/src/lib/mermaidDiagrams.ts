@@ -16,6 +16,35 @@ interface Diagram {
 
 let nextId = 0;
 let renderQueue = Promise.resolve();
+let sharedThemeObserver: MutationObserver | null = null;
+let sharedDarkTheme = false;
+const themeListeners = new Set<(dark: boolean) => void>();
+
+function subscribeThemeChanges(listener: (dark: boolean) => void): () => void {
+	if (typeof document === 'undefined') return () => {};
+	if (!sharedThemeObserver) {
+		sharedDarkTheme = document.documentElement.classList.contains('dark');
+		sharedThemeObserver = new MutationObserver(() => {
+			const nextDark = document.documentElement.classList.contains('dark');
+			if (nextDark === sharedDarkTheme) return;
+			sharedDarkTheme = nextDark;
+			for (const cb of themeListeners) cb(nextDark);
+		});
+		sharedThemeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
+	}
+	themeListeners.add(listener);
+	return () => {
+		themeListeners.delete(listener);
+		if (themeListeners.size === 0 && sharedThemeObserver) {
+			sharedThemeObserver.disconnect();
+			sharedThemeObserver = null;
+		}
+	};
+}
+
+function mayContainMermaid(html: string | undefined): boolean {
+	return typeof html === 'string' && html.length > 0 && html.toLowerCase().includes('mermaid');
+}
 
 function renderDiagram(diagram: Diagram, isCurrent: () => boolean): Promise<DiagramImage | null> {
 	// Mermaid has global configuration. Serialize initialization and rendering so
@@ -74,12 +103,26 @@ function renderDiagram(diagram: Diagram, isCurrent: () => boolean): Promise<Diag
 }
 
 /** Enhance sanitized Markdown code fences without changing the stored message. */
-export const mermaidDiagrams: Action<HTMLElement, string> = (node) => {
+export const mermaidDiagrams: Action<HTMLElement, string> = (node, initialHtml) => {
 	let diagrams: Diagram[] = [];
 	let revision = 0;
 	let destroyed = false;
-	let timer: ReturnType<typeof setTimeout>;
+	let timer: ReturnType<typeof setTimeout> | undefined;
 	let dark = document.documentElement.classList.contains('dark');
+	let unsubscribeTheme: (() => void) | null = null;
+
+	function syncThemeSubscription() {
+		if (diagrams.length > 0 && !unsubscribeTheme) {
+			unsubscribeTheme = subscribeThemeChanges((nextDark) => {
+				if (nextDark === dark) return;
+				dark = nextDark;
+				schedule();
+			});
+		} else if (diagrams.length === 0 && unsubscribeTheme) {
+			unsubscribeTheme();
+			unsubscribeTheme = null;
+		}
+	}
 
 	async function render(version: number) {
 		await tick();
@@ -91,6 +134,7 @@ export const mermaidDiagrams: Action<HTMLElement, string> = (node) => {
 			const previous = diagrams[index];
 			return previous?.source === source && previous.dark === dark ? previous : { source, dark };
 		});
+		syncThemeSubscription();
 		for (const [index, code] of codes.entries()) {
 			const diagram = diagrams[index];
 			diagram.image ??= renderDiagram(diagram, () => !destroyed && diagrams.includes(diagram));
@@ -143,20 +187,29 @@ export const mermaidDiagrams: Action<HTMLElement, string> = (node) => {
 		// Coalesce streamed chunks; completed blocks reuse their previous render.
 		timer = setTimeout(() => void render(version), 150);
 	}
-	const themeObserver = new MutationObserver(() => {
-		const nextDark = document.documentElement.classList.contains('dark');
-		if (nextDark === dark) return;
-		dark = nextDark;
+
+	function handleContentChange(html: string | undefined) {
+		if (!mayContainMermaid(html)) {
+			if (diagrams.length > 0) {
+				diagrams = [];
+				syncThemeSubscription();
+			}
+			clearTimeout(timer);
+			revision += 1;
+			return;
+		}
+		dark = document.documentElement.classList.contains('dark');
 		schedule();
-	});
-	themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
-	schedule();
+	}
+
+	handleContentChange(initialHtml);
 	return {
-		update: schedule,
+		update: handleContentChange,
 		destroy() {
 			destroyed = true;
 			clearTimeout(timer);
-			themeObserver.disconnect();
+			unsubscribeTheme?.();
+			unsubscribeTheme = null;
 			diagrams = [];
 		},
 	};

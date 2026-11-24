@@ -3,7 +3,7 @@
 	import { onDestroy, onMount } from 'svelte';
 	import yaml from 'js-yaml';
 	import { agents, conversations, projects, workflows, type Agent, type Conversation, type ConversationMessage, type ConversationMessageUpload, type ConversationTurn, type Project, type Task, type Workflow } from '$lib/api';
-	import { isTransientRefreshError, subscribeLiveUpdates, usePaneActive } from '$lib/liveUpdates';
+	import { isTransientRefreshError, subscribeLiveUpdates, subscribeLiveUpdatesVisibility, usePaneActive } from '$lib/liveUpdates';
 	import { clearComposerDraft, loadComposerDraft, saveComposerDraft } from '$lib/composerDrafts';
 	import { clipboardFiles, imageDataUrl, pastedImageFiles, shouldHandleImagePaste } from '$lib/imageAttachments';
 	import { PROJECT_MUTATION_EVENT, type ProjectMutation } from '$lib/projectEvents';
@@ -53,7 +53,9 @@
 	let messagePane = $state<HTMLDivElement>();
 	const paneActive = usePaneActive();
 	let unsubscribeLiveUpdates: (() => void) | null = null;
+	let unsubscribeVisibility: (() => void) | null = null;
 	let eventSource: EventSource | null = null;
+	let disposed = false;
 	let stopInitialScrollPin: (() => void) | null = null;
 	let projectMutationVersion = 0;
 	const projectMutations = new Map<string, ProjectMutation>();
@@ -103,7 +105,8 @@
 			if (initialLoadPromise === initial) initialLoadPromise = null;
 		});
 		initialLoadPromise = initial;
-		connectEvents();
+		syncEventSource();
+		unsubscribeVisibility = subscribeLiveUpdatesVisibility(syncEventSource);
 		unsubscribeLiveUpdates = subscribeLiveUpdates(
 			['conversations', 'tasks', 'agents'],
 			async () => {
@@ -116,9 +119,12 @@
 	});
 
 	onDestroy(() => {
+		disposed = true;
 		unsubscribeLiveUpdates?.();
 		unsubscribeLiveUpdates = null;
-		eventSource?.close();
+		unsubscribeVisibility?.();
+		unsubscribeVisibility = null;
+		disconnectEvents();
 		stopInitialScrollPin?.();
 	});
 
@@ -205,6 +211,14 @@
 		return currentProject;
 	}
 
+	function sameSnapshot(left: unknown, right: unknown): boolean {
+		try {
+			return JSON.stringify(left) === JSON.stringify(right);
+		} catch {
+			return false;
+		}
+	}
+
 	async function refreshActivity(rethrowTransient = false) {
 		const gen = ++activityGeneration;
 		const latestMessageIdAtRequest = messages.at(-1)?.id ?? 0;
@@ -216,17 +230,23 @@
 				conversations.tasks(conversationId),
 				reconcileLoadedHistory ? conversations.messageDeletions(conversationId) : Promise.resolve([]),
 			]);
-			if (gen < appliedActivityGeneration) return;
+			if (disposed || gen < appliedActivityGeneration) return;
 			appliedActivityGeneration = gen;
-			if (reconcileLoadedHistory) {
-				messages = reconcileRecentMessages(messages, nextMessages, latestMessageIdAtRequest, deletedMessageIds);
+			const mergedMessages = reconcileLoadedHistory
+				? reconcileRecentMessages(messages, nextMessages, latestMessageIdAtRequest, deletedMessageIds)
+				: nextMessages;
+			if (!sameSnapshot(messages, mergedMessages)) {
+				messages = mergedMessages;
 			}
-			else {
-				messages = nextMessages;
+			if (!reconcileLoadedHistory) {
 				hasOlderMessages = nextMessages.length === MESSAGE_PAGE_SIZE;
 			}
-			turns = nextTurns;
-			taskList = nextTasks;
+			if (!sameSnapshot(turns, nextTurns)) {
+				turns = nextTurns;
+			}
+			if (!sameSnapshot(taskList, nextTasks)) {
+				taskList = nextTasks;
+			}
 		} catch (err) {
 			if (rethrowTransient && isTransientRefreshError(err)) throw err;
 		}
@@ -274,9 +294,31 @@
 		}
 	}
 
+	function disconnectEvents() {
+		if (eventSource) {
+			eventSource.close();
+			eventSource = null;
+		}
+	}
+
+	function syncEventSource() {
+		if (disposed) {
+			disconnectEvents();
+			return;
+		}
+		const shouldConnect = paneActive() && (typeof document === 'undefined' || !document.hidden);
+		if (shouldConnect) {
+			if (!eventSource) connectEvents();
+		} else {
+			disconnectEvents();
+		}
+	}
+
 	function connectEvents() {
+		if (eventSource || disposed) return;
 		eventSource = new EventSource(`/api/conversations/${encodeURIComponent(conversationId)}/events`);
 		eventSource.onmessage = (event) => {
+			if (disposed) return;
 			try {
 				const update = JSON.parse(event.data) as { type?: string; message_id?: number };
 				if (update.type === 'message_deleted' && update.message_id !== undefined) {
@@ -286,6 +328,7 @@
 			void refreshActivity().then(() => scrollToLatest());
 		};
 		eventSource.onerror = () => {
+			if (disposed) return;
 			// EventSource hides the handshake status. Probe one protected route so
 			// the shared API client can route an expired session to login.
 			void conversations.get(conversationId).catch(() => undefined);

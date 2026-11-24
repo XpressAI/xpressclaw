@@ -68,6 +68,8 @@ interface Subscriber {
 	fallbackActive: () => boolean;
 	lastRunAt: number;
 	inFlight: boolean;
+	queuedSource: LiveUpdateSource | null;
+	queuedDomains: Set<UiDomain>;
 	pendingSource: LiveUpdateSource | null;
 	pendingDomains: Set<UiDomain>;
 	dirty: boolean;
@@ -79,9 +81,14 @@ interface Subscriber {
 	coveredRevisions: Record<UiDomain, number>;
 }
 
+const MAX_CONCURRENT_SUBSCRIBER_RUNS = 4;
+
 let nextSubscriberId = 1;
 const subscribers = new Map<number, Subscriber>();
 const streamStatusListeners = new Set<(connected: boolean) => void>();
+const visibilityListeners = new Set<() => void>();
+const queuedSubscriberIds = new Set<number>();
+let activeSubscriberRuns = 0;
 
 let currentRevisions: UiRevisions | null = null;
 let serverProvidesRevisionHeaders = false;
@@ -166,6 +173,24 @@ export function subscribeLiveStreamStatus(listener: (connected: boolean) => void
 	};
 }
 
+export function subscribeLiveUpdatesVisibility(listener: () => void): () => void {
+	installGlobalListeners();
+	visibilityListeners.add(listener);
+	return () => {
+		visibilityListeners.delete(listener);
+	};
+}
+
+function notifyVisibilityListeners(): void {
+	for (const listener of visibilityListeners) {
+		try {
+			listener();
+		} catch {
+			// Ignore listener errors.
+		}
+	}
+}
+
 function clearSubscriberRetryTimer(sub: Subscriber): void {
 	if (sub.retryTimer !== null) {
 		clearTimeout(sub.retryTimer);
@@ -178,8 +203,16 @@ function installGlobalListeners(): void {
 	listenersInstalled = true;
 
 	document.addEventListener('visibilitychange', () => {
+		notifyVisibilityListeners();
 		if (isDocumentHidden()) {
 			for (const sub of subscribers.values()) {
+				if (sub.queuedSource !== null) {
+					sub.dirty = true;
+					for (const domain of sub.queuedDomains) sub.dirtyDomains.add(domain);
+					sub.queuedSource = null;
+					sub.queuedDomains.clear();
+					queuedSubscriberIds.delete(sub.id);
+				}
 				if (sub.retryDomains.size > 0) {
 					sub.dirty = true;
 					for (const domain of sub.retryDomains) sub.dirtyDomains.add(domain);
@@ -216,8 +249,92 @@ function installGlobalListeners(): void {
 }
 
 export function notifyLiveUpdatesVisibilityChanged(): void {
+	notifyVisibilityListeners();
 	if (isDocumentHidden()) return;
 	flushDirtySubscribers();
+}
+
+function drainSubscriberQueue(): void {
+	while (activeSubscriberRuns < MAX_CONCURRENT_SUBSCRIBER_RUNS && queuedSubscriberIds.size > 0) {
+		const nextId = queuedSubscriberIds.values().next().value;
+		if (nextId === undefined) break;
+		queuedSubscriberIds.delete(nextId);
+		const sub = subscribers.get(nextId);
+		if (!sub || sub.queuedSource === null) continue;
+		const nextSource = sub.queuedSource;
+		const nextDomains = new Set(sub.queuedDomains);
+		sub.queuedSource = null;
+		sub.queuedDomains.clear();
+		if (isDocumentHidden() || !sub.isActive()) {
+			sub.dirty = true;
+			for (const domain of nextDomains) sub.dirtyDomains.add(domain);
+			continue;
+		}
+		executeSubscriber(sub, currentRevisions ?? EMPTY_REVISIONS, nextSource, nextDomains);
+	}
+}
+
+function executeSubscriber(
+	sub: Subscriber,
+	revisions: UiRevisions,
+	source: LiveUpdateSource,
+	domainSet: Set<UiDomain>
+): void {
+	sub.inFlight = true;
+	activeSubscriberRuns += 1;
+	sub.lastRunAt = Date.now();
+	let transientFailure = false;
+
+	Promise.resolve()
+		.then(() => sub.callback(revisions, { source, changedDomains: domainSet }))
+		.then(() => {
+			sub.retryAttempt = 0;
+			sub.retryDomains.clear();
+			sub.retrySource = null;
+		})
+		.catch((err) => {
+			if (isTransientRefreshError(err)) {
+				transientFailure = true;
+				for (const domain of domainSet) sub.retryDomains.add(domain);
+				sub.retrySource = sub.retrySource === 'sse' ? 'sse' : source;
+			} else {
+				sub.retryAttempt = 0;
+				sub.retryDomains.clear();
+				sub.retrySource = null;
+			}
+		})
+		.finally(() => {
+			sub.inFlight = false;
+			activeSubscriberRuns = Math.max(0, activeSubscriberRuns - 1);
+			if (subscribers.has(sub.id)) {
+				if (sub.pendingSource !== null) {
+					const nextSource = sub.pendingSource;
+					const nextDomains = new Set(sub.pendingDomains);
+					sub.pendingSource = null;
+					sub.pendingDomains.clear();
+					triggerSubscriber(sub, currentRevisions ?? revisions, nextSource, nextDomains);
+				} else if (transientFailure && sub.retryDomains.size > 0) {
+					if (isDocumentHidden() || !sub.isActive()) {
+						sub.dirty = true;
+						for (const domain of sub.retryDomains) sub.dirtyDomains.add(domain);
+					} else {
+						const delayMs = Math.min(15_000, 1000 * 2 ** Math.min(sub.retryAttempt, 4));
+						sub.retryAttempt += 1;
+						sub.retryTimer = setTimeout(() => {
+							sub.retryTimer = null;
+							if (!subscribers.has(sub.id)) return;
+							triggerSubscriber(
+								sub,
+								currentRevisions ?? revisions,
+								sub.retrySource ?? source,
+								new Set(sub.retryDomains)
+							);
+						}, delayMs);
+					}
+				}
+			}
+			drainSubscriberQueue();
+		});
 }
 
 function flushDirtySubscribers(): void {
@@ -258,60 +375,14 @@ function triggerSubscriber(
 		return;
 	}
 
-	sub.inFlight = true;
-	sub.lastRunAt = Date.now();
-	const domainSet = mergedDomains;
-	let transientFailure = false;
+	if (activeSubscriberRuns >= MAX_CONCURRENT_SUBSCRIBER_RUNS) {
+		sub.queuedSource = sub.queuedSource === 'sse' ? 'sse' : source;
+		for (const domain of mergedDomains) sub.queuedDomains.add(domain);
+		queuedSubscriberIds.add(sub.id);
+		return;
+	}
 
-	Promise.resolve()
-		.then(() => sub.callback(revisions, { source, changedDomains: domainSet }))
-		.then(() => {
-			sub.retryAttempt = 0;
-			sub.retryDomains.clear();
-			sub.retrySource = null;
-		})
-		.catch((err) => {
-			if (isTransientRefreshError(err)) {
-				transientFailure = true;
-				for (const domain of domainSet) sub.retryDomains.add(domain);
-				sub.retrySource = sub.retrySource === 'sse' ? 'sse' : source;
-			} else {
-				sub.retryAttempt = 0;
-				sub.retryDomains.clear();
-				sub.retrySource = null;
-			}
-		})
-		.finally(() => {
-			sub.inFlight = false;
-			if (!subscribers.has(sub.id)) return;
-			if (sub.pendingSource !== null) {
-				const nextSource = sub.pendingSource;
-				const nextDomains = new Set(sub.pendingDomains);
-				sub.pendingSource = null;
-				sub.pendingDomains.clear();
-				triggerSubscriber(sub, currentRevisions ?? revisions, nextSource, nextDomains);
-				return;
-			}
-			if (transientFailure && sub.retryDomains.size > 0) {
-				if (isDocumentHidden() || !sub.isActive()) {
-					sub.dirty = true;
-					for (const domain of sub.retryDomains) sub.dirtyDomains.add(domain);
-					return;
-				}
-				const delayMs = Math.min(15_000, 1000 * 2 ** Math.min(sub.retryAttempt, 4));
-				sub.retryAttempt += 1;
-				sub.retryTimer = setTimeout(() => {
-					sub.retryTimer = null;
-					if (!subscribers.has(sub.id)) return;
-					triggerSubscriber(
-						sub,
-						currentRevisions ?? revisions,
-						sub.retrySource ?? source,
-						new Set(sub.retryDomains)
-					);
-				}, delayMs);
-			}
-		});
+	executeSubscriber(sub, revisions, source, mergedDomains);
 }
 
 function observeApiRevisionsHeader(raw: string, path: string): void {
@@ -683,6 +754,8 @@ export function subscribeLiveUpdates(
 		fallbackActive: options.fallbackActive ?? (() => true),
 		lastRunAt: Date.now(),
 		inFlight: false,
+		queuedSource: null,
+		queuedDomains: new Set(),
 		pendingSource: null,
 		pendingDomains: new Set(),
 		dirty: false,
@@ -708,10 +781,12 @@ export function subscribeLiveUpdates(
 
 	return () => {
 		clearSubscriberRetryTimer(subscriber);
+		queuedSubscriberIds.delete(id);
 		subscribers.delete(id);
 		if (subscribers.size === 0) {
 			stopStream();
 			stopFallbackLoop();
+			queuedSubscriberIds.clear();
 			currentRevisions = null;
 			serverProvidesRevisionHeaders = false;
 			streamUnsupported = false;

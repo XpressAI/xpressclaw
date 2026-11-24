@@ -895,6 +895,131 @@ test.describe('Spatial Canvas workspace', () => {
 		await expect(secondEditorCard.getByLabel('Workspace file path')).toHaveValue('other.ts');
 	});
 
+	test('zooms when scrolling on the minimap, isolates projects via the project picker, and drags an entire project zone group', async ({ page }) => {
+		let alphaTaskPolls = 0;
+		await mockCanvasApi(page);
+		await page.route('**/api/tasks/task-parent/activity**', async (route) => {
+			alphaTaskPolls += 1;
+			return route.fulfill({
+				json: {
+					attempts: [],
+					events: [],
+					has_more_before: false,
+					has_more_after: false,
+					delegated_work: [],
+				},
+			});
+		});
+
+		await page.setViewportSize({ width: 1440, height: 900 });
+		await page.goto('/canvas');
+		const canvas = page.locator('[data-workspace-canvas]');
+		await expect(canvas).toBeVisible();
+		await expect(page.locator('[data-canvas-project-card="proj-alpha"]')).toBeVisible();
+		await expect(page.locator('[data-canvas-project-card="proj-beta"]')).toBeVisible();
+
+		// 1. Scrolling inside the minimap zooms the canvas without requiring Ctrl/Cmd.
+		const minimap = page.locator('[data-canvas-minimap]');
+		await expect(minimap).toBeVisible();
+		const initialZoom = Number(await canvas.getAttribute('data-canvas-zoom'));
+		const minimapBox = await minimap.boundingBox();
+		expect(minimapBox).not.toBeNull();
+		await page.mouse.move(minimapBox!.x + minimapBox!.width / 2, minimapBox!.y + minimapBox!.height / 2);
+		await page.mouse.wheel(0, -120);
+		await expect.poll(async () => Number(await canvas.getAttribute('data-canvas-zoom'))).toBeGreaterThan(initialZoom);
+		const zoomedIn = Number(await canvas.getAttribute('data-canvas-zoom'));
+		await page.mouse.wheel(0, 120);
+		await page.mouse.wheel(0, 120);
+		await expect.poll(async () => Number(await canvas.getAttribute('data-canvas-zoom'))).toBeLessThan(zoomedIn);
+
+		// 2. Dragging the project group header moves all windows in that project rigidly together.
+		const parseCoords = (style: string | null) => {
+			const left = Number(style?.match(/left:\s*(-?\d+(?:\.\d+)?)px/)?.[1] ?? NaN);
+			const top = Number(style?.match(/top:\s*(-?\d+(?:\.\d+)?)px/)?.[1] ?? NaN);
+			return { left, top };
+		};
+		await page.locator('[data-canvas-fit]').click();
+		const alphaWindowLocators = [
+			page.locator('[data-canvas-node]', { has: page.locator('[data-canvas-project-card="proj-alpha"]') }),
+			page.locator('[data-canvas-node-kind="task"]').nth(0),
+			page.locator('[data-canvas-node-kind="task"]').nth(1),
+			page.locator('[data-canvas-node-kind="task"]').nth(2),
+		];
+		const betaWindow = page.locator('[data-canvas-node]', { has: page.locator('[data-canvas-project-card="proj-beta"]') });
+
+		const alphaBefore = await Promise.all(alphaWindowLocators.map(async (loc) => parseCoords(await loc.getAttribute('style'))));
+		const betaBefore = parseCoords(await betaWindow.getAttribute('style'));
+
+		const zoneHandle = page.locator('[data-canvas-zone-drag-handle="proj-alpha"]');
+		await expect(zoneHandle).toBeVisible();
+		const handleBox = await zoneHandle.boundingBox();
+		expect(handleBox).not.toBeNull();
+		await page.mouse.move(handleBox!.x + handleBox!.width / 2, handleBox!.y + handleBox!.height / 2);
+		await page.mouse.down();
+		await page.mouse.move(handleBox!.x + handleBox!.width / 2 + 120, handleBox!.y + handleBox!.height / 2 + 80, { steps: 6 });
+		await page.mouse.up();
+
+		const alphaAfter = await Promise.all(alphaWindowLocators.map(async (loc) => parseCoords(await loc.getAttribute('style'))));
+		const betaAfter = parseCoords(await betaWindow.getAttribute('style'));
+		const dx0 = alphaAfter[0].left - alphaBefore[0].left;
+		const dy0 = alphaAfter[0].top - alphaBefore[0].top;
+		expect(dx0).toBeGreaterThan(40);
+		expect(dy0).toBeGreaterThan(20);
+		for (let i = 1; i < alphaAfter.length; i += 1) {
+			expect(alphaAfter[i].left - alphaBefore[i].left).toBe(dx0);
+			expect(alphaAfter[i].top - alphaBefore[i].top).toBe(dy0);
+		}
+		expect(betaAfter).toEqual(betaBefore);
+
+		// Reloading persists the moved project cluster coordinates.
+		await page.reload();
+		await expect(canvas).toBeVisible();
+		const alphaRestored = await Promise.all(alphaWindowLocators.map(async (loc) => parseCoords(await loc.getAttribute('style'))));
+		expect(alphaRestored).toEqual(alphaAfter);
+
+		// 3. Selecting a project in the top project picker isolates it and hides/deactivates other projects.
+		const alphaCard = page.locator('[data-canvas-project-card="proj-alpha"]');
+		await alphaCard.getByRole('button', { name: 'Editor', exact: true }).click();
+		const alphaEditor = page.locator('[data-canvas-editor-card]').first();
+		await expect(alphaEditor).toBeVisible();
+		await alphaEditor.getByRole('button', { name: 'main.ts' }).click();
+		await expect(alphaEditor.locator('[data-monaco-editor] .view-lines')).toContainText('hello canvas');
+		await alphaEditor.locator('[data-monaco-editor]').click();
+		await page.keyboard.type('draft-keep ');
+		await expect(alphaEditor.getByRole('button', { name: /Save •/ })).toBeVisible();
+
+		// Switch to Beta UI: Alpha Core windows/edges/zones are hidden & unmounted (dirty editor stays hidden, not visible).
+		await page.locator('[data-canvas-hud]').getByRole('button', { name: /Beta UI/ }).click();
+		await expect(canvas).toHaveAttribute('data-canvas-project-filter', 'proj-beta');
+		await expect(page.locator('[data-canvas-project-card="proj-beta"]')).toBeVisible();
+		await expect(page.locator('[data-canvas-project-card="proj-alpha"]')).toHaveCount(0);
+		await expect(page.locator('[data-canvas-node-kind="task"]')).toHaveCount(0);
+		await expect(page.locator('[data-canvas-edge-kind="delegation"]')).toHaveCount(0);
+		await expect(page.locator('[data-canvas-project-zone="proj-alpha"]')).toHaveCount(0);
+		await expect(alphaEditor).not.toBeVisible();
+
+		// Hidden Alpha Core tasks stop polling while isolated to Beta UI.
+		const pollsAfterSwitch = alphaTaskPolls;
+		await page.waitForTimeout(400);
+		expect(alphaTaskPolls).toBe(pollsAfterSwitch);
+
+		// Switching to Alpha Core restores Alpha windows & preserves the dirty editor buffer, while hiding Beta UI.
+		await page.locator('[data-canvas-hud]').getByRole('button', { name: /Alpha Core/ }).click();
+		await expect(canvas).toHaveAttribute('data-canvas-project-filter', 'proj-alpha');
+		await expect(page.locator('[data-canvas-project-card="proj-alpha"]')).toBeVisible();
+		await expect(page.locator('[data-canvas-project-card="proj-beta"]')).toHaveCount(0);
+		await expect(page.locator('[data-canvas-node-kind="task"]')).toHaveCount(3);
+		await expect(alphaEditor).toBeVisible();
+		await expect(alphaEditor.getByRole('button', { name: /Save •/ })).toBeVisible();
+		await expect(alphaEditor.locator('[data-monaco-editor] .view-lines')).toContainText('draft-keep');
+
+		// Clicking All Projects restores all projects on the canvas.
+		await page.locator('[data-canvas-hud]').getByRole('button', { name: 'All Projects' }).click();
+		await expect(canvas).toHaveAttribute('data-canvas-project-filter', 'all');
+		await expect(page.locator('[data-canvas-project-card="proj-alpha"]')).toBeVisible();
+		await expect(page.locator('[data-canvas-project-card="proj-beta"]')).toBeVisible();
+	});
+
 	test('canvas model enforces safe app URLs, non-overlapping placement, delegation edges, and layout persistence', () => {
 		const origin = 'http://127.0.0.1:8935';
 		const localApp = classifyAppUrl('http://127.0.0.1:3000/dashboard', origin);
@@ -940,13 +1065,22 @@ test.describe('Spatial Canvas workspace', () => {
 			nodes: [...laidOut, { bad: true } as unknown as CanvasNode],
 			camera: { x: 10, y: 20, zoom: 99 },
 			focusedNodeId: parentTaskNode.id,
+			activeProjectFilter: 'proj-alpha',
 			snapToGrid: false,
 			showMinimap: true,
 			autoPinDelegated: true,
 		});
 		expect(restored?.nodes.length).toBe(laidOut.length);
 		expect(restored?.camera.zoom).toBe(1.6);
+		expect(restored?.activeProjectFilter).toBe('proj-alpha');
 		expect(restored?.snapToGrid).toBe(false);
+
+		const restoredAll = normalizePersistedCanvasState({
+			nodes: laidOut,
+			camera: { x: 0, y: 0, zoom: 1 },
+			activeProjectFilter: '',
+		});
+		expect(restoredAll?.activeProjectFilter).toBeNull();
 
 		// Link classification & workspace path mapping helpers
 		expect(resolveWorkspaceRelativePath('/workspace/temp/demo.html', ['/workspace'])).toBe('temp/demo.html');

@@ -6,9 +6,9 @@ XpressClaw offers an optional **Spatial Canvas** view alongside the default tab-
 
 The canvas provides an infinite pan-and-zoom workspace inspired by GameMaker's spatial IDE:
 
-- **Project zones**: Windows belonging to the same Project group into labeled spatial zones. Use the top project pills to jump straight to a Project's cluster or open its Project Hub.
+- **Project zones & isolation**: Windows belonging to the same Project group into labeled spatial zones. Drag any project zone's top-left header handle to move all windows in that project together as a rigid group. Use the top project pills to isolate a single Project—hiding and deactivating other projects' windows to keep large canvases responsive—or click **All Projects** to show everything again.
 - **Live delegation & dependency wires**: Parent tasks connect to delegated child tasks (`parent_task_id`) and prerequisite dependencies (`depends_on`) with live Bezier curves colored by execution state. Enable **Auto-pin delegated** (on by default) to surface newly delegated parallel subtasks next to their parent automatically, or click the delegation badge on any Task window to fan them out on demand.
-- **Layout controls**: Drag windows by their title bar, resize from edges/corners, collapse windows to compact headers, snap to the 20px grid, **Tidy** to auto-arrange by Project and delegation depth, **Fit** to frame all windows, or navigate quickly with the **Minimap**.
+- **Layout controls**: Drag windows by their title bar, drag project zone headers to reposition an entire project cluster, resize from edges/corners, collapse windows to compact headers, snap to the 20px grid, **Tidy** to auto-arrange by Project and delegation depth, **Fit** to frame visible windows, or navigate quickly with the **Minimap** (click/drag to pan, scroll to zoom).
 
 ## Contextual tool windows
 
@@ -28,5 +28,5 @@ From any Project, Agent, Task, or Conversation window's `+` menu (or the top **A
 ## Navigation controls
 
 - **Pan**: Drag the canvas background, hold `Space` and drag anywhere, middle-mouse drag, or scroll on the empty canvas background.
-- **Zoom**: `Ctrl`/`⌘` + scroll wheel, trackpad pinch, or the toolbar zoom buttons (`-`, `100%`, `+`, **Fit**).
+- **Zoom**: `Ctrl`/`⌘` + scroll wheel, scroll wheel over the **Minimap**, trackpad pinch, or the toolbar zoom buttons (`-`, `100%`, `+`, **Fit**).
 - **Pop out to Tabs**: Click the external-tab icon on any routed window to switch back to Tabs view at that resource.

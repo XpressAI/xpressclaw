@@ -49,6 +49,7 @@ export interface CanvasState {
 	nodes: CanvasNode[];
 	camera: CanvasCamera;
 	focusedNodeId: string | null;
+	activeProjectFilter?: string | null;
 	snapToGrid: boolean;
 	showMinimap: boolean;
 	autoPinDelegated: boolean;
@@ -1132,6 +1133,9 @@ export function normalizePersistedCanvasState(raw: unknown): CanvasState | null 
 		focusedNodeId: typeof parsed.focusedNodeId === 'string' && nodes.some((n) => n.id === parsed.focusedNodeId)
 			? parsed.focusedNodeId
 			: nodes.at(-1)?.id ?? null,
+		activeProjectFilter: typeof parsed.activeProjectFilter === 'string' && parsed.activeProjectFilter.length > 0
+			? parsed.activeProjectFilter
+			: null,
 		snapToGrid: parsed.snapToGrid !== false,
 		showMinimap: parsed.showMinimap !== false,
 		autoPinDelegated: parsed.autoPinDelegated !== false,
