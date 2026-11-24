@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onDestroy, onMount, untrack } from 'svelte';
 	import { Folder, FolderOpen, FileCode2, Image as ImageIcon, PanelLeft, RefreshCw, Save, Globe } from '@lucide/svelte';
 	import { workspaces, type Agent, type GitChange, type WorkspaceEntry, type WorkspaceFile, type WorkspaceGitDiff, type WorkspaceGitStatus } from '$lib/api';
 	import { isHtmlFilePath, isImageFilePath } from '$lib/canvas';
@@ -52,8 +52,12 @@
 	let visibleEntries = $derived(flattenEntries());
 
 	$effect(() => {
-		onDirtyChange?.(dirty);
-		return () => onDirtyChange?.(false);
+		const isDirty = dirty;
+		untrack(() => onDirtyChange?.(isDirty));
+	});
+
+	onDestroy(() => {
+		onDirtyChange?.(false);
 	});
 
 	onMount(() => {

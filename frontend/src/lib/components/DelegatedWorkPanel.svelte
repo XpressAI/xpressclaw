@@ -2,24 +2,28 @@
 	import { onMount } from 'svelte';
 	import { ArrowUpRight, GitBranch } from '@lucide/svelte';
 	import type { Agent, DelegatedWork } from '$lib/api';
+	import { subscribeLiveUpdatesVisibility, usePaneActive } from '$lib/liveUpdates';
 	import { elapsedTimeLabel, serverTimestampMs } from '$lib/serverTime';
 
-	let { items, agents }: { items: DelegatedWork[]; agents: Agent[] } = $props();
+	let { items, agents, active = true }: { items: DelegatedWork[]; agents: Agent[]; active?: boolean } = $props();
+	const paneActive = usePaneActive();
 	let now = $state(Date.now());
-	let visible = $state(true);
+	let paneVisible = $state(true);
 	let outstanding = $derived(items.filter(item => item.status !== 'completed'));
 	let completed = $derived(items.filter(item => item.status === 'completed'));
 
 	onMount(() => {
-		const updateVisibility = () => (visible = !document.hidden);
-		updateVisibility();
-		document.addEventListener('visibilitychange', updateVisibility);
-		return () => document.removeEventListener('visibilitychange', updateVisibility);
+		const syncActive = () => {
+			paneVisible = !document.hidden && paneActive();
+		};
+		syncActive();
+		return subscribeLiveUpdatesVisibility(syncActive);
 	});
 	$effect(() => {
-		if (!visible || items.length === 0) return;
+		if (!active || !paneVisible || items.length === 0) return;
 		now = Date.now();
-		const timer = setInterval(() => { now = Date.now(); }, 1000);
+		const intervalMs = outstanding.length > 0 ? 1_000 : 10_000;
+		const timer = setInterval(() => { now = Date.now(); }, intervalMs);
 		return () => clearInterval(timer);
 	});
 

@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import { subscribeLiveUpdatesVisibility, usePaneActive } from '$lib/liveUpdates';
 	import { elapsedTimeLabel, serverTimestampMs } from '$lib/serverTime';
 
 	let {
@@ -14,23 +15,27 @@
 		phase?: 'active' | 'preparing' | 'queued' | 'loading';
 	} = $props();
 
+	const paneActive = usePaneActive();
 	let now = $state(Date.now());
-	let visible = $state(true);
+	let active = $state(true);
 	let parsedStart = $derived(serverTimestampMs(startedAt));
 	let elapsed = $derived(parsedStart === null ? null : Math.max(0, now - parsedStart));
+	let subMinute = $derived(elapsed !== null && elapsed < 60_000);
 	const pixels = Array.from({ length: 9 });
 
 	onMount(() => {
-		const updateVisibility = () => (visible = !document.hidden);
-		updateVisibility();
-		document.addEventListener('visibilitychange', updateVisibility);
-		return () => document.removeEventListener('visibilitychange', updateVisibility);
+		const syncActive = () => {
+			active = !document.hidden && paneActive();
+		};
+		syncActive();
+		return subscribeLiveUpdatesVisibility(syncActive);
 	});
 
 	$effect(() => {
-		if (!visible || parsedStart === null) return;
+		if (!active || parsedStart === null) return;
 		now = Date.now();
-		const timer = window.setInterval(() => (now = Date.now()), 250);
+		const intervalMs = subMinute ? 250 : 1_000;
+		const timer = window.setInterval(() => (now = Date.now()), intervalMs);
 		return () => window.clearInterval(timer);
 	});
 </script>

@@ -9,7 +9,7 @@
 	import { MIN_DETAILS_WIDTH } from '$lib/workspaceLayout';
 	import { goto } from '$app/navigation';
 	import { tasks, agents, sessions, workspaces, ApiError } from '$lib/api';
-	import { isTransientRefreshError, subscribeLiveUpdates, usePaneActive } from '$lib/liveUpdates';
+	import { isTransientRefreshError, subscribeLiveUpdates, subscribeLiveUpdatesVisibility, usePaneActive, useReportPaneRetainState, type UiDomain } from '$lib/liveUpdates';
 	import { selectChoices, isModelOption, isReasoningOption, isAdditionalModelOption, reconcileConfig, duplicatesReasoningMode } from '$lib/acpConfig';
 	import type { TaskControlSnapshot, AcpCommand, AcpConfigOption, AcpModeState, DelegatedWork, Task, TaskMessage, Agent, WorkAttempt, SessionEvent, ImageAttachmentUpload, GitChange, WorkspaceGitStatus, MessageVisualization } from '$lib/api';
 	import { timeAgo, openExternal } from '$lib/utils';
@@ -211,7 +211,9 @@
 	let controlsInitializedFor = '';
 	let composing = $state(false);
 	const paneActive = usePaneActive();
+	const reportPaneRetainState = useReportPaneRetainState();
 	let unsubscribeLiveUpdates: (() => void) | null = null;
+	let unsubscribeVisibility: (() => void) | null = null;
 	let messagesEl = $state<HTMLDivElement>();
 	let composerEl = $state<HTMLDivElement>();
 	let taskViewEl = $state<HTMLDivElement>();
@@ -224,11 +226,19 @@
 	let showDetailsSidebar = $derived(detailsSidebarFits && !detailsCollapsed && !detailsSheetOpen);
 	let prevMessageCount = 0;
 	let lastActivityEventId = 0;
+	let oldestContiguousActivityId: number | null = null;
 	let lastCommandsEventId = 0;
+	let lastTerminalCheckAt = 0;
+	let terminalRecheckTimer: ReturnType<typeof setTimeout> | null = null;
+	let terminalRecheckPending = false;
 	let allTasksLoaded = false;
 	let allTasksLoading = false;
+	const MAX_LIVE_ACTIVITY_EVENTS = 400;
+	const TRIMMED_LIVE_ACTIVITY_EVENTS = 300;
+	const TERMINAL_COMPACT_RECHECK_MS = 10_000;
 	let hasEarlierActivity = $state(false);
 	let loadingEarlierActivity = $state(false);
+	let userLoadedEarlierActivity = false;
 	let initialLoad = true;
 	let followLatest = $state(true);
 	let showJumpToLatest = $state(false);
@@ -236,10 +246,20 @@
 	let lastWorkspaceGitRefresh = 0;
 	let workspaceGitRequest: AbortController | null = null;
 	let pollPromise: Promise<void> | null = null;
+	let scrollTimer: ReturnType<typeof setTimeout> | null = null;
 	let disposed = false;
 
 	$effect(() => {
 		if (messageDraftReady) saveComposerDraft(messageDraftScope(), messageInput);
+	});
+
+	$effect(() => {
+		const hasUnsavedState =
+			messageAttachments.length > 0
+			|| editing
+			|| Boolean(planningTask)
+			|| Object.keys(elicitationAnswers).length > 0;
+		reportPaneRetainState(hasUnsavedState);
 	});
 
 	let availableDeps = $derived(
@@ -1056,6 +1076,34 @@
 		}
 	}
 
+	function clearTerminalRecheckTimer() {
+		if (terminalRecheckTimer !== null) {
+			clearTimeout(terminalRecheckTimer);
+			terminalRecheckTimer = null;
+		}
+	}
+
+	function scheduleTerminalRecheck(delayMs: number) {
+		terminalRecheckPending = true;
+		if (terminalRecheckTimer !== null) return;
+		terminalRecheckTimer = setTimeout(() => {
+			terminalRecheckTimer = null;
+			if (disposed || !terminalRecheckPending) return;
+			if (document.hidden || !paneActive()) return;
+			terminalRecheckPending = false;
+			void poll(false, new Set<UiDomain>(['tasks']));
+		}, Math.max(50, delayMs));
+	}
+
+	function canDeferTerminalChecks(): boolean {
+		return Boolean(
+			!isTaskOrDelegatesActive()
+			&& task !== null
+			&& ['completed', 'cancelled'].includes(task.status)
+			&& !latestError
+		);
+	}
+
 	onMount(() => {
 		try { detailsCollapsed = localStorage.getItem(detailsPreferenceKey) === 'true'; } catch { /* Use the default when storage is unavailable. */ }
 		document.addEventListener('pointerdown', handleComposerPointerDown);
@@ -1071,6 +1119,13 @@
 		});
 		pollPromise = initialLoadPromise;
 
+		unsubscribeVisibility = subscribeLiveUpdatesVisibility(() => {
+			if (disposed || !terminalRecheckPending || document.hidden || !paneActive()) return;
+			clearTerminalRecheckTimer();
+			terminalRecheckPending = false;
+			void poll(false, new Set<UiDomain>(['tasks']));
+		});
+
 		unsubscribeLiveUpdates = subscribeLiveUpdates(
 			['tasks', 'sessions', 'agents'],
 			async (_revisions, ctx) => {
@@ -1078,21 +1133,32 @@
 					await initialLoadPromise.catch(() => {});
 					if (disposed) return;
 					if (isTaskOrDelegatesActive()) {
-						await poll(true);
+						await poll(true, ctx.changedDomains);
 					}
 					if (modelMenuOpen || hasPendingControls() || isTaskOrDelegatesActive()) {
 						await refreshModelMenu(false, true);
 					}
 					return;
 				}
+				const activeTask = isTaskOrDelegatesActive();
+				// Truly terminal tasks (completed/cancelled with no error banner) skip pure
+				// session/agent churn, and in Canvas (compact) mode coalesce repeated task ticks
+				// behind a trailing cooldown check so wake-ups/reopens are never dropped.
+				if (canDeferTerminalChecks() && !modelMenuOpen && !hasPendingControls() && ctx.source !== 'resume') {
+					if (!ctx.changedDomains.has('tasks')) return;
+					const elapsed = Date.now() - lastTerminalCheckAt;
+					if (compact && elapsed < TERMINAL_COMPACT_RECHECK_MS) {
+						scheduleTerminalRecheck(TERMINAL_COMPACT_RECHECK_MS - elapsed);
+						return;
+					}
+				}
 				// Live SSE / revision push (including updates arriving during initial load or scheduled wake-ups!):
-				await poll(true);
+				await poll(true, ctx.source === 'resume' ? undefined : ctx.changedDomains);
 				if (
 					!controlSnapshot
 					|| modelMenuOpen
 					|| hasPendingControls()
-					|| ctx.changedDomains.has('sessions')
-					|| ctx.changedDomains.has('agents')
+					|| ((activeTask || isTaskOrDelegatesActive()) && (ctx.changedDomains.has('sessions') || ctx.changedDomains.has('agents')))
 				) {
 					await refreshModelMenu(false, true);
 				}
@@ -1107,10 +1173,19 @@
 
 	onDestroy(() => {
 		disposed = true;
+		reportPaneRetainState(false);
+		clearTerminalRecheckTimer();
+		terminalRecheckPending = false;
+		if (scrollTimer !== null) {
+			clearTimeout(scrollTimer);
+			scrollTimer = null;
+		}
 		workspaceGitRequest?.abort();
 		++configRequestVersion;
 		unsubscribeLiveUpdates?.();
 		unsubscribeLiveUpdates = null;
+		unsubscribeVisibility?.();
+		unsubscribeVisibility = null;
 		taskViewResizeObserver?.disconnect();
 		document.removeEventListener('pointerdown', handleComposerPointerDown);
 	});
@@ -1138,6 +1213,8 @@
 			subtaskList = subResult.tasks;
 			prevMessageCount = messages.length;
 			lastActivityEventId = activityEvents.at(-1)?.id ?? 0;
+			oldestContiguousActivityId = activityEvents.at(0)?.id ?? null;
+			if (!isTaskOrDelegatesActive()) lastTerminalCheckAt = Date.now();
 			if (loadedTask.agent_id) {
 				void refreshWorkspaceGit(loadedTask.agent_id);
 				const events = await sessions.events(loadedTask.agent_id, {
@@ -1205,7 +1282,7 @@
 
 	function applyAttempts(incoming: WorkAttempt[]) {
 		const id = taskId;
-		attempts = incoming;
+		if (!sameSnapshot(attempts, incoming)) attempts = incoming;
 		for (const attempt of incoming) {
 			if (attempt.error_dismissed_at) {
 				if (!dismissedAttemptIds.has(attempt.id)) rememberTaskAttemptDismissal(id, attempt.id);
@@ -1240,8 +1317,13 @@
 
 	// Git is auxiliary metadata. A slow repository must not delay the task,
 	// its saved messages, or terminal attempt state, or accumulate requests.
-	async function refreshWorkspaceGit(agentId: string) {
-		if (disposed || workspaceGitRequest || Date.now() - lastWorkspaceGitRefresh < 10_000) return;
+	async function refreshWorkspaceGit(agentId: string, force = false) {
+		if (disposed) return;
+		if (!force && (workspaceGitRequest || Date.now() - lastWorkspaceGitRefresh < 10_000)) return;
+		if (force && workspaceGitRequest) {
+			workspaceGitRequest.abort();
+			workspaceGitRequest = null;
+		}
 		const id = taskId;
 		const controller = new AbortController();
 		workspaceGitRequest = controller;
@@ -1250,15 +1332,57 @@
 		try {
 			const git = await workspaces.gitStatus(agentId, controller.signal, id);
 			if (!disposed && workspaceGitRequest === controller && task?.id === id && task.agent_id === agentId) workspaceGit = git;
-		} catch { /* Preserve the last Git snapshot; task polling continues. */ }
+		} catch (err) {
+			if (!controller.signal.aborted) {
+				console.debug(`Failed to refresh git status for task ${id}:`, err);
+			}
+		}
 		finally {
 			clearTimeout(timeout);
 			if (workspaceGitRequest === controller) workspaceGitRequest = null;
 		}
 	}
 
+	function sameSnapshot(left: unknown, right: unknown): boolean {
+		try {
+			return JSON.stringify(left) === JSON.stringify(right);
+		} catch (err) {
+			console.warn('Failed to compare task snapshot:', err);
+			return false;
+		}
+	}
+
+	function trimLiveActivityEvents(events: SessionEvent[]): {
+		events: SessionEvent[];
+		trimmed: boolean;
+		oldestContiguousId: number | null;
+	} {
+		if (events.length <= MAX_LIVE_ACTIVITY_EVENTS) {
+			return { events, trimmed: false, oldestContiguousId: oldestContiguousActivityId };
+		}
+		const cutoffIndex = events.length - TRIMMED_LIVE_ACTIVITY_EVENTS;
+		const head = events.slice(0, cutoffIndex);
+		const tail = events.slice(cutoffIndex);
+		const resolvedIds = new Set(
+			events
+				.filter((event) => event.event_type === 'elicitation_resolved')
+				.map((event) => String(event.payload?.elicitationId ?? ''))
+				.filter(Boolean)
+		);
+		const retainedHead = head.filter((event) => {
+			if (event.event_type !== 'elicitation_pending') return false;
+			const id = String(event.payload?.elicitationId ?? '');
+			return Boolean(id && !resolvedIds.has(id) && !locallyResolvedElicitations[id]);
+		});
+		return {
+			events: retainedHead.length > 0 ? [...retainedHead, ...tail] : tail,
+			trimmed: true,
+			oldestContiguousId: tail[0]?.id ?? null,
+		};
+	}
+
 	/** Poll semantic task activity without exposing the runner's terminal. */
-	async function poll(rethrowTransient = false) {
+	async function poll(rethrowTransient = false, changedDomains?: ReadonlySet<UiDomain>) {
 		if (disposed) return;
 		while (pollPromise) {
 			const inflight = pollPromise;
@@ -1270,36 +1394,70 @@
 			if (disposed) return;
 		}
 		let currentRun: Promise<void>;
-		currentRun = runPollOnce(rethrowTransient).finally(() => {
+		currentRun = runPollOnce(rethrowTransient, changedDomains).finally(() => {
 			if (pollPromise === currentRun) pollPromise = null;
 		});
 		pollPromise = currentRun;
 		await currentRun;
 	}
 
-	async function runPollOnce(rethrowTransient: boolean) {
+	async function runPollOnce(rethrowTransient: boolean, changedDomains?: ReadonlySet<UiDomain>) {
 		try {
 			const id = taskId;
+			clearTerminalRecheckTimer();
+			terminalRecheckPending = false;
+			const wasActiveBeforePoll = isTaskOrDelegatesActive();
 			const hadActivityCursor = Boolean(lastActivityEventId);
 			const afterMessageId = incrementalMessagePivot(messages);
-			const [newTask, incomingMessages, newActivity, subResult] = await Promise.all([
-				tasks.get(id),
-				tasks.messages(id, afterMessageId),
-				tasks.activity(id, { after: lastActivityEventId || undefined }),
-				tasks.subtasks(id).catch((err) => {
-					if (isTransientRefreshError(err)) throw err;
-					return { tasks: subtaskList };
-				}),
-			]);
+			let newTask: Task;
+			let incomingMessages: TaskMessage[];
+			let newActivity: Awaited<ReturnType<typeof tasks.activity>>;
+			let subResult: { tasks: Task[] };
+
+			// For a completed/cancelled task with no active delegates and no undismissed
+			// error notice, check the single task record first on background live-update ticks
+			// so unrelated global task/session ticks do not fan out across messages, activity,
+			// subtasks, git, and commands. Blocked tasks and tasks showing an attempt error
+			// always fetch activity so cross-browser notice dismissals appear immediately.
+			if (canDeferTerminalChecks() && !initialLoad && changedDomains !== undefined) {
+				newTask = await tasks.get(id);
+				if (disposed || taskId !== id) return;
+				if (sameSnapshot(task, newTask)) {
+					error = null;
+					lastTerminalCheckAt = Date.now();
+					return;
+				}
+				[incomingMessages, newActivity, subResult] = await Promise.all([
+					tasks.messages(id, afterMessageId),
+					tasks.activity(id, { after: lastActivityEventId || undefined }),
+					tasks.subtasks(id).catch((err) => {
+						if (isTransientRefreshError(err)) throw err;
+						console.warn(`Failed to load subtasks for task ${id}:`, err);
+						return { tasks: subtaskList };
+					}),
+				]);
+			} else {
+				[newTask, incomingMessages, newActivity, subResult] = await Promise.all([
+					tasks.get(id),
+					tasks.messages(id, afterMessageId),
+					tasks.activity(id, { after: lastActivityEventId || undefined }),
+					tasks.subtasks(id).catch((err) => {
+						if (isTransientRefreshError(err)) throw err;
+						console.warn(`Failed to load subtasks for task ${id}:`, err);
+						return { tasks: subtaskList };
+					}),
+				]);
+			}
 			if (disposed || taskId !== id) return;
-			// Update task status/details in-place
-			task = newTask;
+			// Update task status/details in-place only when changed to avoid cascading $derived recomputations.
+			if (!sameSnapshot(task, newTask)) task = newTask;
 			error = null;
 			if (!hadActivityCursor) hasEarlierActivity = newActivity.has_more_before;
 			resetHarnessControls(newTask.agent_id);
 			applyAttempts(newActivity.attempts);
-			delegatedWork = newActivity.delegated_work ?? [];
-			subtaskList = subResult.tasks;
+			const nextDelegated = newActivity.delegated_work ?? [];
+			if (!sameSnapshot(delegatedWork, nextDelegated)) delegatedWork = nextDelegated;
+			if (!sameSnapshot(subtaskList, subResult.tasks)) subtaskList = subResult.tasks;
 			let shouldScroll = false;
 			if (initialLoad) {
 				initialLoad = false;
@@ -1312,32 +1470,69 @@
 				if (mergedResult.shouldScroll) shouldScroll = true;
 			}
 			let activityPage = newActivity;
-			while (activityPage.events.length > 0) {
-				const known = new Set(activityEvents.map(event => event.id));
-				activityEvents = [
-					...activityEvents,
-					...activityPage.events.filter(event => !known.has(event.id)),
-				];
-				lastActivityEventId = activityEvents.at(-1)?.id ?? lastActivityEventId;
-				shouldScroll = true;
-				if (!activityPage.has_more_after || !lastActivityEventId || disposed || taskId !== id) break;
-				activityPage = await tasks.activity(id, { after: lastActivityEventId });
+			if (activityPage.events.length > 0) {
+				const known = new Set(activityEvents.map((event) => event.id));
+				const appended: SessionEvent[] = [];
+				let cursor = lastActivityEventId;
+				while (activityPage.events.length > 0) {
+					for (const event of activityPage.events) {
+						if (!known.has(event.id)) {
+							known.add(event.id);
+							appended.push(event);
+						}
+						if (event.id > cursor) cursor = event.id;
+					}
+					if (!activityPage.has_more_after || !cursor || disposed || taskId !== id) break;
+					activityPage = await tasks.activity(id, { after: cursor });
+				}
+				if (disposed || taskId !== id) return;
+				if (appended.length > 0) {
+					let nextEvents = [...activityEvents, ...appended];
+					if (oldestContiguousActivityId === null && nextEvents.length > 0) {
+						oldestContiguousActivityId = nextEvents[0].id;
+					}
+					if (followLatest && !userLoadedEarlierActivity) {
+						const trimmedResult = trimLiveActivityEvents(nextEvents);
+						nextEvents = trimmedResult.events;
+						if (trimmedResult.trimmed) {
+							hasEarlierActivity = true;
+							oldestContiguousActivityId = trimmedResult.oldestContiguousId;
+						}
+					}
+					activityEvents = nextEvents;
+					lastActivityEventId = Math.max(cursor, nextEvents.at(-1)?.id ?? lastActivityEventId);
+					shouldScroll = true;
+				}
 			}
+			const activeAfterPoll = isTaskOrDelegatesActive();
+			if (!activeAfterPoll) lastTerminalCheckAt = Date.now();
 			if (newTask.agent_id) {
-				void refreshWorkspaceGit(newTask.agent_id);
-				const latestCommandEvents = await sessions.events(newTask.agent_id, {
-					eventType: 'available_commands',
-					limit: 1,
-				}).catch((err) => {
-					if (isTransientRefreshError(err)) throw err;
-					return [];
-				});
-				if (task?.id !== id || task.agent_id !== newTask.agent_id) return;
-				const newestCommandId = latestCommandEvents.at(-1)?.id ?? 0;
-				if (latestCommandEvents.length > 0 && newestCommandId !== lastCommandsEventId) {
-					sessionEvents = latestCommandEvents;
-					lastCommandsEventId = newestCommandId;
-					refreshHarnessControls(sessionEvents, newTask.agent_id);
+				const justFinished = wasActiveBeforePoll && !activeAfterPoll;
+				const activeOrJustFinished = wasActiveBeforePoll || activeAfterPoll;
+				if (activeOrJustFinished || !workspaceGit) {
+					void refreshWorkspaceGit(newTask.agent_id, justFinished);
+				}
+				const shouldRefreshCommands =
+					lastCommandsEventId === 0
+					|| !changedDomains
+					|| changedDomains.has('sessions')
+					|| changedDomains.has('agents');
+				if (shouldRefreshCommands && (activeOrJustFinished || lastCommandsEventId === 0)) {
+					const latestCommandEvents = await sessions.events(newTask.agent_id, {
+						eventType: 'available_commands',
+						limit: 1,
+					}).catch((err) => {
+						if (isTransientRefreshError(err)) throw err;
+						console.warn(`Failed to load available commands for agent ${newTask.agent_id}:`, err);
+						return [];
+					});
+					if (disposed || task?.id !== id || task.agent_id !== newTask.agent_id) return;
+					const newestCommandId = latestCommandEvents.at(-1)?.id ?? 0;
+					if (latestCommandEvents.length > 0 && newestCommandId !== lastCommandsEventId) {
+						sessionEvents = latestCommandEvents;
+						lastCommandsEventId = newestCommandId;
+						refreshHarnessControls(sessionEvents, newTask.agent_id);
+					}
 				}
 			}
 			if (shouldScroll) scrollToBottom();
@@ -1349,18 +1544,22 @@
 	}
 
 	async function loadEarlierActivity() {
-		const oldestId = activityEvents.at(0)?.id;
+		const oldestId = oldestContiguousActivityId ?? activityEvents.at(0)?.id;
 		if (!oldestId || loadingEarlierActivity || !hasEarlierActivity) return;
+		userLoadedEarlierActivity = true;
 		loadingEarlierActivity = true;
 		const previousHeight = messagesEl?.scrollHeight ?? 0;
 		const previousTop = messagesEl?.scrollTop ?? 0;
 		try {
 			const older = await tasks.activity(taskId, { before: oldestId });
 			const known = new Set(activityEvents.map((event) => event.id));
-			activityEvents = [
-				...older.events.filter((event) => !known.has(event.id)),
-				...activityEvents,
-			];
+			const added = older.events.filter((event) => !known.has(event.id));
+			if (added.length > 0) {
+				activityEvents = [...added, ...activityEvents].sort((left, right) => left.id - right.id);
+			}
+			if (older.events.length > 0) {
+				oldestContiguousActivityId = older.events[0].id;
+			}
 			hasEarlierActivity = older.has_more_before;
 			requestAnimationFrame(() => requestAnimationFrame(() => {
 				if (!messagesEl) return;
@@ -1394,14 +1593,23 @@
 		}
 		followLatest = true;
 		showJumpToLatest = false;
-		setTimeout(() => {
-			if (!messagesEl) return;
+		if (scrollTimer !== null) clearTimeout(scrollTimer);
+		scrollTimer = setTimeout(() => {
+			scrollTimer = null;
+			if (disposed || !messagesEl) return;
 			messagesEl.scrollTop = messagesEl.scrollHeight;
 			lastTranscriptScrollTop = messagesEl.scrollTop;
 		}, 50);
 	}
 
 	function jumpToLatest() {
+		userLoadedEarlierActivity = false;
+		const trimmedResult = trimLiveActivityEvents(activityEvents);
+		if (trimmedResult.trimmed) {
+			activityEvents = trimmedResult.events;
+			hasEarlierActivity = true;
+			oldestContiguousActivityId = trimmedResult.oldestContiguousId;
+		}
 		scrollToBottom(true);
 	}
 
@@ -1823,7 +2031,7 @@
 					</div>
 				{/if}
 
-				<DelegatedWorkPanel items={delegatedWork} agents={agentList} />
+				<DelegatedWorkPanel items={delegatedWork} agents={agentList} active={showDetailsSidebar || detailsSheetOpen} />
 
 				{#if current.parent_task_id}
 					<div class="space-y-2">

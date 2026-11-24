@@ -1,5 +1,7 @@
 <script lang="ts">
+	import { onDestroy } from 'svelte';
 	import { workspaces, type LiveConfig, type WorkspaceRepositoryStatus } from '$lib/api';
+	import { useReportPaneRetainState } from '$lib/liveUpdates';
 	import DirectoryPicker from '$lib/components/DirectoryPicker.svelte';
 	import EnvironmentPorts from '$lib/components/EnvironmentPorts.svelte';
 
@@ -10,6 +12,7 @@
 	}
 
 	let { agentId, agentConfig, onSave }: Props = $props();
+	const reportPaneRetainState = useReportPaneRetainState();
 	let newVolumePath = $state('');
 	let saving = $state(false);
 	let error = $state('');
@@ -21,6 +24,14 @@
 	let repositoryRequest = 0;
 
 	let rawVolumes = $derived(agentConfig?.volumes ?? []);
+
+	$effect(() => {
+		reportPaneRetainState(Boolean(newVolumePath.trim()) || showFolderPicker);
+	});
+
+	onDestroy(() => {
+		reportPaneRetainState(false);
+	});
 
 	$effect(() => {
 		const requestedAgent = agentId;

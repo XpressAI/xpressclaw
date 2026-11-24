@@ -1,8 +1,8 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
-	import { onMount } from 'svelte';
+	import { onDestroy, onMount } from 'svelte';
 	import { agents, conversations, projects, tasks, type Agent, type Conversation, type Project, type Task } from '$lib/api';
-	import { isTransientRefreshError, subscribeLiveUpdates, usePaneActive } from '$lib/liveUpdates';
+	import { isTransientRefreshError, subscribeLiveUpdates, usePaneActive, useReportPaneRetainState } from '$lib/liveUpdates';
 	import { PROJECT_MUTATION_EVENT, publishProjectMutation, type ProjectMutation } from '$lib/projectEvents';
 	import { agentRuntimeSummary, harnessMark, timeAgo } from '$lib/utils';
 	import AgentLoading from '$lib/components/AgentLoading.svelte';
@@ -11,6 +11,7 @@
 
 	let { projectId }: { projectId: string } = $props();
 	const paneActive = usePaneActive();
+	const reportPaneRetainState = useReportPaneRetainState();
 	let project = $state<Project | null>(null);
 	let projectConversations = $state<Conversation[]>([]);
 	let agentList = $state<Agent[]>([]);
@@ -32,6 +33,20 @@
 
 	let projectAgents = $derived(agentList.filter((agent) => agent.project_id === projectId));
 	let availableAgents = $derived(agentList.filter((agent) => agent.project_id !== projectId));
+
+	$effect(() => {
+		const hasUnsavedState =
+			creatingConversation
+			|| Boolean(conversationTitle.trim())
+			|| addingAgent
+			|| showingProjectSettings
+			|| showingStorage;
+		reportPaneRetainState(hasUnsavedState);
+	});
+
+	onDestroy(() => {
+		reportPaneRetainState(false);
+	});
 
 	onMount(() => {
 		const handleProjectMutation = (event: Event) => {

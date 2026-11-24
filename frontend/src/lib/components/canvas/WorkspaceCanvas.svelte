@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onDestroy, onMount, untrack } from 'svelte';
 	import {
 		Bot,
 		Code2,
@@ -9,6 +9,7 @@
 		GitBranch,
 		Globe,
 		Grid3x3,
+		GripVertical,
 		Image as ImageIcon,
 		LayoutGrid,
 		Map as MapIcon,
@@ -43,13 +44,14 @@
 		seedCanvasNodes,
 		snapCoordinate,
 		tidyCanvasLayout,
+		tidyFilteredCanvasNodes,
 		type CanvasCamera,
 		type CanvasLinkPreviewTarget,
 		type CanvasNode,
 		type CanvasNodeKind,
 		type CanvasState,
 	} from '$lib/canvas';
-	import { createWorkspaceTab, describeWorkspacePath } from '$lib/workspace';
+	import { createWorkspaceTab, describeWorkspacePath, type WorkspaceTab } from '$lib/workspace';
 	import WorkspaceContent from '$lib/components/workspace/WorkspaceContent.svelte';
 	import CanvasWindow from './CanvasWindow.svelte';
 	import CanvasProjectCard from './CanvasProjectCard.svelte';
@@ -106,8 +108,14 @@
 	let addMenuOpen = $state(false);
 	let addSearch = $state('');
 	let activeProjectFilter = $state<string | null>(null);
+	let activeZoneDrag = $state<{ projectId: string; dx: number; dy: number } | null>(null);
 	let seenDelegatedTaskIds = new Set<string>();
-	const dirtyEditorIds = new Set<string>();
+	let dirtyEditorIds = $state<Record<string, boolean>>({});
+	let retainedNodeIds = $state<Record<string, boolean>>({});
+	let activeInteractionCleanup: (() => void) | null = null;
+	let persistTimer: ReturnType<typeof setTimeout> | null = null;
+	let visibilityNotifyTimer: ReturnType<typeof setTimeout> | null = null;
+	const workspaceTabCache = new Map<string, WorkspaceTab>();
 
 	interface LinkPopoverState {
 		id: number;
@@ -131,8 +139,72 @@
 	let taskById = $derived(new Map(tasks.map((task) => [task.id, task])));
 	let nodeById = $derived(new Map(nodes.map((node) => [node.id, node])));
 
-	let edges = $derived(deriveCanvasEdges(nodes, tasks, agents, conversations));
-	let projectZones = $derived(computeProjectZones(nodes, projects));
+	function resolveNodeProjectId(node: CanvasNode): string | null {
+		if (node.projectId) return node.projectId;
+		if (node.kind === 'task' && node.taskId) {
+			return inferTaskProjectId(taskById.get(node.taskId), agentById, conversationById);
+		}
+		if (node.kind === 'conversation' && node.conversationId) {
+			return conversationById.get(node.conversationId)?.project_id ?? null;
+		}
+		if (node.agentId) {
+			return agentById.get(node.agentId)?.project_id ?? null;
+		}
+		return null;
+	}
+
+	let visibleNodes = $derived(
+		activeProjectFilter === null
+			? nodes
+			: nodes.filter((node) => resolveNodeProjectId(node) === activeProjectFilter)
+	);
+	// Unmount clean non-selected project windows to free DOM/timers/observers/network,
+	// while keeping any window with unsaved local state (dirty editors, attachments,
+	// open edit/task forms, elicitation drafts) hidden in the background so work is never lost.
+	let renderedNodes = $derived(
+		activeProjectFilter === null
+			? nodes
+			: nodes.filter(
+				(node) => resolveNodeProjectId(node) === activeProjectFilter
+					|| (node.kind === 'editor' && Boolean(dirtyEditorIds[node.id]))
+					|| Boolean(retainedNodeIds[node.id])
+			)
+	);
+	let visibleNodeById = $derived(new Map(visibleNodes.map((node) => [node.id, node])));
+	let activeProject = $derived(activeProjectFilter ? projectById.get(activeProjectFilter) ?? null : null);
+
+	let edges = $derived(deriveCanvasEdges(visibleNodes, tasks, agents, conversations));
+	let projectZones = $derived(computeProjectZones(visibleNodes, projects));
+
+	let projectNodeCounts = $derived((() => {
+		const counts = new Map<string, number>();
+		for (const node of nodes) {
+			const pid = resolveNodeProjectId(node);
+			if (pid) counts.set(pid, (counts.get(pid) ?? 0) + 1);
+		}
+		return counts;
+	})());
+
+	let projectStatusById = $derived((() => {
+		const rank: Record<string, number> = { ready: 0, running: 1, waiting_for_input: 2, blocked: 3 };
+		const map = new Map<string, string>();
+		for (const task of tasks) {
+			if (['completed', 'cancelled'].includes(task.status)) continue;
+			const pid = inferTaskProjectId(task, agentById, conversationById);
+			if (!pid) continue;
+			const state = task.activity_status ?? task.status;
+			const next = ['failed', 'error', 'blocked'].includes(state)
+				? 'blocked'
+				: state === 'waiting_for_input'
+					? 'waiting_for_input'
+					: ['running', 'in_progress', 'preparing'].includes(state)
+						? 'running'
+						: 'ready';
+			const prev = map.get(pid) ?? 'ready';
+			if ((rank[next] ?? 0) > (rank[prev] ?? 0)) map.set(pid, next);
+		}
+		return map;
+	})());
 
 	let delegatedByParentTask = $derived((() => {
 		const map = new Map<string, Task[]>();
@@ -145,6 +217,102 @@
 		return map;
 	})());
 
+	let visibleWorldBounds = $derived((() => {
+		const margin = 240 / Math.max(0.1, camera.zoom);
+		return {
+			minX: -camera.x / camera.zoom - margin,
+			minY: -camera.y / camera.zoom - margin,
+			maxX: (viewportWidth - camera.x) / camera.zoom + margin,
+			maxY: (viewportHeight - camera.y) / camera.zoom + margin,
+		};
+	})());
+
+	function isNodeNearViewport(node: CanvasNode): boolean {
+		const height = nodeVisualHeight(node);
+		return node.x + node.width >= visibleWorldBounds.minX
+			&& node.x <= visibleWorldBounds.maxX
+			&& node.y + height >= visibleWorldBounds.minY
+			&& node.y <= visibleWorldBounds.maxY;
+	}
+
+	function workspaceTabFor(route: string): WorkspaceTab {
+		let cached = workspaceTabCache.get(route);
+		if (!cached) {
+			cached = createWorkspaceTab(route);
+			workspaceTabCache.set(route, cached);
+		}
+		return cached;
+	}
+
+	function scheduleVisibilityRefresh(immediate = false) {
+		if (visibilityNotifyTimer !== null) {
+			clearTimeout(visibilityNotifyTimer);
+			visibilityNotifyTimer = null;
+		}
+		if (immediate) {
+			notifyLiveUpdatesVisibilityChanged();
+			return;
+		}
+		visibilityNotifyTimer = setTimeout(() => {
+			visibilityNotifyTimer = null;
+			notifyLiveUpdatesVisibilityChanged();
+		}, 180);
+	}
+
+	let activeNodeSignature = $derived(
+		!visible
+			? ''
+			: renderedNodes
+				.filter((node) => {
+					const nodeHidden = activeProjectFilter !== null && resolveNodeProjectId(node) !== activeProjectFilter;
+					return !nodeHidden && !node.collapsed && (focusedNodeId === node.id || isNodeNearViewport(node));
+				})
+				.map((node) => node.id)
+				.join(',')
+	);
+
+	$effect(() => {
+		// Notify live-update subscribers whenever the active window set changes
+		// (pan, zoom, drag, group drag, resize, expand/collapse, tidy, filter, focus, or tab switch).
+		void activeNodeSignature;
+		scheduleVisibilityRefresh(!visible);
+	});
+
+	$effect(() => {
+		// Keep memoized WorkspaceTab cache bounded to routes currently present in nodes.
+		const activeRoutes = new Set<string>();
+		for (const node of nodes) {
+			if (node.route) activeRoutes.add(node.route);
+		}
+		for (const route of workspaceTabCache.keys()) {
+			if (!activeRoutes.has(route)) workspaceTabCache.delete(route);
+		}
+	});
+
+	$effect(() => {
+		// Reset stale project filter if the filtered project was deleted.
+		if (initialized && activeProjectFilter !== null && projects.length > 0 && !projectById.has(activeProjectFilter)) {
+			activeProjectFilter = null;
+			persist();
+		}
+	});
+
+	$effect(() => {
+		// Keep seenDelegatedTaskIds bounded over multi-hour sessions.
+		// Read reactive props before the size guard so Svelte tracks updates.
+		const currentTasks = tasks;
+		const currentNodes = nodes;
+		if (seenDelegatedTaskIds.size <= 200) return;
+		const keep = new Set<string>();
+		for (const task of currentTasks) keep.add(task.id);
+		for (const node of currentNodes) {
+			if (node.taskId) keep.add(node.taskId);
+		}
+		for (const id of seenDelegatedTaskIds) {
+			if (!keep.has(id)) seenDelegatedTaskIds.delete(id);
+		}
+	});
+
 	let gridPixelSize = $derived(Math.max(12, CANVAS_GRID_SIZE * camera.zoom));
 	let filteredAddTasks = $derived(
 		tasks
@@ -152,7 +320,7 @@
 			.slice(0, 8)
 	);
 
-	// Minimap world bounds.
+	// Minimap world bounds (scoped to visible nodes when a project filter is active).
 	let minimapMetrics = $derived((() => {
 		const mapW = 196;
 		const mapH = 128;
@@ -160,7 +328,7 @@
 		let minY = -camera.y / camera.zoom;
 		let maxX = (viewportWidth - camera.x) / camera.zoom;
 		let maxY = (viewportHeight - camera.y) / camera.zoom;
-		for (const node of nodes) {
+		for (const node of visibleNodes) {
 			minX = Math.min(minX, node.x - 120);
 			minY = Math.min(minY, node.y - 120);
 			maxX = Math.max(maxX, node.x + node.width + 120);
@@ -174,10 +342,36 @@
 
 	function activeStorage(): Storage | null {
 		if (storage) return storage;
-		try { return localStorage; } catch { return null; }
+		try {
+			return localStorage;
+		} catch (err) {
+			console.warn('Canvas storage is unavailable:', err);
+			return null;
+		}
+	}
+
+	function flushPersist() {
+		if (persistTimer !== null) {
+			clearTimeout(persistTimer);
+			persistTimer = null;
+			persist();
+		}
+	}
+
+	function schedulePersist(delayMs = 250) {
+		if (!initialized) return;
+		if (persistTimer !== null) clearTimeout(persistTimer);
+		persistTimer = setTimeout(() => {
+			persistTimer = null;
+			persist();
+		}, delayMs);
 	}
 
 	function persist() {
+		if (persistTimer !== null) {
+			clearTimeout(persistTimer);
+			persistTimer = null;
+		}
 		if (!initialized) return;
 		const target = activeStorage();
 		if (!target) return;
@@ -185,14 +379,27 @@
 			nodes,
 			camera,
 			focusedNodeId,
+			activeProjectFilter,
 			snapToGrid,
 			showMinimap,
 			autoPinDelegated,
 		};
 		try {
 			target.setItem(storageKey, JSON.stringify(state));
-		} catch {}
+		} catch (err) {
+			console.warn(`Failed to persist canvas state under ${storageKey}:`, err);
+		}
 	}
+
+	onDestroy(() => {
+		activeInteractionCleanup?.();
+		activeInteractionCleanup = null;
+		if (visibilityNotifyTimer !== null) {
+			clearTimeout(visibilityNotifyTimer);
+			visibilityNotifyTimer = null;
+		}
+		flushPersist();
+	});
 
 	onMount(() => {
 		try {
@@ -203,13 +410,16 @@
 					nodes = restored.nodes;
 					camera = restored.camera;
 					focusedNodeId = restored.focusedNodeId;
+					activeProjectFilter = restored.activeProjectFilter ?? null;
 					snapToGrid = restored.snapToGrid;
 					showMinimap = restored.showMinimap;
 					autoPinDelegated = restored.autoPinDelegated;
 					seededOnce = restored.nodes.length > 0;
 				}
 			}
-		} catch {}
+		} catch (err) {
+			console.warn(`Failed to restore canvas state from ${storageKey}:`, err);
+		}
 		initialized = true;
 
 		const observer = new ResizeObserver(() => {
@@ -245,8 +455,11 @@
 		const handleKeyUp = (event: KeyboardEvent) => {
 			if (event.code === 'Space') spacePressed = false;
 		};
+		const handleBeforeUnload = () => flushPersist();
 		window.addEventListener('keydown', handleKeyDown);
 		window.addEventListener('keyup', handleKeyUp);
+		window.addEventListener('beforeunload', handleBeforeUnload);
+		window.addEventListener('pagehide', handleBeforeUnload);
 		const el = viewportEl;
 		el?.addEventListener('click', handleCanvasClick);
 
@@ -254,6 +467,8 @@
 			observer.disconnect();
 			window.removeEventListener('keydown', handleKeyDown);
 			window.removeEventListener('keyup', handleKeyUp);
+			window.removeEventListener('beforeunload', handleBeforeUnload);
+			window.removeEventListener('pagehide', handleBeforeUnload);
 			el?.removeEventListener('click', handleCanvasClick);
 		};
 	});
@@ -382,17 +597,23 @@
 	}
 
 	function fitAll() {
-		camera = computeFitCamera(nodes, viewportWidth, viewportHeight);
+		camera = computeFitCamera(visibleNodes, viewportWidth, viewportHeight);
 		persist();
 	}
 
 	function tidyLayout() {
-		nodes = tidyCanvasLayout(nodes, tasks, projects);
-		camera = computeFitCamera(nodes, viewportWidth, viewportHeight);
+		if (activeProjectFilter === null) {
+			nodes = tidyCanvasLayout(nodes, tasks, projects);
+			camera = computeFitCamera(nodes, viewportWidth, viewportHeight);
+		} else {
+			const result = tidyFilteredCanvasNodes(nodes, visibleNodes, tasks, projects, snapToGrid);
+			nodes = result.nodes;
+			camera = computeFitCamera(result.tidiedVisible, viewportWidth, viewportHeight);
+		}
 		persist();
 	}
 
-	function zoomBy(factor: number, clientX?: number, clientY?: number) {
+	function zoomBy(factor: number, clientX?: number, clientY?: number, immediatePersist = true) {
 		const nextZoom = clampZoom(camera.zoom * factor);
 		if (nextZoom === camera.zoom) return;
 		const rect = viewportEl?.getBoundingClientRect();
@@ -405,7 +626,8 @@
 			x: Math.round(px - worldX * nextZoom),
 			y: Math.round(py - worldY * nextZoom),
 		};
-		persist();
+		if (immediatePersist) persist();
+		else schedulePersist();
 	}
 
 	function resetZoom() {
@@ -415,6 +637,7 @@
 	function startPan(event: PointerEvent) {
 		event.preventDefault();
 		event.stopPropagation();
+		activeInteractionCleanup?.();
 		addMenuOpen = false;
 		linkPopover = null;
 		panning = true;
@@ -422,24 +645,106 @@
 		const startY = event.clientY;
 		const originX = camera.x;
 		const originY = camera.y;
+		let latestX = originX;
+		let latestY = originY;
+		let frame = 0;
 
-		const move = (moveEvent: PointerEvent) => {
-			camera = {
-				...camera,
-				x: Math.round(originX + (moveEvent.clientX - startX)),
-				y: Math.round(originY + (moveEvent.clientY - startY)),
-			};
+		const flush = () => {
+			frame = 0;
+			camera = { ...camera, x: latestX, y: latestY };
 		};
-		const up = () => {
+		const move = (moveEvent: PointerEvent) => {
+			latestX = Math.round(originX + (moveEvent.clientX - startX));
+			latestY = Math.round(originY + (moveEvent.clientY - startY));
+			if (!frame) frame = requestAnimationFrame(flush);
+		};
+		const teardown = (commit: boolean) => {
+			if (frame) {
+				cancelAnimationFrame(frame);
+				frame = 0;
+			}
 			panning = false;
 			window.removeEventListener('pointermove', move);
 			window.removeEventListener('pointerup', up);
 			window.removeEventListener('pointercancel', up);
-			persist();
+			if (activeInteractionCleanup === abort) activeInteractionCleanup = null;
+			if (commit) {
+				camera = { ...camera, x: latestX, y: latestY };
+				persist();
+			}
 		};
+		const up = () => teardown(true);
+		const abort = () => teardown(false);
+		activeInteractionCleanup = abort;
 		window.addEventListener('pointermove', move);
 		window.addEventListener('pointerup', up);
 		window.addEventListener('pointercancel', up);
+	}
+
+	function startZoneDrag(projectId: string, event: PointerEvent) {
+		if (event.button !== 0 || spacePressed || panning) return;
+		event.preventDefault();
+		event.stopPropagation();
+		activeInteractionCleanup?.();
+		addMenuOpen = false;
+		linkPopover = null;
+
+		const movedIds = new Set(
+			visibleNodes
+				.filter((node) => resolveNodeProjectId(node) === projectId)
+				.map((node) => node.id)
+		);
+		if (movedIds.size === 0) return;
+
+		const startClientX = event.clientX;
+		const startClientY = event.clientY;
+		const startZoom = camera.zoom;
+		let latestDx = 0;
+		let latestDy = 0;
+		let frame = 0;
+		activeZoneDrag = { projectId, dx: 0, dy: 0 };
+
+		const flush = () => {
+			frame = 0;
+			activeZoneDrag = { projectId, dx: Math.round(latestDx), dy: Math.round(latestDy) };
+		};
+		const move = (moveEvent: PointerEvent) => {
+			latestDx = (moveEvent.clientX - startClientX) / startZoom;
+			latestDy = (moveEvent.clientY - startClientY) / startZoom;
+			if (!frame) frame = requestAnimationFrame(flush);
+		};
+		const teardown = (commit: boolean) => {
+			if (frame) {
+				cancelAnimationFrame(frame);
+				frame = 0;
+			}
+			window.removeEventListener('pointermove', move);
+			window.removeEventListener('pointerup', up);
+			window.removeEventListener('pointercancel', up);
+			if (activeInteractionCleanup === abort) activeInteractionCleanup = null;
+			activeZoneDrag = null;
+			if (!commit) return;
+			const finalDx = snapCoordinate(latestDx, snapToGrid);
+			const finalDy = snapCoordinate(latestDy, snapToGrid);
+			if (finalDx === 0 && finalDy === 0) return;
+			nodes = nodes.map((node) =>
+				movedIds.has(node.id)
+					? { ...node, x: node.x + finalDx, y: node.y + finalDy }
+					: node
+			);
+			persist();
+		};
+		const up = () => teardown(true);
+		const abort = () => teardown(false);
+		activeInteractionCleanup = abort;
+		window.addEventListener('pointermove', move);
+		window.addEventListener('pointerup', up);
+		window.addEventListener('pointercancel', up);
+	}
+
+	function effectiveNodePosition(node: CanvasNode): CanvasNode {
+		if (!activeZoneDrag || resolveNodeProjectId(node) !== activeZoneDrag.projectId) return node;
+		return { ...node, x: node.x + activeZoneDrag.dx, y: node.y + activeZoneDrag.dy };
 	}
 
 	function handleCapturePointerDown(event: PointerEvent) {
@@ -462,13 +767,22 @@
 		startPan(event);
 	}
 
+	function handleMinimapWheel(event: WheelEvent) {
+		event.preventDefault();
+		event.stopPropagation();
+		linkPopover = null;
+		if (event.deltaY === 0) return;
+		const factor = event.deltaY < 0 ? 1.1 : 1 / 1.1;
+		zoomBy(factor, undefined, undefined, false);
+	}
+
 	function handleWheel(event: WheelEvent) {
 		// Zoom on Ctrl/Cmd+wheel (and trackpad pinch) anywhere over the canvas.
 		if (event.ctrlKey || event.metaKey) {
 			event.preventDefault();
 			linkPopover = null;
 			const factor = event.deltaY < 0 ? 1.1 : 1 / 1.1;
-			zoomBy(factor, event.clientX, event.clientY);
+			zoomBy(factor, event.clientX, event.clientY, false);
 			return;
 		}
 		// Only pan with wheel when hovering the empty canvas background so scrolling
@@ -482,7 +796,7 @@
 			x: Math.round(camera.x - event.deltaX),
 			y: Math.round(camera.y - event.deltaY),
 		};
-		persist();
+		schedulePersist();
 	}
 
 	async function loadWorkspaceRoots(agentId: string): Promise<string[]> {
@@ -688,33 +1002,79 @@
 	}
 
 	function setEditorDirty(id: string, dirty: boolean) {
-		if (dirty) dirtyEditorIds.add(id);
-		else dirtyEditorIds.delete(id);
+		untrack(() => {
+			if (dirty) {
+				if (!dirtyEditorIds[id]) dirtyEditorIds = { ...dirtyEditorIds, [id]: true };
+			} else if (dirtyEditorIds[id]) {
+				const next = { ...dirtyEditorIds };
+				delete next[id];
+				dirtyEditorIds = next;
+			}
+		});
+	}
+
+	function setNodeRetained(id: string, retained: boolean) {
+		untrack(() => {
+			if (retained) {
+				if (!retainedNodeIds[id]) retainedNodeIds = { ...retainedNodeIds, [id]: true };
+			} else if (retainedNodeIds[id]) {
+				const next = { ...retainedNodeIds };
+				delete next[id];
+				retainedNodeIds = next;
+			}
+		});
+	}
+
+	function ensureFilterShowsProject(projectId: string | null) {
+		if (activeProjectFilter === null || projectId === activeProjectFilter) return;
+		activeProjectFilter = projectId;
 	}
 
 	function closeNode(id: string) {
-		if (dirtyEditorIds.has(id)) {
+		if (dirtyEditorIds[id]) {
 			const target = nodeById.get(id);
 			const label = target?.filePath || target?.title || 'this editor';
 			if (!window.confirm(`Discard unsaved changes in ${label}?`)) return;
 		}
-		dirtyEditorIds.delete(id);
+		setEditorDirty(id, false);
+		setNodeRetained(id, false);
 		nodes = nodes.filter((node) => node.id !== id).map((node) => node.parentId === id ? { ...node, parentId: null } : node);
-		if (focusedNodeId === id) focusedNodeId = nodes.at(-1)?.id ?? null;
+		if (focusedNodeId === id) focusedNodeId = visibleNodes.at(-1)?.id ?? nodes.at(-1)?.id ?? null;
 		persist();
 	}
 
 	function clearCanvas() {
-		const dirtyNodes = nodes.filter((node) => node.kind === 'editor' && dirtyEditorIds.has(node.id));
-		if (dirtyNodes.length > 0) {
-			const message = dirtyNodes.length === 1
-				? `Discard unsaved changes in ${dirtyNodes[0].filePath || dirtyNodes[0].title || '1 editor'} and clear the canvas?`
-				: `Discard unsaved changes in ${dirtyNodes.length} editors and clear the canvas?`;
+		const targetNodes = activeProjectFilter === null ? nodes : visibleNodes;
+		if (targetNodes.length === 0) return;
+		const targetIds = new Set(targetNodes.map((node) => node.id));
+		const scopeLabel = activeProject ? `${activeProject.name}` : 'the canvas';
+		const dirtyEditors = targetNodes.filter((node) => node.kind === 'editor' && Boolean(dirtyEditorIds[node.id]));
+		const unsavedOthers = targetNodes.filter((node) => node.kind !== 'editor' && Boolean(retainedNodeIds[node.id]));
+		if (dirtyEditors.length > 0) {
+			const message = dirtyEditors.length === 1
+				? `Discard unsaved changes in ${dirtyEditors[0].filePath || dirtyEditors[0].title || '1 editor'} and clear ${scopeLabel}?`
+				: `Discard unsaved changes in ${dirtyEditors.length} editors and clear ${scopeLabel}?`;
+			if (!window.confirm(message)) return;
+		} else if (unsavedOthers.length > 0) {
+			const message = unsavedOthers.length === 1
+				? `Discard unsaved form or attachment state in ${unsavedOthers[0].title} and clear ${scopeLabel}?`
+				: `Discard unsaved form or attachment state in ${unsavedOthers.length} windows and clear ${scopeLabel}?`;
 			if (!window.confirm(message)) return;
 		}
-		dirtyEditorIds.clear();
-		nodes = [];
-		focusedNodeId = null;
+		const nextDirty = { ...dirtyEditorIds };
+		const nextRetained = { ...retainedNodeIds };
+		for (const id of targetIds) {
+			delete nextDirty[id];
+			delete nextRetained[id];
+		}
+		dirtyEditorIds = nextDirty;
+		retainedNodeIds = nextRetained;
+		nodes = nodes
+			.filter((node) => !targetIds.has(node.id))
+			.map((node) => node.parentId && targetIds.has(node.parentId) ? { ...node, parentId: null } : node);
+		if (focusedNodeId && targetIds.has(focusedNodeId)) {
+			focusedNodeId = visibleNodes.at(-1)?.id ?? nodes.at(-1)?.id ?? null;
+		}
 		persist();
 	}
 
@@ -725,12 +1085,14 @@
 	): CanvasNode {
 		const existing = nodes.find(matcher);
 		if (existing) {
+			if (center) ensureFilterShowsProject(resolveNodeProjectId(existing));
 			if (existing.collapsed) updateNode(existing.id, { collapsed: false });
 			if (center) centerOnNode(existing);
 			else bringToFront(existing.id);
 			return existing;
 		}
 		const created = createCanvasNode(partial, nodes, viewportCenterWorld());
+		if (center) ensureFilterShowsProject(resolveNodeProjectId(created));
 		nodes = [...nodes, created];
 		focusedNodeId = created.id;
 		if (center) {
@@ -742,7 +1104,6 @@
 
 	function spawnProjectNode(project: Project) {
 		addMenuOpen = false;
-		activeProjectFilter = project.id;
 		addOrFocusNode(
 			(node) => node.kind === 'project' && node.projectId === project.id,
 			{
@@ -804,6 +1165,7 @@
 		const targetRoute = route || `/agents/${encodeURIComponent(agent.id)}`;
 		const existing = nodes.find((node) => node.kind === 'agent' && node.agentId === agent.id);
 		if (existing) {
+			ensureFilterShowsProject(resolveNodeProjectId(existing));
 			const patch: Partial<CanvasNode> = {};
 			if (existing.collapsed) patch.collapsed = false;
 			if (route && existing.route !== targetRoute) patch.route = targetRoute;
@@ -863,6 +1225,7 @@
 		// Deduplicate editor/image/app windows targeting the exact same file or URL if already open.
 		const focusExisting = (existing: CanvasNode | undefined): boolean => {
 			if (!existing) return false;
+			ensureFilterShowsProject(resolveNodeProjectId(existing));
 			if (existing.collapsed) updateNode(existing.id, { collapsed: false });
 			centerOnNode(existing);
 			return true;
@@ -883,6 +1246,7 @@
 			if (focusExisting(nodes.find((node) => node.kind === 'app' && node.appUrl === options.appUrl))) return;
 		}
 
+		ensureFilterShowsProject(resolvedProjectId);
 		const created = createCanvasNode(
 			{
 				kind,
@@ -941,25 +1305,46 @@
 				existingKeys.add(key);
 			}
 		}
-		nodes = tidyCanvasLayout(nextNodes, tasks, projects);
-		camera = computeFitCamera(nodes, viewportWidth, viewportHeight);
+		if (activeProjectFilter === null) {
+			nodes = tidyCanvasLayout(nextNodes, tasks, projects);
+			camera = computeFitCamera(nodes, viewportWidth, viewportHeight);
+		} else {
+			const filtered = nextNodes.filter((node) => resolveNodeProjectId(node) === activeProjectFilter);
+			const result = tidyFilteredCanvasNodes(nextNodes, filtered, tasks, projects, snapToGrid);
+			nodes = result.nodes;
+			camera = computeFitCamera(result.tidiedVisible, viewportWidth, viewportHeight);
+		}
 		persist();
 	}
 
 	function jumpToProject(projectId: string | null) {
 		activeProjectFilter = projectId;
+		linkPopover = null;
+		addMenuOpen = false;
 		if (!projectId) {
-			fitAll();
+			camera = computeFitCamera(nodes, viewportWidth, viewportHeight);
+			persist();
+			scheduleVisibilityRefresh(true);
 			return;
 		}
-		const projectNodes = nodes.filter((node) => node.projectId === projectId);
+		const projectNodes = nodes.filter((node) => resolveNodeProjectId(node) === projectId);
 		if (projectNodes.length > 0) {
 			camera = computeFitCamera(projectNodes, viewportWidth, viewportHeight);
+			if (!focusedNodeId || !projectNodes.some((node) => node.id === focusedNodeId)) {
+				focusedNodeId = projectNodes.at(-1)?.id ?? null;
+			}
 			persist();
+			scheduleVisibilityRefresh(true);
 			return;
 		}
 		const project = projectById.get(projectId);
-		if (project) spawnProjectNode(project);
+		if (project) {
+			spawnProjectNode(project);
+			scheduleVisibilityRefresh(true);
+			return;
+		}
+		persist();
+		scheduleVisibilityRefresh(true);
 	}
 
 	/** Called by WorkspaceShell when links or sidebar items are activated in Canvas mode. */
@@ -1058,11 +1443,7 @@
 			return agentById.get(node.agentId)?.status ?? null;
 		}
 		if (node.kind === 'project' && node.projectId) {
-			const projectTasks = tasks.filter((task) => inferTaskProjectId(task, agentById, conversationById) === node.projectId && !['completed', 'cancelled'].includes(task.status));
-			if (projectTasks.some((task) => ['failed', 'error', 'blocked'].includes(task.activity_status ?? task.status))) return 'blocked';
-			if (projectTasks.some((task) => (task.activity_status ?? task.status) === 'waiting_for_input')) return 'waiting_for_input';
-			if (projectTasks.some((task) => ['running', 'in_progress', 'preparing'].includes(task.activity_status ?? task.status))) return 'running';
-			return 'ready';
+			return projectStatusById.get(node.projectId) ?? 'ready';
 		}
 		return null;
 	}
@@ -1098,28 +1479,64 @@
 	}
 
 	function minimapNavigate(event: PointerEvent) {
+		if (event.button !== 0) return;
+		activeInteractionCleanup?.();
 		const el = event.currentTarget as HTMLElement;
+		const startRect = el.getBoundingClientRect();
+		// Snapshot minimap bounds at pointerdown so panning the viewport does not
+		// shift the coordinate system underneath the pointer during click/drag.
+		const startMetrics = { ...minimapMetrics };
+		let latestClientX = event.clientX;
+		let latestClientY = event.clientY;
+		let hasPendingMove = false;
+		let frame = 0;
 		const panTo = (clientX: number, clientY: number) => {
-			const rect = el.getBoundingClientRect();
-			const mx = clientX - rect.left - 6;
-			const my = clientY - rect.top - 6;
-			const worldX = minimapMetrics.minX + mx / minimapMetrics.scale;
-			const worldY = minimapMetrics.minY + my / minimapMetrics.scale;
+			const mx = clientX - startRect.left - 6;
+			const my = clientY - startRect.top - 6;
+			const worldX = startMetrics.minX + mx / startMetrics.scale;
+			const worldY = startMetrics.minY + my / startMetrics.scale;
 			camera = {
 				...camera,
 				x: Math.round(viewportWidth / 2 - worldX * camera.zoom),
 				y: Math.round(viewportHeight / 2 - worldY * camera.zoom),
 			};
 		};
-		panTo(event.clientX, event.clientY);
-		const move = (moveEvent: PointerEvent) => panTo(moveEvent.clientX, moveEvent.clientY);
-		const up = () => {
+		panTo(latestClientX, latestClientY);
+		const flush = () => {
+			frame = 0;
+			if (!hasPendingMove) return;
+			hasPendingMove = false;
+			panTo(latestClientX, latestClientY);
+		};
+		const move = (moveEvent: PointerEvent) => {
+			latestClientX = moveEvent.clientX;
+			latestClientY = moveEvent.clientY;
+			hasPendingMove = true;
+			if (!frame) frame = requestAnimationFrame(flush);
+		};
+		const teardown = (commit: boolean) => {
+			if (frame) {
+				cancelAnimationFrame(frame);
+				frame = 0;
+			}
 			window.removeEventListener('pointermove', move);
 			window.removeEventListener('pointerup', up);
-			persist();
+			window.removeEventListener('pointercancel', up);
+			if (activeInteractionCleanup === abort) activeInteractionCleanup = null;
+			if (commit) {
+				if (hasPendingMove) {
+					hasPendingMove = false;
+					panTo(latestClientX, latestClientY);
+				}
+				persist();
+			}
 		};
+		const up = () => teardown(true);
+		const abort = () => teardown(false);
+		activeInteractionCleanup = abort;
 		window.addEventListener('pointermove', move);
 		window.addEventListener('pointerup', up);
+		window.addEventListener('pointercancel', up);
 	}
 
 	function minimapNodeColor(kind: CanvasNodeKind): string {
@@ -1141,6 +1558,7 @@
 	bind:this={viewportEl}
 	data-workspace-canvas
 	data-canvas-zoom={camera.zoom}
+	data-canvas-project-filter={activeProjectFilter ?? 'all'}
 	role="region"
 	aria-label="Spatial workspace canvas"
 	onpointerdowncapture={handleCapturePointerDown}
@@ -1158,20 +1576,25 @@
 		onpointerdown={(event) => event.stopPropagation()}
 		class="pointer-events-auto absolute left-3 right-3 top-3 z-40 flex flex-wrap items-center gap-2"
 	>
-		<!-- Project spatial pills -->
+		<!-- Project spatial pills (selecting a project isolates and deactivates other projects) -->
 		<div class="flex max-w-full items-center gap-1 overflow-x-auto rounded-xl border border-border bg-card/95 p-1 shadow-[var(--shadow-overlay)] backdrop-blur scrollbar-hide">
 			<button
 				type="button"
 				onclick={() => jumpToProject(null)}
+				aria-pressed={activeProjectFilter === null}
+				title="Show all projects on the canvas"
 				class="shrink-0 rounded-lg px-2.5 py-1 text-xs font-medium transition {activeProjectFilter === null ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:bg-accent hover:text-foreground'}"
 			>
 				All Projects
 			</button>
 			{#each projects as project (project.id)}
+				{@const count = projectNodeCounts.get(project.id) ?? 0}
 				<button
 					type="button"
 					onclick={() => jumpToProject(project.id)}
-					class="inline-flex shrink-0 items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs font-medium transition {activeProjectFilter === project.id ? 'bg-accent text-accent-foreground' : 'text-muted-foreground hover:bg-accent/60 hover:text-foreground'}"
+					aria-pressed={activeProjectFilter === project.id}
+					title="Show only {project.name} ({count} window{count === 1 ? '' : 's'}) and hide other projects"
+					class="inline-flex shrink-0 items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs font-medium transition {activeProjectFilter === project.id ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:bg-accent/60 hover:text-foreground'}"
 				>
 					<span>{project.icon || project.name.slice(0, 1).toUpperCase()}</span>
 					<span class="max-w-28 truncate">{project.name}</span>
@@ -1339,13 +1762,13 @@
 				<MapIcon class="h-3.5 w-3.5" />
 			</button>
 
-			{#if nodes.length > 0}
+			{#if visibleNodes.length > 0}
 				<button
 					type="button"
 					onclick={clearCanvas}
 					class="rounded-lg p-1.5 text-muted-foreground hover:bg-destructive/15 hover:text-destructive"
-					title="Clear canvas"
-					aria-label="Clear canvas"
+					title={activeProject ? `Clear ${activeProject.name} windows` : 'Clear canvas'}
+					aria-label={activeProject ? `Clear ${activeProject.name} windows` : 'Clear canvas'}
 				>
 					<Trash2 class="h-3.5 w-3.5" />
 				</button>
@@ -1361,12 +1784,22 @@
 	>
 		<!-- Project spatial zone frames -->
 		{#each projectZones as zone (zone.projectId)}
+			{@const zoneDragging = activeZoneDrag?.projectId === zone.projectId}
 			<div
 				data-canvas-project-zone={zone.projectId}
-				style="left:{zone.x}px;top:{zone.y}px;width:{zone.width}px;height:{zone.height}px;"
-				class="pointer-events-none absolute rounded-2xl border border-dashed border-primary/25 bg-primary/[0.03]"
+				style="left:{zone.x}px;top:{zone.y}px;width:{zone.width}px;height:{zone.height}px;{zoneDragging && activeZoneDrag ? `transform:translate3d(${activeZoneDrag.dx}px,${activeZoneDrag.dy}px,0);` : ''}"
+				class="pointer-events-none absolute rounded-2xl border border-dashed {zoneDragging ? 'border-primary/60 bg-primary/[0.06]' : 'border-primary/25 bg-primary/[0.03]'}"
 			>
-				<div class="inline-flex items-center gap-1.5 rounded-br-xl rounded-tl-2xl border-b border-r border-primary/20 bg-card/85 px-3 py-1 text-xs font-semibold text-foreground shadow-sm">
+				<div
+					role="button"
+					tabindex="-1"
+					data-canvas-zone-drag-handle={zone.projectId}
+					aria-label="Drag {zone.name} group ({zone.nodeCount} windows)"
+					title="Drag to move all {zone.nodeCount} windows in {zone.name}"
+					onpointerdown={(event) => startZoneDrag(zone.projectId, event)}
+					class="pointer-events-auto inline-flex cursor-grab select-none items-center gap-1.5 rounded-br-xl rounded-tl-2xl border-b border-r border-primary/20 bg-card/90 px-3 py-1 text-xs font-semibold text-foreground shadow-sm transition-colors hover:border-primary/50 hover:bg-card active:cursor-grabbing"
+				>
+					<GripVertical class="h-3.5 w-3.5 shrink-0 text-primary/70" aria-hidden="true" />
 					<span>{zone.icon || zone.name.slice(0, 1).toUpperCase()}</span>
 					<span>{zone.name}</span>
 					<span class="text-[10px] font-normal text-muted-foreground">{zone.nodeCount} windows</span>
@@ -1393,9 +1826,11 @@
 				</marker>
 			</defs>
 			{#each edges as edge (edge.id)}
-				{@const from = nodeById.get(edge.fromId)}
-				{@const to = nodeById.get(edge.toId)}
-				{#if from && to}
+				{@const rawFrom = visibleNodeById.get(edge.fromId)}
+				{@const rawTo = visibleNodeById.get(edge.toId)}
+				{#if rawFrom && rawTo}
+					{@const from = effectiveNodePosition(rawFrom)}
+					{@const to = effectiveNodePosition(rawTo)}
 					{@const geometry = bezierEdgePath(from, to)}
 					{@const stroke = edgeStroke(edge.kind, edge.status)}
 					{@const active = edge.kind === 'delegation' && Boolean(edge.status && ['running', 'in_progress', 'preparing'].includes(edge.status))}
@@ -1424,14 +1859,21 @@
 
 		<!-- Floating Spatial Windows -->
 		<div class="pointer-events-auto">
-			{#each nodes as node (node.id)}
+			{#each renderedNodes as node (node.id)}
+				{@const nodeProjId = resolveNodeProjectId(node)}
+				{@const nodeHidden = activeProjectFilter !== null && nodeProjId !== activeProjectFilter}
+				{@const nodeDragOffset = !nodeHidden && activeZoneDrag && nodeProjId === activeZoneDrag.projectId ? { x: activeZoneDrag.dx, y: activeZoneDrag.dy } : null}
+				{@const nodeActive = !nodeHidden && (focusedNodeId === node.id || isNodeNearViewport(node))}
 				{@const delegated = node.kind === 'task' && node.taskId ? (delegatedByParentTask.get(node.taskId)?.length ?? 0) : 0}
 				<CanvasWindow
 					{node}
 					focused={focusedNodeId === node.id}
 					{visible}
+					active={nodeActive}
+					hidden={nodeHidden}
+					dragOffset={nodeDragOffset}
 					zoom={camera.zoom}
-					canvasInteracting={panning || spacePressed}
+					canvasInteracting={panning || spacePressed || activeZoneDrag !== null}
 					status={nodeStatus(node)}
 					contextLabel={nodeContextLabel(node)}
 					delegatedCount={delegated}
@@ -1450,6 +1892,7 @@
 					onCenter={() => centerOnNode(node)}
 					onOpenInTabs={node.route ? () => onOpenInTabs(node.route!) : undefined}
 					onClose={() => closeNode(node.id)}
+					onRetainChange={(retained) => setNodeRetained(node.id, retained)}
 					onSpawnTool={(kind) => spawnToolNode(kind, node.agentId, node.id)}
 					onExpandDelegated={node.taskId ? () => expandDelegatedForTask(node.taskId!, node.id) : undefined}
 				>
@@ -1505,7 +1948,7 @@
 							onOpenEditor={(agentId, filePath, parentId) => spawnToolNode('editor', agentId, parentId, { filePath })}
 						/>
 					{:else if node.route}
-						<WorkspaceContent tab={createWorkspaceTab(node.route)} compact={true} />
+						<WorkspaceContent tab={workspaceTabFor(node.route)} compact={true} />
 					{/if}
 				</CanvasWindow>
 			{/each}
@@ -1513,7 +1956,7 @@
 	</div>
 
 	<!-- Empty canvas onboarding hint -->
-	{#if initialized && nodes.length === 0}
+	{#if initialized && visibleNodes.length === 0}
 		<div
 			role="region"
 			aria-label="Empty canvas actions"
@@ -1521,18 +1964,33 @@
 			onpointerdown={(event) => event.stopPropagation()}
 			class="pointer-events-auto m-auto max-w-md rounded-2xl border border-dashed border-border bg-card/90 p-6 text-center shadow-lg backdrop-blur"
 		>
-			<h2 class="text-sm font-semibold text-foreground">Spatial Canvas Workspace</h2>
-			<p class="mt-1.5 text-xs text-muted-foreground">
-				Arrange Projects, parallel Task chats, Conversations, Code Editors, Terminals, Images, and live Web Apps spatially with visual context links.
-			</p>
-			<div class="mt-4 flex flex-wrap justify-center gap-2">
-				<button type="button" onclick={syncActiveWork} class="rounded-lg bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90">
-					Load Projects & Active Work
-				</button>
-				<button type="button" onclick={() => (addMenuOpen = true)} class="rounded-lg border border-border bg-card px-3 py-1.5 text-xs font-medium hover:bg-accent">
-					Add Window…
-				</button>
-			</div>
+			{#if activeProject}
+				<h2 class="text-sm font-semibold text-foreground">No windows open in {activeProject.name}</h2>
+				<p class="mt-1.5 text-xs text-muted-foreground">
+					Other projects are hidden while filtering to {activeProject.name}. Open this project's hub or return to All Projects.
+				</p>
+				<div class="mt-4 flex flex-wrap justify-center gap-2">
+					<button type="button" onclick={() => spawnProjectNode(activeProject)} class="rounded-lg bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90">
+						Open {activeProject.name} Hub
+					</button>
+					<button type="button" onclick={() => jumpToProject(null)} class="rounded-lg border border-border bg-card px-3 py-1.5 text-xs font-medium hover:bg-accent">
+						Show All Projects
+					</button>
+				</div>
+			{:else}
+				<h2 class="text-sm font-semibold text-foreground">Spatial Canvas Workspace</h2>
+				<p class="mt-1.5 text-xs text-muted-foreground">
+					Arrange Projects, parallel Task chats, Conversations, Code Editors, Terminals, Images, and live Web Apps spatially with visual context links.
+				</p>
+				<div class="mt-4 flex flex-wrap justify-center gap-2">
+					<button type="button" onclick={syncActiveWork} class="rounded-lg bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90">
+						Load Projects & Active Work
+					</button>
+					<button type="button" onclick={() => (addMenuOpen = true)} class="rounded-lg border border-border bg-card px-3 py-1.5 text-xs font-medium hover:bg-accent">
+						Add Window…
+					</button>
+				</div>
+			{/if}
 		</div>
 	{/if}
 
@@ -1652,23 +2110,25 @@
 		data-canvas-hud
 		class="pointer-events-none absolute bottom-3 left-3 z-30 hidden rounded-lg border border-border/80 bg-card/85 px-2.5 py-1 text-[10px] text-muted-foreground backdrop-blur md:block"
 	>
-		Drag background or Space+drag to pan · Ctrl/⌘+scroll to zoom · {nodes.length} window{nodes.length === 1 ? '' : 's'}
+		Drag background or Space+drag to pan · Ctrl/⌘+scroll or minimap scroll to zoom · {#if activeProjectFilter !== null}{visibleNodes.length} of {nodes.length} windows{#if activeProject} ({activeProject.name}){/if}{:else}{nodes.length} window{nodes.length === 1 ? '' : 's'}{/if}
 	</div>
 
 	<!-- Interactive Minimap -->
-	{#if showMinimap && nodes.length > 0}
+	{#if showMinimap && visibleNodes.length > 0}
 		<div
 			data-canvas-minimap
 			data-canvas-hud
 			role="presentation"
 			onpointerdown={(event) => { event.stopPropagation(); minimapNavigate(event); }}
+			onwheel={handleMinimapWheel}
 			style="width:{minimapMetrics.mapW}px;height:{minimapMetrics.mapH}px;"
 			class="pointer-events-auto absolute bottom-3 right-3 z-30 cursor-crosshair overflow-hidden rounded-xl border border-border bg-card/90 shadow-[var(--shadow-overlay)] backdrop-blur"
-			title="Click or drag to pan canvas"
+			title="Click or drag to pan · Scroll to zoom"
 		>
-			{#each nodes as node (node.id)}
+			{#each visibleNodes as node (node.id)}
+				{@const pos = effectiveNodePosition(node)}
 				<div
-					style="left:{6 + (node.x - minimapMetrics.minX) * minimapMetrics.scale}px;top:{6 + (node.y - minimapMetrics.minY) * minimapMetrics.scale}px;width:{Math.max(6, node.width * minimapMetrics.scale)}px;height:{Math.max(4, nodeVisualHeight(node) * minimapMetrics.scale)}px;"
+					style="left:{6 + (pos.x - minimapMetrics.minX) * minimapMetrics.scale}px;top:{6 + (pos.y - minimapMetrics.minY) * minimapMetrics.scale}px;width:{Math.max(6, node.width * minimapMetrics.scale)}px;height:{Math.max(4, nodeVisualHeight(node) * minimapMetrics.scale)}px;"
 					class="absolute rounded-[2px] {minimapNodeColor(node.kind)} {focusedNodeId === node.id ? 'ring-1 ring-foreground' : ''}"
 				></div>
 			{/each}

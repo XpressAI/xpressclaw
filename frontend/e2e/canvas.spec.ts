@@ -15,6 +15,7 @@ import {
 	resolveWorkspaceRelativePath,
 	seedCanvasNodes,
 	tidyCanvasLayout,
+	tidyFilteredCanvasNodes,
 	type CanvasNode,
 } from '../src/lib/canvas';
 
@@ -895,6 +896,417 @@ test.describe('Spatial Canvas workspace', () => {
 		await expect(secondEditorCard.getByLabel('Workspace file path')).toHaveValue('other.ts');
 	});
 
+	test('zooms when scrolling on the minimap, isolates projects via the project picker, and drags an entire project zone group', async ({ page }) => {
+		let alphaTaskPolls = 0;
+		await page.addInitScript(() => {
+			const listeners: Array<(chunk: string) => void> = [];
+			const originalFetch = window.fetch.bind(window);
+			const encoder = new TextEncoder();
+			let revisions = { seq: 1, projects: 1, agents: 1, conversations: 1, tasks: 1, sessions: 1, schedules: 1, workflows: 1 };
+			window.fetch = (input, init) => {
+				const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+				if (new URL(url, window.location.origin).pathname === '/api/ui/stream') {
+					const stream = new ReadableStream<Uint8Array>({
+						start(controller) {
+							let closed = false;
+							const push = (chunk: string) => {
+								if (closed) return;
+								controller.enqueue(encoder.encode(chunk));
+							};
+							listeners.push(push);
+							push(`event: revisions\ndata: ${JSON.stringify(revisions)}\n\n`);
+							init?.signal?.addEventListener('abort', () => {
+								if (closed) return;
+								closed = true;
+								const idx = listeners.indexOf(push);
+								if (idx >= 0) listeners.splice(idx, 1);
+								controller.close();
+							});
+						},
+					});
+					return Promise.resolve(new Response(stream, {
+						status: 200,
+						headers: { 'Content-Type': 'text/event-stream' },
+					}));
+				}
+				return originalFetch(input, init);
+			};
+			(window as unknown as { __emitCanvasRevisions?: (patch: Partial<typeof revisions>) => void }).__emitCanvasRevisions = (patch) => {
+				revisions = { ...revisions, ...patch, seq: revisions.seq + 1 };
+				const frame = `event: revisions\ndata: ${JSON.stringify(revisions)}\n\n`;
+				for (const push of [...listeners]) push(frame);
+			};
+		});
+		await mockCanvasApi(page);
+		await page.route('**/api/tasks/task-parent/activity**', async (route) => {
+			alphaTaskPolls += 1;
+			return route.fulfill({
+				json: {
+					attempts: [],
+					events: [],
+					has_more_before: false,
+					has_more_after: false,
+					delegated_work: [],
+				},
+			});
+		});
+
+		await page.setViewportSize({ width: 1440, height: 900 });
+		await page.goto('/canvas');
+		const canvas = page.locator('[data-workspace-canvas]');
+		await expect(canvas).toBeVisible();
+		await expect(page.locator('[data-canvas-project-card="proj-alpha"]')).toBeVisible();
+		await expect(page.locator('[data-canvas-project-card="proj-beta"]')).toBeVisible();
+
+		// Verify live SSE revision events actually trigger polls on active Alpha Core tasks (makes the later isolation check falsifiable).
+		const pollsBeforeActiveEmit = alphaTaskPolls;
+		await page.evaluate(() => {
+			(window as unknown as { __emitCanvasRevisions?: (patch: Record<string, number>) => void }).__emitCanvasRevisions?.({ tasks: 2, sessions: 2 });
+		});
+		await expect.poll(() => alphaTaskPolls).toBeGreaterThan(pollsBeforeActiveEmit);
+
+		// 1. Scrolling inside the minimap zooms the canvas without requiring Ctrl/Cmd.
+		const minimap = page.locator('[data-canvas-minimap]');
+		await expect(minimap).toBeVisible();
+		const initialZoom = Number(await canvas.getAttribute('data-canvas-zoom'));
+		const minimapBox = await minimap.boundingBox();
+		expect(minimapBox).not.toBeNull();
+		await page.mouse.move(minimapBox!.x + minimapBox!.width / 2, minimapBox!.y + minimapBox!.height / 2);
+		await page.mouse.wheel(0, -120);
+		await expect.poll(async () => Number(await canvas.getAttribute('data-canvas-zoom'))).toBeGreaterThan(initialZoom);
+		const zoomedIn = Number(await canvas.getAttribute('data-canvas-zoom'));
+		await page.mouse.wheel(0, 120);
+		await page.mouse.wheel(0, 120);
+		await expect.poll(async () => Number(await canvas.getAttribute('data-canvas-zoom'))).toBeLessThan(zoomedIn);
+
+		// 2. Dragging the project group header moves all windows in that project rigidly together.
+		const parseCoords = (style: string | null) => {
+			const left = Number(style?.match(/left:\s*(-?\d+(?:\.\d+)?)px/)?.[1] ?? NaN);
+			const top = Number(style?.match(/top:\s*(-?\d+(?:\.\d+)?)px/)?.[1] ?? NaN);
+			return { left, top };
+		};
+		await page.locator('[data-canvas-fit]').click();
+		const alphaWindowLocators = [
+			page.locator('[data-canvas-node]', { has: page.locator('[data-canvas-project-card="proj-alpha"]') }),
+			page.locator('[data-canvas-node-kind="task"]').nth(0),
+			page.locator('[data-canvas-node-kind="task"]').nth(1),
+			page.locator('[data-canvas-node-kind="task"]').nth(2),
+		];
+		const betaWindow = page.locator('[data-canvas-node]', { has: page.locator('[data-canvas-project-card="proj-beta"]') });
+
+		const alphaBefore = await Promise.all(alphaWindowLocators.map(async (loc) => parseCoords(await loc.getAttribute('style'))));
+		const betaBefore = parseCoords(await betaWindow.getAttribute('style'));
+
+		const zoneHandle = page.locator('[data-canvas-zone-drag-handle="proj-alpha"]');
+		await expect(zoneHandle).toBeVisible();
+		const handleBox = await zoneHandle.boundingBox();
+		expect(handleBox).not.toBeNull();
+		await page.mouse.move(handleBox!.x + handleBox!.width / 2, handleBox!.y + handleBox!.height / 2);
+		await page.mouse.down();
+		await page.mouse.move(handleBox!.x + handleBox!.width / 2 + 120, handleBox!.y + handleBox!.height / 2 + 80, { steps: 6 });
+		await page.mouse.up();
+
+		const alphaAfter = await Promise.all(alphaWindowLocators.map(async (loc) => parseCoords(await loc.getAttribute('style'))));
+		const betaAfter = parseCoords(await betaWindow.getAttribute('style'));
+		const dx0 = alphaAfter[0].left - alphaBefore[0].left;
+		const dy0 = alphaAfter[0].top - alphaBefore[0].top;
+		expect(dx0).toBeGreaterThan(40);
+		expect(dy0).toBeGreaterThan(20);
+		for (let i = 1; i < alphaAfter.length; i += 1) {
+			expect(alphaAfter[i].left - alphaBefore[i].left).toBe(dx0);
+			expect(alphaAfter[i].top - alphaBefore[i].top).toBe(dy0);
+		}
+		expect(betaAfter).toEqual(betaBefore);
+
+		// Reloading persists the moved project cluster coordinates.
+		await page.reload();
+		await expect(canvas).toBeVisible();
+		const alphaRestored = await Promise.all(alphaWindowLocators.map(async (loc) => parseCoords(await loc.getAttribute('style'))));
+		expect(alphaRestored).toEqual(alphaAfter);
+
+		// Opening a project from the Add menu while in All Projects does NOT isolate/unmount other projects.
+		await page.locator('[data-canvas-add-button]').click();
+		await page.locator('[data-canvas-add-menu]').getByRole('button', { name: 'Alpha Core' }).click();
+		await expect(canvas).toHaveAttribute('data-canvas-project-filter', 'all');
+		await expect(page.locator('[data-canvas-project-card="proj-beta"]')).toBeVisible();
+
+		// 3. Selecting a project in the top project picker isolates it and hides/deactivates other projects.
+		const alphaCard = page.locator('[data-canvas-project-card="proj-alpha"]');
+		await alphaCard.getByRole('button', { name: 'Editor', exact: true }).click();
+		const alphaEditor = page.locator('[data-canvas-editor-card]').first();
+		await expect(alphaEditor).toBeVisible();
+		await alphaEditor.getByRole('button', { name: 'main.ts' }).click();
+		await expect(alphaEditor.locator('[data-monaco-editor] .view-lines')).toContainText('hello canvas');
+		await alphaEditor.locator('[data-monaco-editor]').click();
+		await page.keyboard.type('draft-keep ');
+		await expect(alphaEditor.getByRole('button', { name: /Save •/ })).toBeVisible();
+
+		// Also open a Conversation window with an unsaved attachment so we verify non-editor windows with unsaved state are retained too.
+		await page.locator('[data-canvas-fit]').click();
+		await alphaCard.getByRole('button', { name: /Release Sync/ }).click();
+		const alphaConvWindow = page.locator('[data-canvas-node-kind="conversation"]').first();
+		await expect(alphaConvWindow).toBeVisible();
+		await alphaConvWindow.locator('[data-conversation-attachment-input]').setInputFiles({
+			name: 'draft.png',
+			mimeType: 'image/png',
+			buffer: png1x1,
+		});
+		await expect(alphaConvWindow.locator('img[alt="draft.png"]')).toBeVisible();
+
+		// Switch to Beta UI: clean Alpha Core windows/edges/zones unmount, while dirty editor & unsaved conversation stay hidden.
+		await page.locator('[data-canvas-hud]').getByRole('button', { name: /Beta UI/ }).click();
+		await expect(canvas).toHaveAttribute('data-canvas-project-filter', 'proj-beta');
+		await expect(page.locator('[data-canvas-project-card="proj-beta"]')).toBeVisible();
+		await expect(page.locator('[data-canvas-project-card="proj-alpha"]')).toHaveCount(0);
+		await expect(page.locator('[data-canvas-node-kind="task"]')).toHaveCount(0);
+		await expect(page.locator('[data-canvas-edge-kind="delegation"]')).toHaveCount(0);
+		await expect(page.locator('[data-canvas-project-zone="proj-alpha"]')).toHaveCount(0);
+		await expect(alphaEditor).not.toBeVisible();
+		await expect(alphaConvWindow).not.toBeVisible();
+
+		// Emit a real SSE revision push while isolated to Beta UI: unmounted Alpha Core tasks make 0 polls.
+		const pollsAfterSwitch = alphaTaskPolls;
+		await page.evaluate(() => {
+			(window as unknown as { __emitCanvasRevisions?: (patch: Record<string, number>) => void }).__emitCanvasRevisions?.({ tasks: 3, sessions: 3 });
+		});
+		await page.waitForTimeout(250);
+		expect(alphaTaskPolls).toBe(pollsAfterSwitch);
+
+		// Clearing while filtered to Beta UI removes only Beta UI windows and preserves hidden Alpha Core windows.
+		await page.getByRole('button', { name: 'Clear Beta UI windows' }).click();
+		await expect(page.locator('[data-canvas-project-card="proj-beta"]')).toHaveCount(0);
+		await expect(page.locator('[data-canvas-empty]')).toContainText('No windows open in Beta UI');
+
+		// Switching to Alpha Core restores Alpha windows, preserves both dirty editor & unsaved attachment state, and resumes live updates.
+		await page.locator('[data-canvas-hud]').getByRole('button', { name: /Alpha Core/ }).click();
+		await expect(canvas).toHaveAttribute('data-canvas-project-filter', 'proj-alpha');
+		await expect(page.locator('[data-canvas-project-card="proj-alpha"]')).toBeVisible();
+		await expect(page.locator('[data-canvas-node-kind="task"]')).toHaveCount(3);
+		await expect(alphaEditor).toBeVisible();
+		await expect(alphaEditor.getByRole('button', { name: /Save •/ })).toBeVisible();
+		await expect(alphaEditor.locator('[data-monaco-editor] .view-lines')).toContainText('draft-keep');
+		await expect(alphaConvWindow).toBeVisible();
+		await expect(alphaConvWindow.locator('img[alt="draft.png"]')).toBeVisible();
+		await expect.poll(() => alphaTaskPolls).toBeGreaterThan(pollsAfterSwitch);
+
+		// Expanding a collapsed task window resumes live SSE updates for it immediately.
+		const parentTaskWindow = page.locator('[data-canvas-node-kind="task"]', { hasText: 'Implement Spatial Canvas' }).first();
+		await parentTaskWindow.getByRole('button', { name: /^Collapse / }).click();
+		const pollsWhileCollapsed = alphaTaskPolls;
+		await page.evaluate(() => {
+			(window as unknown as { __emitCanvasRevisions?: (patch: Record<string, number>) => void }).__emitCanvasRevisions?.({ tasks: 4, sessions: 4 });
+		});
+		await page.waitForTimeout(250);
+		expect(alphaTaskPolls).toBe(pollsWhileCollapsed);
+		await parentTaskWindow.getByRole('button', { name: /^Expand / }).click();
+		await expect.poll(() => alphaTaskPolls).toBeGreaterThan(pollsWhileCollapsed);
+
+		// Clicking All Projects returns to the unfiltered view.
+		await page.locator('[data-canvas-hud]').getByRole('button', { name: 'All Projects' }).click();
+		await expect(canvas).toHaveAttribute('data-canvas-project-filter', 'all');
+		await expect(page.locator('[data-canvas-project-card="proj-alpha"]')).toBeVisible();
+	});
+
+	test('preserves Agent Files tab edits across isolation, avoids readiness loops on Canvas return, bounds conversation EventSources, and pans once on stationary minimap clicks', async ({ page }) => {
+		let readinessRequests = 0;
+		const fiveConversations = Array.from({ length: 5 }, (_, idx) => ({
+			id: `conv-multi-${idx + 1}`,
+			project_id: 'proj-alpha',
+			title: `Thread ${idx + 1}`,
+			icon: '#',
+			created_at: now,
+			updated_at: now,
+			last_message_at: now,
+			participants: [
+				{ participant_type: 'agent', participant_id: 'agent-codex', joined_at: now },
+			],
+		}));
+
+		await page.addInitScript(() => {
+			const originalFetch = window.fetch.bind(window);
+			const encoder = new TextEncoder();
+			const revisions = { seq: 1, projects: 1, agents: 1, conversations: 1, tasks: 1, sessions: 1, schedules: 1, workflows: 1 };
+			window.fetch = (input, init) => {
+				const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+				if (new URL(url, window.location.origin).pathname === '/api/ui/stream') {
+					const stream = new ReadableStream<Uint8Array>({
+						start(controller) {
+							let closed = false;
+							controller.enqueue(encoder.encode(`event: revisions\ndata: ${JSON.stringify(revisions)}\n\n`));
+							init?.signal?.addEventListener('abort', () => {
+								if (closed) return;
+								closed = true;
+								controller.close();
+							});
+						},
+					});
+					return Promise.resolve(new Response(stream, {
+						status: 200,
+						headers: { 'Content-Type': 'text/event-stream' },
+					}));
+				}
+				return originalFetch(input, init);
+			};
+			const openedConversationStreams: string[] = [];
+			let activeConversationStreams = 0;
+			let maxActiveConversationStreams = 0;
+			const NativeEventSource = window.EventSource;
+			window.EventSource = class extends NativeEventSource {
+				#isConv: boolean;
+				#closed = false;
+				constructor(url: string | URL, config?: EventSourceInit) {
+					super(url, config);
+					this.#isConv = String(url).includes('/api/conversations/');
+					if (this.#isConv) {
+						openedConversationStreams.push(String(url));
+						activeConversationStreams += 1;
+						maxActiveConversationStreams = Math.max(maxActiveConversationStreams, activeConversationStreams);
+					}
+				}
+				override close() {
+					if (this.#isConv && !this.#closed) {
+						this.#closed = true;
+						activeConversationStreams = Math.max(0, activeConversationStreams - 1);
+					}
+					super.close();
+				}
+			};
+			(window as unknown as {
+				__convStreamStats?: () => { opened: number; active: number; maxActive: number };
+			}).__convStreamStats = () => ({
+				opened: openedConversationStreams.length,
+				active: activeConversationStreams,
+				maxActive: maxActiveConversationStreams,
+			});
+		});
+
+		await mockCanvasApi(page);
+		await page.route('**/api/conversations**', async (route) => {
+			const url = new URL(route.request().url());
+			const path = url.pathname;
+			if (path === '/api/conversations') {
+				const projectId = url.searchParams.get('project_id');
+				return route.fulfill({
+					json: projectId ? fiveConversations.filter((c) => c.project_id === projectId) : fiveConversations,
+				});
+			}
+			if (path.endsWith('/messages')) return route.fulfill({ json: [] });
+			if (path.endsWith('/turns')) return route.fulfill({ json: [] });
+			if (path.endsWith('/tasks')) return route.fulfill({ json: [] });
+			if (path.endsWith('/events')) return route.fulfill({ status: 200, contentType: 'text/event-stream', body: ': connected\n\n' });
+			const id = decodeURIComponent(path.split('/')[3]);
+			const found = fiveConversations.find((c) => c.id === id);
+			return route.fulfill({ status: found ? 200 : 404, json: found ?? { error: 'not found' } });
+		});
+		await page.route('**/api/sessions/agent-codex/readiness', async (route) => {
+			readinessRequests += 1;
+			return route.fulfill({
+				json: { ready: false, image_present: false, issues: ['Runner image not built'], warnings: [] },
+			});
+		});
+		await page.route('**/api/sessions/agent-codex', async (route) =>
+			route.fulfill({
+				json: {
+					agent_id: 'agent-codex',
+					status: 'idle',
+					active_task: null,
+					recent_tasks: [],
+				},
+			}),
+		);
+		await page.route('**/api/environments/agent-codex/tree**', async (route) =>
+			route.fulfill({
+				json: {
+					path: '/tmp',
+					entries: [
+						{ name: 'notes.txt', path: '/tmp/notes.txt', kind: 'file', symlink: false, size: 15, modified_at: now },
+					],
+					truncated: false,
+				},
+			}),
+		);
+		await page.route('**/api/environments/agent-codex/file**', async (route) =>
+			route.fulfill({
+				json: {
+					path: '/tmp/notes.txt',
+					content: 'original notes\n',
+					revision: 'rev-container-1',
+					size: 15,
+				},
+			}),
+		);
+
+		await page.setViewportSize({ width: 1440, height: 900 });
+		await page.goto('/canvas');
+		const canvas = page.locator('[data-workspace-canvas]');
+		const alphaCard = page.locator('[data-canvas-project-card="proj-alpha"]');
+		await expect(alphaCard).toBeVisible();
+
+		// 1. Stationary minimap click pans once on pointerdown and never jumps again on pointerup.
+		const worldLayer = page.locator('[data-canvas-pan-surface]');
+		const minimap = page.locator('[data-canvas-minimap]');
+		await expect(minimap).toBeVisible();
+		const minimapBox = await minimap.boundingBox();
+		expect(minimapBox).not.toBeNull();
+		const beforeClickTransform = await worldLayer.getAttribute('style');
+		await page.mouse.move(minimapBox!.x + minimapBox!.width - 14, minimapBox!.y + minimapBox!.height - 14);
+		await page.mouse.down();
+		const afterDownTransform = await worldLayer.getAttribute('style');
+		expect(afterDownTransform).not.toEqual(beforeClickTransform);
+		await page.waitForTimeout(50);
+		await page.mouse.up();
+		const afterUpTransform = await worldLayer.getAttribute('style');
+		expect(afterUpTransform).toEqual(afterDownTransform);
+
+		// 2. Five visible conversations on Canvas keep active EventSource sockets at 0 once /api/ui/stream is connected.
+		await page.locator('[data-canvas-fit]').click();
+		for (const conv of fiveConversations) {
+			await alphaCard.getByRole('button', { name: new RegExp(conv.title) }).click();
+			await page.locator('[data-canvas-fit]').click();
+		}
+		await expect(page.locator('[data-canvas-node-kind="conversation"]')).toHaveCount(5);
+		await expect.poll(async () => page.evaluate(() =>
+			(window as unknown as { __convStreamStats?: () => { active: number; maxActive: number } }).__convStreamStats?.()
+		)).toMatchObject({ active: 0 });
+		const convStats = await page.evaluate(() =>
+			(window as unknown as { __convStreamStats?: () => { active: number; maxActive: number } }).__convStreamStats?.()
+		);
+		expect(convStats!.maxActive).toBeLessThanOrEqual(2);
+
+		// 3. Unready agent Work tab does not enter a readiness polling loop when switching back to Canvas.
+		await page.locator('[data-canvas-fit]').click();
+		await alphaCard.locator('button[title="Open Agent window on canvas"]', { hasText: 'Codex Builder' }).click();
+		const agentWindow = page.locator('[data-canvas-node-kind="agent"]').first();
+		await expect(agentWindow).toBeVisible();
+		await expect.poll(() => readinessRequests).toBeGreaterThanOrEqual(1);
+		const readinessBeforeToggle = readinessRequests;
+		await page.locator('[data-workspace-mode-toggle]').getByRole('button', { name: 'Tabs' }).click();
+		await expect(canvas).not.toBeVisible();
+		await page.locator('[data-workspace-mode-toggle]').getByRole('button', { name: 'Canvas' }).click();
+		await expect(canvas).toBeVisible();
+		await page.waitForTimeout(450);
+		expect(readinessRequests - readinessBeforeToggle).toBeLessThanOrEqual(1);
+
+		// 4. Editing a container file inside the Agent's Files tab retains the window across project switches.
+		await agentWindow.getByRole('tab', { name: 'Files' }).click();
+		await agentWindow.getByLabel('File location').selectOption('container');
+		await agentWindow.getByRole('button', { name: /notes\.txt/ }).click();
+		await expect(agentWindow.locator('[data-monaco-editor] .view-lines')).toContainText('original notes');
+		await agentWindow.locator('[data-monaco-editor]').click();
+		await page.keyboard.type('files-tab-unsaved ');
+		await expect(agentWindow.getByRole('button', { name: 'Save', exact: true })).toBeEnabled();
+
+		await page.locator('[data-canvas-hud]').getByRole('button', { name: /Beta UI/ }).click();
+		await expect(canvas).toHaveAttribute('data-canvas-project-filter', 'proj-beta');
+		await expect(agentWindow).not.toBeVisible();
+
+		await page.locator('[data-canvas-hud]').getByRole('button', { name: /Alpha Core/ }).click();
+		await expect(canvas).toHaveAttribute('data-canvas-project-filter', 'proj-alpha');
+		await expect(agentWindow).toBeVisible();
+		await expect(agentWindow.locator('[data-monaco-editor] .view-lines')).toContainText('files-tab-unsaved');
+		await expect(agentWindow.getByRole('button', { name: 'Save', exact: true })).toBeEnabled();
+	});
+
 	test('canvas model enforces safe app URLs, non-overlapping placement, delegation edges, and layout persistence', () => {
 		const origin = 'http://127.0.0.1:8935';
 		const localApp = classifyAppUrl('http://127.0.0.1:3000/dashboard', origin);
@@ -928,6 +1340,14 @@ test.describe('Spatial Canvas workspace', () => {
 		expect(projNode.x).toBeLessThan(parentTaskNode.x);
 		expect(parentTaskNode.x).toBeLessThan(childTaskNode.x);
 
+		// Tidying an isolated project keeps it anchored at its own origin rather than stacking onto hidden projects at (80, 80).
+		const betaNodes = laidOut.filter((n) => n.projectId === 'proj-beta');
+		const betaOriginY = Math.min(...betaNodes.map((n) => n.y));
+		const filteredTidy = tidyFilteredCanvasNodes(laidOut, betaNodes, mockTasks, mockProjects, true);
+		const tidiedBeta = filteredTidy.tidiedVisible[0];
+		expect(tidiedBeta.y).toBeGreaterThanOrEqual(betaOriginY);
+		expect(filteredTidy.nodes.find((n) => n.id === projNode.id)?.y).toBe(projNode.y);
+
 		const edges = deriveCanvasEdges(laidOut, mockTasks, mockAgents, mockConversations);
 		expect(edges.some((e) => e.fromId === parentTaskNode.id && e.toId === childTaskNode.id && e.kind === 'delegation')).toBe(true);
 
@@ -940,13 +1360,22 @@ test.describe('Spatial Canvas workspace', () => {
 			nodes: [...laidOut, { bad: true } as unknown as CanvasNode],
 			camera: { x: 10, y: 20, zoom: 99 },
 			focusedNodeId: parentTaskNode.id,
+			activeProjectFilter: 'proj-alpha',
 			snapToGrid: false,
 			showMinimap: true,
 			autoPinDelegated: true,
 		});
 		expect(restored?.nodes.length).toBe(laidOut.length);
 		expect(restored?.camera.zoom).toBe(1.6);
+		expect(restored?.activeProjectFilter).toBe('proj-alpha');
 		expect(restored?.snapToGrid).toBe(false);
+
+		const restoredAll = normalizePersistedCanvasState({
+			nodes: laidOut,
+			camera: { x: 0, y: 0, zoom: 1 },
+			activeProjectFilter: '',
+		});
+		expect(restoredAll?.activeProjectFilter).toBeNull();
 
 		// Link classification & workspace path mapping helpers
 		expect(resolveWorkspaceRelativePath('/workspace/temp/demo.html', ['/workspace'])).toBe('temp/demo.html');

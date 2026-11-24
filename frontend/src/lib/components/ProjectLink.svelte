@@ -1,7 +1,112 @@
-<script lang="ts">
-	import { onMount, untrack } from 'svelte';
+<script lang="ts" module>
 	import { projects, type Project } from '$lib/api';
 	import { PROJECT_MUTATION_EVENT, type ProjectMutation } from '$lib/projectEvents';
+
+	interface CachedProjectEntry {
+		project: Project | null;
+		deleted: boolean;
+		fetchedAt: number;
+	}
+
+	const PROJECT_CACHE_TTL_MS = 30_000;
+	const MAX_PROJECT_CACHE_ENTRIES = 200;
+	const projectCache = new Map<string, CachedProjectEntry>();
+	const inflightProjectLoads = new Map<string, Promise<Project | null>>();
+	const projectListeners = new Map<string, Set<(entry: CachedProjectEntry) => void>>();
+	let mutationListenerAttached = false;
+
+	function writeProjectCache(projectId: string, entry: CachedProjectEntry) {
+		ensureMutationListener();
+		projectCache.delete(projectId);
+		projectCache.set(projectId, entry);
+		while (projectCache.size > MAX_PROJECT_CACHE_ENTRIES) {
+			const oldest = projectCache.keys().next().value;
+			if (oldest === undefined) break;
+			projectCache.delete(oldest);
+		}
+	}
+
+	function notifyProjectListeners(projectId: string, entry: CachedProjectEntry) {
+		const listeners = projectListeners.get(projectId);
+		if (!listeners) return;
+		for (const listener of listeners) listener(entry);
+	}
+
+	function handleGlobalProjectMutation(event: Event) {
+		const mutation = (event as CustomEvent<ProjectMutation>).detail;
+		if (!mutation) return;
+		if (mutation.kind === 'deleted') {
+			const entry: CachedProjectEntry = { project: null, deleted: true, fetchedAt: Date.now() };
+			writeProjectCache(mutation.projectId, entry);
+			notifyProjectListeners(mutation.projectId, entry);
+			return;
+		}
+		const existing = projectCache.get(mutation.project.id);
+		if (!existing?.project || mutation.authoritative || existing.project.updated_at < mutation.project.updated_at) {
+			const entry: CachedProjectEntry = { project: mutation.project, deleted: false, fetchedAt: Date.now() };
+			writeProjectCache(mutation.project.id, entry);
+			notifyProjectListeners(mutation.project.id, entry);
+		}
+	}
+
+	function ensureMutationListener() {
+		if (mutationListenerAttached || typeof window === 'undefined') return;
+		mutationListenerAttached = true;
+		window.addEventListener(PROJECT_MUTATION_EVENT, handleGlobalProjectMutation);
+	}
+
+	function subscribeProjectLink(projectId: string, listener: (entry: CachedProjectEntry) => void): () => void {
+		ensureMutationListener();
+		let listeners = projectListeners.get(projectId);
+		if (!listeners) {
+			listeners = new Set();
+			projectListeners.set(projectId, listeners);
+		}
+		listeners.add(listener);
+		return () => {
+			listeners.delete(listener);
+			if (listeners.size === 0) {
+				projectListeners.delete(projectId);
+				// Keep the single module-level mutation listener active while cached entries exist
+				// so renames/deletes made when no ProjectLink is mounted still update the cache.
+				if (projectListeners.size === 0 && projectCache.size === 0 && mutationListenerAttached && typeof window !== 'undefined') {
+					window.removeEventListener(PROJECT_MUTATION_EVENT, handleGlobalProjectMutation);
+					mutationListenerAttached = false;
+				}
+			}
+		};
+	}
+
+	function fetchProjectCached(id: string): Promise<Project | null> {
+		const cached = projectCache.get(id);
+		if (cached && (cached.deleted || Date.now() - cached.fetchedAt < PROJECT_CACHE_TTL_MS)) {
+			return Promise.resolve(cached.project);
+		}
+		const inflight = inflightProjectLoads.get(id);
+		if (inflight) return inflight;
+		const req = projects.get(id)
+			.then((loaded) => {
+				const existing = projectCache.get(id);
+				if (!existing || (!existing.deleted && (!existing.project || existing.project.updated_at <= loaded.updated_at))) {
+					const entry: CachedProjectEntry = { project: loaded, deleted: false, fetchedAt: Date.now() };
+					writeProjectCache(id, entry);
+					notifyProjectListeners(id, entry);
+				}
+				return projectCache.get(id)?.project ?? loaded;
+			})
+			.catch((cause) => {
+				console.warn(`Failed to load project ${id} for breadcrumbs`, cause);
+				return projectCache.get(id)?.project ?? null;
+			})
+			.finally(() => {
+				inflightProjectLoads.delete(id);
+			});
+		inflightProjectLoads.set(id, req);
+		return req;
+	}
+</script>
+
+<script lang="ts">
 	import { collaborationProjectPath } from '$lib/workspace';
 
 	// Breadcrumb link back to the owning Project. Follows renames and deletions
@@ -13,30 +118,31 @@
 
 	$effect(() => {
 		const id = projectId;
-		if (untrack(() => project?.id) === id) return;
-		project = null;
-		deleted = false;
+		const cached = projectCache.get(id);
+		project = cached?.project ?? null;
+		deleted = cached?.deleted ?? false;
 		let cancelled = false;
-		projects.get(id)
-			.then((loaded) => { if (!cancelled) project = loaded; })
-			.catch((cause) => console.warn(`Failed to load project ${id} for breadcrumbs`, cause));
-		return () => { cancelled = true; };
-	});
-
-	onMount(() => {
-		const handleProjectMutation = (event: Event) => {
-			const mutation = (event as CustomEvent<ProjectMutation>).detail;
-			if (!mutation) return;
-			if (mutation.kind === 'deleted') {
-				if (mutation.projectId === projectId) deleted = true;
-				return;
-			}
-			if (mutation.project.id !== projectId) return;
-			if (mutation.authoritative || !project || project.updated_at < mutation.project.updated_at) project = mutation.project;
-			deleted = false;
+		const unsubscribe = subscribeProjectLink(id, (entry) => {
+			if (cancelled) return;
+			project = entry.project;
+			deleted = entry.deleted;
+		});
+		if (!cached || (!cached.deleted && Date.now() - cached.fetchedAt >= PROJECT_CACHE_TTL_MS)) {
+			void fetchProjectCached(id).then((loaded) => {
+				if (cancelled) return;
+				const latest = projectCache.get(id);
+				if (latest) {
+					project = latest.project;
+					deleted = latest.deleted;
+				} else if (loaded) {
+					project = loaded;
+				}
+			});
+		}
+		return () => {
+			cancelled = true;
+			unsubscribe();
 		};
-		window.addEventListener(PROJECT_MUTATION_EVENT, handleProjectMutation);
-		return () => window.removeEventListener(PROJECT_MUTATION_EVENT, handleProjectMutation);
 	});
 </script>
 

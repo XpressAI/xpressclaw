@@ -1,5 +1,5 @@
 <script lang="ts">
-	import type { Snippet } from 'svelte';
+	import { onDestroy, type Snippet } from 'svelte';
 	import {
 		Bot,
 		ChevronDown,
@@ -17,7 +17,7 @@
 		SquareTerminal,
 		X,
 	} from '@lucide/svelte';
-	import { providePaneActive } from '$lib/liveUpdates';
+	import { providePaneActive, providePaneRetainState } from '$lib/liveUpdates';
 	import { measurePane } from '$lib/workspaceLayout';
 	import { CANVAS_COLLAPSED_HEIGHT, CANVAS_DEFAULT_SIZE, type CanvasNode, type CanvasNodeKind } from '$lib/canvas';
 
@@ -25,6 +25,9 @@
 		node: CanvasNode;
 		focused: boolean;
 		visible?: boolean;
+		active?: boolean;
+		hidden?: boolean;
+		dragOffset?: { x: number; y: number } | null;
 		zoom: number;
 		canvasInteracting: boolean;
 		status?: string | null;
@@ -39,6 +42,7 @@
 		onCenter: () => void;
 		onOpenInTabs?: () => void;
 		onClose: () => void;
+		onRetainChange?: (retained: boolean) => void;
 		onSpawnTool?: (kind: 'editor' | 'terminal' | 'image' | 'app') => void;
 		onExpandDelegated?: () => void;
 		children: Snippet;
@@ -48,6 +52,9 @@
 		node,
 		focused,
 		visible = true,
+		active = true,
+		hidden = false,
+		dragOffset = null,
 		zoom,
 		canvasInteracting,
 		status = null,
@@ -62,18 +69,27 @@
 		onCenter,
 		onOpenInTabs,
 		onClose,
+		onRetainChange,
 		onSpawnTool,
 		onExpandDelegated,
 		children,
 	}: Props = $props();
 
-	providePaneActive(() => visible && !node.collapsed);
+	providePaneActive(() => visible && active && !hidden && !node.collapsed);
+	providePaneRetainState((retained) => onRetainChange?.(retained));
 
 	let dragging = $state(false);
 	let resizing = $state(false);
 	let spawnMenuOpen = $state(false);
+	let cancelInteraction: (() => void) | null = null;
 
-	let shieldActive = $derived(dragging || resizing || canvasInteracting);
+	onDestroy(() => {
+		cancelInteraction?.();
+		cancelInteraction = null;
+		onRetainChange?.(false);
+	});
+
+	let shieldActive = $derived(dragging || resizing || canvasInteracting || dragOffset !== null);
 	let limits = $derived(CANVAS_DEFAULT_SIZE[node.kind]);
 
 	function kindMeta(kind: CanvasNodeKind): { label: string; accent: string; badge: string } {
@@ -115,6 +131,7 @@
 		if (target?.closest('button, a, input, select')) return;
 		event.preventDefault();
 		event.stopPropagation();
+		cancelInteraction?.();
 		onFocus();
 		spawnMenuOpen = false;
 		dragging = true;
@@ -124,19 +141,32 @@
 		const originY = node.y;
 		let latestX = originX;
 		let latestY = originY;
+		let frame = 0;
 
+		const flush = () => {
+			frame = 0;
+			onMove(latestX, latestY, false);
+		};
 		const move = (moveEvent: PointerEvent) => {
 			latestX = originX + (moveEvent.clientX - startClientX) / zoom;
 			latestY = originY + (moveEvent.clientY - startClientY) / zoom;
-			onMove(latestX, latestY, false);
+			if (!frame) frame = requestAnimationFrame(flush);
 		};
-		const up = () => {
+		const teardown = (commit: boolean) => {
+			if (frame) {
+				cancelAnimationFrame(frame);
+				frame = 0;
+			}
 			dragging = false;
 			window.removeEventListener('pointermove', move);
 			window.removeEventListener('pointerup', up);
 			window.removeEventListener('pointercancel', up);
-			onMove(latestX, latestY, true);
+			if (cancelInteraction === abort) cancelInteraction = null;
+			if (commit) onMove(latestX, latestY, true);
 		};
+		const up = () => teardown(true);
+		const abort = () => teardown(false);
+		cancelInteraction = abort;
 		window.addEventListener('pointermove', move);
 		window.addEventListener('pointerup', up);
 		window.addEventListener('pointercancel', up);
@@ -146,6 +176,7 @@
 		if (event.button !== 0 || node.collapsed) return;
 		event.preventDefault();
 		event.stopPropagation();
+		cancelInteraction?.();
 		onFocus();
 		resizing = true;
 		const startClientX = event.clientX;
@@ -154,7 +185,12 @@
 		const originH = node.height;
 		let latestW = originW;
 		let latestH = originH;
+		let frame = 0;
 
+		const flush = () => {
+			frame = 0;
+			onResize(latestW, latestH, false);
+		};
 		const move = (moveEvent: PointerEvent) => {
 			const dx = (moveEvent.clientX - startClientX) / zoom;
 			const dy = (moveEvent.clientY - startClientY) / zoom;
@@ -164,21 +200,34 @@
 			if (axis === 's' || axis === 'se') {
 				latestH = Math.max(limits.minHeight, Math.round(originH + dy));
 			}
-			onResize(latestW, latestH, false);
+			if (!frame) frame = requestAnimationFrame(flush);
 		};
-		const up = () => {
+		const teardown = (commit: boolean) => {
+			if (frame) {
+				cancelAnimationFrame(frame);
+				frame = 0;
+			}
 			resizing = false;
 			window.removeEventListener('pointermove', move);
 			window.removeEventListener('pointerup', up);
 			window.removeEventListener('pointercancel', up);
-			onResize(latestW, latestH, true);
+			if (cancelInteraction === abort) cancelInteraction = null;
+			if (commit) onResize(latestW, latestH, true);
 		};
+		const up = () => teardown(true);
+		const abort = () => teardown(false);
+		cancelInteraction = abort;
 		window.addEventListener('pointermove', move);
 		window.addEventListener('pointerup', up);
 		window.addEventListener('pointercancel', up);
 	}
 
 	let meta = $derived(kindMeta(node.kind));
+	let windowStyle = $derived(
+		`left:${node.x}px;top:${node.y}px;width:${node.width}px;height:${node.collapsed ? CANVAS_COLLAPSED_HEIGHT : node.height}px;z-index:${node.zIndex};`
+		+ (dragOffset ? `transform:translate3d(${dragOffset.x}px,${dragOffset.y}px,0);` : '')
+		+ (hidden ? 'display:none;' : '')
+	);
 </script>
 
 <article
@@ -186,7 +235,8 @@
 	data-canvas-node-kind={node.kind}
 	data-canvas-node-focused={focused || undefined}
 	data-canvas-node-collapsed={node.collapsed || undefined}
-	style="left:{node.x}px;top:{node.y}px;width:{node.width}px;height:{node.collapsed ? CANVAS_COLLAPSED_HEIGHT : node.height}px;z-index:{node.zIndex};"
+	data-canvas-node-hidden={hidden || undefined}
+	style={windowStyle}
 	class="canvas-window absolute flex flex-col overflow-hidden rounded-xl border bg-card transition-shadow {focused ? 'border-primary/60 shadow-[0_12px_36px_rgb(0_0_0/18%)] ring-1 ring-primary/35 dark:shadow-[0_14px_42px_rgb(0_0_0/48%)]' : 'border-border/90 shadow-[var(--shadow-overlay)] hover:border-border'}"
 	onpointerdown={(event) => {
 		if (event.button === 1 || canvasInteracting) return;

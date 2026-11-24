@@ -1414,7 +1414,7 @@
 		const unsubscribeLiveUpdates = subscribeLiveUpdates(
 			['projects', 'conversations', 'agents', 'sessions', 'tasks', 'workflows', 'schedules'],
 			(_revisions, ctx) => loadWorkspaceSummary(ctx.changedDomains, true),
-			{ fallbackIntervalMs: 3000 }
+			{ fallbackIntervalMs: 3000, priority: 'high' }
 		);
 		const unsubscribeStreamStatus = subscribeLiveStreamStatus((connected) => {
 			if (connected) {

@@ -147,11 +147,52 @@ function formatLinks(html: string, options: RenderContentOptions): string {
 	return template.innerHTML;
 }
 
+const MAX_RENDER_CACHE_ENTRIES = 500;
+const MAX_RENDER_CACHE_CHARS = 3_000_000;
+const MAX_SINGLE_CACHE_ENTRY_CHARS = 50_000;
+const renderCache = new Map<string, string>();
+let renderCacheChars = 0;
+
+function readCachedRender(key: string): string | undefined {
+	const cached = renderCache.get(key);
+	if (cached === undefined) return undefined;
+	// Refresh LRU recency.
+	renderCache.delete(key);
+	renderCache.set(key, cached);
+	return cached;
+}
+
+function writeCachedRender(key: string, value: string): void {
+	const entrySize = key.length + value.length;
+	if (entrySize > MAX_SINGLE_CACHE_ENTRY_CHARS) return;
+	const existing = renderCache.get(key);
+	if (existing !== undefined) {
+		renderCacheChars -= key.length + existing.length;
+		renderCache.delete(key);
+	}
+	renderCache.set(key, value);
+	renderCacheChars += entrySize;
+	while (renderCache.size > MAX_RENDER_CACHE_ENTRIES || renderCacheChars > MAX_RENDER_CACHE_CHARS) {
+		const oldest = renderCache.entries().next().value;
+		if (!oldest) break;
+		renderCache.delete(oldest[0]);
+		renderCacheChars -= oldest[0].length + oldest[1].length;
+	}
+}
+
 /**
  * Render stored message content to safe HTML without treating raw HTML as DOM.
  * Optionally handles the reserved Agent streaming tags, plus @mentions and Markdown.
  */
 export function renderContent(content: string, options: RenderContentOptions = {}): string {
+	const cacheKey = content.length <= MAX_SINGLE_CACHE_ENTRY_CHARS
+		? `${options.openLinksInNewWindow ? 1 : 0}|${options.renderStructuredAgentMarkup ? 1 : 0}|${options.downloadAgentId ?? ''}|${content}`
+		: null;
+	if (cacheKey !== null) {
+		const cached = readCachedRender(cacheKey);
+		if (cached !== undefined) return cached;
+	}
+
 	let result = content;
 
 	const thinkingBlocks: string[] = [];
@@ -222,5 +263,7 @@ export function renderContent(content: string, options: RenderContentOptions = {
 		ADD_ATTR: ['open'],
 	});
 
-	return options.openLinksInNewWindow || options.downloadAgentId ? formatLinks(result, options) : result;
+	const formatted = options.openLinksInNewWindow || options.downloadAgentId ? formatLinks(result, options) : result;
+	if (cacheKey !== null) writeCachedRender(cacheKey, formatted);
+	return formatted;
 }

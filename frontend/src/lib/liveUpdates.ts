@@ -1,4 +1,4 @@
-import { getContext, hasContext, setContext } from 'svelte';
+import { getContext, hasContext, setContext, untrack } from 'svelte';
 import { ApiError, sendToLogin, setApiRevisionObserver, ui, type UiRevisions } from './api';
 
 export function isTransientRefreshError(err: unknown): boolean {
@@ -34,6 +34,8 @@ export interface SubscribeLiveUpdatesOptions {
 	 * `/api/ui/stream` nor `/api/ui/revisions` is available (e.g. partial mocks).
 	 */
 	fallbackActive?: () => boolean;
+	/** High-priority subscribers (e.g. shell/sidebar) drain ahead of per-window views. */
+	priority?: 'high' | 'normal';
 }
 
 const ALL_DOMAINS: readonly UiDomain[] = [
@@ -47,6 +49,7 @@ const ALL_DOMAINS: readonly UiDomain[] = [
 ];
 
 const PANE_ACTIVE_CONTEXT = Symbol('xpressclaw.workspace.paneActive');
+const PANE_RETAIN_CONTEXT = Symbol('xpressclaw.workspace.paneRetain');
 
 export function providePaneActive(getActive: () => boolean): void {
 	setContext(PANE_ACTIVE_CONTEXT, getActive);
@@ -59,6 +62,24 @@ export function usePaneActive(): () => boolean {
 	return () => true;
 }
 
+export function providePaneRetainState(report: (retained: boolean) => void): void {
+	const retainedTokens = new Set<symbol>();
+	setContext(PANE_RETAIN_CONTEXT, (token: symbol, retained: boolean) => {
+		if (retained) retainedTokens.add(token);
+		else retainedTokens.delete(token);
+		report(retainedTokens.size > 0);
+	});
+}
+
+export function useReportPaneRetainState(): (retained: boolean) => void {
+	if (hasContext(PANE_RETAIN_CONTEXT)) {
+		const reportToken = getContext<(token: symbol, retained: boolean) => void>(PANE_RETAIN_CONTEXT);
+		const token = Symbol('xpressclaw.workspace.paneRetainToken');
+		return (retained: boolean) => reportToken(token, retained);
+	}
+	return () => {};
+}
+
 interface Subscriber {
 	id: number;
 	domains: UiDomain[];
@@ -66,8 +87,11 @@ interface Subscriber {
 	isActive: () => boolean;
 	fallbackIntervalMs: number;
 	fallbackActive: () => boolean;
+	priority: 'high' | 'normal';
 	lastRunAt: number;
 	inFlight: boolean;
+	queuedSource: LiveUpdateSource | null;
+	queuedDomains: Set<UiDomain>;
 	pendingSource: LiveUpdateSource | null;
 	pendingDomains: Set<UiDomain>;
 	dirty: boolean;
@@ -79,9 +103,16 @@ interface Subscriber {
 	coveredRevisions: Record<UiDomain, number>;
 }
 
+const MAX_CONCURRENT_SUBSCRIBER_RUNS = 4;
+const SUBSCRIBER_SLOT_TIMEOUT_MS = 15_000;
+
 let nextSubscriberId = 1;
 const subscribers = new Map<number, Subscriber>();
 const streamStatusListeners = new Set<(connected: boolean) => void>();
+const visibilityListeners = new Set<() => void>();
+const highPriorityQueuedIds = new Set<number>();
+const queuedSubscriberIds = new Set<number>();
+let activeSubscriberRuns = 0;
 
 let currentRevisions: UiRevisions | null = null;
 let serverProvidesRevisionHeaders = false;
@@ -166,6 +197,24 @@ export function subscribeLiveStreamStatus(listener: (connected: boolean) => void
 	};
 }
 
+export function subscribeLiveUpdatesVisibility(listener: () => void): () => void {
+	installGlobalListeners();
+	visibilityListeners.add(listener);
+	return () => {
+		visibilityListeners.delete(listener);
+	};
+}
+
+function notifyVisibilityListeners(): void {
+	for (const listener of visibilityListeners) {
+		try {
+			listener();
+		} catch (err) {
+			console.warn('Live-update visibility listener failed:', err);
+		}
+	}
+}
+
 function clearSubscriberRetryTimer(sub: Subscriber): void {
 	if (sub.retryTimer !== null) {
 		clearTimeout(sub.retryTimer);
@@ -178,8 +227,17 @@ function installGlobalListeners(): void {
 	listenersInstalled = true;
 
 	document.addEventListener('visibilitychange', () => {
+		notifyVisibilityListeners();
 		if (isDocumentHidden()) {
 			for (const sub of subscribers.values()) {
+				if (sub.queuedSource !== null) {
+					sub.dirty = true;
+					for (const domain of sub.queuedDomains) sub.dirtyDomains.add(domain);
+					sub.queuedSource = null;
+					sub.queuedDomains.clear();
+					highPriorityQueuedIds.delete(sub.id);
+					queuedSubscriberIds.delete(sub.id);
+				}
 				if (sub.retryDomains.size > 0) {
 					sub.dirty = true;
 					for (const domain of sub.retryDomains) sub.dirtyDomains.add(domain);
@@ -216,8 +274,163 @@ function installGlobalListeners(): void {
 }
 
 export function notifyLiveUpdatesVisibilityChanged(): void {
-	if (isDocumentHidden()) return;
-	flushDirtySubscribers();
+	// Untrack so callers invoking this inside a Svelte $effect never subscribe to
+	// reactive $state read by visibility listeners or subscriber active predicates.
+	untrack(() => {
+		notifyVisibilityListeners();
+		if (isDocumentHidden()) return;
+		flushDirtySubscribers();
+	});
+}
+
+function enqueueSubscriber(
+	sub: Subscriber,
+	source: LiveUpdateSource,
+	domains: Iterable<UiDomain>
+): void {
+	sub.queuedSource = sub.queuedSource === 'sse' ? 'sse' : source;
+	for (const domain of domains) sub.queuedDomains.add(domain);
+	const queue = sub.priority === 'high' ? highPriorityQueuedIds : queuedSubscriberIds;
+	queue.add(sub.id);
+}
+
+function takeNextQueuedSubscriberId(): number | undefined {
+	if (highPriorityQueuedIds.size > 0) {
+		const nextId = highPriorityQueuedIds.values().next().value;
+		if (nextId !== undefined) {
+			highPriorityQueuedIds.delete(nextId);
+			return nextId;
+		}
+	}
+	if (queuedSubscriberIds.size > 0) {
+		const nextId = queuedSubscriberIds.values().next().value;
+		if (nextId !== undefined) {
+			queuedSubscriberIds.delete(nextId);
+			return nextId;
+		}
+	}
+	return undefined;
+}
+
+function drainSubscriberQueue(): void {
+	while (activeSubscriberRuns < MAX_CONCURRENT_SUBSCRIBER_RUNS) {
+		const nextId = takeNextQueuedSubscriberId();
+		if (nextId === undefined) break;
+		const sub = subscribers.get(nextId);
+		if (!sub || sub.queuedSource === null || sub.inFlight) continue;
+		const nextSource = sub.queuedSource;
+		const nextDomains = new Set(sub.queuedDomains);
+		sub.queuedSource = null;
+		sub.queuedDomains.clear();
+		if (isDocumentHidden() || !sub.isActive()) {
+			sub.dirty = true;
+			for (const domain of nextDomains) sub.dirtyDomains.add(domain);
+			continue;
+		}
+		executeSubscriber(sub, currentRevisions ?? EMPTY_REVISIONS, nextSource, nextDomains);
+	}
+}
+
+function executeSubscriber(
+	sub: Subscriber,
+	revisions: UiRevisions,
+	source: LiveUpdateSource,
+	domainSet: Set<UiDomain>
+): void {
+	sub.inFlight = true;
+	activeSubscriberRuns += 1;
+	sub.lastRunAt = Date.now();
+	let transientFailure = false;
+	let slotReleased = false;
+
+	const releaseSlot = () => {
+		if (slotReleased) return;
+		slotReleased = true;
+		activeSubscriberRuns = Math.max(0, activeSubscriberRuns - 1);
+		drainSubscriberQueue();
+	};
+
+	const slotTimer = setTimeout(() => {
+		if (slotReleased) return;
+		console.warn(
+			`Live-update subscriber #${sub.id} (${sub.domains.join(',')}) exceeded ${SUBSCRIBER_SLOT_TIMEOUT_MS}ms; releasing concurrency slot.`
+		);
+		releaseSlot();
+	}, SUBSCRIBER_SLOT_TIMEOUT_MS);
+
+	Promise.resolve()
+		.then(() => sub.callback(revisions, { source, changedDomains: domainSet }))
+		.then(() => {
+			for (const domain of domainSet) {
+				sub.retryDomains.delete(domain);
+			}
+			if (sub.retryDomains.size === 0) {
+				sub.retryAttempt = 0;
+				sub.retrySource = null;
+			}
+		})
+		.catch((err) => {
+			if (isTransientRefreshError(err)) {
+				transientFailure = true;
+				for (const domain of domainSet) sub.retryDomains.add(domain);
+				sub.retrySource = sub.retrySource === 'sse' ? 'sse' : source;
+			} else {
+				for (const domain of domainSet) {
+					sub.retryDomains.delete(domain);
+				}
+				if (sub.retryDomains.size === 0) {
+					sub.retryAttempt = 0;
+					sub.retrySource = null;
+				}
+			}
+		})
+		.finally(() => {
+			clearTimeout(slotTimer);
+			sub.inFlight = false;
+			if (subscribers.has(sub.id)) {
+				if (sub.pendingSource !== null) {
+					const nextSource = sub.pendingSource;
+					const nextDomains = new Set(sub.pendingDomains);
+					// Preserve any unrecovered retry domains across overlapping updates so a
+					// narrower pending refresh cannot discard a previously failed domain.
+					for (const domain of sub.retryDomains) {
+						nextDomains.add(domain);
+					}
+					sub.pendingSource = null;
+					sub.pendingDomains.clear();
+					// Queue pending reruns at the back of the FIFO queue so waiting
+					// subscribers are never starved by a continuously streaming view.
+					if (isDocumentHidden() || !sub.isActive()) {
+						sub.dirty = true;
+						for (const domain of nextDomains) sub.dirtyDomains.add(domain);
+					} else {
+						enqueueSubscriber(sub, nextSource, nextDomains);
+					}
+				} else if ((transientFailure || sub.retryDomains.size > 0) && sub.retryDomains.size > 0) {
+					if (isDocumentHidden() || !sub.isActive()) {
+						sub.dirty = true;
+						for (const domain of sub.retryDomains) sub.dirtyDomains.add(domain);
+					} else {
+						const delayMs = Math.min(15_000, 1000 * 2 ** Math.min(sub.retryAttempt, 4));
+						sub.retryAttempt += 1;
+						sub.retryTimer = setTimeout(() => {
+							sub.retryTimer = null;
+							if (!subscribers.has(sub.id)) return;
+							triggerSubscriber(
+								sub,
+								currentRevisions ?? revisions,
+								sub.retrySource ?? source,
+								new Set(sub.retryDomains)
+							);
+						}, delayMs);
+					}
+				}
+			}
+			const releasedBeforeFinally = slotReleased;
+			releaseSlot();
+			// If the slot was already released early by timeout, drain any newly enqueued pending rerun.
+			if (releasedBeforeFinally) drainSubscriberQueue();
+		});
 }
 
 function flushDirtySubscribers(): void {
@@ -258,60 +471,17 @@ function triggerSubscriber(
 		return;
 	}
 
-	sub.inFlight = true;
-	sub.lastRunAt = Date.now();
-	const domainSet = mergedDomains;
-	let transientFailure = false;
+	if (
+		activeSubscriberRuns >= MAX_CONCURRENT_SUBSCRIBER_RUNS
+		|| highPriorityQueuedIds.size > 0
+		|| queuedSubscriberIds.size > 0
+	) {
+		enqueueSubscriber(sub, source, mergedDomains);
+		drainSubscriberQueue();
+		return;
+	}
 
-	Promise.resolve()
-		.then(() => sub.callback(revisions, { source, changedDomains: domainSet }))
-		.then(() => {
-			sub.retryAttempt = 0;
-			sub.retryDomains.clear();
-			sub.retrySource = null;
-		})
-		.catch((err) => {
-			if (isTransientRefreshError(err)) {
-				transientFailure = true;
-				for (const domain of domainSet) sub.retryDomains.add(domain);
-				sub.retrySource = sub.retrySource === 'sse' ? 'sse' : source;
-			} else {
-				sub.retryAttempt = 0;
-				sub.retryDomains.clear();
-				sub.retrySource = null;
-			}
-		})
-		.finally(() => {
-			sub.inFlight = false;
-			if (!subscribers.has(sub.id)) return;
-			if (sub.pendingSource !== null) {
-				const nextSource = sub.pendingSource;
-				const nextDomains = new Set(sub.pendingDomains);
-				sub.pendingSource = null;
-				sub.pendingDomains.clear();
-				triggerSubscriber(sub, currentRevisions ?? revisions, nextSource, nextDomains);
-				return;
-			}
-			if (transientFailure && sub.retryDomains.size > 0) {
-				if (isDocumentHidden() || !sub.isActive()) {
-					sub.dirty = true;
-					for (const domain of sub.retryDomains) sub.dirtyDomains.add(domain);
-					return;
-				}
-				const delayMs = Math.min(15_000, 1000 * 2 ** Math.min(sub.retryAttempt, 4));
-				sub.retryAttempt += 1;
-				sub.retryTimer = setTimeout(() => {
-					sub.retryTimer = null;
-					if (!subscribers.has(sub.id)) return;
-					triggerSubscriber(
-						sub,
-						currentRevisions ?? revisions,
-						sub.retrySource ?? source,
-						new Set(sub.retryDomains)
-					);
-				}, delayMs);
-			}
-		});
+	executeSubscriber(sub, revisions, source, mergedDomains);
 }
 
 function observeApiRevisionsHeader(raw: string, path: string): void {
@@ -681,8 +851,11 @@ export function subscribeLiveUpdates(
 		isActive: () => paneActive() && (options.active ? options.active() : true),
 		fallbackIntervalMs: options.fallbackIntervalMs ?? 3000,
 		fallbackActive: options.fallbackActive ?? (() => true),
+		priority: options.priority ?? 'normal',
 		lastRunAt: Date.now(),
 		inFlight: false,
+		queuedSource: null,
+		queuedDomains: new Set(),
 		pendingSource: null,
 		pendingDomains: new Set(),
 		dirty: false,
@@ -708,10 +881,14 @@ export function subscribeLiveUpdates(
 
 	return () => {
 		clearSubscriberRetryTimer(subscriber);
+		highPriorityQueuedIds.delete(id);
+		queuedSubscriberIds.delete(id);
 		subscribers.delete(id);
 		if (subscribers.size === 0) {
 			stopStream();
 			stopFallbackLoop();
+			highPriorityQueuedIds.clear();
+			queuedSubscriberIds.clear();
 			currentRevisions = null;
 			serverProvidesRevisionHeaders = false;
 			streamUnsupported = false;

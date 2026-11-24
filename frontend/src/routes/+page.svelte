@@ -1,6 +1,6 @@
 <script lang="ts">
 	import DictationButton from '$lib/components/DictationButton.svelte';
-	import { onMount } from 'svelte';
+	import { onDestroy, onMount } from 'svelte';
 	import { goto } from '$app/navigation';
 	import yaml from 'js-yaml';
 	import { setup, sessions, agents as agentsApi, conversations as conversationsApi, projects as projectsApi, workflows as workflowsApi } from '$lib/api';
@@ -9,10 +9,12 @@
 	import { clearComposerDraft, loadComposerDraft, loadComposerTarget, saveComposerDraft, saveComposerTarget } from '$lib/composerDrafts';
 	import { appendImageFiles, imageDataUrl, IMAGE_FILE_ACCEPT, MAX_IMAGE_ATTACHMENTS, pastedImageFiles, shouldHandleImagePaste } from '$lib/imageAttachments';
 	import { PROJECT_MUTATION_EVENT, sortProjectsByRecency, type ProjectMutation } from '$lib/projectEvents';
+	import { useReportPaneRetainState } from '$lib/liveUpdates';
 	import AgentLoading from '$lib/components/AgentLoading.svelte';
 	import { harnessMark } from '$lib/utils';
 
 	const messageDraftScope = 'new-work';
+	const reportPaneRetainState = useReportPaneRetainState();
 	let status_text = $state('Connecting to server...');
 	let loading = $state(true);
 	let retries = 0;
@@ -121,6 +123,17 @@
 
 	$effect(() => {
 		if (composerModeReady) saveComposerTarget(`${messageDraftScope}-mode`, composerMode);
+	});
+
+	$effect(() => {
+		const hasUnsavedState =
+			imageAttachments.length > 0
+			|| Object.values(workflowInputValues).some((value) => value.trim().length > 0);
+		reportPaneRetainState(hasUnsavedState);
+	});
+
+	onDestroy(() => {
+		reportPaneRetainState(false);
 	});
 
 	onMount(() => {
