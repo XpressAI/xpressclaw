@@ -1,0 +1,3 @@
+branch: feat/canvas-perf-and-controls (PR #301 initial commit)
+summary: Fixed multi-hour Spatial Canvas leaks/freezes (live-update concurrency cap, viewport/collapse gating, incremental message/activity cursors, live activity trimming, ProjectLink shared cache, Monaco model disposal) and added minimap scroll-to-zoom, project-picker isolation, and draggable project zone group headers.
+validation: npm run check 0 errors/warnings; vite build clean; canvas/mermaid/workspace chromium E2E passing.
