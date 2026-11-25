@@ -2,7 +2,7 @@
  import { onDestroy, untrack } from 'svelte';
  import { environments, type ContainerFileTarget, type WorkspaceEntry, type WorkspaceFile } from '$lib/api';
  import MonacoEditor from './MonacoEditor.svelte';
- let { agentId, showTree = true, target, onDirtyChange = () => {} }: { agentId: string; showTree?: boolean; target?: ContainerFileTarget; onDirtyChange?: (dirty: boolean) => void } = $props();
+ let { agentId, showTree = true, fileOnly = false, target, onDirtyChange = () => {} }: { agentId: string; showTree?: boolean; fileOnly?: boolean; target?: ContainerFileTarget; onDirtyChange?: (dirty: boolean) => void } = $props();
  let directory = $state('/tmp');
  let location = $state('/tmp');
  let entries = $state<WorkspaceEntry[]>([]);
@@ -25,7 +25,7 @@
    error = ''; busy = true; file = null; content = ''; savedVersion = false;
    directory = location = next.folder ? next.path : next.path.slice(0, next.path.lastIndexOf('/')) || '/';
    entries = []; truncated = false;
-   const listing = environments.tree(agentId, directory).then(result => {
+   const listing = fileOnly ? undefined : environments.tree(agentId, directory).then(result => {
      if (request === sequence) { entries = result.entries; truncated = result.truncated; }
    }).catch(cause => { if (request === sequence && next.folder) error = String(cause); });
    try {
@@ -76,15 +76,19 @@
 </script>
 
 <div class="flex min-h-0 flex-1 flex-col" data-container-files>
- <form class="flex flex-wrap items-center gap-2 border-b border-border p-2" onsubmit={(event) => { event.preventDefault(); void browse(location); }}>
-  <button type="button" onclick={() => browse(directory.slice(0, directory.lastIndexOf('/')) || '/')} disabled={directory === '/'} class="rounded border border-border px-2 py-1 text-xs">Up</button>
-  <input aria-label="Container directory" bind:value={location} class="min-w-32 flex-1 rounded border border-input bg-background px-2 py-1 font-mono text-xs" />
-  <button class="rounded border border-border px-2 py-1 text-xs">Open folder</button>
-  <a href={environments.downloadUrl(agentId, directory)} download class="rounded border border-border px-2 py-1 text-xs">Download folder</a>
- </form>
- {#if error}<p role="alert" class="border-b border-destructive/30 p-2 text-xs text-destructive">{error}</p>{/if}
+ {#if !fileOnly}
+  <form class="flex flex-wrap items-center gap-2 border-b border-border p-2" onsubmit={(event) => { event.preventDefault(); void browse(location); }}>
+   <button type="button" onclick={() => browse(directory.slice(0, directory.lastIndexOf('/')) || '/')} disabled={directory === '/'} class="rounded border border-border px-2 py-1 text-xs">Up</button>
+   <input aria-label="Container directory" bind:value={location} class="min-w-32 flex-1 rounded border border-input bg-background px-2 py-1 font-mono text-xs" />
+   <button class="rounded border border-border px-2 py-1 text-xs">Open folder</button>
+   <a href={environments.downloadUrl(agentId, directory)} download class="rounded border border-border px-2 py-1 text-xs">Download folder</a>
+  </form>
+ {/if}
+ {#if error}<p role="alert" class="border-b border-destructive/30 p-2 text-xs text-destructive">{error}
+   {#if fileOnly}<button type="button" class="ml-2 underline" onclick={refresh}>Retry</button>{/if}
+ </p>{/if}
  <div class="flex min-h-0 flex-1 flex-col md:flex-row">
-  {#if showTree}<div class="max-h-64 overflow-auto border-r border-border md:max-h-none md:w-72 md:shrink-0">
+  {#if showTree && !fileOnly}<div class="max-h-64 overflow-auto border-r border-border md:max-h-none md:w-72 md:shrink-0">
    {#each entries as entry (entry.path)}
     <div class="flex items-center gap-1 px-2 py-1 text-xs hover:bg-accent">
      <button type="button" disabled={entry.kind !== 'file' && entry.kind !== 'directory'} onclick={() => entry.kind === 'directory' ? browse(entry.path) : open(entry.path)} class="min-w-0 flex-1 truncate text-left disabled:opacity-50" title={entry.path}>{entry.kind === 'directory' ? '▸' : '▧'} {entry.name}</button>
@@ -97,7 +101,7 @@
    {#if file}
     <div class="flex items-center justify-between gap-2 border-b border-border p-2 text-xs"><span class="truncate" title={file.path}>{file.path}{dirty ? ' •' : ''}</span>{#if savedVersion}<span>Saved Git version</span>{:else}<button type="button" onclick={save} disabled={!dirty || busy} class="rounded bg-primary px-3 py-1 text-primary-foreground disabled:opacity-50">Save</button>{/if}</div>
     <div class="min-h-0 flex-1">{#key file.path}<MonacoEditor value={content} path={file.path} readOnly={savedVersion} onChange={(value) => (content = value)} onSave={save} />{/key}</div>
-   {:else}<p class="m-auto p-6 text-center text-sm text-muted-foreground">{busy ? 'Loading…' : 'Browse the container, edit text files, or download files and folders. Folders download as .tar.gz archives.'}</p>{/if}
+   {:else if busy || !fileOnly}<p class="m-auto p-6 text-center text-sm text-muted-foreground">{busy ? 'Loading…' : 'Browse the container, edit text files, or download files and folders. Folders download as .tar.gz archives.'}</p>{/if}
   </div>
  </div>
 </div>

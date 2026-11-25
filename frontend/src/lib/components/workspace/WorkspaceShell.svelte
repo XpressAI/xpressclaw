@@ -973,7 +973,10 @@
 
 	function handleOpenSplit(event: Event) {
 		const path = (event as CustomEvent<WorkspaceOpenSplitDetail>).detail.path;
-		if (workspaceMode === 'canvas' && canvasRef?.openRoute(path)) return;
+		if (workspaceMode === 'canvas') {
+			const source = event.target instanceof Element ? event.target.closest<HTMLElement>('[data-canvas-node]') : null;
+			if (canvasRef?.openRoute(path, source?.dataset.canvasNode)) return;
+		}
 		openPathInSplit(path);
 	}
 

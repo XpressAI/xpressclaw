@@ -6,6 +6,7 @@
 	import { useReportPaneRetainState } from '$lib/liveUpdates';
 	import MonacoEditor from '$lib/components/MonacoEditor.svelte';
 	import TerminalPanel from '$lib/components/TerminalPanel.svelte';
+	import { containerFileTarget } from '$lib/workspace';
 	import ContainerFiles from '$lib/components/ContainerFiles.svelte';
 	import type { ContainerFileTarget } from '$lib/api';
 
@@ -81,17 +82,13 @@
 	function routeState(value: string) {
 		const search = value.includes('?') ? value.slice(value.indexOf('?')) : window.location.search;
 		const params = new URLSearchParams(search);
-		const containerPath = params.get('containerPath');
 		const task = params.get('task') || undefined;
-		const directory = params.get('directory');
 		return {
 			path: params.get('path') ?? '',
 			showTree: params.get('tree') !== 'collapsed',
 			terminal: params.get('terminal'),
 			task,
-			container: containerPath && task && directory ? {
-				path: containerPath, task, directory, folder: params.has('folder'), version: params.get('version'),
-			} : undefined,
+			container: containerFileTarget(params),
 		};
 	}
 
