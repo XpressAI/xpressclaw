@@ -837,6 +837,27 @@ export interface WorkspaceGitDiff {
 	truncated: boolean;
 }
 
+export interface TaskDirectoryFile {
+	path: string;
+	status: string;
+	has_version: boolean;
+}
+
+export interface TaskDirectory {
+	id: string;
+	path: string;
+	files: TaskDirectoryFile[];
+	notice: string | null;
+}
+
+export interface ContainerFileTarget {
+	path: string;
+	folder: boolean;
+	task: string;
+	directory: string;
+	version: string | null;
+}
+
 export const workspaces = {
 	status: (agentId: string) =>
 		request<WorkspaceStatus>(`/api/workspaces/${encodeURIComponent(agentId)}`),
@@ -861,6 +882,8 @@ export const workspaces = {
 	/** With a task, also lists the linked worktrees that task edited. */
 	gitStatus: (agentId: string, signal?: AbortSignal, taskId?: string) =>
 		request<WorkspaceGitStatus>(`/api/workspaces/${encodeURIComponent(agentId)}/git/status${taskId ? `?task_id=${encodeURIComponent(taskId)}` : ''}`, { signal }),
+	taskChanges: (agentId: string, taskId: string, signal?: AbortSignal) =>
+		request<WorkspaceGitStatus | { directories: TaskDirectory[] }>(`/api/workspaces/${encodeURIComponent(agentId)}/git/status?task_id=${encodeURIComponent(taskId)}&directories=true`, { signal }),
 	gitDiff: (agentId: string, path: string) =>
 		request<WorkspaceGitDiff>(`/api/workspaces/${encodeURIComponent(agentId)}/git/diff?path=${encodeURIComponent(path)}`),
 	repository: (agentId: string) =>
@@ -1672,6 +1695,8 @@ export interface PortForward {
  active: boolean;
 }
 export const environments = {
+ taskFileVersion: (agent: string, task: string, directory: string, path: string) =>
+   request<{content: string}>(`/api/environments/${encodeURIComponent(agent)}/tasks/${encodeURIComponent(task)}/directories/${encodeURIComponent(directory)}/version?path=${encodeURIComponent(path)}`),
  ports: (id: string) => request<{ports: PortForward[]}>(`/api/environments/${encodeURIComponent(id)}/ports`),
  addPort: (id: string, port: Pick<PortForward, 'direction' | 'host_port' | 'container_port'>) => request<PortForward>(`/api/environments/${encodeURIComponent(id)}/ports`, { method: 'POST', body: JSON.stringify(port) }),
  removePort: (id: string, port: string) => request(`/api/environments/${encodeURIComponent(id)}/ports/${encodeURIComponent(port)}`, { method: 'DELETE' }),

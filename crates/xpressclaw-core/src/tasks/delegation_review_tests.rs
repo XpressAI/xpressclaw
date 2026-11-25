@@ -80,6 +80,7 @@ fn upgrade_preserves_notification_receipts_and_requires_review_of_open_delegatio
     db.conn()
         .execute_batch(
             "ALTER TABLE tasks DROP COLUMN parent_review_required;
+        DROP TABLE task_directories;
         ALTER TABLE work_attempts DROP COLUMN error_dismissed_at;
         ALTER TABLE task_delegation_notifications DROP COLUMN decision;
         ALTER TABLE task_delegation_notifications DROP COLUMN review_note;

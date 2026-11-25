@@ -165,6 +165,7 @@ fn ui_domain_mask_for_table(table: &str) -> u32 {
         | "task_message_sync"
         | "task_queue"
         | "task_dependencies"
+        | "task_directories"
         | "task_pull_requests"
         | "message_visualizations" => ui_domains::TASKS,
         "logical_sessions" | "attempt_artifacts" => ui_domains::SESSIONS,
@@ -3026,6 +3027,7 @@ fn schema_migrations() -> &'static [(u32, &'static str)] {
         (55, MIGRATION_V55),
         (56, MIGRATION_V56),
         (57, MIGRATION_V57),
+        (58, include_str!("tasks/directories.sql")),
     ]
 }
 
@@ -3263,7 +3265,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "57");
+        assert_eq!(version, "58");
         let visualization_table: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master

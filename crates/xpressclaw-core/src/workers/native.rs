@@ -1883,14 +1883,20 @@ async fn execute_item_once(runtime: NativeAttemptRuntime, item: QueueItem) -> Re
         let result = match saved_result {
             Some(result) => result,
             None => {
-                let result = docker
-                    .workflow_command(
+                let result = crate::tasks::directories::track(
+                    &db,
+                    &docker,
+                    &item.task_id,
+                    &item.agent_id,
+                    attempt_id,
+                    docker.workflow_command(
                         workload_id,
                         &container_workspace,
                         &repository.container_bootstrap,
                         &command,
-                    )
-                    .await;
+                    ),
+                )
+                .await;
                 sessions.clear_container(attempt_id)?;
                 if finish_terminal_dispatch_after_worker_exit(
                     &db,
@@ -1978,9 +1984,13 @@ async fn execute_item_once(runtime: NativeAttemptRuntime, item: QueueItem) -> Re
         docker.container_files(workload_id, request)
     })
     .await?;
-    let turn = live
-        .process
-        .run_turn(
+    let turn = crate::tasks::directories::track(
+        &db,
+        &docker,
+        &item.task_id,
+        &item.agent_id,
+        attempt_id,
+        live.process.run_turn(
             AcpTurnRuntime::new(recorder, elicitation_broker, turn_controls)
                 .with_retry_capacity(retry_capacity),
             session_start,
@@ -1995,8 +2005,9 @@ async fn execute_item_once(runtime: NativeAttemptRuntime, item: QueueItem) -> Re
                 additional_directories: presentation_support.additional_directories,
                 image_attachments: prompt.attachments,
             },
-        )
-        .await;
+        ),
+    )
+    .await;
     if capture_task_dashboard_metrics {
         if let Err(error) =
             DashboardManager::new(db.clone()).record_git_snapshot("attempt", attempt_id, true)

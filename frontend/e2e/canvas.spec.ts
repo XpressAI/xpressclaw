@@ -400,11 +400,17 @@ async function mockCanvasApi(page: Page) {
 	return { savedFiles };
 }
 
+async function openWorkspace(page: Page, path: '/' | '/canvas') {
+	// The workspace mounts after authentication bootstrap. On a cold Vite
+	// server the document can finish loading while client modules are compiling.
+	await Promise.all([page.waitForResponse('**/api/auth/bootstrap'), page.goto(path)]);
+}
+
 test.describe('Spatial Canvas workspace', () => {
 	test('defaults to Tabs mode, switches cleanly to Canvas with spatial delegation edges, and persists layout', async ({ page }) => {
 		await mockCanvasApi(page);
 		await page.setViewportSize({ width: 1440, height: 900 });
-		await page.goto('/');
+		await openWorkspace(page, '/');
 
 		// Tabs mode remains the default.
 		const toggle = page.locator('[data-workspace-mode-toggle]');
@@ -454,7 +460,7 @@ test.describe('Spatial Canvas workspace', () => {
 	test('spawns connected Code Editor, Terminal, Image Viewer, and Web App windows in project context', async ({ page }) => {
 		await mockCanvasApi(page);
 		await page.setViewportSize({ width: 1440, height: 900 });
-		await page.goto('/canvas');
+		await openWorkspace(page, '/canvas');
 
 		const canvas = page.locator('[data-workspace-canvas]');
 		await expect(canvas).toBeVisible();
@@ -543,7 +549,7 @@ test.describe('Spatial Canvas workspace', () => {
 		});
 
 		await page.setViewportSize({ width: 1440, height: 900 });
-		await page.goto('/canvas');
+		await openWorkspace(page, '/canvas');
 		const alphaCard = page.locator('[data-canvas-project-card="proj-alpha"]');
 		await expect(alphaCard).toBeVisible();
 
@@ -698,7 +704,7 @@ test.describe('Spatial Canvas workspace', () => {
 		);
 
 		await page.setViewportSize({ width: 1440, height: 900 });
-		await page.goto('/canvas');
+		await openWorkspace(page, '/canvas');
 		const parentTaskWindow = page.locator('[data-canvas-node-kind="task"]', { hasText: 'Implement Spatial Canvas' }).first();
 		await expect(parentTaskWindow).toBeVisible();
 		await expect(parentTaskWindow.getByRole('link', { name: 'demo.html' })).toBeVisible();
@@ -833,7 +839,7 @@ test.describe('Spatial Canvas workspace', () => {
 		);
 
 		await page.setViewportSize({ width: 1440, height: 900 });
-		await page.goto('/canvas');
+		await openWorkspace(page, '/canvas');
 		const alphaCard = page.locator('[data-canvas-project-card="proj-alpha"]');
 		await expect(alphaCard).toBeVisible();
 		await alphaCard.getByRole('button', { name: /Release Sync/ }).click();
@@ -952,7 +958,7 @@ test.describe('Spatial Canvas workspace', () => {
 		});
 
 		await page.setViewportSize({ width: 1440, height: 900 });
-		await page.goto('/canvas');
+		await openWorkspace(page, '/canvas');
 		const canvas = page.locator('[data-workspace-canvas]');
 		await expect(canvas).toBeVisible();
 		await expect(page.locator('[data-canvas-project-card="proj-alpha"]')).toBeVisible();
@@ -1237,7 +1243,7 @@ test.describe('Spatial Canvas workspace', () => {
 		);
 
 		await page.setViewportSize({ width: 1440, height: 900 });
-		await page.goto('/canvas');
+		await openWorkspace(page, '/canvas');
 		const canvas = page.locator('[data-workspace-canvas]');
 		const alphaCard = page.locator('[data-canvas-project-card="proj-alpha"]');
 		await expect(alphaCard).toBeVisible();

@@ -110,8 +110,12 @@ its live ACP sessions along with installed tools, caches, `/home/node`, and
 Open an Agent's **Files** tab to browse and edit its configured workspace with
 Monaco, inspect current Git changes and diffs, or open a terminal in its
 retained container. The terminal becomes available after the Agent has run its
-first task. Task details also show the workspace's current changed files and
-link directly to them in the editor.
+first task. An Agent can call `add_task_directory` before editing a local
+folder, including a linked Git worktree or a checkout elsewhere in its
+container. **Changed files** on the task then lists each registered folder
+and links its changed files to the editor. The list stays available after a
+commit or a follow-up turn. Tasks without a registered folder show live
+workspace Git status.
 
 ### Clone first, attach GitHub later
 

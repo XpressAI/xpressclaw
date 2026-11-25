@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFile as execFileCallback, spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -93,6 +93,9 @@ test('native environment tools bind ports, task creation and publication to thei
     await call('publish_task_files', { files: ['/tmp/report', 'results'], content: 'Files ready' });
     assert.equal(requests.at(-1).url, '/api/environments/atlas/tasks/parent-task/files');
     assert.deepEqual(requests.at(-1).body.files, ['/tmp/report', path.resolve('results')]);
+    assert.ok(names.includes('add_task_directory'));
+    await call('add_task_directory', { path: '/tmp', task_id: 'unrelated' });
+    assert.deepEqual(requests.at(-1), { url: '/api/environments/atlas/tasks/parent-task/directories', agent: 'atlas', body: { path: await realpath('/tmp') } });
   } finally { child.kill(); await new Promise(resolve => server.close(resolve)); }
 });
 

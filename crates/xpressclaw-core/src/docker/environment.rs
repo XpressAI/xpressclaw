@@ -29,6 +29,12 @@ pub const MAX_CONTAINER_DOWNLOAD_BYTES: usize = 100 * 1024 * 1024;
 // Base64 expands each three bytes to four. Allow a small, separate envelope
 // for the JSON fields; this is a transport limit, not the decoded file cap.
 fn file_response_limit(request: &Value) -> Result<usize> {
+    if matches!(
+        request["operation"].as_str(),
+        Some("directory_baseline" | "directory_changes" | "directory_version")
+    ) {
+        return Ok(16 * 1024 * 1024);
+    }
     let bytes = if request["operation"] == "download" {
         match request.get("max_bytes") {
             Some(value) => value
@@ -266,11 +272,24 @@ impl DockerManager {
 
     pub async fn container_files(&self, agent_id: &str, request: Value) -> Result<Value> {
         let response_limit = file_response_limit(&request)?;
-        self.start_project_environment(agent_id).await?;
+        let script = match request["operation"].as_str() {
+            Some("directory_baseline" | "directory_changes" | "directory_version") => {
+                include_str!("task-directory.cjs")
+            }
+            _ => include_str!("files.cjs"),
+        };
+        // Directory observations run during an active turn. They must not
+        // restart the container after an explicit stop or cancellation.
+        if !matches!(
+            request["operation"].as_str(),
+            Some("directory_baseline" | "directory_changes")
+        ) {
+            self.start_project_environment(agent_id).await?;
+        }
         let mut attached = self
             .open_project_process(
                 agent_id,
-                &["node".into(), "-e".into(), include_str!("files.cjs").into()],
+                &["node".into(), "-e".into(), script.into()],
                 None,
                 &[],
             )
@@ -864,6 +883,7 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(10), BufReader::new(stream_reader(&mut main)).read_line(&mut ready)).await.unwrap().unwrap();
             assert!(ready.contains("ready"));
             eprintln!("container ready");
+            verify_task_directory_turn(&docker).await;
             let mut command = crate::workflows::commands::WorkflowCommand {
                 execution_id: "test-command".into(), script: "printf captured; printf failure >&2; exit 7".into(),
                 cwd: ".".into(), timeout_secs: 5, allow_failure: true,
@@ -992,5 +1012,50 @@ mod tests {
         if let Err(panic) = result {
             std::panic::resume_unwind(panic);
         }
+    }
+
+    async fn verify_task_directory_turn(docker: &DockerManager) {
+        use crate::tasks::directories::{list, register, track};
+        let db = Database::open_memory().unwrap();
+        db.conn().execute_batch(
+            "INSERT INTO agents(id,name,backend,config) VALUES('loopback','Test','native','{}');
+             INSERT INTO tasks(id,title,status,agent_id) VALUES('task','Code','in_progress','loopback');
+             INSERT INTO logical_sessions(id,agent_id) VALUES('loopback','loopback');
+             INSERT INTO work_attempts(id,session_id,task_id,runner,status)
+                 VALUES('attempt','loopback','task','test','running');",
+        ).unwrap();
+        track(&db, docker, "task", "loopback", "attempt", async {
+            register(&db, docker, "task", "loopback", "/tmp/artifacts")
+                .await
+                .unwrap();
+            capture(
+                docker,
+                "require('fs').writeFileSync('/tmp/artifacts/live.txt','live')",
+            )
+            .await;
+            tokio::time::timeout(Duration::from_secs(25), async {
+                loop {
+                    if list(&db, "task", "loopback").unwrap()[0]
+                        .files
+                        .iter()
+                        .any(|f| f.path == "live.txt")
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+            .await
+            .expect("changed files should update during a turn with no tool events");
+            capture(
+                docker,
+                "require('fs').renameSync('/tmp/artifacts/live.txt','/tmp/artifacts/final.txt')",
+            )
+            .await;
+        })
+        .await;
+        let dirs = list(&db, "task", "loopback").unwrap();
+        assert_eq!(dirs[0].files.len(), 1);
+        assert_eq!(dirs[0].files[0].path, "final.txt");
     }
 }

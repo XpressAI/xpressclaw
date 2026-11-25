@@ -4557,6 +4557,48 @@ test('deleted workspace changes remain available as diff-only selections', async
 	await expect(page.getByText('workspace path was not found')).toBeHidden();
 });
 
+test('a failed changed-files request stays visible and can be retried', async ({ page }) => {
+	await mockApi(page);
+	let failing = true;
+	await page.route(url => url.pathname.endsWith('/git/status') && url.searchParams.has('directories'), route =>
+		failing ? route.fulfill({ status: 413, json: { error: 'Too many changed paths' } }) : route.fallback());
+	await page.goto(`/tasks/${taskId}`);
+	const section = page.locator('[data-task-changed-files]');
+	await expect(section.getByRole('status')).toContainText('Too many changed paths');
+	failing = false;
+	await section.getByRole('button', { name: 'Retry' }).click();
+	await expect(section.getByRole('link', { name: 'src/main.ts' })).toBeVisible();
+	await expect(section.getByRole('status')).toHaveCount(0);
+});
+
+test('registered task directories open live files and saved Git versions in the editor', async ({ page }) => {
+	await page.setViewportSize({ width: 1024, height: 768 });
+	await mockApi(page);
+	const root = '/tmp/other checkout';
+	await page.route(url => url.pathname === `/api/workspaces/${agentId}/git/status` && url.searchParams.has('directories'),
+		route => route.fulfill({ json: { directories: [{ id: 'registered', path: root, notice: null, files: [
+			{ path: 'src/result.ts', status: 'A', has_version: true },
+			{ path: 'src/removed.ts', status: 'D', has_version: true },
+		] }] } }));
+	await page.route(url => url.pathname === `/api/environments/${agentId}/tree`,
+		route => route.fulfill({ json: { path: root + '/src', entries: [], truncated: false } }));
+	await page.route(url => url.pathname === `/api/environments/${agentId}/file` && url.searchParams.get('path') === root + '/src/result.ts',
+		route => route.fulfill({ json: { path: root + '/src/result.ts', content: 'export const result = 42;', size: 25, revision: 'file-revision' } }));
+	await page.route(url => url.pathname === `/api/environments/${agentId}/tasks/${taskId}/directories/registered/version` && url.searchParams.get('path') === root + '/src/removed.ts',
+		route => route.fulfill({ json: { content: 'export const removed = true;' } }));
+	await page.goto(`/tasks/${taskId}`);
+	const changed = page.locator('[data-task-changed-files]');
+	await expect(changed.getByRole('link', { name: root })).toBeVisible();
+	await changed.getByTitle('src/result.ts').click();
+	const editor = page.locator('[data-container-files] .view-lines');
+	await expect(editor).toContainText('result = 42', { timeout: 20_000 });
+	await page.goto(`/tasks/${taskId}`);
+	await changed.getByTitle('src/removed.ts').click();
+	await expect(editor).toContainText('removed = true', { timeout: 20_000 });
+	await expect(page.getByText('Saved Git version')).toBeVisible();
+	await expect(page.locator('[data-container-files]').getByRole('button', { name: 'Save', exact: true })).toHaveCount(0);
+});
+
 test('task changed files include the worktrees the task edited', async ({ page }) => {
 	const gitStatusTaskIds: (string | null)[] = [];
 	await mockApi(page, { taskWorktreeFiles: true, gitStatusTaskIds });

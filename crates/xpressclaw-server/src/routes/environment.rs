@@ -54,6 +54,10 @@ pub fn routes() -> Router<AppState> {
         .route("/{agent_id}/ports/{id}", delete(remove_port))
         .route("/{agent_id}/tree", get(tree))
         .route("/{agent_id}/file", get(read_file).put(write_file))
+        .route(
+            "/{agent_id}/tasks/{task_id}/directories/{id}/version",
+            get(task_file_version),
+        )
         .route("/{agent_id}/download", get(download))
         .route("/{agent_id}/terminal-sessions", get(terminal_sessions))
 }
@@ -65,6 +69,10 @@ pub fn internal_routes() -> Router<AppState> {
             get(planning::list_tasks).post(planning::create_task),
         )
         .merge(planning::routes())
+        .route(
+            "/{agent_id}/tasks/{task_id}/directories",
+            post(add_task_directory),
+        )
         .route(
             "/{agent_id}/tasks/{task_id}/files",
             post(publish_task_files),
@@ -396,6 +404,61 @@ struct PublishInput {
     content: String,
     files: Vec<String>,
 }
+
+#[derive(Deserialize)]
+struct DirectoryPath {
+    path: String,
+}
+
+async fn add_task_directory(
+    State(state): State<AppState>,
+    Path((agent, task)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(input): Json<DirectoryPath>,
+) -> ApiResult<Json<Value>> {
+    authorize(&state, &agent, &headers)?;
+    require_agent(&headers, &agent)?;
+    let docker = docker(&state).await?;
+    xpressclaw_core::tasks::directories::register(&state.db, &docker, &task, &agent, &input.path)
+        .await
+        .map(Json)
+        .map_err(bad)
+}
+
+async fn task_file_version(
+    State(state): State<AppState>,
+    Path((agent, task, directory_id)): Path<(String, String, String)>,
+    Query(query): Query<DirectoryPath>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    authorize(&state, &agent, &headers)?;
+    let directory = xpressclaw_core::tasks::directories::list(&state.db, &task, &agent)
+        .map_err(bad)?
+        .into_iter()
+        .find(|d| d.id == directory_id)
+        .ok_or_else(forbidden)?;
+    let relative = query
+        .path
+        .strip_prefix(&format!("{}/", directory.path))
+        .ok_or_else(forbidden)?;
+    let version = directory
+        .files
+        .into_iter()
+        .find(|f| f.path == relative)
+        .and_then(|f| f.version)
+        .ok_or_else(|| bad("No saved Git version for this file"))?;
+    Ok(Json(
+        active_docker(&state, &agent)
+            .await?
+            .container_files(
+                &agent,
+                json!({"operation":"directory_version", "version":version}),
+            )
+            .await
+            .map_err(bad)?,
+    ))
+}
+
 async fn publish_task_files(
     State(state): State<AppState>,
     Path((agent_id, task_id)): Path<(String, String)>,
