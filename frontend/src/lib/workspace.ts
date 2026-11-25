@@ -1,3 +1,20 @@
+import type { ContainerFileTarget } from './api';
+
+export function containerFileTarget(params: URLSearchParams): ContainerFileTarget | undefined {
+	const path = params.get('containerPath');
+	const task = params.get('task');
+	const directory = params.get('directory');
+	if (!path || !task || !directory) return undefined;
+	return { path, task, directory, folder: params.has('folder'), version: params.get('version') };
+}
+
+export function containerFileUrl(agentId: string, target: ContainerFileTarget): string {
+	const params = new URLSearchParams({ tab: 'files', task: target.task, directory: target.directory, containerPath: target.path });
+	if (target.folder) params.set('folder', '1');
+	else if (target.version) params.set('version', target.version);
+	return `/agents/${encodeURIComponent(agentId)}?${params}`;
+}
+
 export type WorkspaceTabKind =
 	| 'home'
 	| 'dashboard'

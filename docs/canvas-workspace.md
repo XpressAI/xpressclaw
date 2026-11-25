@@ -16,6 +16,7 @@ From any Project, Agent, Task, or Conversation window's `+` menu (or the top **A
 
 - **Task & Conversation Chats**: Live interactive Task and Conversation views with streaming updates and delegation controls.
 - **Code Editors**: Monaco editor with collapsible workspace file tree, Code/Diff view toggle, and save support. Clicking an image file opens a connected Image Viewer; clicking **Preview App** on an HTML file opens a connected Web App preview.
+  Click a file under **Changed files** in a Task window to open a connected editor. Clicking it again focuses the existing editor. For a registered directory, you can edit the live file or read its saved Git version when the file has been removed.
 - **Terminals**: Live `TerminalPanel` connected to the Agent's retained container and tmux sessions.
 - **Images**: Read-only preview of workspace images (served via `GET /api/workspaces/{agent_id}/raw` with capability-safe workspace checks, `X-Content-Type-Options: nosniff`, and `Content-Security-Policy: default-src 'none'; sandbox`) or direct attachment/image URLs with zoom and transparency-grid controls.
 - **Web Apps**: Embed live previews from:

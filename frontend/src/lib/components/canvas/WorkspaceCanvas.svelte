@@ -51,10 +51,11 @@
 		type CanvasNodeKind,
 		type CanvasState,
 	} from '$lib/canvas';
-	import { createWorkspaceTab, describeWorkspacePath, type WorkspaceTab } from '$lib/workspace';
+	import { containerFileTarget, containerFileUrl, createWorkspaceTab, describeWorkspacePath, type WorkspaceTab } from '$lib/workspace';
 	import WorkspaceContent from '$lib/components/workspace/WorkspaceContent.svelte';
 	import CanvasWindow from './CanvasWindow.svelte';
 	import CanvasProjectCard from './CanvasProjectCard.svelte';
+	import ContainerFiles from '$lib/components/ContainerFiles.svelte';
 	import CanvasEditorCard from './CanvasEditorCard.svelte';
 	import CanvasTerminalCard from './CanvasTerminalCard.svelte';
 	import CanvasImageCard from './CanvasImageCard.svelte';
@@ -1196,6 +1197,7 @@
 		agentId: string | null,
 		parentNodeId: string | null = null,
 		options?: {
+			fileRoute?: string;
 			filePath?: string | null;
 			terminalSession?: string | null;
 			imageUrl?: string | null;
@@ -1231,7 +1233,9 @@
 			return true;
 		};
 		if (kind === 'editor' && resolvedAgentId && options?.filePath) {
-			if (focusExisting(nodes.find((node) => node.kind === 'editor' && node.agentId === resolvedAgentId && node.filePath === options.filePath))) return;
+			const existing = nodes.find(node => node.kind === 'editor' && node.agentId === resolvedAgentId
+				&& node.filePath === options.filePath && node.route === (options.fileRoute ?? null));
+			if (focusExisting(existing)) return;
 		}
 		if (kind === 'image' && resolvedAgentId && options?.filePath) {
 			if (focusExisting(nodes.find((node) => node.kind === 'image' && node.agentId === resolvedAgentId && node.filePath === options.filePath))) return;
@@ -1255,6 +1259,7 @@
 				edgeLabel: kind,
 				projectId: resolvedProjectId,
 				agentId: resolvedAgentId,
+				route: options?.fileRoute ?? null,
 				filePath: options?.filePath ?? null,
 				terminalSession: options?.terminalSession ?? null,
 				imageUrl: options?.imageUrl ?? null,
@@ -1404,6 +1409,13 @@
 			const terminal = url.searchParams.get('terminal');
 			if (tabParam === 'files' && terminal) {
 				spawnToolNode('terminal', desc.resourceId, parentId, { terminalSession: terminal });
+				return true;
+			}
+			const target = containerFileTarget(url.searchParams);
+			if (tabParam === 'files' && target && !target.folder) {
+				spawnToolNode('editor', desc.resourceId, parentId, {
+					filePath: target.path, fileRoute: containerFileUrl(desc.resourceId, target),
+				});
 				return true;
 			}
 			if (tabParam === 'files' && filePath) {
@@ -1910,16 +1922,22 @@
 							onExpandActiveTasks={expandActiveTasksForProject}
 						/>
 					{:else if node.kind === 'editor'}
-						<CanvasEditorCard
-							nodeId={node.id}
-							agentId={node.agentId}
-							initialPath={node.filePath}
-							{agents}
-							onUpdateNode={(patch) => updateNode(node.id, patch)}
-							onDirtyChange={(dirty) => setEditorDirty(node.id, dirty)}
-							onOpenImage={(agentId, filePath, parentId) => spawnToolNode('image', agentId, parentId, { filePath, imageSource: 'workspace' })}
-							onOpenHtmlApp={(agentId, filePath, parentId) => spawnToolNode('app', agentId, parentId, { appSource: 'workspace-html', appFilePath: filePath })}
-						/>
+						{@const editorRoute = node.route}
+						{@const target = editorRoute ? containerFileTarget(new URLSearchParams(editorRoute.split('?')[1])) : undefined}
+						{#if target && node.agentId}
+							<ContainerFiles agentId={node.agentId} {target} fileOnly onDirtyChange={(dirty) => setEditorDirty(node.id, dirty)} />
+						{:else}
+							<CanvasEditorCard
+								nodeId={node.id}
+								agentId={node.agentId}
+								initialPath={node.filePath}
+								{agents}
+								onUpdateNode={(patch) => updateNode(node.id, patch)}
+								onDirtyChange={(dirty) => setEditorDirty(node.id, dirty)}
+								onOpenImage={(agentId, filePath, parentId) => spawnToolNode('image', agentId, parentId, { filePath, imageSource: 'workspace' })}
+								onOpenHtmlApp={(agentId, filePath, parentId) => spawnToolNode('app', agentId, parentId, { appSource: 'workspace-html', appFilePath: filePath })}
+							/>
+						{/if}
 					{:else if node.kind === 'terminal'}
 						<CanvasTerminalCard
 							agentId={node.agentId}

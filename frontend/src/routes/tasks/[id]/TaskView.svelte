@@ -27,7 +27,7 @@
 	import { rememberTaskAttemptDismissal, subscribeTaskErrorDismissal } from '$lib/taskErrorDismissals';
 	import { appendImageFiles, imageDataUrl, MAX_IMAGE_ATTACHMENTS, pastedImageFiles, shouldHandleImagePaste } from '$lib/imageAttachments';
 	import { coalesceAgentMessageFragments } from '$lib/agentMessageFragments';
-	import { WORKSPACE_OPEN_SPLIT_EVENT, type WorkspaceOpenSplitDetail } from '$lib/workspace';
+	import { containerFileUrl, WORKSPACE_OPEN_SPLIT_EVENT, type WorkspaceOpenSplitDetail } from '$lib/workspace';
 
 	let { taskId, compact = false }: { taskId: string; compact?: boolean } = $props();
 	let planningTask = $state<Task | null>(null);
@@ -1909,20 +1909,21 @@
 	}
 
 	function directoryUrl(agentId: string, directory: TaskDirectory, file?: TaskDirectoryFile): string {
-		const params = new URLSearchParams({ tab: 'files', task: taskId, directory: directory.id,
-			containerPath: file ? `${directory.path}/${file.path}` : directory.path });
-		if (!file) params.set('folder', '1');
-		else if (file.has_version) params.set('version', file.status === 'D' ? 'deleted' : 'fallback');
-		return `/agents/${encodeURIComponent(agentId)}?${params}`;
+		return containerFileUrl(agentId, {
+			task: taskId, directory: directory.id, folder: !file,
+			path: file ? `${directory.path}/${file.path}` : directory.path,
+			version: file?.has_version ? (file.status === 'D' ? 'deleted' : 'fallback') : null,
+		});
 	}
 
 	function openChangedFile(event: MouseEvent) {
 		if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
 		event.preventDefault();
 		detailsDialog?.close();
-		const route = `${(event.currentTarget as HTMLAnchorElement).getAttribute('href')}&tree=collapsed`;
-		window.dispatchEvent(new CustomEvent<WorkspaceOpenSplitDetail>(WORKSPACE_OPEN_SPLIT_EVENT, {
-			detail: { path: route },
+		const link = event.currentTarget as HTMLAnchorElement;
+		const route = `${link.getAttribute('href')}&tree=collapsed`;
+		link.dispatchEvent(new CustomEvent<WorkspaceOpenSplitDetail>(WORKSPACE_OPEN_SPLIT_EVENT, {
+			bubbles: true, detail: { path: route },
 		}));
 	}
 

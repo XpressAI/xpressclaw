@@ -642,6 +642,65 @@ test.describe('Spatial Canvas workspace', () => {
 		await expect(environmentTab).toHaveAttribute('aria-selected', 'true');
 	});
 
+	test('opens registered changed files in dedicated editors and restores saved Git versions', async ({ page }) => {
+		await mockCanvasApi(page);
+		const root = '/tmp/other checkout';
+		const task = 'task-parent', agent = 'agent-codex';
+		const env = `/api/environments/${agent}`;
+		await page.route(url => url.pathname.endsWith('/git/status') && url.searchParams.get('task_id') === task,
+			route => route.fulfill({ json: { directories: [{ id: 'reg', path: root, files: [
+				{ path: 'src/app.ts', status: 'M', has_version: true },
+				{ path: 'src/gone.ts', status: 'D', has_version: true },
+			] }] } }));
+		let saved: {path: string; expected_revision: string; content: string} | undefined;
+		await page.route(url => url.pathname === env + '/file', route => {
+			if (route.request().method() === 'PUT') saved = route.request().postDataJSON();
+			expect(new URL(route.request().url()).searchParams.get('path') ?? saved?.path).toBe(root + '/src/app.ts');
+			return route.fulfill({ json: { path: root + '/src/app.ts', revision: saved ? 'r2' : 'r1', content: saved?.content ?? 'const live = true;', size: 18 } });
+		});
+		await page.route(url => url.pathname === env + '/tasks/' + task + '/directories/reg/version' && url.searchParams.get('path') === root + '/src/gone.ts',
+			route => route.fulfill({ json: { content: 'const removed = true;' } }));
+
+		await page.setViewportSize({ width: 1600, height: 960 });
+		await openWorkspace(page, '/canvas');
+		const taskWindow = page.locator('[data-canvas-node-kind="task"]').filter({ hasText: 'Implement Spatial Canvas' }).first();
+		const editors = page.locator('[data-canvas-node-kind="editor"]');
+		await expect(taskWindow).toBeVisible();
+		const agentWindows = page.locator('[data-canvas-node-kind="agent"]');
+		const initialAgents = await agentWindows.count();
+		async function selectFile(path: string) {
+			await page.locator('[data-canvas-fit]').click();
+			const details = taskWindow.getByRole('button', { name: 'Show task details' });
+			if (await details.isVisible()) await details.click();
+			await taskWindow.getByRole('link', { name: path }).press('Enter');
+		}
+		await selectFile('src/app.ts');
+		const live = editors.filter({ has: page.getByRole('toolbar', { name: 'app.ts window controls' }) });
+		await expect(live.locator('.view-lines')).toContainText('const live = true;');
+		await expect(agentWindows).toHaveCount(initialAgents);
+		const parentId = await taskWindow.getAttribute('data-canvas-node');
+		const editorId = await live.getAttribute('data-canvas-node');
+		await expect(page.locator(`[data-canvas-edge="context:${parentId}->${editorId}"]`)).toHaveCount(1);
+		await expect(live.getByLabel('Container directory')).toHaveCount(0);
+		await live.locator('.view-lines').click();
+		await page.keyboard.press('Control+a');
+		await page.keyboard.insertText('const edited = true;');
+		await selectFile('src/app.ts');
+		await expect(editors).toHaveCount(1);
+		await expect(live.locator('.view-lines')).toContainText('const edited = true;');
+		await live.getByRole('button', { name: 'Save', exact: true }).click();
+		await expect.poll(() => saved).toEqual({ path: root + '/src/app.ts', expected_revision: 'r1', content: 'const edited = true;' });
+
+		await selectFile('src/gone.ts');
+		const deleted = editors.filter({ has: page.getByRole('toolbar', { name: 'gone.ts window controls' }) });
+		await expect(deleted.locator('.view-lines')).toContainText('const removed = true;');
+		await expect(deleted.getByText('Saved Git version')).toBeVisible();
+		await expect(deleted.getByRole('button', { name: 'Save', exact: true })).toHaveCount(0);
+		await page.reload();
+		await expect(deleted.locator('.view-lines')).toContainText('const removed = true;');
+		await expect(page).toHaveURL(/\/canvas$/);
+	});
+
 	test('previews file links, HTML/image attachments, and web URLs in Canvas directly from inside Task windows', async ({ page }) => {
 		await mockCanvasApi(page);
 		await page.route('**/api/workspaces/agent-codex', (route) =>
