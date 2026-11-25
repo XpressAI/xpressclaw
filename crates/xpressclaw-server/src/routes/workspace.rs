@@ -834,6 +834,15 @@ async fn git_status(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_same_origin(&headers)?;
+    if let Some(task) = query.task_id.as_deref().filter(|_| query.directories) {
+        let registered = xpressclaw_core::tasks::directories::list(&state.db, task, &agent_id)
+            .map_err(core_error)?;
+        if !registered.is_empty() {
+            return Ok(Json(
+                json!({"directories": registered.iter().map(|d| d.view()).collect::<Vec<_>>() }),
+            ));
+        }
+    }
     let (agent, bootstrap) = agent_workspace(&state, &agent_id)?;
     let root = workspace_root(&state, &agent_id).await?;
     let repository_status = repository_status_json(&state, &agent_id).await?;
@@ -912,6 +921,8 @@ async fn git_status(
 
 #[derive(Debug, Default, Deserialize)]
 struct GitStatusQuery {
+    #[serde(default)]
+    directories: bool,
     #[serde(default)]
     task_id: Option<String>,
 }
@@ -1820,6 +1831,35 @@ mod tests {
             .iter()
             .map(|file| file["path"].as_str().unwrap().to_string())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn task_sidebar_serves_registered_directories_without_an_active_checkout_or_events() {
+        let (app, _, db, _workspace) = repository_app();
+        db.conn().execute_batch(
+            r#"INSERT INTO tasks(id,title,status,agent_id) VALUES ('task','Review files','completed','workspace-agent');
+               INSERT INTO task_directories(id,task_id,agent_id,path,attempt_id,files)
+                 VALUES ('directory','task','workspace-agent','/tmp/other repo','old-turn','[{"path":"result.rs","status":"M"}]');"#
+        ).unwrap();
+        let status = response_json(
+            app.oneshot(
+                Request::get(
+                    "/workspaces/workspace-agent/git/status?task_id=task&directories=true",
+                )
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            status["directories"][0],
+            json!({
+                "id":"directory", "path":"/tmp/other repo", "notice":null,
+                "files":[{"path":"result.rs","status":"M","has_version":false}]
+            })
+        );
     }
 
     #[tokio::test]

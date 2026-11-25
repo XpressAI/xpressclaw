@@ -5,6 +5,7 @@ pub mod conversation;
 pub mod delegation;
 pub(crate) mod delegation_notifications;
 pub mod delegation_review;
+pub mod directories;
 pub mod dispatcher;
 pub mod procedure_runner;
 pub mod queue;

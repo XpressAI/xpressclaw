@@ -11,7 +11,7 @@
 	import { tasks, agents, sessions, workspaces, ApiError } from '$lib/api';
 	import { isTransientRefreshError, subscribeLiveUpdates, subscribeLiveUpdatesVisibility, usePaneActive, useReportPaneRetainState, type UiDomain } from '$lib/liveUpdates';
 	import { selectChoices, isModelOption, isReasoningOption, isAdditionalModelOption, reconcileConfig, duplicatesReasoningMode } from '$lib/acpConfig';
-	import type { TaskControlSnapshot, AcpCommand, AcpConfigOption, AcpModeState, DelegatedWork, Task, TaskMessage, Agent, WorkAttempt, SessionEvent, ImageAttachmentUpload, GitChange, WorkspaceGitStatus, MessageVisualization } from '$lib/api';
+	import type { TaskControlSnapshot, AcpCommand, AcpConfigOption, AcpModeState, DelegatedWork, Task, TaskMessage, Agent, WorkAttempt, SessionEvent, ImageAttachmentUpload, GitChange, TaskDirectory, TaskDirectoryFile, WorkspaceGitStatus, MessageVisualization } from '$lib/api';
 	import { timeAgo, openExternal } from '$lib/utils';
 	import { serverTimestampMs } from '$lib/serverTime';
 	import { renderContent } from '$lib/formatMessage';
@@ -162,6 +162,8 @@
 	let taskProjectId = $derived(task?.project_id || agentList.find((agent) => agent.id === task?.agent_id)?.project_id || null);
 	let allTasks = $state<Task[]>([]);
 	let workspaceGit = $state<WorkspaceGitStatus | null>(null);
+	let taskDirectories = $state<TaskDirectory[] | null>(null);
+	let workspaceGitError = $state('');
 	let error = $state<string | null>(null);
 	let dismissedAttemptIds = $state<ReadonlySet<string>>(new Set());
 	let dismissingAttemptError = $state(false);
@@ -244,6 +246,7 @@
 	let showJumpToLatest = $state(false);
 	let lastTranscriptScrollTop = 0;
 	let lastWorkspaceGitRefresh = 0;
+	let trailingGitRefresh: ReturnType<typeof setTimeout> | undefined;
 	let workspaceGitRequest: AbortController | null = null;
 	let pollPromise: Promise<void> | null = null;
 	let scrollTimer: ReturnType<typeof setTimeout> | null = null;
@@ -906,7 +909,11 @@
 		controlsInitializedFor = controlsScope;
 		workspaceGitRequest?.abort();
 		workspaceGitRequest = null;
+		clearTimeout(trailingGitRefresh);
+		trailingGitRefresh = undefined;
 		workspaceGit = null;
+		taskDirectories = null;
+		workspaceGitError = '';
 		lastWorkspaceGitRefresh = 0;
 		lastCommandsEventId = 0;
 		sessionEvents = [];
@@ -1181,6 +1188,7 @@
 			scrollTimer = null;
 		}
 		workspaceGitRequest?.abort();
+		clearTimeout(trailingGitRefresh);
 		++configRequestVersion;
 		unsubscribeLiveUpdates?.();
 		unsubscribeLiveUpdates = null;
@@ -1319,22 +1327,38 @@
 	// its saved messages, or terminal attempt state, or accumulate requests.
 	async function refreshWorkspaceGit(agentId: string, force = false) {
 		if (disposed) return;
-		if (!force && (workspaceGitRequest || Date.now() - lastWorkspaceGitRefresh < 10_000)) return;
+		const id = taskId;
+		if (!force && workspaceGitRequest) return;
+		const delay = 10_000 - (Date.now() - lastWorkspaceGitRefresh);
+		if (!force && delay > 0) {
+			// A committed directory snapshot can be the last event during a long
+			// command. Deliver that refresh even if it falls inside the cooldown.
+			trailingGitRefresh ??= setTimeout(() => {
+				trailingGitRefresh = undefined;
+				if (!disposed && task?.id === id && task.agent_id === agentId) void refreshWorkspaceGit(agentId);
+			}, delay);
+			return;
+		}
+		clearTimeout(trailingGitRefresh);
+		trailingGitRefresh = undefined;
 		if (force && workspaceGitRequest) {
 			workspaceGitRequest.abort();
 			workspaceGitRequest = null;
 		}
-		const id = taskId;
 		const controller = new AbortController();
 		workspaceGitRequest = controller;
 		lastWorkspaceGitRefresh = Date.now();
 		const timeout = setTimeout(() => controller.abort(), 10_000);
 		try {
-			const git = await workspaces.gitStatus(agentId, controller.signal, id);
-			if (!disposed && workspaceGitRequest === controller && task?.id === id && task.agent_id === agentId) workspaceGit = git;
+			const git = await workspaces.taskChanges(agentId, id, controller.signal);
+			if (!disposed && workspaceGitRequest === controller && task?.id === id && task.agent_id === agentId) {
+				workspaceGit = 'directories' in git ? null : git;
+				taskDirectories = 'directories' in git ? git.directories : null;
+				workspaceGitError = '';
+			}
 		} catch (err) {
-			if (!controller.signal.aborted) {
-				console.debug(`Failed to refresh git status for task ${id}:`, err);
+			if (!disposed && workspaceGitRequest === controller && task?.id === id && task.agent_id === agentId) {
+				workspaceGitError = controller.signal.aborted ? 'Git status timed out.' : (err instanceof Error ? err.message : String(err));
 			}
 		}
 		finally {
@@ -1509,7 +1533,7 @@
 			if (newTask.agent_id) {
 				const justFinished = wasActiveBeforePoll && !activeAfterPoll;
 				const activeOrJustFinished = wasActiveBeforePoll || activeAfterPoll;
-				if (activeOrJustFinished || !workspaceGit) {
+				if (activeOrJustFinished || (!workspaceGit && !taskDirectories)) {
 					void refreshWorkspaceGit(newTask.agent_id, justFinished);
 				}
 				const shouldRefreshCommands =
@@ -1884,11 +1908,19 @@
 		return `${base}${inWorktree ? `&task=${encodeURIComponent(taskId)}` : ''}&path=${encodeURIComponent(path)}`;
 	}
 
-	function openChangedFile(event: MouseEvent, agentId: string, path: string) {
+	function directoryUrl(agentId: string, directory: TaskDirectory, file?: TaskDirectoryFile): string {
+		const params = new URLSearchParams({ tab: 'files', task: taskId, directory: directory.id,
+			containerPath: file ? `${directory.path}/${file.path}` : directory.path });
+		if (!file) params.set('folder', '1');
+		else if (file.has_version) params.set('version', file.status === 'D' ? 'deleted' : 'fallback');
+		return `/agents/${encodeURIComponent(agentId)}?${params}`;
+	}
+
+	function openChangedFile(event: MouseEvent) {
 		if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
 		event.preventDefault();
 		detailsDialog?.close();
-		const route = `${workspaceFileUrl(agentId, path)}&tree=collapsed`;
+		const route = `${(event.currentTarget as HTMLAnchorElement).getAttribute('href')}&tree=collapsed`;
 		window.dispatchEvent(new CustomEvent<WorkspaceOpenSplitDetail>(WORKSPACE_OPEN_SPLIT_EVENT, {
 			detail: { path: route },
 		}));
@@ -1959,18 +1991,47 @@
 					</div>
 				{/if}
 
-				{#if current.agent_id && workspaceGit}
+				{#if current.agent_id && (taskDirectories || workspaceGit || workspaceGitError)}
 					<div class="space-y-2" data-task-changed-files>
 						<div class="flex items-center justify-between gap-2">
 							<h3 class="text-xs font-medium uppercase tracking-wide text-muted-foreground">Changed files</h3>
-							<a href={workspaceFileUrl(current.agent_id)} class="text-[11px] text-muted-foreground hover:text-foreground">Open files</a>
+							{#if !taskDirectories}<a href={workspaceFileUrl(current.agent_id)} class="text-[11px] text-muted-foreground hover:text-foreground">Open files</a>{/if}
 						</div>
-						{#if workspaceGit.repository && workspaceGit.files.length > 0}
+						{#if workspaceGitError}
+							<p class="text-xs text-muted-foreground" role="status">Could not refresh changed files. {workspaceGitError}
+								<button class="underline" onclick={() => current.agent_id && refreshWorkspaceGit(current.agent_id, true)}>Retry</button>
+							</p>
+						{/if}
+						{#if taskDirectories}
+							{#each taskDirectories as directory (directory.id)}
+								<div class="space-y-1">
+									<a class="block truncate text-xs font-medium underline" title={directory.path} href={directoryUrl(current.agent_id, directory)}>{directory.path}</a>
+									{#if directory.notice}<p class="text-xs text-muted-foreground" role="status">{directory.notice}</p>{/if}
+									{#if directory.files.length === 0 && !directory.notice}<p class="text-xs text-muted-foreground">No changes recorded</p>{/if}
+									{#snippet entry(file: TaskDirectoryFile)}
+										{#if file.status === 'D' && !file.has_version}
+											<span class="block truncate px-1.5 text-xs text-muted-foreground" title={file.path}>D {file.path}</span>
+										{:else}
+											<a href={directoryUrl(current.agent_id ?? '', directory, file)} onclick={openChangedFile} title={file.path}
+												class="flex items-center gap-2 rounded px-1.5 py-1 text-xs hover:bg-accent">
+												<span class="font-mono text-[10px] text-amber-500">{file.status}</span><span class="truncate">{file.path}</span>
+											</a>
+										{/if}
+									{/snippet}
+									{#each directory.files.slice(0,12) as file (file.path)}{@render entry(file)}{/each}
+									{#if directory.files.length > 12}
+										<details><summary class="cursor-pointer text-xs">Show {directory.files.length - 12} more</summary>
+											{#each directory.files.slice(12) as file (file.path)}{@render entry(file)}{/each}
+										</details>
+									{/if}
+								</div>
+							{/each}
+						{:else if workspaceGit?.repository && workspaceGit.files.length > 0}
 							<div class="space-y-0.5">
 								{#each workspaceGit.files.slice(0, 12) as change (change.path)}
 									<a
 										href={workspaceFileUrl(current.agent_id, change.path)}
-										onclick={(event) => openChangedFile(event, current.agent_id ?? '', change.path)}
+										onclick={openChangedFile}
 										title={change.path}
 										class="flex items-center gap-2 rounded px-1.5 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-foreground"
 									>
@@ -1984,9 +2045,9 @@
 									</a>
 								{/if}
 							</div>
-						{:else if workspaceGit.repository}
+						{:else if workspaceGit?.repository && !workspaceGitError}
 							<p class="text-xs text-muted-foreground">Working tree clean</p>
-						{:else}
+						{:else if workspaceGit && !workspaceGitError}
 							<p class="text-xs text-muted-foreground">{workspaceGit.repository_status?.message || 'No active Git repository'}</p>
 						{/if}
 					</div>

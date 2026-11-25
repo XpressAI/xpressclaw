@@ -7,6 +7,7 @@
 	import MonacoEditor from '$lib/components/MonacoEditor.svelte';
 	import TerminalPanel from '$lib/components/TerminalPanel.svelte';
 	import ContainerFiles from '$lib/components/ContainerFiles.svelte';
+	import type { ContainerFileTarget } from '$lib/api';
 
 	let { agentId, route = '' }: { agentId: string; route?: string } = $props();
 	let status = $state<WorkspaceStatus | null>(null);
@@ -31,6 +32,7 @@
 	let showTerminal = $state(false);
 	let source = $state<'workspace' | 'container'>('workspace');
 	let containerDirty = $state(false);
+	let containerTarget = $state<ContainerFileTarget>();
 	let containerBrowser = $state<{ refresh: () => void }>();
 	let showTree = $state(true);
 	let initialized = $state(false);
@@ -54,26 +56,42 @@
 	});
 
 	onMount(() => {
-		showTerminal = Boolean(routeState(route).terminal);
-		showTree = routeState(route).showTree;
-		void initialize().finally(() => (initialized = true));
+		const requested = routeState(route);
+		showTerminal = Boolean(requested.terminal);
+		showTree = requested.showTree;
+		if (requested.container) {
+			source = 'container';
+			containerTarget = requested.container;
+			syncedRoute = route;
+			initialized = true;
+			loading = false;
+		} else {
+			void initialize().finally(() => (initialized = true));
+		}
 	});
 
 	$effect(() => {
 		const requestedRoute = route;
 		if (!initialized || requestedRoute === syncedRoute) return;
+		const previousRoute = syncedRoute;
 		syncedRoute = requestedRoute;
-		void applyRoute(requestedRoute);
+		void applyRoute(requestedRoute, previousRoute);
 	});
 
-	function routeState(value: string): { path: string; showTree: boolean; terminal: string | null; task: string | undefined } {
+	function routeState(value: string) {
 		const search = value.includes('?') ? value.slice(value.indexOf('?')) : window.location.search;
 		const params = new URLSearchParams(search);
+		const containerPath = params.get('containerPath');
+		const task = params.get('task') || undefined;
+		const directory = params.get('directory');
 		return {
 			path: params.get('path') ?? '',
 			showTree: params.get('tree') !== 'collapsed',
 			terminal: params.get('terminal'),
-			task: params.get('task') || undefined,
+			task,
+			container: containerPath && task && directory ? {
+				path: containerPath, task, directory, folder: params.has('folder'), version: params.get('version'),
+			} : undefined,
 		};
 	}
 
@@ -86,12 +104,28 @@
 		return `${url.pathname}${url.search}${url.hash}`;
 	}
 
-	async function applyRoute(requestedRoute: string) {
+	async function applyRoute(requestedRoute: string, previousRoute: string) {
 		const previousPath = selectedPath;
 		const previousShowTree = showTree;
 		const requested = routeState(requestedRoute);
 		if (requested.terminal) showTerminal = true;
 		showTree = requested.showTree;
+		if (requested.container || containerTarget) {
+			if (JSON.stringify(requested.container) === JSON.stringify(containerTarget)) return;
+			if ((dirty || containerDirty) && !window.confirm('Discard the unsaved changes in the current file?')) {
+				showTree = previousShowTree;
+				syncedRoute = previousRoute;
+				await goto(previousRoute, { replaceState: true, keepFocus: true, noScroll: true });
+				return;
+			}
+			fileOpenSequence += 1;
+			editorValue = selectedFile?.content ?? '';
+			containerDirty = false;
+			containerTarget = requested.container;
+			source = requested.container ? 'container' : 'workspace';
+			if (requested.container) return;
+			if (!status) { await initialize(); return; }
+		}
 		// A reused tab can receive a link scoped to another task; its worktree
 		// changes must be listed before opening (deleted files need them).
 		if (requested.task === loadedGitTask) {
@@ -308,6 +342,11 @@
 	function changeSource(event: Event) {
 		const select = event.currentTarget as HTMLSelectElement;
 		if (select.value === source) return;
+		if (containerTarget && select.value === 'workspace') {
+			select.value = source;
+			void goto(`/agents/${encodeURIComponent(agentId)}?tab=files`);
+			return;
+		}
 		if ((source === 'workspace' ? dirty : containerDirty)
 			&& !window.confirm('Discard the unsaved changes in the current file?')) {
 			select.value = source;
@@ -354,7 +393,7 @@
 	{/if}
 
 	{#if source === 'container'}
-		<ContainerFiles bind:this={containerBrowser} {agentId} {showTree} onDirtyChange={(value) => (containerDirty = value)} />
+		<ContainerFiles bind:this={containerBrowser} {agentId} {showTree} target={containerTarget} onDirtyChange={(value) => (containerDirty = value)} />
 	{:else if loading}
 		<div class="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground">Loading workspace…</div>
 	{:else}

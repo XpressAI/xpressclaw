@@ -33,7 +33,20 @@ Each Agent has a **Files** view with three related capabilities:
    never run a task explains that one task must initialize its environment
    before a terminal is available.
 
-Git status and per-file staged/working-tree diffs are read directly from the
+Native tasks can register one or more local directories with the shared
+`add_task_directory` MCP tool. XpressClaw records the initial Git commit and
+fingerprints files that are already dirty or untracked. For an ordinary folder
+it fingerprints the files present at registration. The task runner compares
+against this baseline during the turn and samples once more when the harness
+returns. Each follow-up starts a fresh comparison and carries forward the
+previous file list. The Agent's working directory is its own choice.
+
+These paths resolve inside the retained Agent container. The task sidebar
+opens each file in Files → Container, including checkouts outside the mounted
+workspace. If a committed file has been deleted or its worktree was removed,
+Files can open the recorded Git blob read-only while its object store exists.
+
+For tasks without registrations, Git status and per-file staged/working-tree diffs are read directly from the
 active repository. Task details show the current changed files and link
 into the Agent's Files view. The UI deliberately calls these **workspace
 changes**, not task changes, because Git cannot prove which task produced an
