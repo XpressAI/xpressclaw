@@ -20,7 +20,7 @@ function git(dir, args, encoding = 'utf8') {
 
 // Only advertise a saved version when the commit actually contains a blob.
 // This also keeps the file readable if the linked worktree is later removed.
-function blobs(dir, commit, names) {
+function blobVersions(dir, common, commit, names) {
   const objects = new Map();
   if (!commit) return objects;
   for (let i = 0; i < names.length; i += 128) {
@@ -29,7 +29,7 @@ function blobs(dir, commit, names) {
       const tab = entry.indexOf('\t');
       if (tab < 0) continue;
       const [, type, oid] = entry.slice(0, tab).split(' ');
-      if (type === 'blob') objects.set(entry.slice(tab + 1), oid);
+      if (type === 'blob') objects.set(entry.slice(tab + 1), { common, object: oid });
     }
   }
   return objects;
@@ -181,24 +181,33 @@ function inspect(input) {
     if (!changes.has(name)) changes.set(name, status === '??' ? 'A' : status.trim().slice(-1));
   }
   const skipped = [...new Set([...baseline.omitted, ...omitted])];
+  const committedWithoutEdits = [];
   for (const [name, before] of initial) {
     const after = stamp(dir, name, budget);
-    if (before === after) changes.delete(name);
-    else changes.set(name, after === null ? 'D' : before === null ? 'A' : 'M');
-  }
-  if (changes.size > maxFiles) throw new Error('Too many changes. Choose a smaller task directory.');
-  const files = [...changes].filter(([name]) => !skipped.some(prefix => name.startsWith(prefix)))
-    .map(([path, status]) => ({ path, status }));
-  const tip = repo && git(dir, ['rev-parse', '--revs-only', 'HEAD']).trim();
-  if (repo) {
-    const removed = blobs(dir, baseline.head, files.filter(f => f.status === 'D').map(f => f.path));
-    const committed = blobs(dir, tip, files.filter(f => f.status !== 'D' && !working.has(f.path)).map(f => f.path));
-    for (const file of files) {
-      const object = removed.get(file.path) ?? committed.get(file.path);
-      if (object) file.version = { common: repo.common, object };
+    if (before === after) {
+      // An earlier turn's edit can become a clean, committed file in this
+      // turn. Supply its blob without claiming a new edit to that path.
+      if (repo && after !== null && !working.has(name) && changes.has(name)) committedWithoutEdits.push(name);
+      changes.delete(name);
+    } else {
+      changes.set(name, after === null ? 'D' : before === null ? 'A' : 'M');
     }
   }
-  return { files, omitted: skipped };
+  if (changes.size > maxFiles) throw new Error('Too many changes. Choose a smaller task directory.');
+  const included = name => !skipped.some(prefix => name.startsWith(prefix));
+  const files = [...changes].filter(([name]) => included(name))
+    .map(([path, status]) => ({ path, status }));
+  let committedVersions = {};
+  const tip = repo && git(dir, ['rev-parse', '--revs-only', 'HEAD']).trim();
+  if (repo) {
+    const removed = blobVersions(dir, repo.common, baseline.head, files.filter(f => f.status === 'D').map(f => f.path));
+    const committed = blobVersions(dir, repo.common, tip, files.filter(f => f.status !== 'D' && !working.has(f.path)).map(f => f.path));
+    for (const file of files) {
+      file.version = removed.get(file.path) ?? committed.get(file.path);
+    }
+    committedVersions = Object.fromEntries(blobVersions(dir, repo.common, tip, committedWithoutEdits.filter(included)));
+  }
+  return { files, omitted: skipped, committed_versions: committedVersions };
 }
 
 // The control plane sends one line and keeps stdin open until the reply.

@@ -173,6 +173,7 @@ fn save_registration(
 struct Changes {
     files: Vec<ChangedFile>,
     omitted: Vec<String>,
+    committed_versions: BTreeMap<String, GitVersion>,
 }
 
 fn save_changes(
@@ -187,8 +188,16 @@ fn save_changes(
             "SELECT previous_files FROM task_directories WHERE id=?1 AND attempt_id=?2 AND baseline IS NOT NULL",
             params![id, attempt], |row| row.get(0)).optional()?;
         let Some(prior) = prior else { return Ok(()) };
+        let previous: Vec<ChangedFile> = serde_json::from_str(&prior)?;
         let mut files = BTreeMap::new();
-        for file in serde_json::from_str::<Vec<ChangedFile>>(&prior)?.into_iter().chain(changes.files) {
+        let mut versions = changes.committed_versions;
+        for mut file in previous {
+            if file.version.is_none() && file.status != "D" {
+                file.version = versions.remove(&file.path);
+            }
+            files.insert(file.path.clone(), file);
+        }
+        for file in changes.files {
             files.insert(file.path.clone(), file);
         }
         conn.execute("UPDATE task_directories SET files=?1, notice=?2,
@@ -306,6 +315,7 @@ mod tests {
                 version: None,
             }],
             omitted: vec![],
+            committed_versions: BTreeMap::new(),
         }
     }
 
@@ -373,8 +383,22 @@ mod tests {
         )
         .unwrap();
         save_changes(&db, &id, "first", changed("obsolete.rs"), true).unwrap();
-        save_changes(&db, &id, "next", changed("followup.rs"), true).unwrap();
+        let mut followup = changed("followup.rs");
+        let version = GitVersion {
+            common: "/tmp/checkout/.git".into(),
+            object: "saved-blob".into(),
+        };
+        followup
+            .committed_versions
+            .insert("committed.rs".into(), version.clone());
+        followup
+            .committed_versions
+            .insert("unrelated.rs".into(), version);
+        save_changes(&db, &id, "next", followup, true).unwrap();
         let directories = list(&db, "task", "agent").unwrap();
+        let carried = &directories[0].files[0];
+        assert_eq!(carried.status, "M");
+        assert_eq!(carried.version.as_ref().unwrap().object, "saved-blob");
         assert_eq!(
             directories[0]
                 .files

@@ -61,6 +61,37 @@ test('tracks only the registered worktree subdirectory across commit and preserv
   }
 });
 
+test('a follow-up commit provides saved blobs for unchanged first-turn edits', t => {
+  const root = setup(t), repo = join(root, 'repo'), dir = join(root, 'worktree');
+  mkdirSync(repo);
+  git(repo, 'init', '-q');
+  writeFileSync(join(repo, 'edited.ts'), 'original');
+  writeFileSync(join(repo, 'still dirty.ts'), 'original');
+  git(repo, 'add', '.');
+  git(repo, 'commit', '-qm', 'initial');
+  git(repo, 'worktree', 'add', '-qb', 'feature', dir);
+
+  const first = begin(dir);
+  writeFileSync(join(dir, 'added.ts'), 'first-turn addition');
+  writeFileSync(join(dir, 'edited.ts'), 'first-turn edit');
+  writeFileSync(join(dir, 'still dirty.ts'), 'uncommitted');
+  const initialChanges = changes(dir, first);
+  assert.deepEqual(statuses(initialChanges), { 'added.ts': 'A', 'edited.ts': 'M', 'still dirty.ts': 'M' });
+  assert.ok(initialChanges.files.every(file => !file.version));
+
+  const followup = begin(dir);
+  git(dir, 'add', 'added.ts', 'edited.ts');
+  git(dir, 'commit', '-qm', 'commit the first turn');
+  const saved = changes(dir, followup);
+  assert.deepEqual(saved.files, []);
+  assert.deepEqual(Object.keys(saved.committed_versions ?? {}).sort(), ['added.ts', 'edited.ts']);
+  git(dir, 'restore', 'still dirty.ts');
+  git(repo, 'worktree', 'remove', dir);
+  for (const [name, content] of [['added.ts', 'first-turn addition'], ['edited.ts', 'first-turn edit']]) {
+    assert.equal(inspect({ operation: 'directory_version', version: saved.committed_versions[name] }).content, content);
+  }
+});
+
 test('tracks a plain directory, including creation of a repository during the task', t => {
   const dir = setup(t);
   writeFileSync(join(dir, '__proto__'), 'initial');
