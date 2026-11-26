@@ -352,8 +352,8 @@ impl WorkflowManager {
         Ok(changed == 1)
     }
 
-    /// Clear any active quota deferral state on a workflow if its revision and occurrence
-    /// have not changed.
+    /// Clear any active quota deferral state on a workflow if it is still enabled and its
+    /// revision and occurrence have not changed.
     pub fn clear_quota_deferral(&self, record: &WorkflowRecord) -> Result<()> {
         self.db.with_conn(|conn| {
             conn.execute(
@@ -361,6 +361,7 @@ impl WorkflowManager {
                  SET quota_deferred_until = NULL,
                      quota_deferred_reason = NULL
                  WHERE id = ?1
+                   AND enabled = 1
                    AND revision = ?2
                    AND last_triggered_at IS ?3",
                 rusqlite::params![record.id, record.revision, record.last_triggered_at],

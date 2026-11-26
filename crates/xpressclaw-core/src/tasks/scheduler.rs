@@ -363,100 +363,14 @@ impl ScheduleManager {
             }
         }
         let now = Utc::now().naive_utc();
-
-        // Format title with date/time placeholders
-        let title = schedule
-            .title
-            .replace("{date}", &now.format("%Y-%m-%d").to_string())
-            .replace("{time}", &now.format("%H:%M").to_string())
-            .replace("{datetime}", &now.format("%Y-%m-%d %H:%M").to_string());
-
-        let description = schedule.description.as_ref().map(|d| {
-            d.replace("{date}", &now.format("%Y-%m-%d").to_string())
-                .replace("{time}", &now.format("%H:%M").to_string())
-                .replace("{datetime}", &now.format("%Y-%m-%d %H:%M").to_string())
-        });
-
-        let agent_id = schedule.agent_id.clone();
-        let triggered = if let Some(task_id) = schedule.continuation_task_id.as_deref() {
-            match self.enqueue_continuation(
-                &schedule,
-                task_id,
-                &title,
-                description.as_deref(),
-                board,
-            ) {
-                Ok(task) => ScheduleTrigger::Task(task),
-                Err(error) => {
-                    if is_one_shot {
-                        self.release_one_shot_claim(id);
-                    }
-                    return Err(error);
-                }
-            }
-        } else if let Some(conversation_id) = schedule.conversation_id.as_deref() {
-            match self.enqueue_conversation_wakeup(
-                &schedule,
-                conversation_id,
-                &title,
-                description.as_deref(),
-            ) {
-                Ok(message) => ScheduleTrigger::Conversation {
-                    conversation_id: conversation_id.to_string(),
-                    agent_id: agent_id.clone(),
-                    message,
-                },
-                Err(error) => {
-                    if is_one_shot {
-                        self.release_one_shot_claim(id);
-                    }
-                    return Err(error);
-                }
-            }
-        } else {
-            let task = match board.create(&CreateTask {
-                backlog: false,
-                start_after: None,
-                title,
-                description,
-                agent_id: Some(agent_id.clone()),
-                parent_task_id: None,
-                sop_id: None,
-                conversation_id: None,
-                priority: None,
-                context: Some(serde_json::json!({
-                    "origin": "schedule",
-                    "kind": "scheduled",
-                    "source_id": id,
-                    "schedule_type": schedule.schedule_type,
-                })),
-            }) {
-                Ok(task) => task,
-                Err(error) => {
-                    if is_one_shot {
-                        self.release_one_shot_claim(id);
-                    }
-                    return Err(error);
-                }
-            };
-
-            // Standalone and recurring schedules retain their existing
-            // create-a-task behavior.
-            let queue = TaskQueue::new(self.db.clone());
-            if let Err(error) = queue.enqueue(&task.id, &agent_id) {
+        let triggered = match self.dispatch_schedule_trigger(&schedule, now, board) {
+            Ok(triggered) => triggered,
+            Err(error) => {
                 if is_one_shot {
                     self.release_one_shot_claim(id);
-                    let _ = board.delete(&task.id);
-                    return Err(error);
                 }
-                warn!(
-                    task_id = task.id.as_str(),
-                    schedule_id = id,
-                    error = %error,
-                    "failed to enqueue scheduled task"
-                );
+                return Err(error);
             }
-            ScheduleTrigger::Task(task)
         };
 
         // Update last_run and run_count
@@ -476,6 +390,153 @@ impl ScheduleManager {
         })?;
 
         Ok(triggered)
+    }
+
+    /// Atomically claim and dispatch an automatic scheduled occurrence.
+    ///
+    /// Returns `Ok(None)` if the schedule was disabled, deleted, or already triggered/skipped
+    /// since `expected` was loaded (e.g., while an asynchronous quota check was in flight).
+    pub fn trigger_scheduled(
+        &self,
+        expected: &Schedule,
+        board: &TaskBoard,
+    ) -> Result<Option<ScheduleTrigger>> {
+        let now = Utc::now().naive_utc();
+        let now_str = now.format("%Y-%m-%d %H:%M:%S").to_string();
+        let claimed = self.db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE schedules
+                 SET last_run = ?1,
+                     run_count = run_count + 1,
+                     quota_deferred_until = NULL,
+                     quota_deferred_reason = NULL,
+                     enabled = CASE WHEN schedule_type = 'once' THEN 0 ELSE enabled END
+                 WHERE id = ?2
+                   AND enabled = 1
+                   AND run_count = ?3
+                   AND last_run IS ?4",
+                rusqlite::params![now_str, expected.id, expected.run_count, expected.last_run],
+            )
+            .map_err(|e| Error::Database(e.to_string()))
+        })?;
+        if claimed == 0 {
+            return Ok(None);
+        }
+
+        match self.dispatch_schedule_trigger(expected, now, board) {
+            Ok(triggered) => Ok(Some(triggered)),
+            Err(error) => {
+                self.release_scheduled_claim(expected, &now_str);
+                Err(error)
+            }
+        }
+    }
+
+    fn dispatch_schedule_trigger(
+        &self,
+        schedule: &Schedule,
+        now: chrono::NaiveDateTime,
+        board: &TaskBoard,
+    ) -> Result<ScheduleTrigger> {
+        let id = schedule.id.as_str();
+        let is_one_shot = schedule.schedule_type == SCHEDULE_TYPE_ONCE;
+
+        // Format title with date/time placeholders
+        let title = schedule
+            .title
+            .replace("{date}", &now.format("%Y-%m-%d").to_string())
+            .replace("{time}", &now.format("%H:%M").to_string())
+            .replace("{datetime}", &now.format("%Y-%m-%d %H:%M").to_string());
+
+        let description = schedule.description.as_ref().map(|d| {
+            d.replace("{date}", &now.format("%Y-%m-%d").to_string())
+                .replace("{time}", &now.format("%H:%M").to_string())
+                .replace("{datetime}", &now.format("%Y-%m-%d %H:%M").to_string())
+        });
+
+        let agent_id = schedule.agent_id.clone();
+        if let Some(task_id) = schedule.continuation_task_id.as_deref() {
+            let task = self.enqueue_continuation(
+                schedule,
+                task_id,
+                &title,
+                description.as_deref(),
+                board,
+            )?;
+            Ok(ScheduleTrigger::Task(task))
+        } else if let Some(conversation_id) = schedule.conversation_id.as_deref() {
+            let message = self.enqueue_conversation_wakeup(
+                schedule,
+                conversation_id,
+                &title,
+                description.as_deref(),
+            )?;
+            Ok(ScheduleTrigger::Conversation {
+                conversation_id: conversation_id.to_string(),
+                agent_id,
+                message,
+            })
+        } else {
+            let task = board.create(&CreateTask {
+                backlog: false,
+                start_after: None,
+                title,
+                description,
+                agent_id: Some(agent_id.clone()),
+                parent_task_id: None,
+                sop_id: None,
+                conversation_id: None,
+                priority: None,
+                context: Some(serde_json::json!({
+                    "origin": "schedule",
+                    "kind": "scheduled",
+                    "source_id": id,
+                    "schedule_type": schedule.schedule_type,
+                })),
+            })?;
+
+            // Standalone and recurring schedules retain their existing
+            // create-a-task behavior.
+            let queue = TaskQueue::new(self.db.clone());
+            if let Err(error) = queue.enqueue(&task.id, &agent_id) {
+                if is_one_shot {
+                    let _ = board.delete(&task.id);
+                    return Err(error);
+                }
+                warn!(
+                    task_id = task.id.as_str(),
+                    schedule_id = id,
+                    error = %error,
+                    "failed to enqueue scheduled task"
+                );
+            }
+            Ok(ScheduleTrigger::Task(task))
+        }
+    }
+
+    fn release_scheduled_claim(&self, expected: &Schedule, claimed_at: &str) {
+        let _ = self.db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE schedules
+                 SET last_run = ?1,
+                     run_count = ?2,
+                     quota_deferred_until = ?3,
+                     quota_deferred_reason = ?4,
+                     enabled = CASE WHEN schedule_type = 'once' THEN 1 ELSE enabled END
+                 WHERE id = ?5
+                   AND run_count = ?6
+                   AND last_run = ?7",
+                rusqlite::params![
+                    expected.last_run,
+                    expected.run_count,
+                    expected.quota_deferred_until,
+                    expected.quota_deferred_reason,
+                    expected.id,
+                    expected.run_count + 1,
+                    claimed_at,
+                ],
+            )
+        });
     }
 
     pub fn record_quota_deferral(
@@ -782,14 +843,10 @@ pub async fn check_schedules_with_usage(
                     .or_else(|| resolve_agent_provider(db, config, &schedule.agent_id));
                 if let Some(provider) = provider {
                     match usage_service
-                        .evaluate_quota_gate(&provider, gate, now)
+                        .evaluate_quota_gate_with_refresh(&provider, gate, now, deferred_due)
                         .await
                     {
-                        QuotaGateDecision::Allow => {
-                            if schedule.quota_deferred_until.is_some() {
-                                let _ = mgr.clear_quota_deferral(schedule);
-                            }
-                        }
+                        QuotaGateDecision::Allow => {}
                         QuotaGateDecision::Defer { until, reason } => {
                             let resume_at = until.to_rfc3339_opts(SecondsFormat::Secs, true);
                             if mgr.record_quota_deferral(schedule, &resume_at, &reason)? {
@@ -827,17 +884,17 @@ pub async fn check_schedules_with_usage(
                 agent_id = schedule.agent_id.as_str(),
                 "triggering scheduled task"
             );
-            match mgr.trigger(&schedule.id, &board) {
-                Ok(ScheduleTrigger::Task(task)) => info!(
+            match mgr.trigger_scheduled(schedule, &board) {
+                Ok(Some(ScheduleTrigger::Task(task))) => info!(
                     schedule_id = schedule.id.as_str(),
                     task_id = task.id.as_str(),
                     "scheduled task created"
                 ),
-                Ok(ScheduleTrigger::Conversation {
+                Ok(Some(ScheduleTrigger::Conversation {
                     conversation_id,
                     agent_id,
                     message,
-                }) => {
+                })) => {
                     if let Some(bus) = event_bus {
                         if let Ok(value) = serde_json::to_value(&message) {
                             bus.send(
@@ -852,6 +909,12 @@ pub async fn check_schedules_with_usage(
                         agent_id,
                         message_id = message.id,
                         "scheduled Conversation turn created"
+                    );
+                }
+                Ok(None) => {
+                    debug!(
+                        schedule_id = schedule.id.as_str(),
+                        "skipped triggering schedule because it was disabled or already claimed"
                     );
                 }
                 Err(e) => {
@@ -1921,5 +1984,24 @@ mod tests {
         assert!(resumed.quota_deferred_until.is_none());
         assert!(resumed.quota_deferred_reason.is_none());
         assert_eq!(board.list(None, None, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn trigger_scheduled_skips_disabled_or_already_claimed_recurring_schedule() {
+        let (_db, mgr, board) = setup();
+        let snapshot = create_schedule(&mgr);
+
+        // User disables the recurring schedule while an async quota check is in flight.
+        mgr.disable(&snapshot.id).unwrap();
+        assert!(mgr.trigger_scheduled(&snapshot, &board).unwrap().is_none());
+        assert!(board.list(None, None, 10).unwrap().is_empty());
+        assert_eq!(mgr.get(&snapshot.id).unwrap().run_count, 0);
+
+        // Re-enabling allows claiming once, and a duplicate claim with the stale snapshot is ignored.
+        let enabled = mgr.enable(&snapshot.id).unwrap();
+        assert!(mgr.trigger_scheduled(&enabled, &board).unwrap().is_some());
+        assert!(mgr.trigger_scheduled(&enabled, &board).unwrap().is_none());
+        assert_eq!(board.list(None, None, 10).unwrap().len(), 1);
+        assert_eq!(mgr.get(&snapshot.id).unwrap().run_count, 1);
     }
 }

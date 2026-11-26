@@ -735,11 +735,32 @@ impl UsageService {
         gate: &QuotaGatePolicy,
         now: DateTime<Utc>,
     ) -> QuotaGateDecision {
+        self.evaluate_quota_gate_with_refresh(provider, gate, now, false)
+            .await
+    }
+
+    /// Targeted check for a single provider used by automation schedulers.
+    ///
+    /// When `force_refresh` is true (e.g., rechecking a deferred automation whose reset
+    /// wait has just elapsed), bypasses the 5-minute TTL cache while still respecting any
+    /// active HTTP 429 `Retry-After` hold.
+    pub async fn evaluate_quota_gate_with_refresh(
+        &self,
+        provider: &str,
+        gate: &QuotaGatePolicy,
+        now: DateTime<Utc>,
+        force_refresh: bool,
+    ) -> QuotaGateDecision {
         let canonical = crate::acp::canonical_agent_kind(provider)
             .unwrap_or(provider)
             .to_ascii_lowercase();
-        let reports = self.list_reports(false, Some(&canonical)).await;
+        let reports = self.list_reports(force_refresh, Some(&canonical)).await;
         evaluate_reports_against_gate(&canonical, &reports, gate, now)
+    }
+
+    fn is_cache_entry_fresh(&self, cached: &CachedReport, now: DateTime<Utc>) -> bool {
+        let age = (now - cached.cached_at).to_std().unwrap_or(self.cache_ttl);
+        age < self.cache_ttl && !cached_report_crossed_window_reset(cached, now)
     }
 
     async fn fetch_account(
@@ -752,8 +773,7 @@ impl UsageService {
 
         if !force_refresh {
             if let Some(cached) = self.cache.read().await.get(&id).cloned() {
-                let age = (now - cached.cached_at).to_std().unwrap_or(self.cache_ttl);
-                if age < self.cache_ttl {
+                if self.is_cache_entry_fresh(&cached, now) {
                     return cached.report;
                 }
             }
@@ -882,6 +902,26 @@ impl UsageService {
         );
         report
     }
+}
+
+/// Returns true when an available cached report had a window reset timestamp that lay in
+/// the future when cached (`reset > cached_at`) and has now elapsed (`reset <= now`).
+///
+/// Expiring the cache at window resets ensures resumed automations and polls do not reuse
+/// a pre-reset depleted report for the remainder of the 5-minute TTL, while requiring
+/// `reset > cached_at` prevents thrashing if an upstream API keeps returning an old reset
+/// timestamp due to clock skew.
+fn cached_report_crossed_window_reset(cached: &CachedReport, now: DateTime<Utc>) -> bool {
+    if cached.report.status != UsageReportStatus::Available {
+        return false;
+    }
+    cached.report.windows.iter().any(|w| {
+        w.resets_at
+            .as_deref()
+            .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
+            .map(|dt| dt.with_timezone(&Utc))
+            .is_some_and(|reset| reset > cached.cached_at && reset <= now)
+    })
 }
 
 /// Query SQLite for any enabled workflows or schedules currently deferred by a quota gate.
@@ -1298,5 +1338,80 @@ mod tests {
             .expect("coalesced waiter must not stall")
             .unwrap();
         assert_eq!(result.id, expected.id);
+    }
+
+    #[test]
+    fn cache_expires_once_window_reset_elapses_without_thrashing_stale_upstream_timestamps() {
+        let svc = UsageService::new();
+        let fetched_at = DateTime::parse_from_rfc3339("2026-11-26T13:59:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let report = sample_report(
+            "claude",
+            vec![window_from_used_pct(
+                "five_hour",
+                "Session",
+                Some("5h".into()),
+                true,
+                Some(95.0),
+                Some(18_000),
+                Some("2026-11-26T14:00:00Z".into()),
+                None,
+            )],
+        );
+        let cached = CachedReport {
+            cached_at: fetched_at,
+            report: report.clone(),
+        };
+
+        // Before reset (13:59:30Z): still fresh.
+        let before_reset = DateTime::parse_from_rfc3339("2026-11-26T13:59:30Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(svc.is_cache_entry_fresh(&cached, before_reset));
+
+        // After reset + buffer (14:01:00Z, only 2m old < 5m TTL): expired so quota is re-fetched.
+        let after_reset = DateTime::parse_from_rfc3339("2026-11-26T14:01:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(!svc.is_cache_entry_fresh(&cached, after_reset));
+
+        // If a fresh fetch at 14:01:00Z still reports the past 14:00:00Z timestamp (clock skew),
+        // it remains cached within TTL rather than thrashing the upstream API.
+        let recached = CachedReport {
+            cached_at: after_reset,
+            report,
+        };
+        let one_min_later = DateTime::parse_from_rfc3339("2026-11-26T14:02:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(svc.is_cache_entry_fresh(&recached, one_min_later));
+    }
+
+    #[tokio::test]
+    async fn forced_refresh_still_enforces_active_retry_after_hold() {
+        let svc = UsageService::new();
+        let account = providers::DiscoveredAccount {
+            id: "codex:hold-test".into(),
+            provider: "codex".into(),
+            provider_label: "Codex".into(),
+            harness: "Codex".into(),
+            account_label: None,
+            source: providers::AccountSource::CopilotEnv {
+                var: "XPRESSCLAW_NONEXISTENT_TOKEN_VAR".into(),
+            },
+        };
+        let hold_until = Utc::now() + chrono::Duration::minutes(10);
+        svc.rate_limited_until
+            .write()
+            .await
+            .insert(account.id.clone(), hold_until);
+
+        let report = svc.fetch_account(account, true).await;
+        assert_eq!(report.status, UsageReportStatus::Unavailable);
+        assert!(matches!(
+            report.problem,
+            Some(UsageProblem::RateLimited { .. })
+        ));
     }
 }

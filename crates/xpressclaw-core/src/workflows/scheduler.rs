@@ -118,7 +118,7 @@ pub async fn check_scheduled_workflows_with_usage(
                 gate.provider.as_deref(),
             ) {
                 match usage_service
-                    .evaluate_quota_gate(&provider, gate, now)
+                    .evaluate_quota_gate_with_refresh(&provider, gate, now, deferred_due)
                     .await
                 {
                     QuotaGateDecision::Allow => {
