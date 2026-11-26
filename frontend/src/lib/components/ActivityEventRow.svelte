@@ -183,7 +183,7 @@
 						{@html richHtml}
 					</div>
 				{:else if !isTool}
-					<div class="whitespace-pre-wrap text-foreground/75">{event.summary}</div>
+					<div class="whitespace-pre-wrap break-words text-foreground/75">{event.event_type === 'attempt_failed' && typeof event.payload?.error === 'string' ? event.payload.error : event.summary}</div>
 				{/if}
 				{#if isTool && toolDiffs.length > 0}
 					<div class="space-y-3" data-tool-diffs>

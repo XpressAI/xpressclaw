@@ -144,6 +144,13 @@
 			sequence: number;
 		}
 		| {
+			kind: 'failure';
+			attempt: WorkAttempt;
+			key: string;
+			timestamp: string;
+			sequence: number;
+		}
+		| {
 			kind: 'activity';
 			key: string;
 			timestamp: string;
@@ -280,20 +287,26 @@
 	let collapsedActivityEvents = $derived(collapseToolActivity(
 		coalesceAgentMessageFragments(activityEvents, messages, mirroredActivityEventIds)
 	));
-	let primaryActivityEvents = $derived(
-		collapsedActivityEvents.filter(event =>
-			!['artifact_created', 'attempt_completed', 'elicitation_pending', 'elicitation_resolved', 'usage'].includes(event.event_type) &&
-			(event.event_type !== 'runner_progress' || event.payload?.item_type === 'agent_message') &&
-			!mirroredActivityEventIds.has(event.id)
-		)
+	// The status indicator, composer controls and saved messages already represent
+	// these events. Keep the raw event stream for controls, usage and diagnostics.
+	const transcriptOmissions = new Set([
+		'attempt_queued', 'attempt_preparing', 'attempt_running', 'attempt_completed',
+		'task_message_received', 'session_fork', 'session_info', 'session_config_options',
+		'session_config', 'session_mode', 'available_commands', 'delegation_superseded',
+		'artifact_created', 'elicitation_pending', 'elicitation_resolved', 'usage',
+	]);
+	let activityTimelineEvents = $derived(collapsedActivityEvents.filter(event =>
+		!transcriptOmissions.has(event.event_type) && !mirroredActivityEventIds.has(event.id)
+		&& !(event.event_type === 'session_fork_fallback' && event.payload?.reason === 'unsupported')
+	));
+	let latestErrorAttempt = $derived(
+		attempts[0]?.status === 'failed' && !['completed', 'cancelled'].includes(task?.status ?? '')
+			? attempts[0] : null
 	);
-	let technicalActivityEvents = $derived(
-		collapsedActivityEvents.filter(event =>
-			event.event_type === 'runner_progress' && event.payload?.item_type !== 'agent_message'
-		)
-	);
-	let activityTimelineEvents = $derived(
-		[...primaryActivityEvents, ...technicalActivityEvents].sort((left, right) => left.id - right.id)
+	let latestError = $derived(
+		latestErrorAttempt && !latestErrorAttempt.error_dismissed_at && !dismissedAttemptIds.has(latestErrorAttempt.id)
+			? latestErrorAttempt?.error_message ?? null
+			: null
 	);
 	let transcriptItems = $derived((() => {
 		const items: TranscriptItem[] = [];
@@ -332,13 +345,24 @@
 			visualizations: message.visualizations ?? [],
 			sequence: message.id,
 		})));
-		items.push(...activityTimelineEvents.map((event): TranscriptItem => ({
-			kind: 'activity',
-			key: `activity:${event.id}`,
-			timestamp: event.created_at,
-			event,
-			sequence: event.id,
-		})));
+		for (const event of activityTimelineEvents) {
+			if (latestErrorAttempt?.error_message && event.attempt_id === latestErrorAttempt.id &&
+				(event.event_type === 'attempt_failed' || event.event_type === 'authentication_required')) continue;
+			items.push({
+				kind: 'activity',
+				key: `activity:${event.id}`,
+				timestamp: event.created_at,
+				event,
+				sequence: event.id,
+			});
+		}
+		if (latestErrorAttempt && latestError) {
+			items.push({
+				kind: 'failure', key: `failure:${latestErrorAttempt.id}`, attempt: latestErrorAttempt,
+				timestamp: latestErrorAttempt.completed_at ?? latestErrorAttempt.started_at ?? latestErrorAttempt.created_at,
+				sequence: 0,
+			});
+		}
 
 		return items.sort(compareTranscriptItems);
 	})());
@@ -374,7 +398,7 @@
 	let activeAttempt = $derived(runningAttempt ?? queuedAttempt);
 	let usageAttempt = $derived(activeAttempt ?? attempts[0] ?? null);
 	let contextUsage = $derived(contextUsageFor(usageAttempt, activityEvents));
-	let latestResultAttempt = $derived(attempts[0]?.result ? attempts[0] : undefined);
+	let latestResultAttempt = $derived(attempts[0]?.status === 'completed' ? attempts[0] : undefined);
 	let latestAttemptResult = $derived(latestResultAttempt?.result ?? null);
 	let latestResult = $derived(
 		latestAttemptResult && !messages.some(message =>
@@ -383,19 +407,10 @@
 			? latestAttemptResult
 			: null
 	);
-	let latestErrorAttempt = $derived(
-		attempts[0]?.status === 'failed' && !['completed', 'cancelled'].includes(task?.status ?? '')
-			? attempts[0] : null
-	);
 	let authenticationRequired = $derived(Boolean(latestErrorAttempt && (
 		activityEvents.some(event => event.attempt_id === latestErrorAttempt.id && event.event_type === 'authentication_required')
 		|| latestErrorAttempt.error_message?.startsWith('backend error: ACP turn failed: Authentication required')
 	)));
-	let latestError = $derived(
-		latestErrorAttempt && !latestErrorAttempt.error_dismissed_at && !dismissedAttemptIds.has(latestErrorAttempt.id)
-			? latestErrorAttempt?.error_message ?? null
-			: null
-	);
 	$effect(() => subscribeTaskErrorDismissal(taskId, (attemptIds) => dismissedAttemptIds = attemptIds));
 	let platformManaged = $derived(task?.provenance === 'xpress_ai_connect');
 	let blockingDelegates = $derived(delegatedWork.filter(item => item.blocks_parent));
@@ -456,7 +471,7 @@
 	}
 
 	function transcriptRank(item: TranscriptItem): number {
-		if (item.kind === 'activity') return 1;
+		if (item.kind !== 'message') return 1;
 		return item.role === 'user' ? 0 : 2;
 	}
 
@@ -2297,13 +2312,6 @@
 		<div class="flex min-h-0 flex-1 overflow-hidden">
 			<!-- Left: conversation -->
             <div class="flex-1 flex flex-col overflow-hidden">
-                {#if waitingForDelegation && failedDelegates.length > 0}
-                    <div role="alert" data-delegation-blocker class="shrink-0 border-b border-destructive/30 bg-destructive/5 px-3 py-2 text-xs sm:px-6">
-                        <span class="font-semibold text-destructive">Blocked by delegated work.</span>
-                        <a href="/tasks/{failedDelegates[0].task_id}" class="ml-1 text-primary underline">Open {delegatedAgentName(failedDelegates[0])}'s task</a>
-                        {#if failedDelegates.length > 1}<span> · {failedDelegates.length} tasks need attention</span>{/if}
-                    </div>
-                {/if}
 				<div bind:this={messagesEl} onscroll={handleTranscriptScroll} tabindex="-1" aria-label="Task transcript" data-task-transcript-scroll class="flex-1 space-y-4 overflow-y-auto px-3 py-4 sm:px-6 sm:py-5">
 					{#if hasEarlierActivity}
 						<div class="flex justify-center">
@@ -2370,6 +2378,24 @@
 									>
 										<ImageAttachmentPreviews attachments={item.attachments} message />
 									</AiMessage>
+								{:else if item.kind === 'failure'}
+									<section data-attempt-error data-transcript-timestamp={item.timestamp} aria-label="Turn failed" class="py-1">
+										<div class="flex items-start gap-2 text-xs">
+											<details class="min-w-0 flex-1">
+												<summary class="min-h-8 cursor-pointer content-center font-medium text-destructive">{authenticationRequired ? (authenticatedAttemptId === item.attempt.id ? 'Signed in' : 'Sign-in required') : 'Turn failed'}</summary>
+												<p class="max-h-40 overflow-auto whitespace-pre-wrap px-2 py-1 text-muted-foreground [overflow-wrap:anywhere]">{item.attempt.error_message}</p>
+											</details>
+											{#if authenticationRequired && task.agent_id}
+												{#if authenticatedAttemptId === item.attempt.id}
+													{#if !platformManaged}<button type="button" onclick={() => updateStatus('in_progress')} disabled={statusUpdating} class="min-h-8 px-2 text-primary underline">Retry task</button>{/if}
+												{:else}
+													<button type="button" onclick={() => signInAgentId = task?.agent_id ?? null} class="min-h-8 px-2 text-primary underline">Sign in</button>
+												{/if}
+											{/if}
+											<button type="button" onclick={dismissAttemptError} disabled={dismissingAttemptError} aria-label="Dismiss attempt error" class="flex h-8 w-8 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-accent"><X size={14} /></button>
+										</div>
+										{#if dismissalError}<p role="alert" class="text-xs text-destructive">{dismissalError}</p>{/if}
+									</section>
 								{:else}
 									<div data-transcript-kind="activity" data-transcript-timestamp={item.timestamp}>
 										<ActivityEventRow event={item.event} />
@@ -2407,36 +2433,9 @@
 							</div>
 							<div use:mermaidDiagrams={resultHtml} data-task-result-content class="prose prose-invert prose-sm max-w-none">{@html resultHtml}</div>
 						</section>
-					{:else if latestError}
-						<section role="alert" data-attempt-error class="rounded-lg border border-red-500/30 bg-red-500/5 p-4">
-							<div class="mb-2 flex items-start justify-between gap-3">
-								<div class="text-xs font-medium uppercase tracking-wide {authenticationRequired && authenticatedAttemptId === latestErrorAttempt?.id ? 'text-emerald-600 dark:text-emerald-400' : 'text-red-400'}">{authenticationRequired ? authenticatedAttemptId === latestErrorAttempt?.id ? 'Signed in' : 'Sign-in required' : 'Attempt failed'}</div>
-								<button
-									type="button"
-									onclick={dismissAttemptError}
-									disabled={dismissingAttemptError}
-									aria-label="Dismiss attempt error"
-									class="flex h-6 w-6 shrink-0 items-center justify-center rounded text-lg leading-none text-red-300/70 hover:bg-red-500/10 hover:text-red-200"
-								>&times;</button>
-							</div>
-							{#if authenticationRequired && authenticatedAttemptId === latestErrorAttempt?.id}
-								<p class="text-sm text-foreground">Retry this task to continue.</p>
-							{:else}<div class="whitespace-pre-wrap text-sm text-red-200">{latestError}</div>{/if}
-							{#if dismissalError}<p role="alert" class="mt-2 text-sm text-destructive">{dismissalError}</p>{/if}
-							{#if authenticationRequired && task?.agent_id}
-								<div class="mt-3 flex items-center gap-3">
-									{#if authenticatedAttemptId === latestErrorAttempt?.id}
-										<span class="text-sm text-emerald-600 dark:text-emerald-400">Signed in.</span>
-										{#if !platformManaged}<button type="button" onclick={() => updateStatus('in_progress')} disabled={statusUpdating} class="rounded bg-primary px-3 py-1.5 text-sm text-primary-foreground">Retry task</button>{/if}
-									{:else}
-										<button type="button" onclick={() => signInAgentId = task?.agent_id ?? null} class="rounded bg-primary px-3 py-1.5 text-sm text-primary-foreground">Sign in</button>
-									{/if}
-								</div>
-							{/if}
-						</section>
 					{/if}
 
-					{#if transcriptItems.length === 0 && !latestResult && !latestError}
+					{#if transcriptItems.length === 0 && !latestResult && !activeAttempt && !waitingForDelegation}
 						<div class="flex h-full items-center justify-center text-sm text-muted-foreground">
 							<div class="space-y-1 text-center">
 								<div class="text-3xl">&#x1f4cb;</div>
@@ -2640,15 +2639,17 @@
 					{:else if waitingForDelegation}
 						<div role="status" class="space-y-1 py-2 text-sm text-amber-600 dark:text-amber-400" data-delegation-wait>
 							{#if failedDelegates.length > 0}
-                                <p class="font-medium text-destructive">Delegated work needs attention before this task can complete.</p>
-                                {#each failedDelegates as item}<p><a class="underline" href="/tasks/{item.task_id}">{delegatedAgentName(item)}: {item.title}</a> — {item.activity_status.replaceAll('_', ' ')}</p>{/each}
-                            {:else if blockingDelegates.length === 1}
+								<details>
+									<summary class="cursor-pointer text-destructive">{failedDelegates.length === 1 ? '1 delegated task needs attention' : `${failedDelegates.length} delegated tasks need attention`}</summary>
+									{#each failedDelegates as item}<p><a class="underline" href="/tasks/{item.task_id}">{delegatedAgentName(item)}: {item.title}</a> — {item.activity_status.replaceAll('_', ' ')}</p>{/each}
+								</details>
+							{:else if blockingDelegates.length === 1}
 								<p>Waiting for {delegatedAgentName(blockingDelegates[0])}: <a class="underline" href="/tasks/{blockingDelegates[0].task_id}">{blockingDelegates[0].title}</a>.</p>
 							{:else}
 								<p>Waiting for {blockingDelegates.length} required delegated tasks.</p>
 							{/if}
 							{#if queuedAttempt}<p class="text-xs text-muted-foreground">Queued work will run when its prerequisites are resolved.</p>
-							{:else}<p class="text-xs text-muted-foreground">Coordination messages and scheduled checks can run while delegated work continues.</p>{/if}
+							{:else if failedDelegates.length === 0}<p class="text-xs text-muted-foreground">Coordination messages and scheduled checks can run while delegated work continues.</p>{/if}
 						</div>
 					{:else if taskActivityStatus === 'waiting_for_dependencies'}
 						<div role="status" class="space-y-1 py-2 text-sm text-amber-600 dark:text-amber-400" data-dependency-wait>
