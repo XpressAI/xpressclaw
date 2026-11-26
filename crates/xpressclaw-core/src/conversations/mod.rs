@@ -2421,6 +2421,7 @@ mod tests {
                 description: Some("Update the room.".into()),
                 continuation_task_id: None,
                 conversation_id: Some(conv.id.clone()),
+                quota_gate: None,
             })
             .unwrap();
 

@@ -424,12 +424,16 @@ pub async fn serve_on_with_bound_callback(
     // Start the cron schedule runner.
     let scheduler_db = state.db.clone();
     let scheduler_event_bus = state.event_bus.clone();
+    let scheduler_config = state.config.clone();
+    let scheduler_usage = state.usage_service.clone();
     let scheduler_shutdown = shutdown.clone();
     tokio::spawn(async move {
         tokio::select! {
-            _ = xpressclaw_core::tasks::scheduler::start_schedule_runner_with_events(
+            _ = xpressclaw_core::tasks::scheduler::start_schedule_runner_with_usage(
                 scheduler_db,
                 Some(scheduler_event_bus),
+                Some(scheduler_config),
+                Some(scheduler_usage),
             ) => {}
             _ = scheduler_shutdown.cancelled() => { info!("scheduler stopped"); }
         }
@@ -437,10 +441,16 @@ pub async fn serve_on_with_bound_callback(
 
     // Start automatic cron triggers for multi-step workflows.
     let workflow_scheduler_db = state.db.clone();
+    let workflow_scheduler_config = state.config.clone();
+    let workflow_scheduler_usage = state.usage_service.clone();
     let workflow_scheduler_shutdown = shutdown.clone();
     tokio::spawn(async move {
         tokio::select! {
-            _ = xpressclaw_core::workflows::scheduler::start_schedule_runner(workflow_scheduler_db) => {}
+            _ = xpressclaw_core::workflows::scheduler::start_schedule_runner_with_usage(
+                workflow_scheduler_db,
+                Some(workflow_scheduler_config),
+                Some(workflow_scheduler_usage),
+            ) => {}
             _ = workflow_scheduler_shutdown.cancelled() => { info!("workflow scheduler stopped"); }
         }
     });

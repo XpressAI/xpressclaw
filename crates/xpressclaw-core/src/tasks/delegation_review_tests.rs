@@ -572,6 +572,7 @@ fn user_messages_and_scheduled_checks_resume_parents_with_pending_children() {
                     description: None,
                     continuation_task_id: Some(parent.id.clone()),
                     conversation_id: None,
+                    quota_gate: None,
                 })
                 .unwrap();
             manager.trigger(&wakeup.id, &board).unwrap();

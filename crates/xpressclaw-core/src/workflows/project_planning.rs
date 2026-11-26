@@ -233,10 +233,15 @@ impl WorkflowManager {
                         .name
                         .clone()
                         .unwrap_or_else(|| format!("{} (scheduled)", source.name));
+                    let inherited_quota_gate = definition
+                        .schedule
+                        .as_ref()
+                        .and_then(|s| s.quota_gate.clone());
                     definition.schedule = Some(WorkflowSchedule {
                         cron: input.cron.clone().unwrap_or_default(),
                         run_at: input.run_at.clone(),
                         inputs: input.inputs.clone(),
+                        quota_gate: inherited_quota_gate,
                     });
                     insert_project_workflow(&tx, &project, &definition, input.enabled)
                 })
@@ -381,6 +386,7 @@ mod tests {
             cron: String::new(),
             run_at: Some("2099-01-01T00:00:00Z".into()),
             inputs: HashMap::new(),
+            quota_gate: None,
         });
         let yaml = definition.to_yaml().unwrap();
         let scheduled = manager

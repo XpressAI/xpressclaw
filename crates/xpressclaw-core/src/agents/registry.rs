@@ -579,6 +579,7 @@ mod tests {
                 description: Some("Return to the conversation.".into()),
                 continuation_task_id: None,
                 conversation_id: Some("shared".into()),
+                quota_gate: None,
             })
             .unwrap();
         db.with_conn(|conn| {

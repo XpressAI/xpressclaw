@@ -1,10 +1,12 @@
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
-use chrono::{DateTime, Local, NaiveDateTime, Utc};
+use chrono::{DateTime, Local, NaiveDateTime, SecondsFormat, Utc};
 use tracing::{debug, error, info};
 
+use crate::config::Config;
 use crate::db::Database;
 use crate::error::{Error, Result};
+use crate::usage::{resolve_agent_provider, QuotaGateDecision, UsageService};
 
 use super::definition::{WorkflowDefinition, WorkflowSchedule};
 use super::engine::WorkflowEngine;
@@ -19,17 +21,50 @@ const CONNECTOR_AUTOMATION_DISABLED: &str =
 /// restart does not lose a run and a restart within the same cron window does
 /// not duplicate it.
 pub async fn start_schedule_runner(db: Arc<Database>) {
+    start_schedule_runner_with_usage(db, None, None).await;
+}
+
+/// Start the recurring workflow trigger loop with optional quota-gate awareness.
+pub async fn start_schedule_runner_with_usage(
+    db: Arc<Database>,
+    config: Option<Arc<RwLock<Arc<Config>>>>,
+    usage: Option<Arc<UsageService>>,
+) {
     info!("workflow schedule runner started");
 
     loop {
-        if let Err(error) = check_scheduled_workflows_at(&db, Utc::now()) {
+        let cfg_snapshot = config
+            .as_ref()
+            .and_then(|c| c.read().ok().map(|guard| guard.clone()));
+        if let Err(error) = check_scheduled_workflows_with_usage(
+            &db,
+            cfg_snapshot.as_deref(),
+            usage.as_deref(),
+            Utc::now(),
+        )
+        .await
+        {
             error!(error = %error, "workflow schedule check failed");
         }
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
     }
 }
 
+#[cfg(test)]
 fn check_scheduled_workflows_at(db: &Arc<Database>, now: DateTime<Utc>) -> Result<u32> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| Error::Backend(e.to_string()))?;
+    rt.block_on(check_scheduled_workflows_with_usage(db, None, None, now))
+}
+
+pub async fn check_scheduled_workflows_with_usage(
+    db: &Arc<Database>,
+    config: Option<&Config>,
+    usage: Option<&UsageService>,
+    now: DateTime<Utc>,
+) -> Result<u32> {
     let manager = WorkflowManager::new(db.clone());
     let engine = WorkflowEngine::new(db.clone());
     let workflows = manager.list()?;
@@ -62,6 +97,66 @@ fn check_scheduled_workflows_at(db: &Arc<Database>, now: DateTime<Utc>) -> Resul
             continue;
         }
 
+        // Enforce optional quota_gate before starting the instance.
+        if let (Some(gate), Some(usage_service)) = (schedule.quota_gate.as_ref(), usage) {
+            if let Some(deferred_until) = workflow
+                .quota_deferred_until
+                .as_deref()
+                .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
+                .map(|dt| dt.with_timezone(&Utc))
+            {
+                if deferred_until > now {
+                    continue;
+                }
+            }
+
+            if let Some(provider) = resolve_workflow_provider(
+                db,
+                config,
+                &definition,
+                schedule,
+                gate.provider.as_deref(),
+            ) {
+                match usage_service
+                    .evaluate_quota_gate(&provider, gate, now)
+                    .await
+                {
+                    QuotaGateDecision::Allow => {
+                        if workflow.quota_deferred_until.is_some() {
+                            let _ = manager.clear_quota_deferral(&workflow.id);
+                        }
+                    }
+                    QuotaGateDecision::Defer { until, reason } => {
+                        let resume_at = until.to_rfc3339_opts(SecondsFormat::Secs, true);
+                        manager.record_quota_deferral(&workflow.id, &resume_at, &reason)?;
+                        info!(
+                            workflow_id = workflow.id,
+                            provider = %provider,
+                            resume_at = %resume_at,
+                            "deferred scheduled workflow until quota reset"
+                        );
+                        continue;
+                    }
+                    QuotaGateDecision::Skip { reason } => {
+                        let skipped_at = now.naive_utc().format("%Y-%m-%d %H:%M:%S").to_string();
+                        manager.skip_scheduled_occurrence(
+                            workflow,
+                            &skipped_at,
+                            &format!("Skipped by quota gate: {reason}"),
+                            schedule.run_at.is_some(),
+                        )?;
+                        info!(
+                            workflow_id = workflow.id,
+                            provider = %provider,
+                            reason = %reason,
+                            "skipped scheduled workflow due to quota gate"
+                        );
+                        continue;
+                    }
+                }
+            }
+        }
+
         let triggered_at = now.naive_utc().format("%Y-%m-%d %H:%M:%S").to_string();
         match engine.start_scheduled_instance(workflow, &triggered_at) {
             Ok(instance_id) => {
@@ -89,6 +184,44 @@ fn check_scheduled_workflows_at(db: &Arc<Database>, now: DateTime<Utc>) -> Resul
     }
 
     Ok(started)
+}
+
+fn resolve_workflow_provider(
+    db: &Database,
+    config: Option<&Config>,
+    definition: &WorkflowDefinition,
+    schedule: &WorkflowSchedule,
+    explicit_provider: Option<&str>,
+) -> Option<String> {
+    if let Some(explicit) = explicit_provider.map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(
+            crate::acp::canonical_agent_kind(explicit)
+                .unwrap_or(explicit)
+                .to_ascii_lowercase(),
+        );
+    }
+    let first_agent = definition
+        .flows
+        .get("main")
+        .or_else(|| definition.flows.values().next())
+        .and_then(|flow| flow.steps.iter().find_map(|step| step.agent.as_deref()));
+    let agent_ref = first_agent?;
+    let resolved_agent = if let Some(input_name) = agent_ref.strip_prefix('@') {
+        schedule
+            .inputs
+            .get(input_name)
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                definition
+                    .inputs
+                    .get(input_name)
+                    .and_then(|i| i.default.as_ref())
+                    .and_then(|v| v.as_str())
+            })?
+    } else {
+        agent_ref
+    };
+    resolve_agent_provider(db, config, resolved_agent)
 }
 
 fn should_trigger(
@@ -456,5 +589,148 @@ flows:
             check_scheduled_workflows_at(&db, next_occurrence).unwrap(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn quota_gate_defers_scheduled_workflow_until_reset_then_runs() {
+        use crate::usage::{window_from_used_pct, UsageAccountReport, UsageReportStatus};
+
+        let db = setup();
+        let manager = WorkflowManager::new(db.clone());
+        let yaml = r#"
+name: quota-gated-audit
+schedule:
+  run_at: "2099-06-01T12:00:00Z"
+  quota_gate:
+    provider: claude
+    min_remaining_pct: 20
+    window: session
+    on_limit: wait_for_reset
+    reset_buffer_seconds: 60
+flows:
+  main:
+    steps:
+      - id: audit
+        agent: atlas
+        prompt: "Run audit"
+"#;
+        let workflow = manager
+            .create(&CreateWorkflow {
+                name: "quota-gated-audit".into(),
+                description: None,
+                yaml_content: yaml.into(),
+            })
+            .unwrap();
+
+        let usage = UsageService::new();
+        let due_at = DateTime::parse_from_rfc3339("2099-06-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        usage
+            .set_provider_override(
+                "claude",
+                vec![UsageAccountReport {
+                    id: "claude:test".into(),
+                    provider: "claude".into(),
+                    provider_label: "Claude".into(),
+                    harness: "Claude".into(),
+                    account_label: None,
+                    status: UsageReportStatus::Available,
+                    plan_label: Some("Pro".into()),
+                    observed_at: None,
+                    fetched_at: "2099-06-01T12:00:00Z".into(),
+                    windows: vec![window_from_used_pct(
+                        "five_hour",
+                        "Session",
+                        Some("5h".into()),
+                        true,
+                        Some(92.0),
+                        Some(18_000),
+                        Some("2099-06-01T14:00:00Z".into()),
+                        None,
+                    )],
+                    balances: Vec::new(),
+                    details: Vec::new(),
+                    problem: None,
+                    error: None,
+                    last_successful: None,
+                }],
+            )
+            .await;
+
+        // First check at due time defers until 14:01:00Z (reset + 60s buffer).
+        assert_eq!(
+            check_scheduled_workflows_with_usage(&db, None, Some(&usage), due_at)
+                .await
+                .unwrap(),
+            0
+        );
+        let deferred = manager.get(&workflow.id).unwrap();
+        assert_eq!(
+            deferred.quota_deferred_until.as_deref(),
+            Some("2099-06-01T14:01:00Z")
+        );
+        assert!(deferred
+            .quota_deferred_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("claude")));
+
+        // While deferred, still does not run before 14:01:00Z.
+        let still_waiting = DateTime::parse_from_rfc3339("2099-06-01T13:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            check_scheduled_workflows_with_usage(&db, None, Some(&usage), still_waiting)
+                .await
+                .unwrap(),
+            0
+        );
+
+        // After reset, quota recovers to 5% used (95% remaining) and workflow starts!
+        usage
+            .set_provider_override(
+                "claude",
+                vec![UsageAccountReport {
+                    id: "claude:test".into(),
+                    provider: "claude".into(),
+                    provider_label: "Claude".into(),
+                    harness: "Claude".into(),
+                    account_label: None,
+                    status: UsageReportStatus::Available,
+                    plan_label: Some("Pro".into()),
+                    observed_at: None,
+                    fetched_at: "2099-06-01T14:01:00Z".into(),
+                    windows: vec![window_from_used_pct(
+                        "five_hour",
+                        "Session",
+                        Some("5h".into()),
+                        true,
+                        Some(5.0),
+                        Some(18_000),
+                        Some("2099-06-01T19:00:00Z".into()),
+                        None,
+                    )],
+                    balances: Vec::new(),
+                    details: Vec::new(),
+                    problem: None,
+                    error: None,
+                    last_successful: None,
+                }],
+            )
+            .await;
+
+        let after_reset = DateTime::parse_from_rfc3339("2099-06-01T14:01:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            check_scheduled_workflows_with_usage(&db, None, Some(&usage), after_reset)
+                .await
+                .unwrap(),
+            1
+        );
+        let started_wf = manager.get(&workflow.id).unwrap();
+        assert!(started_wf.quota_deferred_until.is_none());
+        assert!(started_wf.quota_deferred_reason.is_none());
+        assert_eq!(started_wf.trigger_count, 1);
     }
 }

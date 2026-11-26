@@ -8,6 +8,7 @@ pub mod external_tools;
 pub mod runtime;
 pub mod sync;
 pub mod system;
+pub mod usage;
 
 pub mod activity;
 pub mod agents;

@@ -113,17 +113,32 @@ impl WorkflowEngine {
             .ok_or_else(|| Error::Workflow("Workflow has no schedule".into()))?;
         let once = schedule.run_at.is_some();
         let (id, ()) = self.start_instance_in_context_inner_with(
-            &record.id, serde_json::json!(schedule.inputs),
-            WorkflowContext { project_id: record.project_id.clone(), conversation_id: None },
-            None, None, |tx, _| {
+            &record.id,
+            serde_json::json!(schedule.inputs),
+            WorkflowContext {
+                project_id: record.project_id.clone(),
+                conversation_id: None,
+            },
+            None,
+            None,
+            |tx, _| {
                 let changed = tx.execute(
                     "UPDATE workflows SET last_triggered_at=?1,trigger_count=trigger_count+1,
-                     trigger_error=NULL,revision=revision+1,enabled=CASE WHEN ?2 THEN 0 ELSE enabled END
+                     trigger_error=NULL,quota_deferred_until=NULL,quota_deferred_reason=NULL,
+                     revision=revision+1,enabled=CASE WHEN ?2 THEN 0 ELSE enabled END
                      WHERE id=?3 AND enabled=1 AND revision=?4
                      AND last_triggered_at IS ?5",
-                    rusqlite::params![triggered_at, once, record.id, record.revision, record.last_triggered_at],
+                    rusqlite::params![
+                        triggered_at,
+                        once,
+                        record.id,
+                        record.revision,
+                        record.last_triggered_at
+                    ],
                 )?;
-                if changed != 1 { return Err(Error::WorkflowScheduleChanged); }
+                if changed != 1 {
+                    return Err(Error::WorkflowScheduleChanged);
+                }
                 Ok(())
             },
         )?;

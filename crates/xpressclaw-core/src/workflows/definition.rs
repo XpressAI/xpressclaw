@@ -51,6 +51,10 @@ pub struct WorkflowSchedule {
     /// Input overrides supplied to every scheduled run.
     #[serde(default)]
     pub inputs: HashMap<String, Value>,
+    /// Optional harness quota gate that can defer or skip a scheduled run
+    /// until the harness's rate-limit window resets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_gate: Option<crate::usage::QuotaGatePolicy>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -420,6 +424,9 @@ impl WorkflowDefinition {
                     .into_iter()
                     .collect::<serde_json::Map<String, Value>>(),
             ))?;
+            if let Some(gate) = schedule.quota_gate.as_ref() {
+                gate.validate().map_err(Error::Workflow)?;
+            }
         }
 
         let flow_names: HashSet<&str> = self.flows.keys().map(|k| k.as_str()).collect();

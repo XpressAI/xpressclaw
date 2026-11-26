@@ -27,6 +27,9 @@
 		agent_id: '',
 		title: '',
 		description: '',
+		quota_gate_enabled: false,
+		quota_min_remaining_pct: 20,
+		quota_window: 'any',
 	});
 	let scheduleFormError = $state('');
 	let creatingSchedule = $state(false);
@@ -119,13 +122,14 @@
 		if (!scheduleForm.agent_id && agentList.length > 0) scheduleForm.agent_id = agentList[0].id;
 	}
 
-	function workflowMetadata(yamlContent: string): { steps: number; flows: number; inputs: number; cron: string | null; runAt: string | null; timing: string | null; sourceTaskOnly: boolean } {
+	function workflowMetadata(yamlContent: string): { steps: number; flows: number; inputs: number; cron: string | null; runAt: string | null; timing: string | null; quotaMinRemaining: number | null; sourceTaskOnly: boolean } {
 		const stepMatches = yamlContent.match(/^\s+- id:/gm);
 		type StepSummary = { type?: string; steps?: StepSummary[]; body?: StepSummary[] };
-		let definition: { inputs?: Record<string, unknown>; schedule?: { cron?: string; run_at?: string }; flows?: Record<string, { steps?: StepSummary[] }> } = {};
+		let definition: { inputs?: Record<string, unknown>; schedule?: { cron?: string; run_at?: string; quota_gate?: { min_remaining_pct?: number } }; flows?: Record<string, { steps?: StepSummary[] }> } = {};
 		try { definition = yaml.load(yamlContent) as typeof definition; } catch {}
 		const continuesSourceTask = (steps: StepSummary[]): boolean =>
 			steps.some((step) => step.type === 'continue' || continuesSourceTask(step.steps ?? step.body ?? []));
+		const quotaMin = definition?.schedule?.quota_gate?.min_remaining_pct;
 		return {
 			steps: stepMatches?.length ?? 0,
 			flows: Math.max(1, Object.keys(definition?.flows ?? {}).length),
@@ -133,6 +137,7 @@
 			cron: definition?.schedule?.cron?.trim() || null,
 			runAt: definition?.schedule?.run_at || null,
 			timing: definition?.schedule?.run_at ? dateLabel(definition.schedule.run_at) : definition?.schedule?.cron?.trim() || null,
+			quotaMinRemaining: typeof quotaMin === 'number' ? quotaMin : null,
 			sourceTaskOnly: Object.values(definition?.flows ?? {}).some((flow) => continuesSourceTask(flow.steps ?? [])),
 		};
 	}
@@ -188,6 +193,15 @@
 				agent_id: scheduleForm.agent_id,
 				title: scheduleForm.title.trim(),
 				description: scheduleForm.description.trim() || undefined,
+				...(scheduleForm.quota_gate_enabled
+					? {
+						quota_gate: {
+							min_remaining_pct: Math.max(0, Math.min(100, Number(scheduleForm.quota_min_remaining_pct) || 0)),
+							window: scheduleForm.quota_window || 'any',
+							on_limit: 'wait_for_reset' as const,
+						},
+					}
+					: {}),
 			};
 			if (scheduleForm.schedule_type === 'once') {
 				await schedules.createOnce({ ...common, run_at: new Date(scheduleForm.run_at).toISOString() });
@@ -202,6 +216,9 @@
 				agent_id: agentList[0]?.id ?? '',
 				title: '',
 				description: '',
+				quota_gate_enabled: false,
+				quota_min_remaining_pct: 20,
+				quota_window: 'any',
 			};
 			await closeScheduleCreate();
 			await loadAutomations();
@@ -309,7 +326,8 @@
 								</div>
 							</div>
 							<div class="flex flex-wrap items-center gap-3 text-[10px] text-muted-foreground"><span>{metadata.steps} step{metadata.steps !== 1 ? 's' : ''}</span><span>{metadata.flows} flow{metadata.flows !== 1 ? 's' : ''}</span><span>{metadata.inputs} input{metadata.inputs !== 1 ? 's' : ''}</span><span>v{workflow.version}</span></div>
-							{#if metadata.timing}<div class="rounded bg-muted/50 px-2 py-1 font-mono text-[10px] text-muted-foreground">{metadata.runAt && workflow.last_triggered_at ? 'Started' : workflow.enabled ? 'Scheduled' : 'Schedule paused'} · {metadata.runAt ? 'Once · ' : ''}{metadata.timing}</div>{/if}
+							{#if metadata.timing}<div class="rounded bg-muted/50 px-2 py-1 font-mono text-[10px] text-muted-foreground">{metadata.runAt && workflow.last_triggered_at ? 'Started' : workflow.enabled ? 'Scheduled' : 'Schedule paused'} · {metadata.runAt ? 'Once · ' : ''}{metadata.timing}{#if metadata.quotaMinRemaining !== null} · quota ≥{metadata.quotaMinRemaining}% left{/if}</div>{/if}
+							{#if workflow.quota_deferred_until}<div class="rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-[10px] text-amber-600 dark:text-amber-400" data-workflow-quota-deferred title={workflow.quota_deferred_reason ?? undefined}>Waiting for quota reset · resumes {dateLabel(workflow.quota_deferred_until)}{#if workflow.quota_deferred_reason} ({workflow.quota_deferred_reason}){/if}</div>{/if}
 							{#if workflow.trigger_error}<div class="line-clamp-2 text-[10px] text-destructive" title={workflow.trigger_error}>Last trigger failed: {workflow.trigger_error}</div>{/if}
 							<div class="flex flex-wrap items-center justify-between gap-2">
 								<span class="text-[10px] text-muted-foreground">Updated {timeAgo(workflow.updated_at)}</span>
@@ -369,6 +387,30 @@
 						<label class="space-y-1 sm:col-span-2"><span class="text-xs text-muted-foreground">Task title</span><input type="text" placeholder={'Use {date} or {time} if useful'} bind:value={scheduleForm.title} class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring" /></label>
 					</div>
 					<label class="block space-y-1"><span class="text-xs text-muted-foreground">Description <span class="text-muted-foreground/70">(optional)</span></span><textarea bind:value={scheduleForm.description} rows="2" class="w-full resize-y rounded-md border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"></textarea></label>
+					<div class="rounded-md border border-border/70 bg-muted/30 p-3 space-y-2">
+						<label class="flex cursor-pointer items-center gap-2 text-xs font-medium">
+							<input type="checkbox" bind:checked={scheduleForm.quota_gate_enabled} data-schedule-quota-gate-toggle class="h-3.5 w-3.5 rounded border-border accent-primary" />
+							Wait for harness quota reset when low
+						</label>
+						{#if scheduleForm.quota_gate_enabled}
+							<div class="grid grid-cols-1 gap-2 sm:grid-cols-2">
+								<label class="space-y-1">
+									<span class="text-[11px] text-muted-foreground">Min remaining quota (%)</span>
+									<input type="number" min="0" max="100" step="5" bind:value={scheduleForm.quota_min_remaining_pct} class="w-full rounded-md border border-input bg-background px-2.5 py-1.5 text-xs" />
+								</label>
+								<label class="space-y-1">
+									<span class="text-[11px] text-muted-foreground">Window</span>
+									<select bind:value={scheduleForm.quota_window} class="w-full rounded-md border border-input bg-background px-2.5 py-1.5 text-xs">
+										<option value="any">Any window</option>
+										<option value="session">Session (5h)</option>
+										<option value="weekly">Weekly (7d)</option>
+										<option value="monthly">Monthly</option>
+									</select>
+								</label>
+							</div>
+							<p class="text-[10px] text-muted-foreground">If the agent's harness has less than {scheduleForm.quota_min_remaining_pct}% remaining, this schedule automatically defers until the quota resets.</p>
+						{/if}
+					</div>
 					<p class="text-[11px] text-muted-foreground">{scheduleForm.schedule_type === 'once' ? 'One-off follow-ups resume the agent conversation once, even after a restart.' : "Cron uses the server's local time. Example: 0 9 * * 1 runs every Monday at 09:00."}</p>
 					{#if scheduleFormError}<p class="text-xs text-destructive">{scheduleFormError}</p>{/if}
 					<div class="flex flex-wrap gap-2"><button type="submit" disabled={!scheduleForm.name.trim() || !(scheduleForm.schedule_type === 'once' ? scheduleForm.run_at : scheduleForm.cron.trim()) || !scheduleForm.agent_id || !scheduleForm.title.trim() || creatingSchedule} class="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50">{creatingSchedule ? 'Creating…' : 'Create schedule'}</button><button type="button" onclick={() => void closeScheduleCreate()} class="rounded-md border border-border px-3 py-1.5 text-xs font-medium hover:bg-accent">Cancel</button></div>
@@ -385,7 +427,7 @@
 								{:else}
 									<button type="button" onclick={() => toggleSchedule(schedule)} class="relative h-5 w-9 shrink-0 rounded-full transition-colors {schedule.enabled ? 'bg-emerald-500' : 'bg-muted'}" title={schedule.enabled ? 'Disable' : 'Enable'} aria-label="{schedule.enabled ? 'Disable' : 'Enable'} {schedule.name}"><span class="absolute top-0.5 h-4 w-4 rounded-full bg-white transition-transform {schedule.enabled ? 'translate-x-4' : 'translate-x-0.5'}"></span></button>
 								{/if}
-								<div class="min-w-0 flex-1"><div class="truncate text-sm font-semibold {!schedule.enabled ? 'text-muted-foreground' : ''}">{schedule.name}</div><div class="mt-0.5 flex flex-wrap items-center gap-x-1 text-xs text-muted-foreground"><code class="rounded bg-muted px-1 py-0.5">{scheduleTiming(schedule)}</code><span>· {agentName(schedule.agent_id)}</span><span>· {schedule.run_count} runs</span>{#if schedule.last_run}<span>· last {timeAgo(schedule.last_run)}</span>{/if}</div></div>
+								<div class="min-w-0 flex-1"><div class="truncate text-sm font-semibold {!schedule.enabled ? 'text-muted-foreground' : ''}">{schedule.name}</div><div class="mt-0.5 flex flex-wrap items-center gap-x-1 text-xs text-muted-foreground"><code class="rounded bg-muted px-1 py-0.5">{scheduleTiming(schedule)}</code><span>· {agentName(schedule.agent_id)}</span><span>· {schedule.run_count} runs</span>{#if schedule.last_run}<span>· last {timeAgo(schedule.last_run)}</span>{/if}{#if schedule.quota_gate}<span class="rounded bg-primary/10 px-1.5 py-0.5 text-[10px] text-primary">quota ≥{schedule.quota_gate.min_remaining_pct}% left</span>{/if}</div>{#if schedule.quota_deferred_until}<div class="mt-1 inline-block rounded border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[10px] text-amber-600 dark:text-amber-400" data-schedule-quota-deferred title={schedule.quota_deferred_reason ?? undefined}>Waiting for quota reset · resumes {dateLabel(schedule.quota_deferred_until)}</div>{/if}</div>
 							</div>
 							<div class="flex shrink-0 flex-wrap gap-2 sm:ml-auto"><button type="button" onclick={() => triggerSchedule(schedule)} disabled={completedOneShot(schedule)} class="rounded-md border border-border px-3 py-1.5 text-xs font-medium transition-colors hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50">Run Now</button><button type="button" onclick={() => deleteSchedule(schedule)} class="rounded-md border border-border px-3 py-1.5 text-xs font-medium text-destructive transition-colors hover:bg-destructive/10">Delete</button></div>
 						</article>

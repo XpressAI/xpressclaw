@@ -2968,6 +2968,14 @@ const MIGRATION_V57: &str = "
 ALTER TABLE work_attempts ADD COLUMN error_dismissed_at TIMESTAMP;
 ";
 
+const MIGRATION_V59: &str = "
+ALTER TABLE workflows ADD COLUMN quota_deferred_until TEXT;
+ALTER TABLE workflows ADD COLUMN quota_deferred_reason TEXT;
+ALTER TABLE schedules ADD COLUMN quota_gate TEXT;
+ALTER TABLE schedules ADD COLUMN quota_deferred_until TEXT;
+ALTER TABLE schedules ADD COLUMN quota_deferred_reason TEXT;
+";
+
 fn schema_migrations() -> &'static [(u32, &'static str)] {
     &[
         (1, MIGRATION_V1),
@@ -3028,6 +3036,7 @@ fn schema_migrations() -> &'static [(u32, &'static str)] {
         (56, MIGRATION_V56),
         (57, MIGRATION_V57),
         (58, include_str!("tasks/directories.sql")),
+        (59, MIGRATION_V59),
     ]
 }
 
@@ -3265,7 +3274,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "58");
+        assert_eq!(version, "59");
         let visualization_table: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
