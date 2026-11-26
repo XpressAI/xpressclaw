@@ -123,18 +123,24 @@ pub async fn check_scheduled_workflows_with_usage(
                 {
                     QuotaGateDecision::Allow => {
                         if workflow.quota_deferred_until.is_some() {
-                            let _ = manager.clear_quota_deferral(&workflow.id);
+                            let _ = manager.clear_quota_deferral(workflow);
                         }
                     }
                     QuotaGateDecision::Defer { until, reason } => {
                         let resume_at = until.to_rfc3339_opts(SecondsFormat::Secs, true);
-                        manager.record_quota_deferral(&workflow.id, &resume_at, &reason)?;
-                        info!(
-                            workflow_id = workflow.id,
-                            provider = %provider,
-                            resume_at = %resume_at,
-                            "deferred scheduled workflow until quota reset"
-                        );
+                        if manager.record_quota_deferral(workflow, &resume_at, &reason)? {
+                            info!(
+                                workflow_id = workflow.id,
+                                provider = %provider,
+                                resume_at = %resume_at,
+                                "deferred scheduled workflow until quota reset"
+                            );
+                        } else {
+                            debug!(
+                                workflow_id = workflow.id,
+                                "skipped persisting quota deferral because workflow schedule changed"
+                            );
+                        }
                         continue;
                     }
                     QuotaGateDecision::Skip { reason } => {
@@ -200,28 +206,52 @@ fn resolve_workflow_provider(
                 .to_ascii_lowercase(),
         );
     }
-    let first_agent = definition
+
+    // Mirror WorkflowEngine::start_scheduled_instance: resolve inputs, build the initial
+    // workflow context with variables and schedule.inputs, and render templated agent
+    // selectors (such as `{{trigger.payload.worker}}` or `@worker`).
+    let raw_trigger = serde_json::json!(schedule.inputs);
+    let trigger_data = definition
+        .resolve_inputs(&raw_trigger)
+        .unwrap_or(raw_trigger);
+    let initial_context = super::context::build_context(
+        &trigger_data,
+        &definition.variables,
+        &std::collections::HashMap::new(),
+    );
+    let mut resolved_def = definition.clone();
+    let _ = resolved_def.resolve_agent_bindings(&initial_context, false);
+
+    let first_agent = resolved_def
         .flows
         .get("main")
-        .or_else(|| definition.flows.values().next())
-        .and_then(|flow| flow.steps.iter().find_map(|step| step.agent.as_deref()));
-    let agent_ref = first_agent?;
-    let resolved_agent = if let Some(input_name) = agent_ref.strip_prefix('@') {
-        schedule
-            .inputs
-            .get(input_name)
-            .and_then(|v| v.as_str())
-            .or_else(|| {
-                definition
-                    .inputs
-                    .get(input_name)
-                    .and_then(|i| i.default.as_ref())
-                    .and_then(|v| v.as_str())
-            })?
-    } else {
-        agent_ref
-    };
-    resolve_agent_provider(db, config, resolved_agent)
+        .or_else(|| resolved_def.flows.values().next())
+        .and_then(|flow| find_first_step_agent(&flow.steps))?;
+
+    let trimmed = first_agent.trim();
+    if trimmed.is_empty() || trimmed.starts_with('@') || trimmed.contains("{{") {
+        return None;
+    }
+    resolve_agent_provider(db, config, trimmed)
+}
+
+fn find_first_step_agent(steps: &[super::definition::Step]) -> Option<&str> {
+    for step in steps {
+        if let Some(agent) = step
+            .agent
+            .as_deref()
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+        {
+            return Some(agent);
+        }
+        if let Some(body) = step.body.as_deref() {
+            if let Some(agent) = find_first_step_agent(body) {
+                return Some(agent);
+            }
+        }
+    }
+    None
 }
 
 fn should_trigger(
@@ -732,5 +762,132 @@ flows:
         assert!(started_wf.quota_deferred_until.is_none());
         assert!(started_wf.quota_deferred_reason.is_none());
         assert_eq!(started_wf.trigger_count, 1);
+    }
+
+    #[tokio::test]
+    async fn quota_gate_resolves_templated_workflow_agent_from_schedule_inputs() {
+        use crate::usage::{window_from_used_pct, UsageAccountReport, UsageReportStatus};
+
+        let db = setup();
+        let manager = WorkflowManager::new(db.clone());
+        let yaml = r#"
+name: templated-agent-audit
+inputs:
+  worker:
+    type: agent
+    required: true
+schedule:
+  run_at: "2099-06-01T12:00:00Z"
+  inputs:
+    worker: atlas
+  quota_gate:
+    min_remaining_pct: 20
+    window: session
+    on_limit: wait_for_reset
+    reset_buffer_seconds: 60
+flows:
+  main:
+    steps:
+      - id: audit
+        agent: "{{trigger.payload.worker}}"
+        prompt: "Run audit"
+"#;
+        let workflow = manager
+            .create(&CreateWorkflow {
+                name: "templated-agent-audit".into(),
+                description: None,
+                yaml_content: yaml.into(),
+            })
+            .unwrap();
+
+        let usage = UsageService::new();
+        let due_at = DateTime::parse_from_rfc3339("2099-06-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        // `setup()` registers `atlas` with backend `codex`.
+        usage
+            .set_provider_override(
+                "codex",
+                vec![UsageAccountReport {
+                    id: "codex:test".into(),
+                    provider: "codex".into(),
+                    provider_label: "Codex".into(),
+                    harness: "Codex".into(),
+                    account_label: None,
+                    status: UsageReportStatus::Available,
+                    plan_label: Some("Plus".into()),
+                    observed_at: None,
+                    fetched_at: "2099-06-01T12:00:00Z".into(),
+                    windows: vec![window_from_used_pct(
+                        "five_hour",
+                        "5-hour",
+                        Some("5h".into()),
+                        true,
+                        Some(95.0),
+                        Some(18_000),
+                        Some("2099-06-01T14:00:00Z".into()),
+                        None,
+                    )],
+                    balances: Vec::new(),
+                    details: Vec::new(),
+                    problem: None,
+                    error: None,
+                    last_successful: None,
+                }],
+            )
+            .await;
+
+        assert_eq!(
+            check_scheduled_workflows_with_usage(&db, None, Some(&usage), due_at)
+                .await
+                .unwrap(),
+            0
+        );
+        let deferred = manager.get(&workflow.id).unwrap();
+        assert_eq!(
+            deferred.quota_deferred_until.as_deref(),
+            Some("2099-06-01T14:01:00Z")
+        );
+    }
+
+    #[test]
+    fn stale_quota_deferral_does_not_overwrite_concurrent_schedule_edit() {
+        let db = setup();
+        let manager = WorkflowManager::new(db.clone());
+        let initial_yaml = r#"
+name: guarded-deferral
+schedule:
+  run_at: "2099-06-01T12:00:00Z"
+flows:
+  main:
+    steps:
+      - id: audit
+        agent: atlas
+        prompt: "Run audit"
+"#;
+        let stale_snapshot = manager
+            .create(&CreateWorkflow {
+                name: "guarded-deferral".into(),
+                description: None,
+                yaml_content: initial_yaml.into(),
+            })
+            .unwrap();
+
+        // User edits the schedule to a later date while the quota check is in flight.
+        let updated_yaml = initial_yaml.replace("2099-06-01T12:00:00Z", "2099-12-01T12:00:00Z");
+        manager.update(&stale_snapshot.id, &updated_yaml).unwrap();
+
+        // Persisting the deferral from the stale revision must be rejected.
+        let persisted = manager
+            .record_quota_deferral(
+                &stale_snapshot,
+                "2099-06-01T14:01:00Z",
+                "codex 5-hour has 5% remaining",
+            )
+            .unwrap();
+        assert!(!persisted);
+        let current = manager.get(&stale_snapshot.id).unwrap();
+        assert!(current.quota_deferred_until.is_none());
+        assert!(current.quota_deferred_reason.is_none());
     }
 }

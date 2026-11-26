@@ -478,35 +478,51 @@ impl ScheduleManager {
         Ok(triggered)
     }
 
-    pub fn record_quota_deferral(&self, id: &str, resume_at: &str, reason: &str) -> Result<()> {
-        self.db.with_conn(|conn| {
+    pub fn record_quota_deferral(
+        &self,
+        schedule: &Schedule,
+        resume_at: &str,
+        reason: &str,
+    ) -> Result<bool> {
+        let changed = self.db.with_conn(|conn| {
             conn.execute(
                 "UPDATE schedules
                  SET quota_deferred_until = ?1,
                      quota_deferred_reason = ?2
-                 WHERE id = ?3",
-                rusqlite::params![resume_at, reason, id],
+                 WHERE id = ?3
+                   AND enabled = 1
+                   AND run_count = ?4
+                   AND last_run IS ?5",
+                rusqlite::params![
+                    resume_at,
+                    reason,
+                    schedule.id,
+                    schedule.run_count,
+                    schedule.last_run
+                ],
             )
             .map_err(|e| Error::Database(e.to_string()))
         })?;
-        Ok(())
+        Ok(changed == 1)
     }
 
-    pub fn clear_quota_deferral(&self, id: &str) -> Result<()> {
+    pub fn clear_quota_deferral(&self, schedule: &Schedule) -> Result<()> {
         self.db.with_conn(|conn| {
             conn.execute(
                 "UPDATE schedules
                  SET quota_deferred_until = NULL,
                      quota_deferred_reason = NULL
-                 WHERE id = ?1",
-                [id],
+                 WHERE id = ?1
+                   AND run_count = ?2
+                   AND last_run IS ?3",
+                rusqlite::params![schedule.id, schedule.run_count, schedule.last_run],
             )
             .map_err(|e| Error::Database(e.to_string()))
         })?;
         Ok(())
     }
 
-    pub fn skip_scheduled_run(&self, id: &str, now: DateTime<Utc>) -> Result<()> {
+    pub fn skip_scheduled_run(&self, schedule: &Schedule, now: DateTime<Utc>) -> Result<()> {
         let now_str = now.naive_utc().format("%Y-%m-%d %H:%M:%S").to_string();
         self.db.with_conn(|conn| {
             conn.execute(
@@ -515,8 +531,11 @@ impl ScheduleManager {
                      quota_deferred_until = NULL,
                      quota_deferred_reason = NULL,
                      enabled = CASE WHEN schedule_type = 'once' THEN 0 ELSE enabled END
-                 WHERE id = ?2",
-                rusqlite::params![now_str, id],
+                 WHERE id = ?2
+                   AND enabled = 1
+                   AND run_count = ?3
+                   AND last_run IS ?4",
+                rusqlite::params![now_str, schedule.id, schedule.run_count, schedule.last_run],
             )
             .map_err(|e| Error::Database(e.to_string()))
         })?;
@@ -768,22 +787,28 @@ pub async fn check_schedules_with_usage(
                     {
                         QuotaGateDecision::Allow => {
                             if schedule.quota_deferred_until.is_some() {
-                                let _ = mgr.clear_quota_deferral(&schedule.id);
+                                let _ = mgr.clear_quota_deferral(schedule);
                             }
                         }
                         QuotaGateDecision::Defer { until, reason } => {
                             let resume_at = until.to_rfc3339_opts(SecondsFormat::Secs, true);
-                            mgr.record_quota_deferral(&schedule.id, &resume_at, &reason)?;
-                            info!(
-                                schedule_id = schedule.id.as_str(),
-                                provider = %provider,
-                                resume_at = %resume_at,
-                                "deferred scheduled task until quota reset"
-                            );
+                            if mgr.record_quota_deferral(schedule, &resume_at, &reason)? {
+                                info!(
+                                    schedule_id = schedule.id.as_str(),
+                                    provider = %provider,
+                                    resume_at = %resume_at,
+                                    "deferred scheduled task until quota reset"
+                                );
+                            } else {
+                                debug!(
+                                    schedule_id = schedule.id.as_str(),
+                                    "skipped persisting quota deferral because schedule changed"
+                                );
+                            }
                             continue;
                         }
                         QuotaGateDecision::Skip { reason } => {
-                            mgr.skip_scheduled_run(&schedule.id, now)?;
+                            mgr.skip_scheduled_run(schedule, now)?;
                             info!(
                                 schedule_id = schedule.id.as_str(),
                                 provider = %provider,

@@ -15,7 +15,7 @@ use std::time::Duration;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, Notify, RwLock};
+use tokio::sync::{watch, Mutex, RwLock};
 use tracing::warn;
 
 use crate::db::Database;
@@ -616,7 +616,7 @@ pub struct UsageService {
     last_successful: Arc<RwLock<HashMap<String, UsageSuccessfulSnapshot>>>,
     rate_limited_until: Arc<RwLock<HashMap<String, DateTime<Utc>>>>,
     overrides: Arc<RwLock<HashMap<String, Vec<UsageAccountReport>>>>,
-    in_flight: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
+    in_flight: Arc<Mutex<HashMap<String, watch::Receiver<Option<UsageAccountReport>>>>>,
 }
 
 impl Default for UsageService {
@@ -759,35 +759,53 @@ impl UsageService {
             }
         }
 
-        // Coalesce concurrent requests for the same account ID.
-        let notify = {
-            let mut in_flight = self.in_flight.lock().await;
-            if let Some(existing) = in_flight.get(&id) {
-                let waiter = existing.clone();
-                drop(in_flight);
-                waiter.notified().await;
-                if let Some(cached) = self.cache.read().await.get(&id).cloned() {
-                    return cached.report;
-                }
-                // Fall through if the first request did not populate cache.
+        // Coalesce concurrent requests for the same account ID using a watch channel so
+        // waiters cannot miss completion signals if the leader finishes between dropping
+        // the map lock and polling, and cancelled leaders never stall waiters.
+        loop {
+            let existing_rx = {
                 let mut in_flight = self.in_flight.lock().await;
-                let fresh = Arc::new(Notify::new());
-                in_flight.insert(id.clone(), fresh.clone());
-                fresh
-            } else {
-                let fresh = Arc::new(Notify::new());
-                in_flight.insert(id.clone(), fresh.clone());
-                fresh
+                if let Some(existing) = in_flight.get(&id) {
+                    if existing.borrow().is_none() && existing.has_changed().is_ok() {
+                        Some(existing.clone())
+                    } else {
+                        let (tx, rx) = watch::channel(None);
+                        in_flight.insert(id.clone(), rx);
+                        drop(in_flight);
+                        return self.run_as_in_flight_leader(id, account, now, tx).await;
+                    }
+                } else {
+                    let (tx, rx) = watch::channel(None);
+                    in_flight.insert(id.clone(), rx);
+                    drop(in_flight);
+                    return self.run_as_in_flight_leader(id, account, now, tx).await;
+                }
+            };
+
+            if let Some(mut rx) = existing_rx {
+                if let Ok(guard) = rx.wait_for(|report| report.is_some()).await {
+                    if let Some(report) = guard.as_ref() {
+                        return report.clone();
+                    }
+                }
+                // Leader dropped without delivering a result; retry to become leader.
             }
-        };
+        }
+    }
 
+    async fn run_as_in_flight_leader(
+        &self,
+        id: String,
+        account: providers::DiscoveredAccount,
+        now: DateTime<Utc>,
+        tx: watch::Sender<Option<UsageAccountReport>>,
+    ) -> UsageAccountReport {
         let result = self.fetch_account_inner(account, now).await;
-
         {
             let mut in_flight = self.in_flight.lock().await;
             in_flight.remove(&id);
         }
-        notify.notify_waiters();
+        let _ = tx.send(Some(result.clone()));
         result
     }
 
@@ -1239,5 +1257,46 @@ mod tests {
             resolve_agent_provider(&db, None, "db-copilot").as_deref(),
             Some("github-copilot")
         );
+    }
+
+    #[tokio::test]
+    async fn in_flight_coalescing_does_not_stall_when_leader_completes_early() {
+        let svc = UsageService::new();
+        let account = providers::DiscoveredAccount {
+            id: "codex:coalesce-test".into(),
+            provider: "codex".into(),
+            provider_label: "Codex".into(),
+            harness: "Codex".into(),
+            account_label: None,
+            source: providers::AccountSource::CopilotEnv {
+                var: "XPRESSCLAW_NONEXISTENT_TOKEN_VAR".into(),
+            },
+        };
+        let expected = sample_report("codex", Vec::new());
+
+        // Simulate a leader registering an in-flight channel, completing, and dropping
+        // the sender before a concurrent waiter awaits the cloned receiver.
+        let (tx, rx) = watch::channel(None);
+        svc.in_flight
+            .lock()
+            .await
+            .insert(account.id.clone(), rx.clone());
+
+        let svc_waiter = svc.clone();
+        let account_waiter = account.clone();
+        let waiter =
+            tokio::spawn(async move { svc_waiter.fetch_account(account_waiter, true).await });
+
+        // Yield once so the waiter can clone the receiver, then complete the leader.
+        tokio::task::yield_now().await;
+        svc.in_flight.lock().await.remove(&account.id);
+        let _ = tx.send(Some(expected.clone()));
+        drop(tx);
+
+        let result = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("coalesced waiter must not stall")
+            .unwrap();
+        assert_eq!(result.id, expected.id);
     }
 }

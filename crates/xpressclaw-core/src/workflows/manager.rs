@@ -320,29 +320,50 @@ impl WorkflowManager {
     }
 
     /// Record that a due scheduled workflow is waiting for a harness quota window to reset.
-    pub fn record_quota_deferral(&self, id: &str, resume_at: &str, reason: &str) -> Result<()> {
-        self.db.with_conn(|conn| {
+    ///
+    /// Guards against concurrent schedule edits or executions by requiring the workflow to
+    /// remain enabled at the exact revision and `last_triggered_at` inspected before the
+    /// asynchronous quota check.
+    pub fn record_quota_deferral(
+        &self,
+        record: &WorkflowRecord,
+        resume_at: &str,
+        reason: &str,
+    ) -> Result<bool> {
+        let changed = self.db.with_conn(|conn| {
             conn.execute(
                 "UPDATE workflows
                  SET quota_deferred_until = ?1,
                      quota_deferred_reason = ?2
-                 WHERE id = ?3",
-                rusqlite::params![resume_at, reason, id],
+                 WHERE id = ?3
+                   AND enabled = 1
+                   AND revision = ?4
+                   AND last_triggered_at IS ?5",
+                rusqlite::params![
+                    resume_at,
+                    reason,
+                    record.id,
+                    record.revision,
+                    record.last_triggered_at
+                ],
             )
             .map_err(|e| Error::Database(e.to_string()))
         })?;
-        Ok(())
+        Ok(changed == 1)
     }
 
-    /// Clear any active quota deferral state on a workflow.
-    pub fn clear_quota_deferral(&self, id: &str) -> Result<()> {
+    /// Clear any active quota deferral state on a workflow if its revision and occurrence
+    /// have not changed.
+    pub fn clear_quota_deferral(&self, record: &WorkflowRecord) -> Result<()> {
         self.db.with_conn(|conn| {
             conn.execute(
                 "UPDATE workflows
                  SET quota_deferred_until = NULL,
                      quota_deferred_reason = NULL
-                 WHERE id = ?1",
-                [id],
+                 WHERE id = ?1
+                   AND revision = ?2
+                   AND last_triggered_at IS ?3",
+                rusqlite::params![record.id, record.revision, record.last_triggered_at],
             )
             .map_err(|e| Error::Database(e.to_string()))
         })?;
@@ -367,8 +388,18 @@ impl WorkflowManager {
                      quota_deferred_reason = NULL,
                      revision = revision + 1,
                      enabled = CASE WHEN ?3 THEN 0 ELSE enabled END
-                 WHERE id = ?4 AND enabled = 1 AND revision = ?5",
-                rusqlite::params![skipped_at, reason, once, record.id, record.revision],
+                 WHERE id = ?4
+                   AND enabled = 1
+                   AND revision = ?5
+                   AND last_triggered_at IS ?6",
+                rusqlite::params![
+                    skipped_at,
+                    reason,
+                    once,
+                    record.id,
+                    record.revision,
+                    record.last_triggered_at
+                ],
             )
             .map_err(|e| Error::Database(e.to_string()))
         })?;
