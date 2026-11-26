@@ -82,7 +82,7 @@ pub(super) fn retire_stale_in_transaction(
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let reason = "Delegated result is no longer current; unused notification response superseded";
     for (attempt, queue, task, agent) in stale {
-        tx.execute("UPDATE work_attempts SET status='cancelled', completed_at=CURRENT_TIMESTAMP, result=?2 WHERE id=?1", params![attempt,reason])?;
+        tx.execute("UPDATE work_attempts SET status='cancelled', completed_at=CURRENT_TIMESTAMP, result=NULL WHERE id=?1", [&attempt])?;
         tx.execute("UPDATE task_queue SET status='failed', completed_at=CURRENT_TIMESTAMP, harness_response=?2 WHERE id=?1", params![queue,reason])?;
         tx.execute(
             "UPDATE tasks SET active_attempt_id=NULL WHERE id=?1 AND active_attempt_id=?2",
@@ -702,13 +702,11 @@ mod tests {
                     next.is_none_or(|item| item.task_id != parent.id),
                     "{resolution} by_agent={by_agent}"
                 );
-                assert_eq!(
-                    SessionManager::new(db.clone())
-                        .get_attempt(&attempt)
-                        .unwrap()
-                        .status,
-                    "cancelled"
-                );
+                let retired = SessionManager::new(db.clone())
+                    .get_attempt(&attempt)
+                    .unwrap();
+                assert_eq!(retired.status, "cancelled");
+                assert!(retired.result.is_none());
                 assert_eq!(
                     count(&db, "task_delegation_notifications"),
                     1,

@@ -1681,6 +1681,56 @@ test('activity stays chronological, compact, expandable, and pageable', async ({
 	await expect(page.getByText('Reasoning effort', { exact: true })).toBeVisible();
 });
 
+test('phone task transcript shows the message once and skips startup receipts and superseded results', async ({ page }) => {
+	await page.setViewportSize({ width: 390, height: 844 });
+	const prompt = 'Please check these files.';
+	const superseded = 'Delegated result is no longer current; unused notification response superseded';
+	const startup = [
+		['attempt_queued', 'Work queued'], ['task_message_received', prompt],
+		['attempt_preparing', 'Checking workspace before runner startup'], ['attempt_preparing', 'Preparing codex'],
+		['attempt_running', 'codex is working over ACP'], ['session_fork', 'Forked the inherited agent conversation for this task'],
+		['session_config_options', 'Agent advertised 6 session controls'], ['session_config_options', 'Agent advertised 6 session controls'],
+		['available_commands', 'Agent advertised 59 commands'], ['delegation_superseded', superseded],
+	];
+	await mockApi(page, {
+		taskDescription: prompt, taskStatus: 'in_progress',
+		taskMessages: [{ id: 1, task_id: taskId, role: 'user', content: prompt, attachments: [], timestamp: timestamp(0) }],
+		taskAttempts: [attempt('cancelled', 0, null, superseded, { id: 'obsolete' }), attempt('running')],
+		taskActivityEvents: [...startup.map(([type, summary], i) => timelineEvent(i + 1, i + 1, type, summary, {})),
+			timelineEvent(11, 11, 'tool_call', 'Read the configuration', { toolCallId: 'read-1', kind: 'read' })],
+	});
+	await page.goto(`/tasks/${taskId}`);
+	const transcript = page.getByLabel('Task transcript', { exact: true });
+	await expect(transcript.getByText(prompt, { exact: true })).toHaveCount(1);
+	await expect(transcript.getByText('The agent is responding', { exact: true })).toBeVisible();
+	await expect(transcript.locator('[data-transcript-kind="activity"]')).toHaveCount(1);
+	await expect(transcript.getByRole('button', { name: /Read the configuration/ })).toBeVisible();
+	await expect(transcript.getByText(superseded)).toHaveCount(0);
+	await expect(page.locator('[data-task-result-content]')).toHaveCount(0);
+});
+
+test('phone task transcript keeps failures collapsed at the time of the failed turn', async ({ page }) => {
+	await page.setViewportSize({ width: 390, height: 844 });
+	const reason = 'Runner stopped before it could finish.';
+	await mockApi(page, {
+		taskStatus: 'blocked', taskAttempts: [attempt('failed', 0, reason, null, { completed_at: timestamp(10) })],
+		taskActivityEvents: [timelineEvent(2, 10, 'attempt_failed', 'Work attempt failed', { error: reason })],
+		taskMessages: [{ id: 3, task_id: taskId, role: 'user', content: 'Try again', timestamp: timestamp(20), attachments: [] }],
+	});
+	await page.goto(`/tasks/${taskId}`);
+	const transcript = page.locator('[data-task-transcript]');
+	const failure = transcript.locator('[data-attempt-error]');
+	await expect(failure.getByText('Turn failed')).toBeVisible();
+	await expect(failure.getByText(reason)).toBeHidden();
+	expect((await failure.boundingBox())!.height).toBeLessThan(52);
+	await expect(transcript.locator('[data-transcript-timestamp]').last()).toContainText('Try again');
+	await expect(transcript.getByText('Work attempt failed')).toHaveCount(0);
+	await failure.locator('summary').click();
+	await expect(failure.getByText(reason)).toBeVisible();
+	await failure.getByRole('button', { name: 'Dismiss attempt error' }).click();
+	await expect(failure).toHaveCount(0);
+});
+
 test('attempt errors stay dismissed across task switches and reloads', async ({ page }) => {
 	const rawError = '<img src=x onerror="window.__rawHtmlExecuted = true"> ACP process stopped during the turn';
 	await mockApi(page, { taskStatus: 'blocked', taskTitle: 'Dismissed error task', attemptError: rawError });
@@ -1739,10 +1789,16 @@ test('attempt errors from older turns stay out of the banner without manual dism
 		attempt('completed', 128_000, null, 'First answer', { id: 'recovered-attempt', created_at: timestamp(62) }),
 		attempt('failed', 128_000, error),
 	];
-	await mockApi(page, { taskStatus: 'waiting_for_input', taskAttempts: attempts });
+	await mockApi(page, {
+		taskStatus: 'waiting_for_input', taskAttempts: attempts,
+		taskActivityEvents: [timelineEvent(11, 30, 'attempt_failed', 'Work attempt failed', { error })],
+	});
 	await page.goto(`/tasks/${taskId}`);
 	await expect(page.getByText('First answer', { exact: true })).toBeVisible();
 	await expect(page.locator('[data-attempt-error]')).toHaveCount(0);
+	const historical = page.getByRole('button', { name: /Work attempt failed/ });
+	await historical.click();
+	await expect(page.locator('[data-task-transcript]').getByText(error, { exact: true })).toBeVisible();
 	await page.reload();
 	await expect(page.getByText('First answer', { exact: true })).toBeVisible();
 	await expect(page.locator('[data-attempt-error]')).toHaveCount(0);
@@ -7773,7 +7829,14 @@ for (const [activity, status, label] of [
 		await expect(panel.getByText(label, { exact: true })).toBeVisible();
 		await expect(panel.getByText('Required by this task')).toBeVisible();
 		await expect(panel.getByText('Working', { exact: true })).toHaveCount(0);
-		await expect(page.locator('[data-delegation-wait]')).toBeVisible();
+		const wait = page.locator('[data-delegation-wait]');
+		await expect(wait).toBeVisible();
+		if (activity === 'failed') {
+			await expect(page.getByRole('alert').filter({ hasText: 'Blocked by delegated work' })).toHaveCount(0);
+			await expect(wait.getByRole('link')).toHaveCount(0);
+			await wait.locator('summary').click();
+			await expect(wait.getByRole('link')).toHaveAttribute('href', '/tasks/review-child');
+		}
 	});
 }
 

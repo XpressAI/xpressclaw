@@ -160,7 +160,9 @@ queued, waiting for the user, or ready; accepts another task immediately; and
 links to each durable task conversation. A task view keeps its conversation,
 semantic progress, native plan steps, result, and reply composer together.
 Diagnostics may retain implementation records, but they are not duplicated in
-the primary work view.
+the primary work view. The task transcript uses one live status for startup.
+A failed turn has an expandable entry at the time it failed. Superseded
+delegation wake-ups remain in the event journal.
 
 Navigation must work as a remote control from a phone. Desktop keeps a project
 switcher in the sidebar. Narrow viewports use an overlay project switcher and a
