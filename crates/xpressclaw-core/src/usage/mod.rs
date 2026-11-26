@@ -955,6 +955,10 @@ fn extract_provider_from_reason(reason: &str) -> Option<String> {
 }
 
 /// Resolve the canonical harness kind for an agent from in-memory config or DB fallback.
+///
+/// Mirrors `workers::native::resolve_runner_kind` so legacy backend names (such as
+/// `claude-sdk` or `copilot-cli`) under `runner.kind: auto` resolve consistently with
+/// actual execution.
 pub fn resolve_agent_provider(
     db: &Database,
     config: Option<&crate::config::Config>,
@@ -962,11 +966,10 @@ pub fn resolve_agent_provider(
 ) -> Option<String> {
     if let Some(cfg) = config {
         if let Some(agent) = cfg.agents.iter().find(|a| a.name == agent_id) {
-            if let Some(kind) = crate::acp::canonical_agent_kind(&agent.runner.kind) {
-                return Some(kind.to_string());
-            }
-            if let Some(kind) = crate::acp::canonical_agent_kind(&agent.backend) {
-                return Some(kind.to_string());
+            if let Ok(kind) = crate::workers::native::resolve_runner_kind(agent) {
+                if !kind.trim().is_empty() {
+                    return Some(kind);
+                }
             }
         }
     }
@@ -980,7 +983,7 @@ pub fn resolve_agent_provider(
     });
     backend
         .as_deref()
-        .and_then(crate::acp::canonical_agent_kind)
+        .and_then(crate::acp::infer_agent_kind_from_backend)
         .map(str::to_string)
 }
 
@@ -1164,5 +1167,77 @@ mod tests {
             Some(now + chrono::Duration::minutes(15))
         );
         assert_eq!(parse_retry_after(Some("not-a-date"), now), None);
+    }
+
+    #[test]
+    fn resolve_agent_provider_handles_legacy_backends_in_config_and_db() {
+        use crate::config::{AgentConfig, Config, NativeRunnerConfig};
+
+        let db = Database::open_memory().unwrap();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO agents (id, name, backend, config)
+                 VALUES ('db-claude', 'DB Claude', 'claude-sdk', '{}'),
+                        ('db-copilot', 'DB Copilot', 'copilot-cli', '{}'),
+                        ('cfg-claude', 'Cfg Claude', 'native', '{}'),
+                        ('cfg-copilot', 'Cfg Copilot', 'native', '{}'),
+                        ('cfg-explicit', 'Cfg Explicit', 'native', '{}');",
+            )
+        })
+        .unwrap();
+
+        let cfg = Config {
+            agents: vec![
+                AgentConfig {
+                    name: "cfg-claude".into(),
+                    backend: "claude-sdk".into(),
+                    runner: NativeRunnerConfig {
+                        kind: "auto".into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                AgentConfig {
+                    name: "cfg-copilot".into(),
+                    backend: "copilot-cli".into(),
+                    runner: NativeRunnerConfig {
+                        kind: "auto".into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                AgentConfig {
+                    name: "cfg-explicit".into(),
+                    backend: "native".into(),
+                    runner: NativeRunnerConfig {
+                        kind: "copilot".into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            resolve_agent_provider(&db, Some(&cfg), "cfg-claude").as_deref(),
+            Some("claude")
+        );
+        assert_eq!(
+            resolve_agent_provider(&db, Some(&cfg), "cfg-copilot").as_deref(),
+            Some("github-copilot")
+        );
+        assert_eq!(
+            resolve_agent_provider(&db, Some(&cfg), "cfg-explicit").as_deref(),
+            Some("github-copilot")
+        );
+        assert_eq!(
+            resolve_agent_provider(&db, Some(&cfg), "db-claude").as_deref(),
+            Some("claude")
+        );
+        assert_eq!(
+            resolve_agent_provider(&db, None, "db-copilot").as_deref(),
+            Some("github-copilot")
+        );
     }
 }

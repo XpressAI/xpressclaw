@@ -1061,6 +1061,26 @@ fn error_outcome(
     }
 }
 
+fn rate_limited_outcome(
+    account: &DiscoveredAccount,
+    headers: &reqwest::header::HeaderMap,
+    provider_name: &str,
+    now: DateTime<Utc>,
+) -> FetchOutcome {
+    let retry_after = headers.get("retry-after").and_then(|v| v.to_str().ok());
+    let retry_at =
+        parse_retry_after(retry_after, now).or_else(|| Some(now + chrono::Duration::minutes(5)));
+    unavailable_outcome(
+        account,
+        now,
+        UsageProblem::RateLimited {
+            retry_at: retry_at.map(|dt| dt.to_rfc3339_opts(SecondsFormat::Secs, true)),
+            detail: format!("Rate limited by {provider_name} usage API"),
+        },
+        retry_at,
+    )
+}
+
 pub async fn fetch_account_usage(
     client: &reqwest::Client,
     account: &DiscoveredAccount,
@@ -1286,21 +1306,7 @@ async fn fetch_claude_http(
         );
     }
     if status == 429 {
-        let retry_after = response
-            .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok());
-        let retry_at = parse_retry_after(retry_after, now)
-            .or_else(|| Some(now + chrono::Duration::minutes(5)));
-        return unavailable_outcome(
-            account,
-            now,
-            UsageProblem::RateLimited {
-                retry_at: retry_at.map(|dt| dt.to_rfc3339_opts(SecondsFormat::Secs, true)),
-                detail: "Rate limited by Claude usage API".into(),
-            },
-            retry_at,
-        );
+        return rate_limited_outcome(account, response.headers(), "Claude", now);
     }
     if !response.status().is_success() {
         return error_outcome(
@@ -1515,6 +1521,9 @@ async fn fetch_codex_file(
             None,
         );
     }
+    if status == 429 {
+        return rate_limited_outcome(account, response.headers(), "Codex", now);
+    }
     if !response.status().is_success() {
         return error_outcome(
             account,
@@ -1659,6 +1668,9 @@ async fn fetch_copilot_http(
             None,
         );
     }
+    if status == 429 {
+        return rate_limited_outcome(account, response.headers(), "Copilot", now);
+    }
     if !response.status().is_success() {
         return error_outcome(
             account,
@@ -1767,6 +1779,9 @@ async fn fetch_cursor_http(
             None,
         );
     }
+    if status == 429 {
+        return rate_limited_outcome(account, response.headers(), "Cursor", now);
+    }
     if !response.status().is_success() {
         return error_outcome(
             account,
@@ -1864,6 +1879,9 @@ async fn fetch_kimi_http(
             },
             None,
         );
+    }
+    if status == 429 {
+        return rate_limited_outcome(account, response.headers(), "Kimi", now);
     }
     if !response.status().is_success() {
         return error_outcome(
@@ -2003,6 +2021,9 @@ async fn fetch_grok_http(
             None,
         );
     }
+    if status == 429 {
+        return rate_limited_outcome(account, response.headers(), "Grok", now);
+    }
     if !response.status().is_success() {
         return error_outcome(
             account,
@@ -2119,6 +2140,9 @@ async fn fetch_opencode_go_http(
             None,
         );
     }
+    if status == 429 {
+        return rate_limited_outcome(account, response.headers(), "OpenCode Go", now);
+    }
     if !response.status().is_success() {
         return error_outcome(
             account,
@@ -2199,6 +2223,9 @@ async fn fetch_glm_http(
                 None,
             );
         }
+        if status == 429 {
+            return rate_limited_outcome(account, response.headers(), "GLM/Z.ai", now);
+        }
         if response.status().is_success() {
             if let Ok(body) = response.json::<Value>().await {
                 let (plan_label, windows) = parse_glm_quota(&body);
@@ -2243,6 +2270,9 @@ async fn fetch_glm_http(
             },
             None,
         );
+    }
+    if status == 429 {
+        return rate_limited_outcome(account, response.headers(), "GLM/Z.ai", now);
     }
     if !response.status().is_success() {
         return error_outcome(
@@ -2771,5 +2801,80 @@ mod tests {
                 .as_deref(),
             Some("tok-2")
         );
+    }
+
+    #[tokio::test]
+    async fn non_claude_http_fetcher_preserves_retry_after_on_429() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let _ = socket
+                .write_all(
+                    b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 900\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+        });
+
+        let account = DiscoveredAccount {
+            id: "kimi:test".into(),
+            provider: "kimi".into(),
+            provider_label: "Kimi".into(),
+            harness: "Kimi".into(),
+            account_label: None,
+            source: AccountSource::KimiEnv {
+                var: "KIMI_API_KEY".into(),
+            },
+        };
+        let now = DateTime::parse_from_rfc3339("2026-11-26T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let client = reqwest::Client::new();
+        let outcome = fetch_kimi_http(
+            &client,
+            &account,
+            "tok",
+            &format!("http://{addr}/usage"),
+            now,
+        )
+        .await;
+        server.await.unwrap();
+
+        let expected = now + chrono::Duration::seconds(900);
+        assert_eq!(outcome.report.status, UsageReportStatus::Unavailable);
+        assert_eq!(outcome.retry_at, Some(expected));
+        match outcome.report.problem {
+            Some(UsageProblem::RateLimited { retry_at, detail }) => {
+                assert_eq!(retry_at.as_deref(), Some("2026-11-26T12:15:00Z"));
+                assert!(detail.contains("Kimi"));
+            }
+            other => panic!("expected RateLimited problem, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rate_limited_outcome_defaults_to_five_minute_hold_without_header() {
+        let account = DiscoveredAccount {
+            id: "codex:test".into(),
+            provider: "codex".into(),
+            provider_label: "Codex".into(),
+            harness: "Codex".into(),
+            account_label: None,
+            source: AccountSource::CopilotEnv {
+                var: "GITHUB_TOKEN".into(),
+            },
+        };
+        let now = DateTime::parse_from_rfc3339("2026-11-26T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let headers = reqwest::header::HeaderMap::new();
+        let outcome = rate_limited_outcome(&account, &headers, "Codex", now);
+        assert_eq!(outcome.report.status, UsageReportStatus::Unavailable);
+        assert_eq!(outcome.retry_at, Some(now + chrono::Duration::minutes(5)));
     }
 }

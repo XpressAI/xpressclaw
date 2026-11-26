@@ -736,18 +736,20 @@ pub async fn check_schedules_with_usage(
     }
 
     for schedule in &schedules {
-        if should_trigger(schedule, now) {
+        let deferred_until = schedule
+            .quota_deferred_until
+            .as_deref()
+            .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
+            .map(|dt| dt.with_timezone(&Utc));
+
+        let deferred_due = match deferred_until {
+            Some(until) if until > now => continue,
+            Some(_) => schedule.schedule_type != SCHEDULE_TYPE_ONCE || schedule.run_count == 0,
+            None => false,
+        };
+
+        if deferred_due || should_trigger(schedule, now) {
             if let (Some(gate), Some(usage_service)) = (schedule.quota_gate.as_ref(), usage) {
-                if let Some(deferred_until) = schedule
-                    .quota_deferred_until
-                    .as_deref()
-                    .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
-                    .map(|dt| dt.with_timezone(&Utc))
-                {
-                    if deferred_until > now {
-                        continue;
-                    }
-                }
                 let provider = gate
                     .provider
                     .as_deref()
@@ -1752,6 +1754,147 @@ mod tests {
         let completed = mgr.get(&schedule.id).unwrap();
         assert_eq!(completed.run_count, 1);
         assert!(completed.quota_deferred_until.is_none());
+        assert_eq!(board.list(None, None, 10).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn deferred_recurring_schedule_that_never_ran_resumes_after_wait_expires() {
+        use crate::usage::{window_from_used_pct, UsageAccountReport, UsageReportStatus};
+        use chrono::Timelike;
+
+        let (db, mgr, board) = setup();
+        // Pick a concrete UTC timestamp, derive its local hour/minute, and build a daily cron for it.
+        let due_at = DateTime::parse_from_rfc3339("2099-07-01T09:00:30Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let due_local = due_at.with_timezone(&chrono::Local);
+        let cron = format!("{} {} * * *", due_local.minute(), due_local.hour());
+
+        let schedule = mgr
+            .create(&CreateSchedule {
+                name: "Daily quota-gated standup".into(),
+                cron,
+                agent_id: "atlas".into(),
+                title: "Daily standup".into(),
+                description: None,
+                quota_gate: Some(QuotaGatePolicy {
+                    min_remaining_pct: 25.0,
+                    window: "session".into(),
+                    provider: Some("codex".into()),
+                    reset_buffer_seconds: 60,
+                    ..Default::default()
+                }),
+            })
+            .unwrap();
+        assert!(schedule.last_run.is_none());
+        assert_eq!(schedule.run_count, 0);
+
+        let reset_at = due_at + chrono::Duration::hours(2);
+        let expected_resume = reset_at + chrono::Duration::seconds(60);
+
+        let usage = UsageService::new();
+        usage
+            .set_provider_override(
+                "codex",
+                vec![UsageAccountReport {
+                    id: "codex:test".into(),
+                    provider: "codex".into(),
+                    provider_label: "Codex".into(),
+                    harness: "Codex".into(),
+                    account_label: None,
+                    status: UsageReportStatus::Available,
+                    plan_label: Some("Plus".into()),
+                    observed_at: None,
+                    fetched_at: due_at.to_rfc3339_opts(SecondsFormat::Secs, true),
+                    windows: vec![window_from_used_pct(
+                        "five_hour",
+                        "5-hour",
+                        Some("5h".into()),
+                        true,
+                        Some(95.0),
+                        Some(18_000),
+                        Some(reset_at.to_rfc3339_opts(SecondsFormat::Secs, true)),
+                        None,
+                    )],
+                    balances: Vec::new(),
+                    details: Vec::new(),
+                    problem: None,
+                    error: None,
+                    last_successful: None,
+                }],
+            )
+            .await;
+
+        // First occurrence matches cron and gets deferred until reset + 60s.
+        check_schedules_with_usage(&db, None, None, Some(&usage), due_at)
+            .await
+            .unwrap();
+        let deferred = mgr.get(&schedule.id).unwrap();
+        assert_eq!(deferred.run_count, 0);
+        assert!(deferred.last_run.is_none());
+        assert_eq!(
+            deferred.quota_deferred_until.as_deref(),
+            Some(
+                expected_resume
+                    .to_rfc3339_opts(SecondsFormat::Secs, true)
+                    .as_str()
+            )
+        );
+
+        // Still waiting before expected_resume.
+        let midpoint = due_at + chrono::Duration::hours(1);
+        check_schedules_with_usage(&db, None, None, Some(&usage), midpoint)
+            .await
+            .unwrap();
+        assert_eq!(mgr.get(&schedule.id).unwrap().run_count, 0);
+
+        // Two hours later, `should_trigger` alone would be false because `last_run` is None
+        // and the 2-minute initial lookback window has moved past the daily cron match.
+        assert!(!should_trigger(&deferred, expected_resume));
+
+        // After quota recovers, the expired deferral must still be rechecked and triggered.
+        usage
+            .set_provider_override(
+                "codex",
+                vec![UsageAccountReport {
+                    id: "codex:test".into(),
+                    provider: "codex".into(),
+                    provider_label: "Codex".into(),
+                    harness: "Codex".into(),
+                    account_label: None,
+                    status: UsageReportStatus::Available,
+                    plan_label: Some("Plus".into()),
+                    observed_at: None,
+                    fetched_at: expected_resume.to_rfc3339_opts(SecondsFormat::Secs, true),
+                    windows: vec![window_from_used_pct(
+                        "five_hour",
+                        "5-hour",
+                        Some("5h".into()),
+                        true,
+                        Some(10.0),
+                        Some(18_000),
+                        Some(
+                            (expected_resume + chrono::Duration::hours(5))
+                                .to_rfc3339_opts(SecondsFormat::Secs, true),
+                        ),
+                        None,
+                    )],
+                    balances: Vec::new(),
+                    details: Vec::new(),
+                    problem: None,
+                    error: None,
+                    last_successful: None,
+                }],
+            )
+            .await;
+
+        check_schedules_with_usage(&db, None, None, Some(&usage), expected_resume)
+            .await
+            .unwrap();
+        let resumed = mgr.get(&schedule.id).unwrap();
+        assert_eq!(resumed.run_count, 1);
+        assert!(resumed.quota_deferred_until.is_none());
+        assert!(resumed.quota_deferred_reason.is_none());
         assert_eq!(board.list(None, None, 10).unwrap().len(), 1);
     }
 }

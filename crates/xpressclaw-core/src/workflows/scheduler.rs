@@ -93,23 +93,23 @@ pub async fn check_scheduled_workflows_with_usage(
             continue;
         }
 
-        if !should_trigger(workflow, schedule, now) {
+        let deferred_until = workflow
+            .quota_deferred_until
+            .as_deref()
+            .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
+            .map(|dt| dt.with_timezone(&Utc));
+        let deferred_due = match deferred_until {
+            Some(until) if until > now => continue,
+            Some(_) => schedule.run_at.is_none() || workflow.last_triggered_at.is_none(),
+            None => false,
+        };
+
+        if !deferred_due && !should_trigger(workflow, schedule, now) {
             continue;
         }
 
         // Enforce optional quota_gate before starting the instance.
         if let (Some(gate), Some(usage_service)) = (schedule.quota_gate.as_ref(), usage) {
-            if let Some(deferred_until) = workflow
-                .quota_deferred_until
-                .as_deref()
-                .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
-                .map(|dt| dt.with_timezone(&Utc))
-            {
-                if deferred_until > now {
-                    continue;
-                }
-            }
-
             if let Some(provider) = resolve_workflow_provider(
                 db,
                 config,
