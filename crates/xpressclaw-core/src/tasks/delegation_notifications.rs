@@ -938,6 +938,11 @@ mod tests {
             .execute_batch(
                 "DROP TABLE task_delegation_automatic_responses;
             DROP TABLE task_directories;
+            ALTER TABLE workflows DROP COLUMN quota_deferred_until;
+            ALTER TABLE workflows DROP COLUMN quota_deferred_reason;
+            ALTER TABLE schedules DROP COLUMN quota_gate;
+            ALTER TABLE schedules DROP COLUMN quota_deferred_until;
+            ALTER TABLE schedules DROP COLUMN quota_deferred_reason;
             ALTER TABLE work_attempts DROP COLUMN error_dismissed_at;
             ALTER TABLE tasks DROP COLUMN parent_review_required;
             DROP INDEX idx_workflows_project;

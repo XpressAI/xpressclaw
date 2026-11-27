@@ -38,6 +38,8 @@ pub struct AppState {
     /// Shared, cached host resource sampler. Only dashboard requests use it.
     pub resource_monitor:
         Arc<std::sync::Mutex<xpressclaw_core::system::resources::ResourceMonitor>>,
+    /// Shared, cached harness quota & rate-limit service.
+    pub usage_service: Arc<xpressclaw_core::usage::UsageService>,
     /// Shared Docker connection (reused across all requests).
     pub docker: Arc<RwLock<Option<Arc<DockerManager>>>>,
     /// Live ACP forms waiting for a response from the task UI.
@@ -148,6 +150,7 @@ impl AppState {
             mcp_manager: Arc::new(McpManager::new()),
             event_bus: Arc::new(ConversationEventBus::new()),
             resource_monitor: Arc::new(std::sync::Mutex::new(Default::default())),
+            usage_service: Arc::new(xpressclaw_core::usage::UsageService::new()),
             docker: Arc::new(RwLock::new(None)),
             elicitations: Arc::new(AcpElicitationBroker::new()),
             turn_controls: Arc::new(AcpTurnControlBroker::new()),

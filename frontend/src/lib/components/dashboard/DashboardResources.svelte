@@ -1,70 +1,19 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { dashboard, type DashboardResources, type ResourceCapacity } from '$lib/api';
+	import type { ResourceCapacity } from '$lib/api';
+	import { resourceStore } from '$lib/stores/resources.svelte';
 	import { timeAgo } from '$lib/utils';
 
 	let { needsAttention }: { needsAttention: number } = $props();
-	let resources = $state<DashboardResources | null>(null);
-	let loading = $state(true);
-	let error = $state(false);
-	let now = $state(Date.now());
-	let receivedAt = $state<number | null>(null);
-	let active = false;
-	let inFlight = false;
-	let timer: ReturnType<typeof setTimeout> | null = null;
-	let clockTimer: ReturnType<typeof setInterval> | null = null;
-	let requestController: AbortController | null = null;
-	// Measure freshness on this device: a server clock offset must not make a
-	// newly received sample look stale. Repeated cached samples do not reset it.
-	let stale = $derived(error || (receivedAt !== null && now - receivedAt > 20_000));
+	let resources = $derived(resourceStore.resources);
+	let loading = $derived(resourceStore.loading);
+	let error = $derived(resourceStore.error);
+	let stale = $derived(resourceStore.stale);
 
-	onMount(() => {
-		active = true;
-		const visibilityChanged = () => {
-			if (timer) clearTimeout(timer);
-			if (clockTimer) clearInterval(clockTimer);
-			if (!document.hidden) {
-				now = Date.now();
-				clockTimer = setInterval(() => (now = Date.now()), 5_000);
-				void refresh();
-			}
-		};
-		visibilityChanged();
-		document.addEventListener('visibilitychange', visibilityChanged);
-		return () => {
-			active = false;
-			if (timer) clearTimeout(timer);
-			if (clockTimer) clearInterval(clockTimer);
-			requestController?.abort();
-			document.removeEventListener('visibilitychange', visibilityChanged);
-		};
-	});
+	onMount(() => resourceStore.subscribe());
 
-	async function refresh() {
-		if (!active || inFlight || document.hidden) return;
-		if (timer) clearTimeout(timer);
-		inFlight = true;
-		const controller = new AbortController();
-		requestController = controller;
-		const timeout = setTimeout(() => controller.abort(), 15_000);
-		try {
-			const sample = await dashboard.resources(controller.signal);
-			if (!active) return;
-			if (sample.sampled_at !== resources?.sampled_at) receivedAt = Date.now();
-			resources = sample;
-			error = false;
-		} catch {
-			if (active) error = true;
-		} finally {
-			clearTimeout(timeout);
-			requestController = null;
-			inFlight = false;
-			if (active) {
-				loading = false;
-				now = Date.now();
-				if (!document.hidden) timer = setTimeout(refresh, 5_000);
-			}
-		}
+	function refresh() {
+		resourceStore.retry();
 	}
 
 	function bytes(value: number): string {

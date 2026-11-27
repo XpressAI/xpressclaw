@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::OptionalExtension;
@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use crate::config::Config;
 use crate::conversations::event_bus::{ConversationEvent, ConversationEventBus};
 use crate::conversations::{ConversationManager, ConversationMessage, SendMessage};
 use crate::db::Database;
@@ -15,6 +16,7 @@ use crate::sessions::{NewEvent, SessionManager};
 use crate::tasks::board::{CreateTask, Task, TaskBoard, TaskStatus};
 use crate::tasks::conversation::TaskConversation;
 use crate::tasks::queue::TaskQueue;
+use crate::usage::{resolve_agent_provider, QuotaGateDecision, QuotaGatePolicy, UsageService};
 
 pub const SCHEDULE_TYPE_CRON: &str = "cron";
 pub const SCHEDULE_TYPE_ONCE: &str = "once";
@@ -38,6 +40,12 @@ pub struct Schedule {
     pub run_at: Option<String>,
     pub continuation_task_id: Option<String>,
     pub conversation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_gate: Option<QuotaGatePolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_deferred_until: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_deferred_reason: Option<String>,
 }
 
 /// Result of firing a schedule. Existing task-based schedules serialize as
@@ -71,6 +79,8 @@ pub struct CreateSchedule {
     pub agent_id: String,
     pub title: String,
     pub description: Option<String>,
+    #[serde(default)]
+    pub quota_gate: Option<QuotaGatePolicy>,
 }
 
 /// Request to create a durable one-shot schedule.
@@ -96,6 +106,8 @@ pub struct CreateOneShotSchedule {
     /// The bundled control tool sets this only for Conversation turns. It is
     /// mutually exclusive with `continuation_task_id`.
     pub conversation_id: Option<String>,
+    #[serde(default)]
+    pub quota_gate: Option<QuotaGatePolicy>,
 }
 
 /// Manages recurring and one-shot schedules that create tasks when triggered.
@@ -113,6 +125,7 @@ impl ScheduleManager {
 
     /// Create a new schedule.
     pub fn create(&self, req: &CreateSchedule) -> Result<Schedule> {
+        let quota_gate_json = serialize_quota_gate(req.quota_gate.as_ref())?;
         let id = Uuid::new_v4().to_string();
         let now = Utc::now()
             .naive_utc()
@@ -126,9 +139,9 @@ impl ScheduleManager {
             )?;
             ensure_agent_project_accepts_work(&transaction, &req.agent_id)?;
             transaction.execute(
-                "INSERT INTO schedules (id, name, cron, agent_id, title, description, enabled, run_count, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, 0, ?7)",
-                rusqlite::params![id, req.name, req.cron, req.agent_id, req.title, req.description, now],
+                "INSERT INTO schedules (id, name, cron, agent_id, title, description, enabled, run_count, created_at, quota_gate)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, 0, ?7, ?8)",
+                rusqlite::params![id, req.name, req.cron, req.agent_id, req.title, req.description, now, quota_gate_json],
             )?;
             transaction.commit()?;
             Ok::<_, Error>(())
@@ -142,6 +155,7 @@ impl ScheduleManager {
         validate_required("name", &req.name)?;
         validate_required("agent_id", &req.agent_id)?;
         validate_required("title", &req.title)?;
+        let quota_gate_json = serialize_quota_gate(req.quota_gate.as_ref())?;
         if req.continuation_task_id.is_some() && req.conversation_id.is_some() {
             return Err(Error::Schedule(
                 "continuation_task_id and conversation_id are mutually exclusive".to_string(),
@@ -187,8 +201,8 @@ impl ScheduleManager {
             transaction.execute(
                 "INSERT INTO schedules
                  (id, name, cron, agent_id, title, description, enabled, run_count, created_at,
-                  schedule_type, run_at, continuation_task_id, conversation_id)
-                 VALUES (?1, ?2, '', ?3, ?4, ?5, 1, 0, ?6, ?7, ?8, ?9, ?10)",
+                  schedule_type, run_at, continuation_task_id, conversation_id, quota_gate)
+                 VALUES (?1, ?2, '', ?3, ?4, ?5, 1, 0, ?6, ?7, ?8, ?9, ?10, ?11)",
                 rusqlite::params![
                     id,
                     req.name,
@@ -200,6 +214,7 @@ impl ScheduleManager {
                     run_at,
                     req.continuation_task_id,
                     req.conversation_id,
+                    quota_gate_json,
                 ],
             )?;
             transaction.commit()?;
@@ -310,7 +325,11 @@ impl ScheduleManager {
                 ensure_agent_project_accepts_work(&transaction, &schedule.agent_id)?;
             }
             transaction.execute(
-                "UPDATE schedules SET enabled = ?1 WHERE id = ?2",
+                "UPDATE schedules
+                 SET enabled = ?1,
+                     quota_deferred_until = NULL,
+                     quota_deferred_reason = NULL
+                 WHERE id = ?2",
                 rusqlite::params![enabled as i32, id],
             )?;
             transaction.commit()?;
@@ -344,6 +363,83 @@ impl ScheduleManager {
             }
         }
         let now = Utc::now().naive_utc();
+        let triggered = match self.dispatch_schedule_trigger(&schedule, now, board) {
+            Ok(triggered) => triggered,
+            Err(error) => {
+                if is_one_shot {
+                    self.release_one_shot_claim(id);
+                }
+                return Err(error);
+            }
+        };
+
+        // Update last_run and run_count
+        let now_str = now.format("%Y-%m-%d %H:%M:%S").to_string();
+        self.db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE schedules
+                 SET last_run = ?1,
+                     run_count = run_count + 1,
+                     quota_deferred_until = NULL,
+                     quota_deferred_reason = NULL,
+                     enabled = CASE WHEN schedule_type = 'once' THEN 0 ELSE enabled END
+                 WHERE id = ?2",
+                rusqlite::params![now_str, id],
+            )
+            .map_err(|e| Error::Database(e.to_string()))
+        })?;
+
+        Ok(triggered)
+    }
+
+    /// Atomically claim and dispatch an automatic scheduled occurrence.
+    ///
+    /// Returns `Ok(None)` if the schedule was disabled, deleted, or already triggered/skipped
+    /// since `expected` was loaded (e.g., while an asynchronous quota check was in flight).
+    pub fn trigger_scheduled(
+        &self,
+        expected: &Schedule,
+        board: &TaskBoard,
+    ) -> Result<Option<ScheduleTrigger>> {
+        let now = Utc::now().naive_utc();
+        let now_str = now.format("%Y-%m-%d %H:%M:%S").to_string();
+        let claimed = self.db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE schedules
+                 SET last_run = ?1,
+                     run_count = run_count + 1,
+                     quota_deferred_until = NULL,
+                     quota_deferred_reason = NULL,
+                     enabled = CASE WHEN schedule_type = 'once' THEN 0 ELSE enabled END
+                 WHERE id = ?2
+                   AND enabled = 1
+                   AND run_count = ?3
+                   AND last_run IS ?4",
+                rusqlite::params![now_str, expected.id, expected.run_count, expected.last_run],
+            )
+            .map_err(|e| Error::Database(e.to_string()))
+        })?;
+        if claimed == 0 {
+            return Ok(None);
+        }
+
+        match self.dispatch_schedule_trigger(expected, now, board) {
+            Ok(triggered) => Ok(Some(triggered)),
+            Err(error) => {
+                self.release_scheduled_claim(expected, &now_str);
+                Err(error)
+            }
+        }
+    }
+
+    fn dispatch_schedule_trigger(
+        &self,
+        schedule: &Schedule,
+        now: chrono::NaiveDateTime,
+        board: &TaskBoard,
+    ) -> Result<ScheduleTrigger> {
+        let id = schedule.id.as_str();
+        let is_one_shot = schedule.schedule_type == SCHEDULE_TYPE_ONCE;
 
         // Format title with date/time placeholders
         let title = schedule
@@ -359,43 +455,29 @@ impl ScheduleManager {
         });
 
         let agent_id = schedule.agent_id.clone();
-        let triggered = if let Some(task_id) = schedule.continuation_task_id.as_deref() {
-            match self.enqueue_continuation(
-                &schedule,
+        if let Some(task_id) = schedule.continuation_task_id.as_deref() {
+            let task = self.enqueue_continuation(
+                schedule,
                 task_id,
                 &title,
                 description.as_deref(),
                 board,
-            ) {
-                Ok(task) => ScheduleTrigger::Task(task),
-                Err(error) => {
-                    if is_one_shot {
-                        self.release_one_shot_claim(id);
-                    }
-                    return Err(error);
-                }
-            }
+            )?;
+            Ok(ScheduleTrigger::Task(task))
         } else if let Some(conversation_id) = schedule.conversation_id.as_deref() {
-            match self.enqueue_conversation_wakeup(
-                &schedule,
+            let message = self.enqueue_conversation_wakeup(
+                schedule,
                 conversation_id,
                 &title,
                 description.as_deref(),
-            ) {
-                Ok(message) => ScheduleTrigger::Conversation {
-                    conversation_id: conversation_id.to_string(),
-                    agent_id: agent_id.clone(),
-                    message,
-                },
-                Err(error) => {
-                    if is_one_shot {
-                        self.release_one_shot_claim(id);
-                    }
-                    return Err(error);
-                }
-            }
+            )?;
+            Ok(ScheduleTrigger::Conversation {
+                conversation_id: conversation_id.to_string(),
+                agent_id,
+                message,
+            })
         } else {
-            let task = match board.create(&CreateTask {
+            let task = board.create(&CreateTask {
                 backlog: false,
                 start_after: None,
                 title,
@@ -411,22 +493,13 @@ impl ScheduleManager {
                     "source_id": id,
                     "schedule_type": schedule.schedule_type,
                 })),
-            }) {
-                Ok(task) => task,
-                Err(error) => {
-                    if is_one_shot {
-                        self.release_one_shot_claim(id);
-                    }
-                    return Err(error);
-                }
-            };
+            })?;
 
             // Standalone and recurring schedules retain their existing
             // create-a-task behavior.
             let queue = TaskQueue::new(self.db.clone());
             if let Err(error) = queue.enqueue(&task.id, &agent_id) {
                 if is_one_shot {
-                    self.release_one_shot_claim(id);
                     let _ = board.delete(&task.id);
                     return Err(error);
                 }
@@ -437,24 +510,97 @@ impl ScheduleManager {
                     "failed to enqueue scheduled task"
                 );
             }
-            ScheduleTrigger::Task(task)
-        };
+            Ok(ScheduleTrigger::Task(task))
+        }
+    }
 
-        // Update last_run and run_count
-        let now_str = now.format("%Y-%m-%d %H:%M:%S").to_string();
+    fn release_scheduled_claim(&self, expected: &Schedule, claimed_at: &str) {
+        let _ = self.db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE schedules
+                 SET last_run = ?1,
+                     run_count = ?2,
+                     quota_deferred_until = ?3,
+                     quota_deferred_reason = ?4,
+                     enabled = CASE WHEN schedule_type = 'once' THEN 1 ELSE enabled END
+                 WHERE id = ?5
+                   AND run_count = ?6
+                   AND last_run = ?7",
+                rusqlite::params![
+                    expected.last_run,
+                    expected.run_count,
+                    expected.quota_deferred_until,
+                    expected.quota_deferred_reason,
+                    expected.id,
+                    expected.run_count + 1,
+                    claimed_at,
+                ],
+            )
+        });
+    }
+
+    pub fn record_quota_deferral(
+        &self,
+        schedule: &Schedule,
+        resume_at: &str,
+        reason: &str,
+    ) -> Result<bool> {
+        let changed = self.db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE schedules
+                 SET quota_deferred_until = ?1,
+                     quota_deferred_reason = ?2
+                 WHERE id = ?3
+                   AND enabled = 1
+                   AND run_count = ?4
+                   AND last_run IS ?5",
+                rusqlite::params![
+                    resume_at,
+                    reason,
+                    schedule.id,
+                    schedule.run_count,
+                    schedule.last_run
+                ],
+            )
+            .map_err(|e| Error::Database(e.to_string()))
+        })?;
+        Ok(changed == 1)
+    }
+
+    pub fn clear_quota_deferral(&self, schedule: &Schedule) -> Result<()> {
+        self.db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE schedules
+                 SET quota_deferred_until = NULL,
+                     quota_deferred_reason = NULL
+                 WHERE id = ?1
+                   AND run_count = ?2
+                   AND last_run IS ?3",
+                rusqlite::params![schedule.id, schedule.run_count, schedule.last_run],
+            )
+            .map_err(|e| Error::Database(e.to_string()))
+        })?;
+        Ok(())
+    }
+
+    pub fn skip_scheduled_run(&self, schedule: &Schedule, now: DateTime<Utc>) -> Result<()> {
+        let now_str = now.naive_utc().format("%Y-%m-%d %H:%M:%S").to_string();
         self.db.with_conn(|conn| {
             conn.execute(
                 "UPDATE schedules
                  SET last_run = ?1,
-                     run_count = run_count + 1,
+                     quota_deferred_until = NULL,
+                     quota_deferred_reason = NULL,
                      enabled = CASE WHEN schedule_type = 'once' THEN 0 ELSE enabled END
-                 WHERE id = ?2",
-                rusqlite::params![now_str, id],
+                 WHERE id = ?2
+                   AND enabled = 1
+                   AND run_count = ?3
+                   AND last_run IS ?4",
+                rusqlite::params![now_str, schedule.id, schedule.run_count, schedule.last_run],
             )
             .map_err(|e| Error::Database(e.to_string()))
         })?;
-
-        Ok(triggered)
+        Ok(())
     }
 
     fn enqueue_continuation(
@@ -609,17 +755,58 @@ pub async fn start_schedule_runner_with_events(
     db: Arc<Database>,
     event_bus: Option<Arc<ConversationEventBus>>,
 ) {
+    start_schedule_runner_with_usage(db, event_bus, None, None).await;
+}
+
+pub async fn start_schedule_runner_with_usage(
+    db: Arc<Database>,
+    event_bus: Option<Arc<ConversationEventBus>>,
+    config: Option<Arc<RwLock<Arc<Config>>>>,
+    usage: Option<Arc<UsageService>>,
+) {
     info!("schedule runner started");
 
     loop {
-        if let Err(e) = check_schedules(&db, event_bus.as_deref()) {
+        let cfg_snapshot = config
+            .as_ref()
+            .and_then(|c| c.read().ok().map(|guard| guard.clone()));
+        if let Err(e) = check_schedules_with_usage(
+            &db,
+            event_bus.as_deref(),
+            cfg_snapshot.as_deref(),
+            usage.as_deref(),
+            Utc::now(),
+        )
+        .await
+        {
             error!(error = %e, "schedule check error");
         }
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
     }
 }
 
+#[cfg(test)]
 fn check_schedules(db: &Arc<Database>, event_bus: Option<&ConversationEventBus>) -> Result<()> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| Error::Backend(e.to_string()))?;
+    rt.block_on(check_schedules_with_usage(
+        db,
+        event_bus,
+        None,
+        None,
+        Utc::now(),
+    ))
+}
+
+pub async fn check_schedules_with_usage(
+    db: &Arc<Database>,
+    event_bus: Option<&ConversationEventBus>,
+    config: Option<&Config>,
+    usage: Option<&UsageService>,
+    now: DateTime<Utc>,
+) -> Result<()> {
     let mgr = ScheduleManager::new(db.clone());
     let board = TaskBoard::new(db.clone());
 
@@ -628,27 +815,86 @@ fn check_schedules(db: &Arc<Database>, event_bus: Option<&ConversationEventBus>)
         return Ok(());
     }
 
-    let now = Utc::now();
-
     for schedule in &schedules {
-        if should_trigger(schedule, now) {
+        let deferred_until = schedule
+            .quota_deferred_until
+            .as_deref()
+            .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
+            .map(|dt| dt.with_timezone(&Utc));
+
+        let deferred_due = match deferred_until {
+            Some(until) if until > now => continue,
+            Some(_) => schedule.schedule_type != SCHEDULE_TYPE_ONCE || schedule.run_count == 0,
+            None => false,
+        };
+
+        if deferred_due || should_trigger(schedule, now) {
+            if let (Some(gate), Some(usage_service)) = (schedule.quota_gate.as_ref(), usage) {
+                let provider = gate
+                    .provider
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|p| {
+                        crate::acp::canonical_agent_kind(p)
+                            .unwrap_or(p)
+                            .to_ascii_lowercase()
+                    })
+                    .or_else(|| resolve_agent_provider(db, config, &schedule.agent_id));
+                if let Some(provider) = provider {
+                    match usage_service
+                        .evaluate_quota_gate_with_refresh(&provider, gate, now, deferred_due)
+                        .await
+                    {
+                        QuotaGateDecision::Allow => {}
+                        QuotaGateDecision::Defer { until, reason } => {
+                            let resume_at = until.to_rfc3339_opts(SecondsFormat::Secs, true);
+                            if mgr.record_quota_deferral(schedule, &resume_at, &reason)? {
+                                info!(
+                                    schedule_id = schedule.id.as_str(),
+                                    provider = %provider,
+                                    resume_at = %resume_at,
+                                    "deferred scheduled task until quota reset"
+                                );
+                            } else {
+                                debug!(
+                                    schedule_id = schedule.id.as_str(),
+                                    "skipped persisting quota deferral because schedule changed"
+                                );
+                            }
+                            continue;
+                        }
+                        QuotaGateDecision::Skip { reason } => {
+                            mgr.skip_scheduled_run(schedule, now)?;
+                            info!(
+                                schedule_id = schedule.id.as_str(),
+                                provider = %provider,
+                                reason = %reason,
+                                "skipped scheduled task due to quota gate"
+                            );
+                            continue;
+                        }
+                    }
+                }
+            }
+
             info!(
                 schedule_id = schedule.id.as_str(),
                 name = schedule.name.as_str(),
                 agent_id = schedule.agent_id.as_str(),
                 "triggering scheduled task"
             );
-            match mgr.trigger(&schedule.id, &board) {
-                Ok(ScheduleTrigger::Task(task)) => info!(
+            match mgr.trigger_scheduled(schedule, &board) {
+                Ok(Some(ScheduleTrigger::Task(task))) => info!(
                     schedule_id = schedule.id.as_str(),
                     task_id = task.id.as_str(),
                     "scheduled task created"
                 ),
-                Ok(ScheduleTrigger::Conversation {
+                Ok(Some(ScheduleTrigger::Conversation {
                     conversation_id,
                     agent_id,
                     message,
-                }) => {
+                })) => {
                     if let Some(bus) = event_bus {
                         if let Ok(value) = serde_json::to_value(&message) {
                             bus.send(
@@ -663,6 +909,12 @@ fn check_schedules(db: &Arc<Database>, event_bus: Option<&ConversationEventBus>)
                         agent_id,
                         message_id = message.id,
                         "scheduled Conversation turn created"
+                    );
+                }
+                Ok(None) => {
+                    debug!(
+                        schedule_id = schedule.id.as_str(),
+                        "skipped triggering schedule because it was disabled or already claimed"
                     );
                 }
                 Err(e) => {
@@ -731,7 +983,21 @@ fn should_trigger(schedule: &Schedule, now: chrono::DateTime<Utc>) -> bool {
     }
 }
 
+fn serialize_quota_gate(gate: Option<&QuotaGatePolicy>) -> Result<Option<String>> {
+    let Some(gate) = gate else {
+        return Ok(None);
+    };
+    gate.validate().map_err(Error::Schedule)?;
+    serde_json::to_string(gate)
+        .map(Some)
+        .map_err(|e| Error::Schedule(format!("invalid quota_gate: {e}")))
+}
+
 fn row_to_schedule(row: &rusqlite::Row) -> Schedule {
+    let quota_gate = row
+        .get::<_, Option<String>>("quota_gate")
+        .unwrap_or_default()
+        .and_then(|raw| serde_json::from_str::<QuotaGatePolicy>(&raw).ok());
     Schedule {
         id: row.get("id").unwrap_or_default(),
         name: row.get("name").unwrap_or_default(),
@@ -749,6 +1015,9 @@ fn row_to_schedule(row: &rusqlite::Row) -> Schedule {
         run_at: row.get("run_at").unwrap_or_default(),
         continuation_task_id: row.get("continuation_task_id").unwrap_or_default(),
         conversation_id: row.get("conversation_id").unwrap_or_default(),
+        quota_gate,
+        quota_deferred_until: row.get("quota_deferred_until").unwrap_or_default(),
+        quota_deferred_reason: row.get("quota_deferred_reason").unwrap_or_default(),
     }
 }
 
@@ -825,6 +1094,7 @@ mod tests {
             agent_id: "atlas".to_string(),
             title: "Daily standup {date}".to_string(),
             description: Some("Run the daily standup report".to_string()),
+            quota_gate: None,
         })
         .unwrap()
     }
@@ -839,6 +1109,7 @@ mod tests {
             description: Some("Inspect the completed experiment and continue the goal.".into()),
             continuation_task_id: None,
             conversation_id: None,
+            quota_gate: None,
         })
         .unwrap()
     }
@@ -887,6 +1158,7 @@ mod tests {
             description: None,
             continuation_task_id: None,
             conversation_id: None,
+            quota_gate: None,
         };
 
         assert!(matches!(
@@ -906,6 +1178,7 @@ mod tests {
             agent_id: "scout".to_string(),
             title: "Weekly report".to_string(),
             description: None,
+            quota_gate: None,
         })
         .unwrap();
 
@@ -988,6 +1261,7 @@ mod tests {
                 agent_id: "atlas".into(),
                 title: "Do stale work".into(),
                 description: None,
+                quota_gate: None,
             })
             .unwrap_err();
         assert!(matches!(
@@ -1005,6 +1279,7 @@ mod tests {
                 description: None,
                 continuation_task_id: None,
                 conversation_id: None,
+                quota_gate: None,
             })
             .unwrap_err();
         assert!(matches!(
@@ -1100,6 +1375,7 @@ mod tests {
                 description: Some("Inspect CI and report whether it passed.".into()),
                 continuation_task_id: Some(original.id.clone()),
                 conversation_id: None,
+                quota_gate: None,
             })
             .unwrap();
 
@@ -1160,6 +1436,7 @@ mod tests {
                 description: Some("Inspect CI and update the room.".into()),
                 continuation_task_id: None,
                 conversation_id: Some(conversation.id.clone()),
+                quota_gate: None,
             })
             .unwrap();
 
@@ -1206,6 +1483,7 @@ mod tests {
             description: Some("This must be rejected.".into()),
             continuation_task_id: Some(task.id),
             conversation_id: None,
+            quota_gate: None,
         });
 
         assert!(matches!(result, Err(Error::Schedule(_))));
@@ -1228,6 +1506,7 @@ mod tests {
             description: Some("This must become a standalone task instead.".into()),
             continuation_task_id: Some(task.id),
             conversation_id: None,
+            quota_gate: None,
         });
 
         assert!(matches!(
@@ -1253,6 +1532,7 @@ mod tests {
                 description: None,
                 continuation_task_id: None,
                 conversation_id: None,
+                quota_gate: None,
             })
             .unwrap();
 
@@ -1276,6 +1556,7 @@ mod tests {
             agent_id: "atlas".to_string(),
             title: "Disabled".to_string(),
             description: None,
+            quota_gate: None,
         })
         .unwrap();
 
@@ -1313,6 +1594,9 @@ mod tests {
             run_at: None,
             continuation_task_id: None,
             conversation_id: None,
+            quota_gate: None,
+            quota_deferred_until: None,
+            quota_deferred_reason: None,
         };
 
         assert!(should_trigger(&schedule, Utc::now()));
@@ -1337,6 +1621,9 @@ mod tests {
             run_at: None,
             continuation_task_id: None,
             conversation_id: None,
+            quota_gate: None,
+            quota_deferred_until: None,
+            quota_deferred_reason: None,
         };
 
         // Just ran — next match is next hour, so should not trigger now
@@ -1360,6 +1647,9 @@ mod tests {
             run_at: None,
             continuation_task_id: None,
             conversation_id: None,
+            quota_gate: None,
+            quota_deferred_until: None,
+            quota_deferred_reason: None,
         };
 
         assert!(!should_trigger(&schedule, Utc::now()));
@@ -1414,6 +1704,7 @@ mod tests {
                 description: Some("Verify job status".to_string()),
                 continuation_task_id: Some(task.id.clone()),
                 conversation_id: None,
+                quota_gate: None,
             })
             .unwrap();
 
@@ -1436,5 +1727,281 @@ mod tests {
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].id, cron.id);
         assert_eq!(mgr.list_filtered(None, false, true).unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn quota_gated_schedule_defers_until_reset_then_creates_task() {
+        use crate::usage::{window_from_used_pct, UsageAccountReport, UsageReportStatus};
+
+        let (db, mgr, board) = setup();
+        let due_at = DateTime::parse_from_rfc3339("2099-07-01T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let schedule = mgr
+            .create_one_shot(&CreateOneShotSchedule {
+                name: "Quota-aware nightly".into(),
+                run_at: Some("2099-07-01T10:00:00Z".into()),
+                delay_seconds: None,
+                agent_id: "atlas".into(),
+                title: "Run nightly checks".into(),
+                description: None,
+                continuation_task_id: None,
+                conversation_id: None,
+                quota_gate: Some(QuotaGatePolicy {
+                    min_remaining_pct: 25.0,
+                    window: "session".into(),
+                    provider: Some("codex".into()),
+                    reset_buffer_seconds: 60,
+                    ..Default::default()
+                }),
+            })
+            .unwrap();
+        assert!(schedule.quota_gate.is_some());
+
+        let usage = UsageService::new();
+        usage
+            .set_provider_override(
+                "codex",
+                vec![UsageAccountReport {
+                    id: "codex:test".into(),
+                    provider: "codex".into(),
+                    provider_label: "Codex".into(),
+                    harness: "Codex".into(),
+                    account_label: None,
+                    status: UsageReportStatus::Available,
+                    plan_label: Some("Plus".into()),
+                    observed_at: None,
+                    fetched_at: "2099-07-01T10:00:00Z".into(),
+                    windows: vec![window_from_used_pct(
+                        "five_hour",
+                        "5-hour",
+                        Some("5h".into()),
+                        true,
+                        Some(90.0),
+                        Some(18_000),
+                        Some("2099-07-01T12:00:00Z".into()),
+                        None,
+                    )],
+                    balances: Vec::new(),
+                    details: Vec::new(),
+                    problem: None,
+                    error: None,
+                    last_successful: None,
+                }],
+            )
+            .await;
+
+        check_schedules_with_usage(&db, None, None, Some(&usage), due_at)
+            .await
+            .unwrap();
+        let deferred = mgr.get(&schedule.id).unwrap();
+        assert_eq!(deferred.run_count, 0);
+        assert_eq!(
+            deferred.quota_deferred_until.as_deref(),
+            Some("2099-07-01T12:01:00Z")
+        );
+
+        // After reset, quota recovers and the scheduled task is created.
+        usage
+            .set_provider_override(
+                "codex",
+                vec![UsageAccountReport {
+                    id: "codex:test".into(),
+                    provider: "codex".into(),
+                    provider_label: "Codex".into(),
+                    harness: "Codex".into(),
+                    account_label: None,
+                    status: UsageReportStatus::Available,
+                    plan_label: Some("Plus".into()),
+                    observed_at: None,
+                    fetched_at: "2099-07-01T12:01:00Z".into(),
+                    windows: vec![window_from_used_pct(
+                        "five_hour",
+                        "5-hour",
+                        Some("5h".into()),
+                        true,
+                        Some(10.0),
+                        Some(18_000),
+                        Some("2099-07-01T17:00:00Z".into()),
+                        None,
+                    )],
+                    balances: Vec::new(),
+                    details: Vec::new(),
+                    problem: None,
+                    error: None,
+                    last_successful: None,
+                }],
+            )
+            .await;
+        let after_reset = DateTime::parse_from_rfc3339("2099-07-01T12:01:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        check_schedules_with_usage(&db, None, None, Some(&usage), after_reset)
+            .await
+            .unwrap();
+        let completed = mgr.get(&schedule.id).unwrap();
+        assert_eq!(completed.run_count, 1);
+        assert!(completed.quota_deferred_until.is_none());
+        assert_eq!(board.list(None, None, 10).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn deferred_recurring_schedule_that_never_ran_resumes_after_wait_expires() {
+        use crate::usage::{window_from_used_pct, UsageAccountReport, UsageReportStatus};
+        use chrono::Timelike;
+
+        let (db, mgr, board) = setup();
+        // Pick a concrete UTC timestamp, derive its local hour/minute, and build a daily cron for it.
+        let due_at = DateTime::parse_from_rfc3339("2099-07-01T09:00:30Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let due_local = due_at.with_timezone(&chrono::Local);
+        let cron = format!("{} {} * * *", due_local.minute(), due_local.hour());
+
+        let schedule = mgr
+            .create(&CreateSchedule {
+                name: "Daily quota-gated standup".into(),
+                cron,
+                agent_id: "atlas".into(),
+                title: "Daily standup".into(),
+                description: None,
+                quota_gate: Some(QuotaGatePolicy {
+                    min_remaining_pct: 25.0,
+                    window: "session".into(),
+                    provider: Some("codex".into()),
+                    reset_buffer_seconds: 60,
+                    ..Default::default()
+                }),
+            })
+            .unwrap();
+        assert!(schedule.last_run.is_none());
+        assert_eq!(schedule.run_count, 0);
+
+        let reset_at = due_at + chrono::Duration::hours(2);
+        let expected_resume = reset_at + chrono::Duration::seconds(60);
+
+        let usage = UsageService::new();
+        usage
+            .set_provider_override(
+                "codex",
+                vec![UsageAccountReport {
+                    id: "codex:test".into(),
+                    provider: "codex".into(),
+                    provider_label: "Codex".into(),
+                    harness: "Codex".into(),
+                    account_label: None,
+                    status: UsageReportStatus::Available,
+                    plan_label: Some("Plus".into()),
+                    observed_at: None,
+                    fetched_at: due_at.to_rfc3339_opts(SecondsFormat::Secs, true),
+                    windows: vec![window_from_used_pct(
+                        "five_hour",
+                        "5-hour",
+                        Some("5h".into()),
+                        true,
+                        Some(95.0),
+                        Some(18_000),
+                        Some(reset_at.to_rfc3339_opts(SecondsFormat::Secs, true)),
+                        None,
+                    )],
+                    balances: Vec::new(),
+                    details: Vec::new(),
+                    problem: None,
+                    error: None,
+                    last_successful: None,
+                }],
+            )
+            .await;
+
+        // First occurrence matches cron and gets deferred until reset + 60s.
+        check_schedules_with_usage(&db, None, None, Some(&usage), due_at)
+            .await
+            .unwrap();
+        let deferred = mgr.get(&schedule.id).unwrap();
+        assert_eq!(deferred.run_count, 0);
+        assert!(deferred.last_run.is_none());
+        assert_eq!(
+            deferred.quota_deferred_until.as_deref(),
+            Some(
+                expected_resume
+                    .to_rfc3339_opts(SecondsFormat::Secs, true)
+                    .as_str()
+            )
+        );
+
+        // Still waiting before expected_resume.
+        let midpoint = due_at + chrono::Duration::hours(1);
+        check_schedules_with_usage(&db, None, None, Some(&usage), midpoint)
+            .await
+            .unwrap();
+        assert_eq!(mgr.get(&schedule.id).unwrap().run_count, 0);
+
+        // Two hours later, `should_trigger` alone would be false because `last_run` is None
+        // and the 2-minute initial lookback window has moved past the daily cron match.
+        assert!(!should_trigger(&deferred, expected_resume));
+
+        // After quota recovers, the expired deferral must still be rechecked and triggered.
+        usage
+            .set_provider_override(
+                "codex",
+                vec![UsageAccountReport {
+                    id: "codex:test".into(),
+                    provider: "codex".into(),
+                    provider_label: "Codex".into(),
+                    harness: "Codex".into(),
+                    account_label: None,
+                    status: UsageReportStatus::Available,
+                    plan_label: Some("Plus".into()),
+                    observed_at: None,
+                    fetched_at: expected_resume.to_rfc3339_opts(SecondsFormat::Secs, true),
+                    windows: vec![window_from_used_pct(
+                        "five_hour",
+                        "5-hour",
+                        Some("5h".into()),
+                        true,
+                        Some(10.0),
+                        Some(18_000),
+                        Some(
+                            (expected_resume + chrono::Duration::hours(5))
+                                .to_rfc3339_opts(SecondsFormat::Secs, true),
+                        ),
+                        None,
+                    )],
+                    balances: Vec::new(),
+                    details: Vec::new(),
+                    problem: None,
+                    error: None,
+                    last_successful: None,
+                }],
+            )
+            .await;
+
+        check_schedules_with_usage(&db, None, None, Some(&usage), expected_resume)
+            .await
+            .unwrap();
+        let resumed = mgr.get(&schedule.id).unwrap();
+        assert_eq!(resumed.run_count, 1);
+        assert!(resumed.quota_deferred_until.is_none());
+        assert!(resumed.quota_deferred_reason.is_none());
+        assert_eq!(board.list(None, None, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn trigger_scheduled_skips_disabled_or_already_claimed_recurring_schedule() {
+        let (_db, mgr, board) = setup();
+        let snapshot = create_schedule(&mgr);
+
+        // User disables the recurring schedule while an async quota check is in flight.
+        mgr.disable(&snapshot.id).unwrap();
+        assert!(mgr.trigger_scheduled(&snapshot, &board).unwrap().is_none());
+        assert!(board.list(None, None, 10).unwrap().is_empty());
+        assert_eq!(mgr.get(&snapshot.id).unwrap().run_count, 0);
+
+        // Re-enabling allows claiming once, and a duplicate claim with the stale snapshot is ignored.
+        let enabled = mgr.enable(&snapshot.id).unwrap();
+        assert!(mgr.trigger_scheduled(&enabled, &board).unwrap().is_some());
+        assert!(mgr.trigger_scheduled(&enabled, &board).unwrap().is_none());
+        assert_eq!(board.list(None, None, 10).unwrap().len(), 1);
+        assert_eq!(mgr.get(&snapshot.id).unwrap().run_count, 1);
     }
 }

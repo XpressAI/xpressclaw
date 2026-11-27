@@ -393,6 +393,10 @@ control-plane restart or overlapping scheduler check from starting the same
 occurrence twice. The Automations page shows the latest trigger error so a bad
 agent or workspace configuration does not fail silently.
 
+Scheduled workflows can also include an optional `quota_gate` block under
+`schedule` so deferrable background runs wait until a harness rate-limit window
+resets when remaining quota is low (see the [Control center guide](control-center.md#quota-aware-automations-quota_gate)).
+
 Connector-backed triggers and notification sinks from legacy workflow files
 remain readable but disabled. Project Conversations now provide the durable
 human/Agent coordination surface; future connector events and sinks can target

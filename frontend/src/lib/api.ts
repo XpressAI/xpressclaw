@@ -513,6 +513,107 @@ export const dashboard = {
 		`/api/dashboard/stream?${dashboardParams(projectId, range, { after: String(after) })}`,
 };
 
+// -- Harness quota usage & automation awareness --
+
+export type UsageTone = 'default' | 'ok' | 'warning' | 'danger';
+
+export interface UsageWindow {
+	id: string;
+	label: string;
+	short_label?: string | null;
+	summary: boolean;
+	used_pct?: number | null;
+	remaining_pct?: number | null;
+	resets_at?: string | null;
+	duration_seconds?: number | null;
+	tone: UsageTone;
+}
+
+export interface UsageBalance {
+	id: string;
+	label: string;
+	used?: number | null;
+	remaining?: number | null;
+	limit?: number | null;
+	unit: 'usd' | 'credits' | 'requests' | 'tokens';
+	resets_at?: string | null;
+	tone: UsageTone;
+}
+
+export interface UsageDetail {
+	id: string;
+	label: string;
+	value: string;
+	tone?: UsageTone | null;
+}
+
+export type UsageProblem =
+	| { kind: 'expired'; expires_at: string; refreshed_by?: string | null }
+	| { kind: 'rejected'; status: number; refreshed_by?: string | null }
+	| { kind: 'no_quota'; detail: string }
+	| { kind: 'rate_limited'; retry_at?: string | null; detail: string };
+
+export interface UsageSuccessfulSnapshot {
+	fetched_at: string;
+	plan_label?: string | null;
+	observed_at?: string | null;
+	windows: UsageWindow[];
+	balances: UsageBalance[];
+	details: UsageDetail[];
+}
+
+export interface UsageAccountReport {
+	id: string;
+	provider: string;
+	provider_label: string;
+	harness: string;
+	account_label?: string | null;
+	status: 'available' | 'unavailable' | 'error';
+	plan_label?: string | null;
+	observed_at?: string | null;
+	fetched_at: string;
+	windows: UsageWindow[];
+	balances: UsageBalance[];
+	details: UsageDetail[];
+	problem?: UsageProblem | null;
+	error?: string | null;
+	last_successful?: UsageSuccessfulSnapshot | null;
+}
+
+export interface DeferredAutomationSummary {
+	kind: 'workflow' | 'schedule';
+	id: string;
+	name: string;
+	provider?: string | null;
+	resume_at: string;
+	reason: string;
+}
+
+export interface UsageSnapshot {
+	fetched_at: string;
+	accounts: UsageAccountReport[];
+	deferred_automations: DeferredAutomationSummary[];
+}
+
+export interface QuotaGatePolicy {
+	min_remaining_pct: number;
+	window: string;
+	provider?: string | null;
+	on_limit?: 'wait_for_reset' | 'skip';
+	on_unknown?: 'run_anyway' | 'wait';
+	reset_buffer_seconds?: number;
+}
+
+export const usage = {
+	get: (options?: { refresh?: boolean; provider?: string; signal?: AbortSignal }) => {
+		const params = new URLSearchParams();
+		if (options?.refresh) params.set('refresh', 'true');
+		if (options?.provider) params.set('provider', options.provider);
+		const qs = params.toString();
+		return request<UsageSnapshot>(`/api/usage${qs ? `?${qs}` : ''}`, { signal: options?.signal });
+	},
+};
+
 // -- Logical sessions and native work attempts --
 
 export interface NativeRunnerConfig {
@@ -1121,6 +1222,9 @@ export interface Schedule {
 	run_at: string | null;
 	continuation_task_id: string | null;
 	conversation_id: string | null;
+	quota_gate?: QuotaGatePolicy | null;
+	quota_deferred_until?: string | null;
+	quota_deferred_reason?: string | null;
 }
 
 export const schedules = {
@@ -1139,6 +1243,7 @@ export const schedules = {
 		agent_id: string;
 		title: string;
 		description?: string;
+		quota_gate?: QuotaGatePolicy;
 	}) => request<Schedule>('/api/schedules', { method: 'POST', body: JSON.stringify(data) }),
 	createOnce: (data: {
 		name: string;
@@ -1149,6 +1254,7 @@ export const schedules = {
 		delay_seconds?: number;
 		continuation_task_id?: string;
 		conversation_id?: string;
+		quota_gate?: QuotaGatePolicy;
 	}) => request<Schedule>('/api/schedules/once', { method: 'POST', body: JSON.stringify(data) }),
 	delete: (id: string) => request<void>(`/api/schedules/${id}`, { method: 'DELETE' }),
 	enable: (id: string) => request<Schedule>(`/api/schedules/${id}/enable`, { method: 'POST' }),
@@ -1617,6 +1723,8 @@ export interface Workflow {
 	last_triggered_at: string | null;
 	trigger_count: number;
 	trigger_error: string | null;
+	quota_deferred_until?: string | null;
+	quota_deferred_reason?: string | null;
 }
 
 export interface WorkflowInstance {

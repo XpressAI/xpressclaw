@@ -12,6 +12,7 @@
 		type DashboardSnapshot,
 	} from '$lib/api';
 	import DashboardChart from '$lib/components/dashboard/DashboardChart.svelte';
+	import DashboardQuotas from '$lib/components/dashboard/DashboardQuotas.svelte';
 	import DashboardResources from '$lib/components/dashboard/DashboardResources.svelte';
 	import DashboardTokens from '$lib/components/dashboard/DashboardTokens.svelte';
 	import { serverTimestampMs } from '$lib/serverTime';
@@ -599,6 +600,7 @@
 		{/if}
 
 		<DashboardResources needsAttention={counters.needs_attention} />
+		<DashboardQuotas />
 
 		{#if loading && !snapshot}
 			<div aria-label="Loading dashboard summary" class="grid gap-4 xl:grid-cols-[minmax(0,1.6fr)_minmax(20rem,.8fr)]">

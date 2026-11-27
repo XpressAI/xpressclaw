@@ -8988,6 +8988,7 @@ flows:
                 description: Some("Inspect the results and continue the active goal.".into()),
                 continuation_task_id: Some(original.id.clone()),
                 conversation_id: None,
+                quota_gate: None,
             })
             .unwrap();
         let wakeup_task = schedules

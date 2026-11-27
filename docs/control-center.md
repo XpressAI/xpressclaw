@@ -103,3 +103,65 @@ Recent dashboard events, metric points, and token reports are retained for eight
 days, with a 20,000-row cap on events. Tasks, Conversations, and their full
 histories keep their existing lifecycle and retention; these tables are only a
 bounded index for the control-center view.
+
+## Harness quotas, status bar, and automation quota gates
+
+The desktop **bottom status bar** stays visible across both Tabs and Canvas views
+and surfaces live fleet and host health at a glance:
+
+- **Left:** Server/container runtime status, active vs. configured Agent count
+  (click to jump to any Agent), queued task count, **Needs you** attention count,
+  and the count of scheduled automations waiting for a harness quota reset.
+- **Center:** Pinned **Harness Quotas** meters (5-hour, weekly, monthly, or
+  model-scoped windows) with a clickable roster popover offering **Used % / Left %**
+  display modes, reset countdowns, average burn-rate pace indicators (*On track*,
+  *Tight*, *Runs out in…*), credit/USD balances, per-account pin/hide toggles,
+  and a manual **Refresh** button.
+- **Right:** Compact host **CPU**, **Memory**, and **Disk** readings shared with
+  Control center over one cached sampler (pausing automatically while the browser
+  tab is hidden).
+
+Control center also renders the **Harness quotas** section below Server resources
+when local harness credentials are detected.
+
+### Read-only quota discovery
+
+`GET /api/usage` discovers existing local credentials on the host in strictly
+read-only mode—it never mutates or refreshes rotating OAuth tokens owned by a
+harness, caches results for 5 minutes with in-flight deduplication, honors HTTP
+`429` `Retry-After` holds, and retains the last successful reading when a refresh
+fails. Supported sources include:
+
+- **Claude** (`~/.claude/.credentials.json`, macOS Keychain, or `~/.pi/agent/auth.json`)
+- **Codex** (`$CODEX_HOME/auth.json`, `~/.codex/auth.json`, OpenCode/Pi OAuth stores)
+- **Antigravity** (`agy -p /usage --output-format json`, gated on `agy --version >= 1.1.11`)
+- **GitHub Copilot** (`COPILOT_TOKEN`/`GITHUB_TOKEN` or `gh` `hosts.yml`)
+- **Cursor** (`CURSOR_ACCESS_TOKEN`, `~/.config/cursor/auth.json`, or desktop `state.vscdb`)
+- **Kimi** (`KIMI_API_KEY` or `~/.kimi/credentials/*.json`)
+- **Grok** (`GROK_API_KEY`/`GROK_TOKEN` or `~/.grok/auth.json`)
+- **OpenCode Go** (`~/.local/share/opencode/auth.json`)
+- **GLM / Z.ai** (`ZAI_API_KEY`/`GLM_API_KEY` or `~/.config/glm-acp-agent/config.json`)
+
+### Quota-aware automations (`quota_gate`)
+
+Scheduled workflows (`schedule.quota_gate`) and task schedules (`quota_gate`) can
+require minimum remaining quota headroom before firing so background automations
+wait until a rate-limit window resets instead of failing or consuming interactive
+capacity:
+
+```yaml
+schedule:
+  cron: "0 2 * * *"
+  quota_gate:
+    min_remaining_pct: 20      # Require at least 20% remaining
+    window: session            # any | session | weekly | monthly | <window_id>
+    provider: claude           # Optional; inferred from the target agent when omitted
+    on_limit: wait_for_reset   # wait_for_reset | skip
+    on_unknown: run_anyway     # run_anyway (fail-open default) | wait
+    reset_buffer_seconds: 60   # Extra buffer after resets_at (0..=3600)
+```
+
+When a due automation is deferred, XpressClaw persists `quota_deferred_until` and
+`quota_deferred_reason` in SQLite, shows the countdown on the **Automations**
+page, **Control center**, and **bottom status bar**, and automatically resumes
+once `resets_at + reset_buffer_seconds` passes.

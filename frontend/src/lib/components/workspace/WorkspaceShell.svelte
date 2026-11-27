@@ -43,6 +43,7 @@
 	import SidebarTasks from './SidebarTasks.svelte';
 	import SidebarAutomations from './SidebarAutomations.svelte';
 	import SidebarProjects from './SidebarProjects.svelte';
+	import WorkspaceStatusBar from './WorkspaceStatusBar.svelte';
 	import WorkspacePane from './WorkspacePane.svelte';
 	import WorkspaceCanvas from '$lib/components/canvas/WorkspaceCanvas.svelte';
 	import type { WorkspaceViewMode } from '$lib/canvas';
@@ -1445,7 +1446,8 @@
 	});
 </script>
 
-<div use:workspaceViewport={updateViewport} data-workspace-shell data-foldable={foldable || undefined} class="workspace-shell flex h-[100dvh] min-w-0 overflow-hidden pt-[env(safe-area-inset-top)] lg:pb-[env(safe-area-inset-bottom)] pl-[env(safe-area-inset-left)] pr-[env(safe-area-inset-right)]">
+<div use:workspaceViewport={updateViewport} data-workspace-shell data-foldable={foldable || undefined} class="workspace-shell flex h-[100dvh] min-w-0 flex-col overflow-hidden pt-[env(safe-area-inset-top)] lg:pb-[env(safe-area-inset-bottom)] pl-[env(safe-area-inset-left)] pr-[env(safe-area-inset-right)]">
+	<div class="flex min-h-0 flex-1 min-w-0 overflow-hidden">
 	<aside data-workspace-sidebar class="hidden shrink-0 flex-col border-r border-border/60 transition-[width] duration-200 lg:flex {sidebarCollapsed ? 'w-14' : 'w-64'}" style="background: hsl(var(--sidebar))">
 		<div class="flex h-11 shrink-0 items-center {sidebarCollapsed ? 'justify-center' : 'gap-2 px-3'}">
 			<a href="/dashboard" class="flex min-w-0 items-center gap-2 rounded-md outline-none transition hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/50" aria-label="Open Control center" title="Control center">
@@ -1670,6 +1672,15 @@
 			{/each}
 		</nav>
 	</main>
+	</div>
+	<WorkspaceStatusBar
+		{agentList}
+		taskList={sidebarTaskList}
+		attentionCount={attentionTasks.length}
+		{serverConnected}
+		{dockerAvailable}
+		onnavigate={(path) => openPath(path)}
+	/>
 </div>
 
 {#if mobileMenuOpen}

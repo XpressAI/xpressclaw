@@ -32,6 +32,10 @@ pub struct WorkflowRecord {
     pub trigger_count: i64,
     pub trigger_error: Option<String>,
     #[serde(default)]
+    pub quota_deferred_until: Option<String>,
+    #[serde(default)]
+    pub quota_deferred_reason: Option<String>,
+    #[serde(default)]
     pub project_id: Option<String>,
     #[serde(default)]
     pub revision: i64,
@@ -159,7 +163,9 @@ impl WorkflowManager {
                      description = ?4,
                      updated_at = ?5,
                      last_triggered_at = CASE WHEN ?6 THEN NULL ELSE last_triggered_at END,
-                     trigger_error = CASE WHEN ?6 THEN NULL ELSE trigger_error END
+                     trigger_error = CASE WHEN ?6 THEN NULL ELSE trigger_error END,
+                     quota_deferred_until = CASE WHEN ?6 THEN NULL ELSE quota_deferred_until END,
+                     quota_deferred_reason = CASE WHEN ?6 THEN NULL ELSE quota_deferred_reason END
                  WHERE id = ?7",
                 rusqlite::params![
                     yaml_content,
@@ -312,6 +318,94 @@ impl WorkflowManager {
         })?;
         Ok(())
     }
+
+    /// Record that a due scheduled workflow is waiting for a harness quota window to reset.
+    ///
+    /// Guards against concurrent schedule edits or executions by requiring the workflow to
+    /// remain enabled at the exact revision and `last_triggered_at` inspected before the
+    /// asynchronous quota check.
+    pub fn record_quota_deferral(
+        &self,
+        record: &WorkflowRecord,
+        resume_at: &str,
+        reason: &str,
+    ) -> Result<bool> {
+        let changed = self.db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE workflows
+                 SET quota_deferred_until = ?1,
+                     quota_deferred_reason = ?2
+                 WHERE id = ?3
+                   AND enabled = 1
+                   AND revision = ?4
+                   AND last_triggered_at IS ?5",
+                rusqlite::params![
+                    resume_at,
+                    reason,
+                    record.id,
+                    record.revision,
+                    record.last_triggered_at
+                ],
+            )
+            .map_err(|e| Error::Database(e.to_string()))
+        })?;
+        Ok(changed == 1)
+    }
+
+    /// Clear any active quota deferral state on a workflow if it is still enabled and its
+    /// revision and occurrence have not changed.
+    pub fn clear_quota_deferral(&self, record: &WorkflowRecord) -> Result<()> {
+        self.db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE workflows
+                 SET quota_deferred_until = NULL,
+                     quota_deferred_reason = NULL
+                 WHERE id = ?1
+                   AND enabled = 1
+                   AND revision = ?2
+                   AND last_triggered_at IS ?3",
+                rusqlite::params![record.id, record.revision, record.last_triggered_at],
+            )
+            .map_err(|e| Error::Database(e.to_string()))
+        })?;
+        Ok(())
+    }
+
+    /// Advance a scheduled occurrence without creating an instance (used when
+    /// `quota_gate.on_limit == skip`).
+    pub fn skip_scheduled_occurrence(
+        &self,
+        record: &WorkflowRecord,
+        skipped_at: &str,
+        reason: &str,
+        once: bool,
+    ) -> Result<()> {
+        self.db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE workflows
+                 SET last_triggered_at = ?1,
+                     trigger_error = ?2,
+                     quota_deferred_until = NULL,
+                     quota_deferred_reason = NULL,
+                     revision = revision + 1,
+                     enabled = CASE WHEN ?3 THEN 0 ELSE enabled END
+                 WHERE id = ?4
+                   AND enabled = 1
+                   AND revision = ?5
+                   AND last_triggered_at IS ?6",
+                rusqlite::params![
+                    skipped_at,
+                    reason,
+                    once,
+                    record.id,
+                    record.revision,
+                    record.last_triggered_at
+                ],
+            )
+            .map_err(|e| Error::Database(e.to_string()))
+        })?;
+        Ok(())
+    }
 }
 
 fn row_to_workflow(row: &rusqlite::Row) -> WorkflowRecord {
@@ -328,6 +422,8 @@ fn row_to_workflow(row: &rusqlite::Row) -> WorkflowRecord {
         last_triggered_at: row.get("last_triggered_at").unwrap_or_default(),
         trigger_count: row.get("trigger_count").unwrap_or(0),
         trigger_error: row.get("trigger_error").unwrap_or_default(),
+        quota_deferred_until: row.get("quota_deferred_until").unwrap_or_default(),
+        quota_deferred_reason: row.get("quota_deferred_reason").unwrap_or_default(),
         project_id: row.get("project_id").unwrap_or_default(),
         revision: row.get("revision").unwrap_or(0),
     }

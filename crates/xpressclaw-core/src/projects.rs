@@ -1935,6 +1935,7 @@ mod tests {
                 agent_id: "atlas".into(),
                 title: "Late".into(),
                 description: None,
+                quota_gate: None,
             })
             .unwrap_err();
         assert!(schedule_error.to_string().contains("being deleted"));
