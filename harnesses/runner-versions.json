@@ -4,7 +4,7 @@
   "runners": {
     "codex": {
       "auto_update": true,
-      "version": "2.10.0",
+      "version": "2.12.1",
       "acp_command": [
         "codex-acp"
       ],
@@ -18,12 +18,12 @@
         }
       ],
       "build_args": {
-        "CODEX_ACP_VERSION": "2.10.0"
+        "CODEX_ACP_VERSION": "2.12.1"
       }
     },
     "claude": {
       "auto_update": true,
-      "version": "0.110.0",
+      "version": "0.113.0",
       "acp_command": [
         "claude-agent-acp"
       ],
@@ -37,12 +37,12 @@
         }
       ],
       "build_args": {
-        "CLAUDE_ACP_VERSION": "0.110.0"
+        "CLAUDE_ACP_VERSION": "0.113.0"
       }
     },
     "antigravity": {
       "auto_update": true,
-      "version": "1.5.16",
+      "version": "1.5.19",
       "acp_command": [
         "agy",
         "acp",
@@ -64,10 +64,10 @@
         "AGENT_KIND": "antigravity",
         "AGENT_BINARY": "agy",
         "AGENT_PATH": "antigravity",
-        "AGENT_ARCHIVE_AMD64": "https://github.com/google-antigravity/antigravity-cli/releases/download/1.5.16/agy_cli_linux_x64.tar.gz",
-        "AGENT_ARCHIVE_ARM64": "https://github.com/google-antigravity/antigravity-cli/releases/download/1.5.16/agy_cli_linux_arm64.tar.gz",
-        "AGENT_SHA256_AMD64": "9bdab234d06bad1a61be2321072652eb06be78baff1acbfae47331da5a090abc",
-        "AGENT_SHA256_ARM64": "7ddeec790084e550af18adb04a5b6c5fdf2db3e1026854f49901a04cb4265c7e"
+        "AGENT_ARCHIVE_AMD64": "https://github.com/google-antigravity/antigravity-cli/releases/download/1.5.19/agy_cli_linux_x64.tar.gz",
+        "AGENT_ARCHIVE_ARM64": "https://github.com/google-antigravity/antigravity-cli/releases/download/1.5.19/agy_cli_linux_arm64.tar.gz",
+        "AGENT_SHA256_AMD64": "971a4aa707fb0886d4e1df5f1f50bad7b01aa492d0b1f13df4ea7402e96dae90",
+        "AGENT_SHA256_ARM64": "aa316ff45b0d40b49ed83d29e3865857fca0c125f350fbb9d3c1cb9a640b49c4"
       }
     },
     "deepseek-harness": {
@@ -99,7 +99,7 @@
     },
     "github-copilot": {
       "auto_update": true,
-      "version": "1.0.114",
+      "version": "1.0.117",
       "acp_command": [
         "copilot",
         "--acp"
@@ -115,13 +115,13 @@
       ],
       "build_args": {
         "AGENT_KIND": "github-copilot",
-        "AGENT_PACKAGE": "@github/copilot@1.0.114",
+        "AGENT_PACKAGE": "@github/copilot@1.0.117",
         "AGENT_BINARY": "copilot"
       }
     },
     "junie": {
       "auto_update": true,
-      "version": "4171.4.0",
+      "version": "4171.7.0",
       "acp_command": [
         "junie",
         "--acp=true"
@@ -138,8 +138,8 @@
         "AGENT_KIND": "junie",
         "AGENT_BINARY": "junie",
         "AGENT_PATH": "junie-app/bin/junie",
-        "AGENT_ARCHIVE_AMD64": "https://github.com/JetBrains/junie-acp-release/releases/download/4171.4/junie-release-4171.4-linux-amd64.zip",
-        "AGENT_ARCHIVE_ARM64": "https://github.com/JetBrains/junie-acp-release/releases/download/4171.4/junie-release-4171.4-linux-aarch64.zip",
+        "AGENT_ARCHIVE_AMD64": "https://github.com/JetBrains/junie-acp-release/releases/download/4171.7/junie-release-4171.7-linux-amd64.zip",
+        "AGENT_ARCHIVE_ARM64": "https://github.com/JetBrains/junie-acp-release/releases/download/4171.7/junie-release-4171.7-linux-aarch64.zip",
         "AGENT_SHA256_AMD64": "",
         "AGENT_SHA256_ARM64": ""
       }
@@ -171,7 +171,7 @@
     },
     "opencode": {
       "auto_update": true,
-      "version": "2.4.1",
+      "version": "2.4.2",
       "acp_command": [
         "opencode",
         "acp"
@@ -188,10 +188,10 @@
         "AGENT_KIND": "opencode",
         "AGENT_BINARY": "opencode",
         "AGENT_PATH": "opencode",
-        "AGENT_ARCHIVE_AMD64": "https://github.com/anomalyco/opencode/releases/download/v2.4.1/opencode-linux-x64.tar.gz",
-        "AGENT_ARCHIVE_ARM64": "https://github.com/anomalyco/opencode/releases/download/v2.4.1/opencode-linux-arm64.tar.gz",
-        "AGENT_SHA256_AMD64": "9ddd18e3faf64eaeccf6a0fcbc96a5c7a14520ae5fd5b61e5be51d894f478b47",
-        "AGENT_SHA256_ARM64": "cb28cf94541aeb62a4b2ea5997a99b5dd6bae595a772f36fbe279299f2032a4f"
+        "AGENT_ARCHIVE_AMD64": "https://github.com/anomalyco/opencode/releases/download/v2.4.2/opencode-linux-x64.tar.gz",
+        "AGENT_ARCHIVE_ARM64": "https://github.com/anomalyco/opencode/releases/download/v2.4.2/opencode-linux-arm64.tar.gz",
+        "AGENT_SHA256_AMD64": "452912288f934d1771bd5bd0d8611ba3a6adc3db3ac3333c37facf373770ba66",
+        "AGENT_SHA256_ARM64": "bf8d18dde87224629341ff398e76c7c17216b9b406affc728b6c1a5c136abf93"
       }
     },
     "jouzu": {
@@ -249,7 +249,7 @@
         "AGENT_KIND": "pi",
         "AGENT_PACKAGE": "pi-acp@0.0.35",
         "AGENT_BINARY": "pi-acp",
-        "AGENT_EXTRA_PACKAGES": "@earendil-works/pi-coding-agent@1.6.0",
+        "AGENT_EXTRA_PACKAGES": "@earendil-works/pi-coding-agent@1.7.0",
         "AGENT_EXTRA_BINARY": "pi",
         "PI_MCP_PACKAGE": "pi-mcp-adapter@7.0.1"
       }
@@ -280,7 +280,7 @@
     },
     "cline": {
       "auto_update": true,
-      "version": "3.0.75",
+      "version": "3.0.76",
       "acp_command": [
         "cline",
         "--acp"
@@ -296,7 +296,7 @@
       ],
       "build_args": {
         "AGENT_KIND": "cline",
-        "AGENT_PACKAGE": "cline@3.0.75",
+        "AGENT_PACKAGE": "cline@3.0.76",
         "AGENT_BINARY": "cline"
       }
     },
@@ -327,7 +327,7 @@
     },
     "glm": {
       "auto_update": true,
-      "version": "1.17.1",
+      "version": "1.18.0",
       "acp_command": [
         "glm-acp-agent"
       ],
@@ -342,13 +342,13 @@
       ],
       "build_args": {
         "AGENT_KIND": "glm",
-        "AGENT_PACKAGE": "glm-acp-agent@1.17.1",
+        "AGENT_PACKAGE": "glm-acp-agent@1.18.0",
         "AGENT_BINARY": "glm-acp-agent"
       }
     },
     "grok": {
       "auto_update": true,
-      "version": "1.0.93",
+      "version": "1.0.94",
       "acp_command": [
         "grok",
         "agent",
@@ -365,7 +365,7 @@
       ],
       "build_args": {
         "AGENT_KIND": "grok",
-        "AGENT_PACKAGE": "@xai-official/grok@1.0.93",
+        "AGENT_PACKAGE": "@xai-official/grok@1.0.94",
         "AGENT_BINARY": "grok"
       }
     },
